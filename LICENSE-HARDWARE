@@ -1,0 +1,29 @@
+StreamSentry Hardware License
+==============================
+
+All hardware design files in this repository are licensed under the
+CERN Open Hardware Licence Version 2 – Strongly Reciprocal (CERN-OHL-S-2.0).
+
+Copyright (c) 2025, GARAGE AGENCY, LLC, THE
+
+You may use, copy, modify, and distribute these hardware design
+documents and products made from them under the terms of the
+CERN-OHL-S-2.0 licence.
+
+You must:
+- Provide access to the complete, machine-readable source of any
+  modified versions you distribute.
+- License your modifications under CERN-OHL-S-2.0 as well.
+- Keep notices and copyright information intact.
+
+This summary is for convenience only. The full legal text of the licence
+is available at:
+
+  https://ohwr.org/project/cernohl/wikis/Documents/CERN-OHL-version-2
+
+and specifically the CERN-OHL-S-2.0 text:
+
+  https://spdx.org/licenses/CERN-OHL-S-2.0.html
+
+By using the hardware design files in this repository, you agree to be
+bound by the terms of CERN-OHL-S-2.0.
