@@ -1,0 +1,7 @@
+*.img
+*.zip
+*.rknn
+*.xz
+*.rkllm
+*.rar
+training/
