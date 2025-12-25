@@ -204,6 +204,42 @@ class UstreamerCapture:
             return None
 
 
+class GStreamerCapture:
+    """Frame capture using GStreamer directly - works with any V4L2 device."""
+
+    def __init__(self, device='/dev/video0'):
+        self.device = device
+        self.screenshot_path = '/dev/shm/stream_sentry_frame.jpg'
+        self.snapshot_url = f'gstreamer://{device}'  # For logging purposes
+
+    def capture(self):
+        """Capture frame using GStreamer and return as numpy array."""
+        try:
+            # Use GStreamer to capture a single frame
+            result = subprocess.run(
+                ['gst-launch-1.0', '-e',
+                 'v4l2src', f'device={self.device}', 'num-buffers=1', '!',
+                 'videoconvert', '!',
+                 'jpegenc', '!',
+                 'filesink', f'location={self.screenshot_path}'],
+                capture_output=True, timeout=5
+            )
+
+            if result.returncode == 0:
+                with SuppressLibjpegWarnings():
+                    img = cv2.imread(self.screenshot_path)
+                if img is not None:
+                    # Scale to 720p for OCR - model uses 960x960 anyway
+                    if img.shape[0] > 720 or img.shape[1] > 1280:
+                        img = cv2.resize(img, (1280, 720))
+                    return img
+
+            return None
+        except Exception as e:
+            logger.error(f"GStreamer capture error: {e}")
+            return None
+
+
 class StreamSentry:
     """
     Stream Sentry - HDMI passthrough with ML-based ad detection.
@@ -588,8 +624,25 @@ class StreamSentry:
 
         logger.info(f"ustreamer started on port {port}")
 
-        # Initialize frame capture
+        # Initialize frame capture - try ustreamer first, fall back to GStreamer
         self.frame_capture = UstreamerCapture(port=port)
+
+        # Test if ustreamer is actually capturing frames
+        test_frame = self.frame_capture.capture()
+        if test_frame is None:
+            logger.warning("ustreamer not capturing frames - falling back to GStreamer capture")
+            # Kill ustreamer since we won't use it
+            if self.ustreamer_process:
+                self.ustreamer_process.terminate()
+                self.ustreamer_process = None
+            # Use GStreamer for direct capture (works with any V4L2 device format)
+            self.frame_capture = GStreamerCapture(device=self.device)
+            # Test GStreamer capture
+            test_frame = self.frame_capture.capture()
+            if test_frame is None:
+                logger.error("GStreamer capture also failed")
+                return False
+            logger.info("Using GStreamer direct capture")
 
         # Start the display pipeline (managed by ad_blocker)
         if self.ad_blocker:
