@@ -1,0 +1,46 @@
+[Unit]
+Description=Stream Sentry - HDMI Ad Blocker
+Documentation=https://github.com/garagehq/stream-sentry
+After=multi-user.target
+Conflicts=gdm.service gdm3.service lightdm.service sddm.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/stream-sentry
+
+# Environment
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENCV_LOG_LEVEL=ERROR
+
+# Pre-start: ensure clean state
+ExecStartPre=/bin/bash -c 'pkill -9 ustreamer 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'fuser -k /dev/video0 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'chvt 1 2>/dev/null || true'
+ExecStartPre=/bin/sleep 1
+
+# Main process
+ExecStart=/usr/bin/python3 /home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/stream-sentry/stream_sentry.py
+
+# Graceful stop
+ExecStop=/bin/kill -TERM $MAINPID
+ExecStopPost=/bin/bash -c 'pkill -9 ustreamer 2>/dev/null || true'
+
+# Restart policy
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# Logging
+StandardOutput=append:/home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/stream-sentry/stream_sentry.log
+StandardError=append:/home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/stream-sentry/stream_sentry.log
+
+# Resource limits
+Nice=-5
+IOSchedulingClass=realtime
+IOSchedulingPriority=0
+
+[Install]
+WantedBy=multi-user.target

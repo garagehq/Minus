@@ -1,0 +1,17 @@
+# Stream Sentry dependencies
+# Install with: pip3 install --break-system-packages -r requirements.txt
+# Or with sudo: sudo pip3 install --break-system-packages -r requirements.txt
+
+# Core dependencies
+numpy>=1.24.0
+opencv-python>=4.5.0
+
+# OCR post-processing
+pyclipper>=1.3.0
+shapely>=2.0.0
+
+# RKNN runtime (should be pre-installed on RK3588)
+# rknn-toolkit-lite2
+
+# GStreamer Python bindings (install via apt)
+# sudo apt install python3-gi gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad

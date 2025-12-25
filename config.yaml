@@ -1,0 +1,66 @@
+# Stream Sentry Configuration
+
+# Input settings
+input:
+  device: /dev/video0
+  # Set to 0 for auto-detect
+  width: 0
+  height: 0
+
+# Output settings
+output:
+  preview: true
+  # Future: HDMI-TX passthrough settings
+
+# ML Pipeline settings
+ml:
+  # Run inference every N frames (higher = less CPU/NPU usage)
+  inference_interval: 10
+
+  # OCR settings
+  ocr:
+    enabled: false
+    # Model path for RKNN-converted PaddleOCR
+    model_path: models/paddleocr.rknn
+    language: en
+    confidence_threshold: 0.7
+
+  # VLM settings
+  vlm:
+    enabled: false
+    model_path: models/vlm.rknn
+    prompt: "Describe any text or notable content in this image"
+
+# Content filter settings
+filter:
+  enabled: false
+
+  # Action when filter triggers: blank, overlay, log
+  action: log
+
+  # Text patterns to filter (regex)
+  text_patterns: []
+  #  - "unwanted_word"
+  #  - "pattern\\d+"
+
+  # Content categories to filter (from VLM)
+  content_categories: []
+  #  - "violence"
+  #  - "explicit"
+
+# Performance tuning
+performance:
+  # Scale down frames for ML (reduces CPU/NPU load)
+  ml_scale_width: 640
+  ml_scale_height: 360
+
+  # Queue settings
+  max_queue_size: 2
+  drop_frames: true
+
+# Logging
+logging:
+  level: INFO
+  # Log ML results to file
+  log_results: false
+  results_path: logs/results.jsonl
