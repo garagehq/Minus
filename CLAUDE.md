@@ -98,20 +98,74 @@ python3 stream_sentry.py
 
 | Metric | Value |
 |--------|-------|
-| Display (video) | ~25fps (GStreamer kmssink, NV12 → plane 72) |
+| Display (video) | **30fps** (GStreamer kmssink, MJPEG → NV12 → plane 72) |
 | Display (blocking) | 2-3fps (videotestsrc + textoverlay) |
 | Ad blocking switch | **INSTANT** (input-selector, no restart) |
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
-| OCR latency | 300-500ms per frame |
+| ustreamer MJPEG stream | **~60fps** (with 1080p downscaling) |
+| OCR latency | **66-80ms** capture + 200-300ms inference |
 | VLM latency | 1.3-1.5s per frame |
 | VLM model load | ~40s (once at startup) |
-| Snapshot capture | ~150ms (non-blocking, scaled to 720p) |
+| Snapshot capture | **~60ms** (with 1080p downscaling) |
 | ustreamer quality | 75% JPEG |
 
 **FPS Tracking:**
 - GStreamer identity element with pad probe counts frames
 - FPS logged every 60 seconds via health monitor
 - Warning logged if FPS drops below 25
+
+## ustreamer-patched (NV12 Support)
+
+We use a patched version of ustreamer from `garagehq/ustreamer` that adds:
+- **NV12/NV16/NV24 format support** for RK3588 HDMI-RX devices
+- **Automatic 2x downscaling** for 4K NV12 content (4K→1080p)
+- **Extended timeouts** for RK3588 HDMI-RX driver compatibility
+- **YCbCr-direct encoding** (no RGB conversion overhead)
+
+**Why patched ustreamer?**
+The stock PiKVM ustreamer doesn't support NV12 format, which is the only format
+the RK3588 HDMI-RX driver outputs. Our fork adds NV12→JPEG encoding with
+performance optimizations that achieve ~60fps on 4K input.
+
+**Performance comparison (4K HDMI input):**
+
+| Mode | ustreamer FPS | Display FPS | Notes |
+|------|---------------|-------------|-------|
+| Native 4K | ~4 fps | ~4 fps | CPU can't keep up with 4K JPEG encoding |
+| 2K (2560x1440) | **~9 fps** | ~9 fps | `--encode-scale 2k` |
+| 1080p (1920x1080) | **~13-30 fps** | **30 fps** | `--encode-scale 1080p` (default for 4K input) |
+| MPP Hardware (2K) | **~18 fps** | ~18 fps | Future: mppjpegenc via GStreamer |
+
+**New --encode-scale flag:**
+```bash
+# Force 1080p output (best FPS for 4K input)
+ustreamer-patched --encode-scale 1080p ...
+
+# Force 2K output (higher quality, lower FPS)
+ustreamer-patched --encode-scale 2k ...
+
+# Auto (default): downscale 4K to 1080p, others native
+ustreamer-patched --encode-scale native ...
+```
+
+**Installation:**
+```bash
+# Clone and build
+git clone https://github.com/garagehq/ustreamer.git
+cd ustreamer && make -j$(nproc)
+cp ustreamer /home/radxa/ustreamer-patched
+
+# StreamSentry uses /home/radxa/ustreamer-patched automatically
+```
+
+**Key changes in garagehq/ustreamer:**
+- `src/libs/capture.c` - NV12/NV16/NV24 format support, extended timeouts, retry logic
+- `src/libs/capture.h` - Format string updates
+- `src/libs/frame.c` - NV format byte calculations
+- `src/ustreamer/encoders/cpu/encoder.c` - NV12 YCbCr encoding, flexible downscaling (1080p/2K)
+- `src/ustreamer/encoder.c` - Global encode scale setting, scale parsing functions
+- `src/ustreamer/encoder.h` - Encode scale enum and extern declaration
+- `src/ustreamer/options.c` - `--encode-scale` CLI option with help text
 
 ## Audio Passthrough
 

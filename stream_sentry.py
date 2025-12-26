@@ -160,6 +160,74 @@ except ImportError as e:
     HAS_HEALTH = False
 
 
+def probe_v4l2_device(device: str) -> dict:
+    """
+    Probe a V4L2 device to get its current format and resolution.
+
+    Returns dict with:
+        - format: V4L2 pixel format string (e.g., 'NV12', 'BGR3', 'YUYV')
+        - width: int
+        - height: int
+        - ustreamer_format: format string for ustreamer (e.g., 'NV12', 'BGR24')
+    """
+    result = {
+        'format': None,
+        'width': 0,
+        'height': 0,
+        'ustreamer_format': None,
+    }
+
+    try:
+        # Run v4l2-ctl to get format info
+        proc = subprocess.run(
+            ['v4l2-ctl', '-d', device, '--get-fmt-video'],
+            capture_output=True, text=True, timeout=5
+        )
+
+        if proc.returncode != 0:
+            logger.warning(f"Failed to probe {device}: {proc.stderr}")
+            return result
+
+        output = proc.stdout
+
+        # Parse width/height
+        wh_match = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)', output)
+        if wh_match:
+            result['width'] = int(wh_match.group(1))
+            result['height'] = int(wh_match.group(2))
+
+        # Parse pixel format - look for the 4-character code
+        # Example: "Pixel Format      : 'NV12' (Y/UV 4:2:0)"
+        # Example: "Pixel Format      : 'BGR3' (24-bit BGR 8-8-8)"
+        fmt_match = re.search(r"Pixel Format\s*:\s*'(\w+)'", output)
+        if fmt_match:
+            v4l2_format = fmt_match.group(1)
+            result['format'] = v4l2_format
+
+            # Map V4L2 format codes to ustreamer format names
+            format_map = {
+                'NV12': 'NV12',
+                'NV16': 'NV16',
+                'NV24': 'NV24',
+                'BGR3': 'BGR24',
+                'RGB3': 'RGB24',
+                'YUYV': 'YUYV',
+                'UYVY': 'UYVY',
+                'MJPG': 'MJPEG',
+                'JPEG': 'MJPEG',
+            }
+            result['ustreamer_format'] = format_map.get(v4l2_format, v4l2_format)
+
+        logger.info(f"Probed {device}: {result['width']}x{result['height']} format={result['format']} -> {result['ustreamer_format']}")
+
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Timeout probing {device}")
+    except Exception as e:
+        logger.warning(f"Error probing {device}: {e}")
+
+    return result
+
+
 @dataclass
 class StreamConfig:
     """Configuration for the stream pipeline."""
@@ -405,17 +473,26 @@ class StreamSentry:
                           capture_output=True, stderr=subprocess.DEVNULL)
             time.sleep(1)
 
-            # Restart
+            # Re-probe the device in case format changed
+            device_info = probe_v4l2_device(self.device)
+            video_format = device_info.get('ustreamer_format') or getattr(self, '_detected_format', 'NV12')
+            resolution = f"{device_info.get('width') or 3840}x{device_info.get('height') or 2160}"
+
+            # Restart with patched ustreamer using detected format
             port = self.config.ustreamer_port
             ustreamer_cmd = [
-                'ustreamer',
+                '/home/radxa/ustreamer-patched',
                 f'--device={self.device}',
-                '--format=BGR24',
+                f'--format={video_format}',
+                f'--resolution={resolution}',
+                '--persistent',
                 f'--port={port}',
                 '--quality=75',
                 '--workers=8',
                 '--buffers=8',
             ]
+
+            logger.info(f"[Recovery] Starting ustreamer: {' '.join(ustreamer_cmd)}")
 
             self.ustreamer_process = subprocess.Popen(
                 ustreamer_cmd,
@@ -539,6 +616,73 @@ class StreamSentry:
 
         return None
 
+    def _init_v4l2_device(self):
+        """Initialize V4L2 device with proper DV timings before starting ustreamer.
+
+        The RK3588 HDMI-RX driver requires DV timings to be set before format
+        configuration. Without this, some HDMI sources fail with format mismatch errors.
+        """
+        try:
+            # Step 1: Query current DV timings from the source
+            logger.info(f"Querying DV timings from {self.device}...")
+            result = subprocess.run(
+                ['v4l2-ctl', '-d', self.device, '--query-dv-timings'],
+                capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"Failed to query DV timings: {result.stderr}")
+                return False
+
+            # Parse resolution from output for logging
+            width = height = 0
+            for line in result.stdout.split('\n'):
+                if 'Active width:' in line:
+                    width = int(line.split(':')[1].strip())
+                elif 'Active height:' in line:
+                    height = int(line.split(':')[1].strip())
+
+            logger.info(f"Detected input: {width}x{height}")
+
+            # Step 2: Set the DV timings from query (this is the critical step)
+            logger.info("Setting DV timings on device...")
+            result = subprocess.run(
+                ['v4l2-ctl', '-d', self.device, '--set-dv-bt-timings', 'query'],
+                capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode != 0:
+                logger.warning(f"Failed to set DV timings: {result.stderr}")
+                return False
+
+            # Give the driver time to stabilize after timing change
+            time.sleep(0.3)
+
+            # Step 3: Explicitly set pixel format to BGR3
+            # This ensures the device is not stuck in a different format (e.g., NV12)
+            # which would cause ustreamer's format negotiation to fail
+            logger.info("Setting pixel format to BGR3...")
+            result = subprocess.run(
+                ['v4l2-ctl', '-d', self.device, '--set-fmt-video', 'pixelformat=BGR3'],
+                capture_output=True, text=True, timeout=5
+            )
+
+            if result.returncode != 0:
+                # Not fatal - ustreamer may still work
+                logger.warning(f"Failed to set pixel format: {result.stderr}")
+
+            time.sleep(0.2)
+
+            logger.info("V4L2 device initialized successfully")
+            return True
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Timeout during V4L2 device initialization")
+            return False
+        except Exception as e:
+            logger.warning(f"V4L2 device initialization error: {e}")
+            return False
+
     def start_display(self):
         """Start ustreamer and display pipeline."""
         # Kill any existing processes
@@ -548,12 +692,25 @@ class StreamSentry:
 
         port = self.config.ustreamer_port
 
-        # Start ustreamer (color correction done via GStreamer videobalance)
-        # Note: HDMI-RX device doesn't support V4L2 image controls
+        # Probe the device to get current format and resolution
+        device_info = probe_v4l2_device(self.device)
+
+        # Use detected format or fall back to defaults
+        video_format = device_info.get('ustreamer_format') or 'NV12'
+        width = device_info.get('width') or 3840
+        height = device_info.get('height') or 2160
+
+        # Store for later reference (health monitor, recovery)
+        self._detected_format = video_format
+        self._detected_resolution = f"{width}x{height}"
+
+        # Start ustreamer with detected format
         ustreamer_cmd = [
-            'ustreamer',
+            '/home/radxa/ustreamer-patched',
             f'--device={self.device}',
-            '--format=BGR24',
+            f'--format={video_format}',
+            f'--resolution={width}x{height}',
+            '--persistent',
             f'--port={port}',
             '--quality=75',
             '--workers=8',
