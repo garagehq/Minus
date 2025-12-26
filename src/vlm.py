@@ -29,8 +29,7 @@ class VLMManager:
     Each inference takes ~1.3 seconds.
     """
 
-    # More specific prompt to reduce false positives on regular video content
-    AD_PROMPT = "Is this a video advertisement or commercial break? Look for: Skip Ad button, Ad label, Sponsored tag, or product commercials. Answer No for music videos, TV shows, movies, or regular content. Answer only Yes or No."
+    AD_PROMPT = "Is this an advertisement? Answer Yes or No."
 
     def __init__(self):
         """Initialize VLM manager."""
