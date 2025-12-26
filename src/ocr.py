@@ -178,6 +178,13 @@ class PaddleOCR:
         'skip', 'sponsor',
     ]
 
+    # Phrases that should NOT trigger ad detection (false positives)
+    # These override keyword matches when the full phrase is detected
+    AD_EXCLUSIONS = [
+        'skip recap', 'skiprecap',  # Netflix "Skip Recap" button
+        'skip intro', 'skipintro',  # Streaming "Skip Intro" button
+    ]
+
     def __init__(self, det_model_path, rec_model_path, dict_path,
                  cls_model_path=None):
         self.det_model_path = det_model_path
@@ -496,12 +503,17 @@ class PaddleOCR:
                     break
 
             # Check word-boundary keywords (must be whole word)
-            for keyword in self.AD_KEYWORDS_WORD:
-                # Use word boundary regex
-                pattern = r'\b' + re.escape(keyword) + r'\b'
-                if re.search(pattern, text_lower):
-                    matched.append((keyword, text))
-                    break
+            # But first check if text matches any exclusion patterns (e.g., "Skip Recap")
+            is_excluded = any(excl in text_lower or excl.replace(' ', '') in text_clean
+                              for excl in self.AD_EXCLUSIONS)
+
+            if not is_excluded:
+                for keyword in self.AD_KEYWORDS_WORD:
+                    # Use word boundary regex
+                    pattern = r'\b' + re.escape(keyword) + r'\b'
+                    if re.search(pattern, text_lower):
+                        matched.append((keyword, text))
+                        break
 
             # Fuzzy matches for common OCR misreads of "Skip Ad"
             if 'skipad' in text_clean or 'skipads' in text_clean:
