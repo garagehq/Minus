@@ -80,7 +80,22 @@ for handler in root_logger.handlers[:]:
     root_logger.removeHandler(handler)
 
 # Add file handler with rotation
-log_file = Path(__file__).parent / 'stream_sentry.log'
+# Use /tmp/stream_sentry.log - sudoers allows passwordless management
+log_file = Path('/tmp/stream_sentry.log')
+try:
+    if log_file.exists():
+        try:
+            with open(log_file, 'a'):
+                pass
+        except PermissionError:
+            # Use sudo to fix permissions (sudoers.d/stream-sentry allows this)
+            import subprocess
+            subprocess.run(['sudo', 'rm', '-f', str(log_file)], capture_output=True)
+    if not log_file.exists():
+        log_file.touch(mode=0o666)
+except Exception:
+    pass
+
 file_handler = logging.handlers.RotatingFileHandler(
     log_file,
     maxBytes=5*1024*1024,  # 5MB
@@ -241,7 +256,7 @@ class StreamSentry:
 
         # Weighted detection parameters
         self.OCR_TRUST_WINDOW = 5.0
-        self.VLM_ALONE_THRESHOLD = 3
+        self.VLM_ALONE_THRESHOLD = 5  # Require 5 consecutive VLM detections to trigger alone
         self.MIN_BLOCKING_DURATION = 3.0
         self.OCR_STOP_THRESHOLD = 3
         self.VLM_STOP_THRESHOLD = 2
