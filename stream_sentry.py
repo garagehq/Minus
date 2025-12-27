@@ -497,7 +497,7 @@ class StreamSentry:
             video_format = device_info.get('ustreamer_format') or getattr(self, '_detected_format', 'NV12')
             resolution = f"{device_info.get('width') or 3840}x{device_info.get('height') or 2160}"
 
-            # Restart with patched ustreamer using detected format
+            # Restart with patched ustreamer using detected format and MPP encoder
             port = self.config.ustreamer_port
             ustreamer_cmd = [
                 '/home/radxa/ustreamer-patched',
@@ -506,9 +506,11 @@ class StreamSentry:
                 f'--resolution={resolution}',
                 '--persistent',
                 f'--port={port}',
-                '--quality=75',
-                '--workers=8',
-                '--buffers=8',
+                '--encoder=mpp-jpeg',      # Use RK3588 VPU hardware encoding
+                '--encode-scale=4k',       # Native 4K output (no downscaling)
+                '--quality=80',
+                '--workers=4',             # 4 parallel MPP encoders (optimal)
+                '--buffers=5',
             ]
 
             logger.info(f"[Recovery] Starting ustreamer: {' '.join(ustreamer_cmd)}")
@@ -727,7 +729,7 @@ class StreamSentry:
         self._detected_format = video_format
         self._detected_resolution = f"{width}x{height}"
 
-        # Start ustreamer with detected format
+        # Start ustreamer with detected format and MPP hardware encoder
         ustreamer_cmd = [
             '/home/radxa/ustreamer-patched',
             f'--device={self.device}',
@@ -735,9 +737,11 @@ class StreamSentry:
             f'--resolution={width}x{height}',
             '--persistent',
             f'--port={port}',
-            '--quality=75',
-            '--workers=8',
-            '--buffers=8',
+            '--encoder=mpp-jpeg',      # Use RK3588 VPU hardware encoding
+            '--encode-scale=4k',       # Native 4K output (no downscaling)
+            '--quality=80',
+            '--workers=4',             # 4 parallel MPP encoders (optimal)
+            '--buffers=5',
         ]
 
         logger.info(f"Starting ustreamer: {' '.join(ustreamer_cmd)}")
