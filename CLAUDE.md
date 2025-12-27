@@ -359,11 +359,26 @@ The health monitor (`src/health.py`) runs in a background thread and checks:
 |-----------|-------|----------|
 | HDMI signal | v4l2-ctl --query-dv-timings | Show "NO SIGNAL" overlay, mute audio |
 | No HDMI at startup | check_hdmi_signal() | Show "NO HDMI INPUT" and wait |
-| ustreamer | HTTP HEAD to :9090/snapshot | Restart ustreamer process |
+| ustreamer | HTTP HEAD to :9090/snapshot | Restart ustreamer + video pipeline |
+| Video pipeline | Buffer flow + FPS monitoring | Restart pipeline with exponential backoff |
 | Output FPS | GStreamer pad probe | Log warning if < 25fps |
 | VLM | Consecutive timeouts < 5 | Degrade to OCR-only, retry VLM after 30s |
 | Memory | Usage < 90% | Force GC, clean old screenshots |
 | Disk | Free > 500MB | Log warning |
+
+**HDMI Disconnect/Reconnect Recovery:**
+- Detects HDMI signal loss via v4l2-ctl
+- Shows "NO SIGNAL" overlay and mutes audio immediately
+- On signal restoration: restarts ustreamer → restarts video pipeline → restores display
+- Full recovery typically completes in ~7 seconds
+
+**Video Pipeline Watchdog:**
+- Buffer watchdog detects stalls (10 seconds without buffer)
+- Monitors GStreamer pipeline state (must be PLAYING)
+- Handles HTTP connection errors from souphttpsrc
+- Handles unexpected EOS (end-of-stream) events
+- Exponential backoff for restarts (1s → 2s → 4s → ... → 30s max)
+- Backoff resets after 10 seconds of sustained buffer flow
 
 **Startup grace period:**
 - 30-second grace period before ustreamer health checks begin

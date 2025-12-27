@@ -318,17 +318,25 @@ Stream Sentry includes a unified health monitor that runs in the background:
 **What it monitors:**
 - HDMI signal (detects unplug/replug, shows "NO SIGNAL" message)
 - ustreamer health (HTTP health check, not just PID)
+- Video pipeline health (buffer flow, pipeline state)
 - Output FPS (logged every 60s, warning if < 25 fps)
 - VLM/OCR health (consecutive timeout detection)
 - Memory usage (warning at 80%, critical at 90%)
 - Disk space (warning below 500MB)
 
 **Automatic recovery:**
-- HDMI signal lost → Shows placeholder, mutes audio
-- HDMI signal restored → Restarts capture, unmutes audio
-- ustreamer stall → Restarts ustreamer process
+- HDMI signal lost → Shows "NO SIGNAL" overlay, mutes audio
+- HDMI signal restored → Restarts ustreamer + video pipeline, unmutes audio (~7s recovery)
+- ustreamer stall → Restarts ustreamer + video pipeline
+- Video pipeline stall → Restarts pipeline with exponential backoff (1s-30s)
 - VLM failure → Degrades to OCR-only mode, attempts VLM restart
 - Critical memory → Triggers garbage collection, cleans old screenshots
+
+**HDMI Cable Robustness:**
+- Jiggling or unplugging HDMI cables triggers automatic recovery
+- No manual restart required - system recovers automatically
+- Video pipeline watchdog detects stalls (10s threshold)
+- Exponential backoff prevents restart storms
 
 **Graceful degradation:**
 - If VLM fails repeatedly (5+ consecutive timeouts), switches to OCR-only mode
@@ -352,6 +360,15 @@ Stream Sentry includes a unified health monitor that runs in the background:
 - Exponential backoff for restart attempts (1s → 2s → 4s → ... → 60s max)
 - No maximum restart limit - always tries to recover
 - Backoff resets after 5 seconds of sustained audio flow
+
+**Video Pipeline Recovery:**
+- Watchdog checks every 3 seconds, restarts if stalled for 10+ seconds
+- Monitors GStreamer pipeline state and buffer flow
+- Handles HTTP connection errors (ustreamer restart)
+- Handles unexpected EOS events
+- Exponential backoff for restart attempts (1s → 2s → 4s → ... → 30s max)
+- Backoff resets after 10 seconds of sustained buffer flow
+- Preserves blocking overlay state across restarts
 
 ## Building Executable
 
