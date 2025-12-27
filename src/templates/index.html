@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Stream Sentry</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>Stream Sentry</h1>
+            <div id="connection-status" class="status-dot"></div>
+        </header>
+
+        <!-- Live Video -->
+        <section class="video-section">
+            <div class="video-container">
+                <img id="video-feed" src="/stream" alt="Live Feed">
+                <div id="video-overlay" class="video-overlay hidden">
+                    <span>NO SIGNAL</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Status -->
+        <section class="status-section">
+            <div id="blocking-status" class="blocking-status">
+                <span class="status-label">Status:</span>
+                <span id="status-text" class="status-value">Loading...</span>
+            </div>
+            <div class="status-details">
+                <div class="stat">
+                    <span class="stat-label">FPS</span>
+                    <span id="fps-value" class="stat-value">--</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">HDMI</span>
+                    <span id="hdmi-value" class="stat-value">--</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Uptime</span>
+                    <span id="uptime-value" class="stat-value">--</span>
+                </div>
+                <div class="stat">
+                    <span class="stat-label">Detected</span>
+                    <span id="detections-value" class="stat-value">--</span>
+                </div>
+            </div>
+        </section>
+
+        <!-- Pause Controls -->
+        <section class="pause-section">
+            <div id="pause-controls" class="pause-controls">
+                <span class="pause-label">Pause blocking:</span>
+                <div class="pause-buttons">
+                    <button onclick="pauseBlocking(1)" class="pause-btn">1m</button>
+                    <button onclick="pauseBlocking(2)" class="pause-btn">2m</button>
+                    <button onclick="pauseBlocking(5)" class="pause-btn">5m</button>
+                    <button onclick="pauseBlocking(10)" class="pause-btn">10m</button>
+                </div>
+            </div>
+            <div id="resume-controls" class="resume-controls hidden">
+                <div class="paused-info">
+                    <span class="paused-icon">&#9208;</span>
+                    <span id="pause-remaining">Paused</span>
+                </div>
+                <button onclick="resumeBlocking()" class="resume-btn">Resume Now</button>
+            </div>
+        </section>
+
+        <!-- Recent Detections -->
+        <section class="detections-section">
+            <h2>Recent Detections</h2>
+            <div id="detections-list" class="detections-list">
+                <div class="empty-state">No detections yet</div>
+            </div>
+        </section>
+
+        <!-- Logs (Collapsible) -->
+        <section class="logs-section">
+            <button class="logs-toggle" onclick="toggleLogs()">
+                <span>View Logs</span>
+                <span id="logs-arrow" class="arrow">&#9660;</span>
+            </button>
+            <div id="logs-container" class="logs-container hidden">
+                <div id="logs-content" class="logs-content">
+                    Loading logs...
+                </div>
+                <button onclick="refreshLogs()" class="refresh-btn">Refresh</button>
+            </div>
+        </section>
+
+        <!-- System Info -->
+        <section class="system-section">
+            <div class="system-info">
+                <span id="vlm-status" class="system-badge">VLM: --</span>
+                <span id="memory-status" class="system-badge">Mem: --</span>
+            </div>
+        </section>
+    </div>
+
+    <script>
+        // State
+        let isPaused = false;
+        let pauseRemaining = 0;
+        let logsVisible = false;
+        let lastStatus = null;
+
+        // Update status every second
+        async function updateStatus() {
+            try {
+                const response = await fetch('/api/status');
+                if (!response.ok) throw new Error('Status fetch failed');
+
+                const status = await response.json();
+                lastStatus = status;
+
+                // Connection indicator
+                document.getElementById('connection-status').classList.remove('disconnected');
+                document.getElementById('connection-status').classList.add('connected');
+
+                // Blocking status
+                const statusEl = document.getElementById('blocking-status');
+                const statusText = document.getElementById('status-text');
+
+                if (status.paused) {
+                    statusEl.className = 'blocking-status paused';
+                    const mins = Math.floor(status.pause_remaining / 60);
+                    const secs = status.pause_remaining % 60;
+                    statusText.textContent = `PAUSED (${mins}:${secs.toString().padStart(2, '0')})`;
+                    isPaused = true;
+                    pauseRemaining = status.pause_remaining;
+                } else if (status.blocking) {
+                    statusEl.className = 'blocking-status blocking';
+                    const source = status.blocking_source ? status.blocking_source.toUpperCase() : '';
+                    statusText.textContent = `BLOCKING (${source})`;
+                    isPaused = false;
+                } else {
+                    statusEl.className = 'blocking-status normal';
+                    statusText.textContent = 'Normal';
+                    isPaused = false;
+                }
+
+                // Update pause/resume visibility
+                document.getElementById('pause-controls').classList.toggle('hidden', isPaused);
+                document.getElementById('resume-controls').classList.toggle('hidden', !isPaused);
+                if (isPaused) {
+                    const mins = Math.floor(pauseRemaining / 60);
+                    const secs = pauseRemaining % 60;
+                    document.getElementById('pause-remaining').textContent =
+                        `Paused: ${mins}:${secs.toString().padStart(2, '0')} remaining`;
+                }
+
+                // Stats
+                document.getElementById('fps-value').textContent = status.fps || '--';
+                document.getElementById('hdmi-value').textContent = status.hdmi_signal ? 'OK' : 'NO SIGNAL';
+                document.getElementById('uptime-value').textContent = status.uptime_str || '--';
+                document.getElementById('detections-value').textContent = status.total_detections || '0';
+
+                // Video overlay
+                const overlay = document.getElementById('video-overlay');
+                if (!status.hdmi_signal) {
+                    overlay.classList.remove('hidden');
+                } else {
+                    overlay.classList.add('hidden');
+                }
+
+                // System info
+                const vlmStatus = document.getElementById('vlm-status');
+                if (status.vlm_disabled) {
+                    vlmStatus.textContent = 'VLM: Disabled';
+                    vlmStatus.className = 'system-badge warning';
+                } else if (status.vlm_ready) {
+                    vlmStatus.textContent = 'VLM: Ready';
+                    vlmStatus.className = 'system-badge ok';
+                } else {
+                    vlmStatus.textContent = 'VLM: Loading';
+                    vlmStatus.className = 'system-badge loading';
+                }
+
+                const memStatus = document.getElementById('memory-status');
+                const memPercent = Math.round(status.memory_percent || 0);
+                memStatus.textContent = `Mem: ${memPercent}%`;
+                memStatus.className = memPercent > 80 ? 'system-badge warning' : 'system-badge ok';
+
+            } catch (error) {
+                console.error('Status update failed:', error);
+                document.getElementById('connection-status').classList.remove('connected');
+                document.getElementById('connection-status').classList.add('disconnected');
+            }
+        }
+
+        // Update detections
+        async function updateDetections() {
+            try {
+                const response = await fetch('/api/detections');
+                if (!response.ok) throw new Error('Detections fetch failed');
+
+                const data = await response.json();
+                const list = document.getElementById('detections-list');
+
+                if (data.detections && data.detections.length > 0) {
+                    list.innerHTML = data.detections.slice(0, 10).map(d => {
+                        const keywords = d.keywords && d.keywords.length > 0
+                            ? d.keywords.join(', ')
+                            : (d.texts && d.texts[0] ? d.texts[0].substring(0, 40) : 'detected');
+                        return `<div class="detection-item">
+                            <span class="detection-time">${d.time}</span>
+                            <span class="detection-source ${d.source.toLowerCase()}">${d.source}</span>
+                            <span class="detection-text">${keywords}</span>
+                        </div>`;
+                    }).join('');
+                } else {
+                    list.innerHTML = '<div class="empty-state">No detections yet</div>';
+                }
+            } catch (error) {
+                console.error('Detections update failed:', error);
+            }
+        }
+
+        // Pause blocking
+        async function pauseBlocking(minutes) {
+            try {
+                const response = await fetch(`/api/pause/${minutes}`, { method: 'POST' });
+                if (!response.ok) throw new Error('Pause failed');
+
+                // Immediate UI feedback
+                isPaused = true;
+                pauseRemaining = minutes * 60;
+                updateStatus();
+            } catch (error) {
+                console.error('Pause failed:', error);
+                alert('Failed to pause blocking');
+            }
+        }
+
+        // Resume blocking
+        async function resumeBlocking() {
+            try {
+                const response = await fetch('/api/resume', { method: 'POST' });
+                if (!response.ok) throw new Error('Resume failed');
+
+                isPaused = false;
+                updateStatus();
+            } catch (error) {
+                console.error('Resume failed:', error);
+                alert('Failed to resume blocking');
+            }
+        }
+
+        // Toggle logs
+        function toggleLogs() {
+            logsVisible = !logsVisible;
+            document.getElementById('logs-container').classList.toggle('hidden', !logsVisible);
+            document.getElementById('logs-arrow').textContent = logsVisible ? '\u25B2' : '\u25BC';
+            if (logsVisible) {
+                refreshLogs();
+            }
+        }
+
+        // Refresh logs
+        async function refreshLogs() {
+            try {
+                const response = await fetch('/api/logs');
+                if (!response.ok) throw new Error('Logs fetch failed');
+
+                const data = await response.json();
+                const content = document.getElementById('logs-content');
+
+                if (data.lines && data.lines.length > 0) {
+                    content.innerHTML = data.lines.map(line =>
+                        `<div class="log-line">${escapeHtml(line)}</div>`
+                    ).join('');
+                    // Scroll to bottom
+                    content.scrollTop = content.scrollHeight;
+                } else {
+                    content.innerHTML = '<div class="empty-state">No logs available</div>';
+                }
+            } catch (error) {
+                console.error('Logs fetch failed:', error);
+                document.getElementById('logs-content').innerHTML =
+                    '<div class="error-state">Failed to load logs</div>';
+            }
+        }
+
+        // Escape HTML for safe display
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Handle video feed errors
+        document.getElementById('video-feed').onerror = function() {
+            console.log('Video feed error, retrying...');
+            setTimeout(() => {
+                this.src = '/stream?' + Date.now();
+            }, 2000);
+        };
+
+        // Initial load and intervals
+        updateStatus();
+        updateDetections();
+
+        setInterval(updateStatus, 1000);
+        setInterval(updateDetections, 5000);
+    </script>
+</body>
+</html>

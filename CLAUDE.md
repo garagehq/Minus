@@ -72,11 +72,15 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
 | `src/vlm.py` | Qwen3-VL-2B on Axera NPU |
 | `src/health.py` | Unified health monitor for all subsystems |
+| `src/webui.py` | Flask web UI for remote monitoring/control |
+| `src/templates/index.html` | Web UI single-page app |
+| `src/static/style.css` | Web UI dark theme styles |
 | `install.sh` | Install as systemd service |
 | `uninstall.sh` | Remove systemd service |
 | `stop.sh` | Graceful shutdown script |
 | `stream-sentry.service` | systemd service file |
 | `screenshots/ocr/` | Ad detection screenshots (auto-truncated) |
+| `screenshots/non_ad/` | Non-ad screenshots for VLM training |
 
 ## Running
 
@@ -92,6 +96,7 @@ python3 stream_sentry.py
 --check-signal            # Just check HDMI signal and exit
 --connector-id 215        # DRM connector ID (default: 215)
 --plane-id 72             # DRM plane ID (default: 72)
+--webui-port 8080         # Web UI port (default: 8080)
 ```
 
 ## Performance
@@ -102,80 +107,80 @@ python3 stream_sentry.py
 | Display (blocking) | 2-3fps (videotestsrc + textoverlay) |
 | Ad blocking switch | **INSTANT** (input-selector, no restart) |
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
-| ustreamer MJPEG stream | **~60fps** (with 1080p downscaling) |
-| OCR latency | **66-80ms** capture + 200-300ms inference |
+| ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
+| OCR latency | **100-200ms** capture + **250-400ms** inference |
 | VLM latency | 1.3-1.5s per frame |
 | VLM model load | ~40s (once at startup) |
-| Snapshot capture | **~60ms** (with 1080p downscaling) |
-| ustreamer quality | 75% JPEG |
+| Snapshot capture | **~150ms** (4K JPEG download) |
+| OCR image size | 960x540 (downscaled from 4K for speed) |
+| ustreamer quality | 80% JPEG (MPP encoder) |
 
 **FPS Tracking:**
 - GStreamer identity element with pad probe counts frames
 - FPS logged every 60 seconds via health monitor
 - Warning logged if FPS drops below 25
 
-## ustreamer-patched (NV12 Support)
+## ustreamer-patched (NV12 + MPP Hardware Encoding)
 
 We use a patched version of ustreamer from `garagehq/ustreamer` that adds:
 - **NV12/NV16/NV24 format support** for RK3588 HDMI-RX devices
-- **Automatic 2x downscaling** for 4K NV12 content (4K→1080p)
+- **MPP hardware JPEG encoding** using RK3588 VPU (~60fps at 4K!)
 - **Extended timeouts** for RK3588 HDMI-RX driver compatibility
-- **YCbCr-direct encoding** (no RGB conversion overhead)
+- **Multi-worker MPP support** (4 parallel encoders optimal)
+- **Cache sync fix** for DMA-related visual artifacts
 
 **Why patched ustreamer?**
-The stock PiKVM ustreamer doesn't support NV12 format, which is one of the formats
-the RK3588 HDMI-RX driver outputs. Our fork adds NV12→JPEG encoding with
-performance optimizations that achieve ~60fps on 4K input.
+The stock PiKVM ustreamer doesn't support NV12 format or RK3588 hardware encoding.
+Our fork adds NV12→JPEG encoding via Rockchip MPP (Media Process Platform) that
+achieves ~60fps on 4K input with minimal CPU usage.
 
 **Dynamic Format Detection:**
 StreamSentry automatically probes the V4L2 device to detect its current format
 and resolution. Supported formats:
-- **NV12** - RK3588 HDMI-RX native (uses patched encoder with YCbCr optimization)
+- **NV12** - RK3588 HDMI-RX native (uses MPP hardware encoder)
 - **BGR24/BGR3** - Some HDMI devices (uses standard ustreamer BGR24 support)
 - **YUYV/UYVY** - Webcam-style devices
 - **MJPEG** - Pre-compressed JPEG sources
 
-This allows seamless switching between HDMI sources with different output formats.
-
 **Performance comparison (4K HDMI input):**
 
-| Mode | ustreamer FPS | Display FPS | Notes |
-|------|---------------|-------------|-------|
-| Native 4K | ~4 fps | ~4 fps | CPU can't keep up with 4K JPEG encoding |
-| 2K (2560x1440) | **~9 fps** | ~9 fps | `--encode-scale 2k` |
-| 1080p (1920x1080) | **~13-30 fps** | **30 fps** | `--encode-scale 1080p` (default for 4K input) |
-| MPP Hardware (2K) | **~18 fps** | ~18 fps | Future: mppjpegenc via GStreamer |
+| Mode | ustreamer FPS | CPU Usage | Notes |
+|------|---------------|-----------|-------|
+| CPU encoding | ~4 fps | ~100% | CPU can't keep up with 4K JPEG encoding |
+| MPP hardware | **~60 fps** | **~5%** | `--encoder=mpp-jpeg` (default) |
 
-**New --encode-scale flag:**
+**ustreamer command (used by StreamSentry):**
 ```bash
-# Force 1080p output (best FPS for 4K input)
-ustreamer-patched --encode-scale 1080p ...
-
-# Force 2K output (higher quality, lower FPS)
-ustreamer-patched --encode-scale 2k ...
-
-# Auto (default): downscale 4K to 1080p, others native
-ustreamer-patched --encode-scale native ...
+/home/radxa/ustreamer-patched \
+  --device=/dev/video0 \
+  --format=NV12 \
+  --resolution=3840x2160 \
+  --persistent \
+  --port=9090 \
+  --host=0.0.0.0 \
+  --encoder=mpp-jpeg \
+  --encode-scale=4k \
+  --quality=80 \
+  --workers=4 \
+  --buffers=5
 ```
 
 **Installation:**
 ```bash
-# Clone and build
-git clone https://github.com/garagehq/ustreamer.git
-cd ustreamer && make -j$(nproc)
+# Clone and build with MPP support
+git clone https://github.com/garagehq/ustreamer.git /home/radxa/ustreamer-garagehq
+cd /home/radxa/ustreamer-garagehq
+make WITH_MPP=1
 cp ustreamer /home/radxa/ustreamer-patched
 
 # StreamSentry uses /home/radxa/ustreamer-patched automatically
 ```
 
 **Key changes in garagehq/ustreamer:**
-- `src/libs/capture.c` - NV12/NV16/NV24 format support, extended timeouts, retry logic
-- `src/libs/capture.h` - Format string updates
-- `src/libs/frame.c` - NV format byte calculations
-- `src/ustreamer/encoders/cpu/encoder.c` - NV12 YCbCr encoding, flexible downscaling (1080p/2K)
-- `src/ustreamer/encoder.c` - Global encode scale setting, scale parsing functions
-- `src/ustreamer/encoder.h` - Encode scale enum and extern declaration
-- `src/ustreamer/options.c` - `--encode-scale` CLI option with help text
+- `src/ustreamer/encoders/mpp/encoder.c` - MPP hardware JPEG encoder with cache sync
+- `src/libs/capture.c` - NV12/NV16/NV24 format support, extended timeouts
+- `src/ustreamer/encoder.c` - MPP encoder integration, multi-worker support
+- `src/ustreamer/options.c` - `--encoder=mpp-jpeg` CLI option
 
 ## Audio Passthrough
 
@@ -304,12 +309,13 @@ Hay que aprovechar el tiempo.
 # System
 sudo apt install -y imagemagick ffmpeg curl
 
-# Build ustreamer
-git clone https://github.com/pikvm/ustreamer.git
-cd ustreamer && make -j$(nproc) && sudo cp ustreamer /usr/local/bin/
+# Build ustreamer with MPP hardware encoding
+git clone https://github.com/garagehq/ustreamer.git /home/radxa/ustreamer-garagehq
+cd /home/radxa/ustreamer-garagehq && make WITH_MPP=1
+cp ustreamer /home/radxa/ustreamer-patched
 
 # Python
-pip3 install pyclipper shapely numpy opencv-python pexpect PyGObject
+pip3 install --break-system-packages pyclipper shapely numpy opencv-python pexpect PyGObject flask requests
 ```
 
 ## Troubleshooting
@@ -398,6 +404,79 @@ The health monitor (`src/health.py`) runs in a background thread and checks:
 - FPS logged every 60 seconds
 - Full status logged every 5 minutes (uptime, fps, hdmi, video, audio, vlm, mem, disk)
 
+## Web UI
+
+Stream Sentry includes a lightweight Flask-based web UI for remote monitoring and control,
+accessible via Tailscale from desktop or mobile devices.
+
+**Features:**
+- **Live video feed** - MJPEG stream proxied from ustreamer (CORS bypass)
+- **Status display** - Blocking state, FPS, HDMI info, uptime
+- **Pause controls** - 1/2/5/10 minute presets to pause ad blocking
+- **Detection history** - Recent OCR/VLM detections with timestamps
+- **Log viewer** - Collapsible log output for debugging
+
+**Architecture:**
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Web Browser                             │
+│  ┌─────────────────┐  ┌──────────────────────────────────┐  │
+│  │   Live View     │  │         Control Panel            │  │
+│  │ (ustreamer:9090)│  │  - Status (blocking, FPS, etc)   │  │
+│  │                 │  │  - Pause button (1/2/5/10 min)   │  │
+│  │   <img src=     │  │  - Recent detections             │  │
+│  │   /stream>      │  │  - Logs viewer                   │  │
+│  └─────────────────┘  └──────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                              │ HTTP :8080
+                              ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    WebUI Server (Flask)                      │
+│  GET /              → Single-page app (index.html)          │
+│  GET /api/status    → JSON status                           │
+│  POST /api/pause/N  → Pause blocking for N minutes          │
+│  POST /api/resume   → Resume blocking immediately           │
+│  GET /api/detections→ Recent OCR/VLM detections             │
+│  GET /api/logs      → Last 100 log lines                    │
+│  GET /stream        → Proxy to ustreamer:9090/stream        │
+│  GET /snapshot      → Proxy to ustreamer:9090/snapshot      │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Access URLs:**
+- Local: `http://localhost:8080`
+- Tailscale: `http://<tailscale-hostname>:8080`
+- Direct stream: `http://<hostname>:9090/stream`
+
+**Security:**
+- No authentication (relies on Tailscale network security)
+- Read-mostly API with minimal attack surface
+- Binds to 0.0.0.0 for remote access
+
+## VLM Training Data Collection
+
+Stream Sentry automatically collects training data for future VLM improvements:
+
+**Ad screenshots** (`screenshots/ocr/`):
+- Saved when OCR detects ad keywords
+- Includes matched keywords and all detected text in logs
+- Auto-truncated to keep last 50 (configurable via `--max-screenshots`)
+- Filename format: `ad_YYYYMMDD_HHMMSS_mmm_NNNN.png`
+
+**Non-ad screenshots** (`screenshots/non_ad/`):
+- Saved when user pauses blocking via WebUI
+- Represents content that should NOT be classified as ads
+- User pausing = "this is a false positive, save for training"
+- Filename format: `non_ad_YYYYMMDD_HHMMSS_mmm_NNNN.png`
+
+**Training workflow:**
+1. Run Stream Sentry normally
+2. When you see a false positive (blocking non-ad content), pause via WebUI
+3. Non-ad screenshot is automatically saved
+4. Use collected screenshots to fine-tune VLM:
+   - `screenshots/ocr/*.png` → label as "ad"
+   - `screenshots/non_ad/*.png` → label as "not_ad"
+
 ## Running as a Service
 
 ```bash
@@ -431,7 +510,7 @@ The service:
 - Color correction via GStreamer videobalance (not V4L2 controls)
 - Health monitor runs every 5 seconds in background thread
 - VLM frame files use PID-based naming to avoid permission conflicts
-- Snapshots scaled to 720p before OCR (model uses 960x960 anyway)
+- Snapshots scaled to 960x540 before OCR (model uses 960x960 anyway, smaller = faster)
 - ustreamer quality set to 75% to reduce CPU load
 - FPS tracked via GStreamer identity element with pad probe
 - Startup cleanup removes stale frame files and kills orphaned processes

@@ -535,6 +535,10 @@ class PaddleOCR:
             if re.search(r'go\s*to\s+\w+\.(io|com|net|org)', text_lower):
                 matched.append(('go to site (ad CTA)', text))
 
+            # "Ad 1 of 2", "Ad2of2", "ad 2 of 3" - video ad progress indicator
+            if re.search(r'ad\s*\d+\s*of\s*\d+', text_lower) or re.search(r'ad\d+of\d+', text_clean):
+                matched.append(('ad X of Y', text))
+
         # Check if this appears to be terminal content
         is_terminal = self.is_terminal_content(all_texts)
 

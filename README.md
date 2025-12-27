@@ -1,10 +1,11 @@
 # Stream Sentry
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
-- **PaddleOCR** on RK3588 NPU (~400ms per frame)
+- **PaddleOCR** on RK3588 NPU (~300ms per frame)
 - **Qwen3-VL-2B** on Axera LLM 8850 NPU (~1.5s per frame)
 - **Audio passthrough** with auto-mute during ads
 - **Spanish vocabulary practice** during ad blocks!
+- **Web UI** for remote monitoring and control via Tailscale
 
 ## Overview
 
@@ -14,6 +15,8 @@ Stream Sentry captures video from HDMI-RX, displays it via GStreamer kmssink at 
 - **Instant ad blocking** - GStreamer input-selector switches in ~1 frame (no black screen!)
 - **Audio passthrough** - HDMI audio with instant mute during ads, silent keepalive prevents stalls
 - **Dual NPU inference** - OCR and VLM run concurrently on separate NPUs
+- **Web UI** - Remote monitoring/control via Tailscale (mobile-friendly)
+- **MPP hardware encoding** - 60fps 4K streaming via RK3588 VPU
 - **No X11 required** - Pure DRM/KMS display via kmssink
 - **Spanish learning** - Practice vocabulary while ads are blocked
 - **30fps display** - Smooth passthrough without stutter
@@ -85,18 +88,20 @@ python3 stream_sentry.py --check-signal
 | `--check-signal` | Check HDMI signal and exit |
 | `--connector-id N` | DRM connector ID (default: 215) |
 | `--plane-id N` | DRM plane ID (default: 72) |
+| `--webui-port N` | Web UI port (default: 8080) |
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Display framerate | ~25 fps (video), 2-3 fps (blocking overlay) |
+| Display framerate | **30fps** (video), 2-3fps (blocking overlay) |
+| ustreamer stream | **~60fps** (MPP hardware encoding at 4K) |
 | Ad blocking switch | **INSTANT** (~1 frame) |
-| Snapshot capture | ~150ms (non-blocking, scaled to 720p) |
-| OCR latency | 300-500ms per frame |
+| Snapshot capture | ~150ms (4K JPEG download) |
+| OCR latency | 250-400ms per frame (960x540 input) |
 | VLM latency | 1.3-1.5s per frame |
 | VLM model load | ~40s (once at startup) |
-| JPEG quality | 75% (optimized for CPU) |
+| JPEG quality | 80% (MPP hardware encoder) |
 
 **FPS Monitoring:** Output FPS is logged every 60 seconds via health monitor.
 
@@ -184,7 +189,12 @@ stream-sentry/
 │   ├── vlm.py            # Qwen3-VL-2B on Axera NPU
 │   ├── ad_blocker.py     # GStreamer video pipeline with input-selector
 │   ├── audio.py          # GStreamer audio passthrough with mute control
-│   └── health.py         # Health monitor for all subsystems
+│   ├── health.py         # Health monitor for all subsystems
+│   ├── webui.py          # Flask web UI server
+│   ├── templates/
+│   │   └── index.html    # Web UI single-page app
+│   └── static/
+│       └── style.css     # Web UI dark theme styles
 ├── install.sh            # Install as systemd service
 ├── uninstall.sh          # Remove systemd service
 ├── stop.sh               # Graceful shutdown script
@@ -192,7 +202,8 @@ stream-sentry/
 ├── models/
 │   └── paddleocr/        # RKNN models (or symlink)
 ├── screenshots/
-│   └── ocr/              # Ad detection screenshots (auto-truncated)
+│   ├── ocr/              # Ad detection screenshots (auto-truncated)
+│   └── non_ad/           # Non-ad screenshots for VLM training
 ├── README.md             # This file
 ├── CLAUDE.md             # Development notes
 └── AUDIO.md              # Audio implementation details
@@ -223,12 +234,13 @@ Model location:
 # System packages
 sudo apt install -y imagemagick ffmpeg curl libevent-dev libjpeg-dev libbsd-dev
 
-# Build ustreamer from source
-git clone https://github.com/pikvm/ustreamer.git
-cd ustreamer && make -j$(nproc) && sudo cp ustreamer /usr/local/bin/
+# Build ustreamer with MPP hardware encoding
+git clone https://github.com/garagehq/ustreamer.git /home/radxa/ustreamer-garagehq
+cd /home/radxa/ustreamer-garagehq && make WITH_MPP=1
+cp ustreamer /home/radxa/ustreamer-patched
 
 # Python packages
-pip3 install pyclipper shapely numpy opencv-python pexpect PyGObject
+pip3 install --break-system-packages pyclipper shapely numpy opencv-python pexpect PyGObject flask requests
 ```
 
 ## Troubleshooting
@@ -344,6 +356,29 @@ Stream Sentry includes a unified health monitor that runs in the background:
 - OCR continues working even if VLM is disabled
 - 30-second startup grace period before health checks begin
 
+## Web UI
+
+Stream Sentry includes a mobile-friendly web UI for remote monitoring and control:
+
+**Access:**
+- Local: `http://localhost:8080`
+- Tailscale: `http://<tailscale-hostname>:8080`
+- Direct video stream: `http://<hostname>:9090/stream`
+
+**Features:**
+- **Live video feed** - Real-time MJPEG stream from ustreamer
+- **Status display** - Blocking state, FPS, HDMI resolution, uptime
+- **Pause controls** - 1/2/5/10 minute presets to pause ad blocking
+- **Detection history** - Recent OCR/VLM detections with timestamps
+- **Log viewer** - Collapsible log output for debugging
+
+**Pause & Training Data:**
+When you pause blocking via the WebUI, Stream Sentry automatically saves a screenshot
+to `screenshots/non_ad/`. This creates training data for improving the VLM:
+- **Pausing = "this is NOT an ad"** (false positive correction)
+- Screenshots saved with `non_ad_` prefix for easy labeling
+- Use these to fine-tune the VLM and reduce false positives
+
 ## Housekeeping
 
 **Log File:**
@@ -351,9 +386,10 @@ Stream Sentry includes a unified health monitor that runs in the background:
 - Max 5MB per log file
 - Keeps 3 backup files (stream_sentry.log.1, .2, .3)
 
-**Screenshot Truncation:**
-- Keeps only last 50 screenshots by default
-- Configurable via `--max-screenshots`
+**Screenshot Management:**
+- Ad screenshots: `screenshots/ocr/` (auto-truncated to last 50)
+- Non-ad screenshots: `screenshots/non_ad/` (saved when pausing via WebUI)
+- Configurable via `--max-screenshots` (0 = unlimited)
 
 **Audio Error Recovery:**
 - Watchdog checks every 3 seconds, restarts if stalled for 6+ seconds

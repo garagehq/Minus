@@ -159,6 +159,14 @@ except ImportError as e:
     logger.warning(f"Health module not available: {e}")
     HAS_HEALTH = False
 
+# Import Web UI
+try:
+    from webui import WebUI
+    HAS_WEBUI = True
+except ImportError as e:
+    logger.warning(f"WebUI module not available: {e}")
+    HAS_WEBUI = False
+
 
 def probe_v4l2_device(device: str) -> dict:
     """
@@ -238,6 +246,7 @@ class StreamConfig:
     max_screenshots: int = 50
     drm_connector_id: int = 215  # HDMI-A-1 connector
     drm_plane_id: int = 72  # Video overlay plane (supports NV12)
+    webui_port: int = 8080  # Web UI port
 
 
 class UstreamerCapture:
@@ -269,9 +278,11 @@ class UstreamerCapture:
                 with SuppressLibjpegWarnings():
                     img = cv2.imread(self.screenshot_path)
                 if img is not None:
-                    # Scale to 720p for OCR - model uses 960x960 anyway
-                    if img.shape[0] > 720 or img.shape[1] > 1280:
-                        img = cv2.resize(img, (1280, 720))
+                    # Scale to 960x540 for OCR - model uses 960x960 anyway
+                    # Using INTER_AREA for best quality downscaling, fast on 4K->540p
+                    h, w = img.shape[:2]
+                    if h > 540 or w > 960:
+                        img = cv2.resize(img, (960, 540), interpolation=cv2.INTER_AREA)
                     return img
 
             return None
@@ -351,11 +362,21 @@ class StreamSentry:
         self.vlm_scene_skip_count = 0
         self.vlm_max_scene_skip = 10  # Force VLM after this many consecutive skips
 
-        # Screenshot directory
+        # Screenshot directories
         self.screenshot_dir = Path(config.screenshot_dir) / "ocr"
         self.screenshot_dir.mkdir(parents=True, exist_ok=True)
+        self.non_ad_screenshot_dir = Path(config.screenshot_dir) / "non_ad"
+        self.non_ad_screenshot_dir.mkdir(parents=True, exist_ok=True)
         self.screenshot_count = 0
+        self.non_ad_screenshot_count = 0
         self.screenshot_hashes = set()  # For deduplication (O(1) lookup)
+
+        # Web UI state
+        self.webui = None
+        self.start_time = time.time()
+        self.blocking_paused_until = 0  # Timestamp when pause expires
+        from collections import deque
+        self.detection_history = deque(maxlen=50)  # Recent detections for web UI
 
         # Initialize OCR
         if HAS_OCR:
@@ -514,6 +535,7 @@ class StreamSentry:
                 f'--resolution={resolution}',
                 '--persistent',
                 f'--port={port}',
+                '--host=0.0.0.0',          # Bind to all interfaces for remote access
                 '--encoder=mpp-jpeg',      # Use RK3588 VPU hardware encoding
                 '--encode-scale=4k',       # Native 4K output (no downscaling)
                 '--quality=80',
@@ -592,6 +614,101 @@ class StreamSentry:
                 logger.debug(f"[Recovery] Deleted {old_file.name}")
         except Exception as e:
             logger.error(f"[Recovery] Error cleaning screenshots: {e}")
+
+    # ===== Web UI Methods =====
+
+    def pause_blocking(self, duration_seconds: int = 120):
+        """Pause ad blocking for specified duration."""
+        with self._state_lock:
+            self.blocking_paused_until = time.time() + duration_seconds
+            logger.info(f"[WebUI] Blocking paused for {duration_seconds}s")
+
+        # Capture non-ad screenshot for future VLM training
+        # This helps collect examples of content that should NOT be classified as ads
+        self._save_non_ad_screenshot()
+
+        # Immediately hide blocking overlay and unmute
+        if self.ad_blocker:
+            self.ad_blocker.hide()
+        if self.audio:
+            self.audio.unmute()
+
+    def resume_blocking(self):
+        """Resume ad blocking immediately."""
+        with self._state_lock:
+            self.blocking_paused_until = 0
+            logger.info("[WebUI] Blocking resumed")
+
+        # Re-evaluate current state
+        self._update_blocking_state()
+
+    def is_blocking_paused(self) -> bool:
+        """Check if blocking is currently paused."""
+        return time.time() < self.blocking_paused_until
+
+    def get_pause_remaining(self) -> int:
+        """Get seconds remaining in pause, or 0 if not paused."""
+        remaining = self.blocking_paused_until - time.time()
+        return max(0, int(remaining))
+
+    def add_detection(self, source: str, texts: list, matched_keywords: list = None):
+        """Add a detection to history for web UI display."""
+        from datetime import datetime
+        self.detection_history.append({
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'timestamp': time.time(),
+            'source': source,
+            'texts': texts[:5] if texts else [],  # Limit to first 5 texts
+            'keywords': [kw for kw, _ in matched_keywords] if matched_keywords else [],
+        })
+
+    def get_status_dict(self) -> dict:
+        """Get current status as dictionary for web API."""
+        # Get health status if available
+        health_status = None
+        if self.health_monitor:
+            try:
+                health_status = self.health_monitor.get_status()
+            except Exception:
+                pass
+
+        # Get FPS from ad_blocker if available
+        fps = 0
+        if self.ad_blocker:
+            try:
+                fps = self.ad_blocker.get_fps()
+            except Exception:
+                pass
+
+        uptime = int(time.time() - self.start_time)
+
+        return {
+            # Blocking state
+            'blocking': self.ad_detected and not self.is_blocking_paused(),
+            'blocking_source': self.blocking_source,
+            'paused': self.is_blocking_paused(),
+            'pause_remaining': self.get_pause_remaining(),
+
+            # Detection counts
+            'ocr_detected': self.ocr_ad_detected,
+            'vlm_detected': self.vlm_ad_detected,
+            'ocr_frame_count': self.frame_count,
+            'vlm_frame_count': self.vlm_frame_count,
+            'total_detections': self.screenshot_count,
+
+            # System status
+            'fps': fps,
+            'uptime': uptime,
+            'uptime_str': f"{uptime // 3600}h {(uptime % 3600) // 60}m",
+            'hdmi_signal': health_status.hdmi_signal if health_status else True,
+            'vlm_ready': not self.vlm_disabled and (self.vlm is not None and self.vlm.is_ready if self.vlm else False),
+            'vlm_disabled': self.vlm_disabled,
+
+            # Memory/health
+            'memory_percent': health_status.memory_percent if health_status else 0,
+            'ustreamer_ok': health_status.ustreamer_responding if health_status else True,
+            'video_ok': health_status.video_pipeline_ok if health_status else True,
+        }
 
     def _compare_frames(self, frame, prev_frame):
         """Compare two frames and return normalized mean difference (0-1)."""
@@ -745,6 +862,7 @@ class StreamSentry:
             f'--resolution={width}x{height}',
             '--persistent',
             f'--port={port}',
+            '--host=0.0.0.0',          # Bind to all interfaces for remote access
             '--encoder=mpp-jpeg',      # Use RK3588 VPU hardware encoding
             '--encode-scale=4k',       # Native 4K output (no downscaling)
             '--quality=80',
@@ -858,12 +976,19 @@ class StreamSentry:
                     self.blocking_source = None
                     logger.warning(f"AD BLOCKING ENDED after {blocking_elapsed:.1f}s")
 
-            # Update overlay
+            # Update overlay (respect pause state)
             if self.ad_blocker:
-                if self.ad_detected and self.blocking_source:
+                if self.ad_detected and self.blocking_source and not self.is_blocking_paused():
                     self.ad_blocker.show(self.blocking_source)
                 else:
                     self.ad_blocker.hide()
+
+            # Also control audio based on blocking state
+            if self.audio:
+                if self.ad_detected and not self.is_blocking_paused():
+                    self.audio.mute()
+                else:
+                    self.audio.unmute()
 
     def ml_worker(self):
         """OCR processing thread."""
@@ -935,6 +1060,7 @@ class StreamSentry:
                         keywords_found = [kw for kw, txt in matched_keywords]
                         logger.info(f"OCR detected ad keywords: {keywords_found}")
                         self._save_screenshot(frame, matched_keywords, all_texts)
+                        self.add_detection('OCR', all_texts, matched_keywords)
                 else:
                     self.ocr_no_ad_count += 1
                     self.ocr_ad_detection_count = 0
@@ -1026,6 +1152,7 @@ class StreamSentry:
                     if not self.vlm_ad_detected:
                         self.vlm_ad_detected = True
                         logger.info(f"VLM detected ad (x{self.vlm_consecutive_ad_count}): \"{response[:50]}\"")
+                        self.add_detection('VLM', [response[:100]] if response else [])
                 else:
                     self.vlm_no_ad_count += 1
                     self.vlm_consecutive_ad_count = 0
@@ -1072,6 +1199,35 @@ class StreamSentry:
             return hash(small.tobytes())
         except Exception:
             return None
+
+    def _save_non_ad_screenshot(self):
+        """
+        Save screenshot when user pauses blocking (for VLM training).
+
+        These screenshots represent content that should NOT be classified as ads.
+        When the user pauses blocking, they're indicating the current content
+        is NOT an ad (false positive), so we save it for training data.
+        """
+        try:
+            if self.frame_capture is None:
+                logger.warning("[WebUI] Cannot save non-ad screenshot: no frame capture")
+                return
+
+            frame = self.frame_capture.capture()
+            if frame is None:
+                logger.warning("[WebUI] Cannot save non-ad screenshot: capture failed")
+                return
+
+            self.non_ad_screenshot_count += 1
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = f"non_ad_{timestamp}_{self.non_ad_screenshot_count:04d}.png"
+            filepath = self.non_ad_screenshot_dir / filename
+
+            cv2.imwrite(str(filepath), frame)
+            logger.info(f"[WebUI] Non-ad screenshot saved: {filename}")
+
+        except Exception as e:
+            logger.error(f"[WebUI] Failed to save non-ad screenshot: {e}")
 
     def _save_screenshot(self, frame, matched_keywords, all_texts):
         """Save screenshot when ad detected (with deduplication)."""
@@ -1177,6 +1333,26 @@ class StreamSentry:
             all_keywords = PaddleOCR.AD_KEYWORDS_EXACT + PaddleOCR.AD_KEYWORDS_WORD
             logger.info(f"OCR watching for ad keywords: {all_keywords}")
 
+        # Start health monitor (before VLM loading)
+        if self.health_monitor:
+            self.health_monitor.start()
+            logger.info("Health monitor started")
+
+        # Start web UI (before VLM loading so it's immediately accessible)
+        if HAS_WEBUI:
+            try:
+                self.webui = WebUI(
+                    stream_sentry=self,
+                    port=self.config.webui_port,
+                    ustreamer_port=self.config.ustreamer_port
+                )
+                self.webui.start()
+                logger.info(f"Web UI available at http://0.0.0.0:{self.config.webui_port}")
+            except Exception as e:
+                logger.warning(f"Failed to start Web UI: {e}")
+                self.webui = None
+
+        # Load VLM model (takes ~40s, so start after WebUI is up)
         if self.vlm:
             logger.info("Loading VLM model (Qwen3-VL-2B-INT4)...")
             if self.vlm.load_model():
@@ -1187,11 +1363,6 @@ class StreamSentry:
             else:
                 logger.warning("VLM model failed to load - VLM detection disabled")
                 self.vlm = None
-
-        # Start health monitor
-        if self.health_monitor:
-            self.health_monitor.start()
-            logger.info("Health monitor started")
 
         logger.info("Stream Sentry running - press Ctrl+C to stop")
 
@@ -1218,6 +1389,10 @@ class StreamSentry:
         # Stop health monitor first
         if self.health_monitor:
             self.health_monitor.stop()
+
+        # Stop web UI
+        if self.webui:
+            self.webui.stop()
 
         # Clean up frame capture temp file
         if self.frame_capture:
@@ -1288,6 +1463,12 @@ def main():
         default=72,
         help='DRM plane ID for video overlay (default: 72)'
     )
+    parser.add_argument(
+        '--webui-port',
+        type=int,
+        default=8080,
+        help='Web UI port (default: 8080)'
+    )
 
     args = parser.parse_args()
 
@@ -1298,6 +1479,7 @@ def main():
         max_screenshots=args.max_screenshots,
         drm_connector_id=args.connector_id,
         drm_plane_id=args.plane_id,
+        webui_port=args.webui_port,
     )
 
     sentry = StreamSentry(config)
