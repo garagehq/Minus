@@ -199,6 +199,16 @@ class HealthMonitor:
                 if self._on_video_pipeline_stall:
                     self._on_video_pipeline_stall()
 
+        # Audio unmute watchdog - ensure audio is not muted when not blocking
+        # This prevents audio from getting stuck muted due to race conditions or bugs
+        if self.stream_sentry.audio and self.stream_sentry.ad_blocker:
+            is_blocking = self.stream_sentry.ad_blocker.is_visible
+            is_muted = self.stream_sentry.audio.is_muted
+
+            if not is_blocking and is_muted:
+                logger.warning("[HealthMonitor] Audio stuck muted while not blocking - forcing unmute")
+                self.stream_sentry.audio.unmute()
+
         # VLM health
         if status.vlm_consecutive_timeouts >= self.vlm_timeout_threshold:
             logger.warning(f"[HealthMonitor] VLM failing ({status.vlm_consecutive_timeouts} consecutive timeouts)")

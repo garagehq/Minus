@@ -106,6 +106,7 @@ At startup, Stream Sentry automatically probes the DRM subsystem to detect:
 - **Connected HDMI output** - Works with either HDMI-A-1 (connector 215) or HDMI-A-2 (connector 231)
 - **Preferred resolution** - Reads EDID to get the display's preferred mode (e.g., 4K@60Hz or 1080p@60Hz)
 - **NV12-capable overlay plane** - Finds a suitable DRM plane that supports NV12 format for video output
+- **Audio output device** - Matches ALSA device to the connected HDMI output (hw:0,0 for HDMI-A-1, hw:1,0 for HDMI-A-2)
 
 This allows Stream Sentry to work with different displays without manual configuration.
 

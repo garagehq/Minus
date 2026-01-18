@@ -154,6 +154,7 @@ def probe_drm_output() -> dict:
         - height: int (preferred resolution height)
         - plane_id: int (suitable plane that supports NV12)
         - crtc_id: int (CRTC connected to this connector)
+        - audio_device: str (ALSA playback device, e.g., 'hw:0,0' or 'hw:1,0')
     """
     result = {
         'connector_id': None,
@@ -162,6 +163,7 @@ def probe_drm_output() -> dict:
         'height': 1080,  # fallback
         'plane_id': 72,  # fallback (known to support NV12)
         'crtc_id': None,
+        'audio_device': 'hw:0,0',  # fallback
     }
 
     try:
@@ -302,8 +304,18 @@ def probe_drm_output() -> dict:
                 type_name = {0: 'Overlay', 1: 'Primary', 2: 'Cursor'}.get(best_plane_type, 'Unknown')
                 logger.info(f"Selected plane {best_plane} (type={type_name}) for NV12 output")
 
+        # Determine audio output device based on connector
+        # On RK3588: HDMI-A-1 -> hw:0,0 (rockchip-hdmi0), HDMI-A-2 -> hw:1,0 (rockchip-hdmi1)
+        if result['connector_name']:
+            if 'HDMI-A-1' in result['connector_name']:
+                result['audio_device'] = 'hw:0,0'
+            elif 'HDMI-A-2' in result['connector_name']:
+                result['audio_device'] = 'hw:1,0'
+            logger.info(f"Audio output device: {result['audio_device']} (based on {result['connector_name']})")
+
         logger.info(f"DRM output probe result: connector={result['connector_id']} ({result['connector_name']}), "
-                   f"resolution={result['width']}x{result['height']}, plane={result['plane_id']}")
+                   f"resolution={result['width']}x{result['height']}, plane={result['plane_id']}, "
+                   f"audio={result['audio_device']}")
 
         return result
 
@@ -395,6 +407,8 @@ class StreamConfig:
     drm_plane_id: int = None  # Auto-detect NV12-capable overlay plane
     output_width: int = None  # Auto-detect from display EDID
     output_height: int = None  # Auto-detect from display EDID
+    audio_capture_device: str = "hw:4,0"  # HDMI-RX audio input (always card 4)
+    audio_playback_device: str = None  # Auto-detect based on connected HDMI output
     webui_port: int = 8080  # Web UI port
 
 
@@ -536,8 +550,8 @@ class StreamSentry:
         from collections import deque
         self.detection_history = deque(maxlen=50)  # Recent detections for web UI
 
-        # Probe DRM output to auto-detect connector, plane, and resolution
-        if config.drm_connector_id is None or config.drm_plane_id is None or config.output_width is None:
+        # Probe DRM output to auto-detect connector, plane, resolution, and audio device
+        if config.drm_connector_id is None or config.drm_plane_id is None or config.output_width is None or config.audio_playback_device is None:
             logger.info("Probing DRM output for connected HDMI display...")
             drm_info = probe_drm_output()
             if drm_info['connector_id'] is not None:
@@ -549,8 +563,11 @@ class StreamSentry:
                     config.output_width = drm_info['width']
                 if config.output_height is None:
                     config.output_height = drm_info['height']
+                if config.audio_playback_device is None:
+                    config.audio_playback_device = drm_info['audio_device']
                 logger.info(f"DRM output: connector={config.drm_connector_id}, plane={config.drm_plane_id}, "
-                           f"resolution={config.output_width}x{config.output_height}")
+                           f"resolution={config.output_width}x{config.output_height}, "
+                           f"audio={config.audio_playback_device}")
             else:
                 # Fallback to defaults if no display detected
                 logger.warning("No HDMI output detected, using defaults")
@@ -558,6 +575,7 @@ class StreamSentry:
                 config.drm_plane_id = config.drm_plane_id or 72
                 config.output_width = config.output_width or 1920
                 config.output_height = config.output_height or 1080
+                config.audio_playback_device = config.audio_playback_device or 'hw:0,0'
 
         # Initialize OCR
         if HAS_OCR:
@@ -602,13 +620,13 @@ class StreamSentry:
         if HAS_AUDIO:
             try:
                 self.audio = AudioPassthrough(
-                    capture_device="hw:4,0",   # HDMI-RX audio
-                    playback_device="hw:0,0"   # HDMI-TX0 audio
+                    capture_device=config.audio_capture_device,  # HDMI-RX audio (hw:4,0)
+                    playback_device=config.audio_playback_device  # HDMI-TX audio (auto-detected)
                 )
                 # Link audio to ad_blocker for mute control
                 if self.ad_blocker:
                     self.ad_blocker.set_audio(self.audio)
-                logger.info("Audio passthrough initialized (hw:4,0 -> hw:0,0)")
+                logger.info(f"Audio passthrough initialized ({config.audio_capture_device} -> {config.audio_playback_device})")
             except Exception as e:
                 logger.warning(f"Audio init failed: {e}")
                 self.audio = None
