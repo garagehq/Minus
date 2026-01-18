@@ -179,13 +179,16 @@ class DRMAdBlocker:
     input is active, no process restart needed.
     """
 
-    def __init__(self, connector_id=215, plane_id=72, stream_sentry=None, ustreamer_port=9090):
+    def __init__(self, connector_id=215, plane_id=72, stream_sentry=None, ustreamer_port=9090,
+                 output_width=1920, output_height=1080):
         self.is_visible = False
         self.current_source = None
         self.connector_id = connector_id
         self.plane_id = plane_id
         self.ustreamer_port = ustreamer_port
         self.stream_sentry = stream_sentry
+        self.output_width = output_width or 1920
+        self.output_height = output_height or 1080
         self._lock = threading.Lock()
 
         # GStreamer pipeline and elements
@@ -243,6 +246,9 @@ class DRMAdBlocker:
             # - saturation=0.85: reduce oversaturation (default 1.0, range 0-2)
             # - contrast=1.0: keep default
             # - brightness=0.0: keep default
+            # Calculate font size based on output resolution (48 at 4K, scaled down for smaller displays)
+            font_size = max(24, int(48 * self.output_height / 2160))
+
             pipeline_str = (
                 f"input-selector name=sel ! "
                 f"identity name=fpsprobe ! "
@@ -255,9 +261,10 @@ class DRMAdBlocker:
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! sel.sink_0 "
 
                 # Blocking input (sink_1) - black screen with text
+                # Resolution matches the output display for proper overlay
                 f"videotestsrc pattern=2 is-live=true ! "
-                f"video/x-raw,format=NV12,width=3840,height=2160,framerate=30/1 ! "
-                f"textoverlay name=blocktext text='BLOCKING AD' font-desc='Sans Bold 48' "
+                f"video/x-raw,format=NV12,width={self.output_width},height={self.output_height},framerate=30/1 ! "
+                f"textoverlay name=blocktext text='BLOCKING AD' font-desc='Sans Bold {font_size}' "
                 f"valignment=center halignment=center shaded-background=true ! "
                 f"queue name=blockqueue ! sel.sink_1"
             )
