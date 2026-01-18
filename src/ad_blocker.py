@@ -429,10 +429,6 @@ class DRMAdBlocker:
                 f"delay {delay:.1f}s, {self._consecutive_failures} consecutive failures)"
             )
 
-            # Preserve current state
-            was_visible = self.is_visible
-            current_source = self.current_source
-
             # Stop current pipeline
             if self.pipeline:
                 try:
@@ -455,12 +451,36 @@ class DRMAdBlocker:
             self._init_pipeline()
 
             if self.pipeline:
-                # Restore state
-                if was_visible and self.selector and self.blocking_pad:
+                # Check CURRENT state to decide whether to show blocking
+                # Don't just restore old state - respect pause, hdmi recovery, etc.
+                should_show_blocking = False
+                blocking_source = None
+
+                if self.stream_sentry:
+                    # Only restore blocking if:
+                    # 1. Ad is actually detected (not just hdmi_lost/no_signal)
+                    # 2. Blocking is not paused
+                    # 3. Not suppressed due to static screen
+                    if (self.stream_sentry.ad_detected and
+                        self.stream_sentry.blocking_source and
+                        self.stream_sentry.blocking_source not in ('hdmi_lost', 'no_hdmi_device') and
+                        not self.stream_sentry.is_blocking_paused() and
+                        not self.stream_sentry.static_blocking_suppressed):
+                        should_show_blocking = True
+                        blocking_source = self.stream_sentry.blocking_source
+
+                if should_show_blocking and self.selector and self.blocking_pad:
                     self.selector.set_property('active-pad', self.blocking_pad)
-                    if self.textoverlay and current_source:
-                        text = self._get_blocking_text(current_source)
+                    if self.textoverlay and blocking_source:
+                        text = self._get_blocking_text(blocking_source)
                         self.textoverlay.set_property('text', text)
+                    self.is_visible = True
+                    self.current_source = blocking_source
+                    logger.info(f"[DRMAdBlocker] Restored blocking state ({blocking_source})")
+                else:
+                    # Start with video visible
+                    self.is_visible = False
+                    self.current_source = None
 
                 ret = self.pipeline.set_state(Gst.State.PLAYING)
                 if ret != Gst.StateChangeReturn.FAILURE:
@@ -682,30 +702,34 @@ class DRMAdBlocker:
     def hide(self):
         """Switch back to video stream - INSTANT, no pipeline restart."""
         with self._lock:
-            if not self.pipeline or not self.selector:
-                logger.warning("[DRMAdBlocker] Pipeline not initialized")
-                return
-
-            if not self.is_visible:
-                return
-
-            # Stop vocabulary rotation
-            self._stop_rotation_thread()
-
-            # Switch to video input - INSTANT!
-            logger.info("[DRMAdBlocker] Switching to video stream")
-            self.selector.set_property('active-pad', self.video_pad)
-
-            # Unmute audio after ad ends
-            if self.audio:
-                self.audio.unmute()
-
+            # Always update visibility state first, even if pipeline is unavailable
+            # This ensures _restart_pipeline() doesn't restore blocking when it shouldn't
+            was_visible = self.is_visible
             self.is_visible = False
             self.current_source = None
 
             # Clear blocking flag
             if self.stream_sentry:
                 self.stream_sentry.blocking_active = False
+
+            # Stop vocabulary rotation (safe to call even if not running)
+            self._stop_rotation_thread()
+
+            # Unmute audio (important even if pipeline is unavailable)
+            if self.audio:
+                self.audio.unmute()
+
+            if not self.pipeline or not self.selector:
+                if was_visible:
+                    logger.warning("[DRMAdBlocker] Pipeline not initialized, but marking as hidden")
+                return
+
+            if not was_visible:
+                return  # Was already hidden, nothing to do with pipeline
+
+            # Switch to video input - INSTANT!
+            logger.info("[DRMAdBlocker] Switching to video stream")
+            self.selector.set_property('active-pad', self.video_pad)
 
     def update(self, ad_detected, is_skippable=False, skip_location=None,
                ocr_detected=False, vlm_detected=False):

@@ -38,34 +38,9 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 import numpy as np
 import cv2
 
-# Redirect stderr temporarily during cv2 operations to suppress libjpeg warnings
-# These warnings (from libjpeg) go directly to stderr, bypassing Python logging
-class SuppressLibjpegWarnings:
-    """Context manager to suppress libjpeg warnings from cv2.imread."""
-    def __init__(self):
-        self._stderr_fd = None
-        self._saved_stderr_fd = None
-        self._devnull_fd = None
-
-    def __enter__(self):
-        try:
-            self._stderr_fd = sys.stderr.fileno()
-            self._saved_stderr_fd = os.dup(self._stderr_fd)
-            self._devnull_fd = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(self._devnull_fd, self._stderr_fd)
-        except Exception:
-            pass  # If we can't suppress, just continue
-        return self
-
-    def __exit__(self, *args):
-        try:
-            if self._saved_stderr_fd is not None:
-                os.dup2(self._saved_stderr_fd, self._stderr_fd)
-                os.close(self._saved_stderr_fd)
-            if self._devnull_fd is not None:
-                os.close(self._devnull_fd)
-        except Exception:
-            pass
+# Note: Previously had SuppressLibjpegWarnings context manager here but it caused
+# file descriptor leaks over time (~500k calls over 13hrs exhausted FD limit).
+# libjpeg warnings are harmless, so we just let them through now.
 
 # Set up logging with rotation (max 5MB, keep 3 backups)
 log_format = '%(asctime)s [%(levelname).1s] %(message)s'
@@ -274,9 +249,7 @@ class UstreamerCapture:
             )
 
             if result.returncode == 0:
-                # Suppress libjpeg warnings during imread (corrupt JPEG warnings)
-                with SuppressLibjpegWarnings():
-                    img = cv2.imread(self.screenshot_path)
+                img = cv2.imread(self.screenshot_path)
                 if img is not None:
                     # Scale to 960x540 for OCR - model uses 960x960 anyway
                     # Using INTER_AREA for best quality downscaling, fast on 4K->540p
@@ -308,6 +281,7 @@ class StreamSentry:
         self.frame_capture = None
         self.running = False
         self.blocking_active = False
+        self._hdmi_recovery_in_progress = False  # Prevent main loop interference during HDMI recovery
 
         # ML processing
         self.ocr = None
@@ -356,6 +330,16 @@ class StreamSentry:
         self.scene_skip_count = 0
         self.scene_change_threshold = 0.01
         self.max_scene_skip = 30  # Force OCR after this many consecutive skips
+
+        # Static screen suppression - disable blocking for still ads
+        # (e.g., paused video with ad, YouTube landing page with sponsored content)
+        self.STATIC_TIME_THRESHOLD = 2.5  # Seconds of static screen to trigger suppression
+        self.STATIC_OCR_THRESHOLD = 4     # OCR iterations without scene change
+        self.DYNAMIC_COOLDOWN = 1.5       # Keep suppression for this long after screen becomes dynamic
+        self.static_since_time = 0        # When screen became static (0 = not static)
+        self.static_ocr_count = 0         # OCR iterations without scene change
+        self.static_blocking_suppressed = False  # Currently suppressing due to static
+        self.screen_became_dynamic_time = 0      # When screen went from static to dynamic
 
         self.vlm_prev_frame = None
         self.vlm_prev_frame_had_ad = False
@@ -477,24 +461,34 @@ class StreamSentry:
     def _on_hdmi_restored(self):
         """Handle HDMI signal restoration."""
         logger.info("[Recovery] HDMI signal restored - restarting capture")
-        # Restart ustreamer first to pick up new signal
-        self._restart_ustreamer()
 
-        # Wait for ustreamer to be fully ready before restarting video pipeline
-        time.sleep(1)
+        # Set flag to prevent main loop from interfering with recovery
+        self._hdmi_recovery_in_progress = True
 
-        # Restart video pipeline to reconnect to ustreamer
-        if self.ad_blocker:
-            logger.info("[Recovery] Restarting video pipeline...")
-            self.ad_blocker.restart()
+        try:
+            # Restart ustreamer first to pick up new signal
+            self._restart_ustreamer()
 
-        # Hide blocking screen and restore video after restart
-        # (The pipeline restart will handle this, but ensure it's done)
-        time.sleep(2)
-        if self.ad_blocker and not self.ad_detected:
-            self.ad_blocker.hide()
-        if self.audio:
-            self.audio.unmute()
+            # Wait for ustreamer to be fully ready before restarting video pipeline
+            time.sleep(2)
+
+            # Restart video pipeline to reconnect to ustreamer
+            if self.ad_blocker:
+                logger.info("[Recovery] Restarting video pipeline...")
+                self.ad_blocker.restart()
+
+            # Wait for pipeline restart to complete (it runs async with backoff)
+            time.sleep(3)
+
+            # Hide blocking screen and restore video after restart
+            if self.ad_blocker and not self.ad_detected:
+                self.ad_blocker.hide()
+            if self.audio:
+                self.audio.unmute()
+
+            logger.info("[Recovery] HDMI recovery complete")
+        finally:
+            self._hdmi_recovery_in_progress = False
 
     def _on_video_pipeline_stall(self):
         """Handle video pipeline stall detected by health monitor."""
@@ -684,10 +678,11 @@ class StreamSentry:
 
         return {
             # Blocking state
-            'blocking': self.ad_detected and not self.is_blocking_paused(),
+            'blocking': self.ad_detected and not self.is_blocking_paused() and not self.static_blocking_suppressed,
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
+            'static_suppressed': self.static_blocking_suppressed,
 
             # Detection counts
             'ocr_detected': self.ocr_ad_detected,
@@ -905,6 +900,17 @@ class StreamSentry:
 
         # Start the display pipeline (managed by ad_blocker)
         if self.ad_blocker:
+            # Wait if pipeline is currently being restarted (avoid race condition)
+            if hasattr(self.ad_blocker, '_pipeline_restarting') and self.ad_blocker._pipeline_restarting:
+                logger.info("Pipeline restart in progress, waiting...")
+                for _ in range(10):  # Wait up to 10 seconds
+                    time.sleep(1)
+                    if not self.ad_blocker._pipeline_restarting:
+                        break
+                if self.ad_blocker._pipeline_restarting:
+                    logger.warning("Pipeline still restarting after 10s")
+                    return False
+
             logger.info("Starting display pipeline...")
             if self.ad_blocker.start():
                 logger.info("Display pipeline started - 30 FPS with instant ad blocking")
@@ -976,16 +982,25 @@ class StreamSentry:
                     self.blocking_source = None
                     logger.warning(f"AD BLOCKING ENDED after {blocking_elapsed:.1f}s")
 
-            # Update overlay (respect pause state)
+            # Update overlay (respect pause state and static screen suppression)
+            # Static screen suppression: don't block still ads (paused video, landing pages)
+            # so user can interact with UI
+            should_show_blocking = (
+                self.ad_detected and
+                self.blocking_source and
+                not self.is_blocking_paused() and
+                not self.static_blocking_suppressed
+            )
+
             if self.ad_blocker:
-                if self.ad_detected and self.blocking_source and not self.is_blocking_paused():
+                if should_show_blocking:
                     self.ad_blocker.show(self.blocking_source)
                 else:
                     self.ad_blocker.hide()
 
-            # Also control audio based on blocking state
+            # Also control audio based on blocking state (same logic)
             if self.audio:
-                if self.ad_detected and not self.is_blocking_paused():
+                if should_show_blocking:
                     self.audio.mute()
                 else:
                     self.audio.unmute()
@@ -1019,7 +1034,51 @@ class StreamSentry:
                 self.frame_count += 1
 
                 # Scene change detection (with max skip cap to catch missed ads)
-                if not self.ad_detected and not self.is_scene_changed(frame) and not self.prev_frame_had_ad:
+                scene_changed = self.is_scene_changed(frame)
+                now = time.time()
+
+                # Track static screen state for suppression of still-ad blocking
+                if scene_changed:
+                    # Screen became dynamic - reset static tracking
+                    if self.static_blocking_suppressed and self.screen_became_dynamic_time == 0:
+                        # First scene change after suppression - start cooldown
+                        self.screen_became_dynamic_time = now
+                        logger.info(f"[Static] Screen became dynamic - cooldown {self.DYNAMIC_COOLDOWN}s before allowing blocking")
+                    self.static_since_time = 0
+                    self.static_ocr_count = 0
+                else:
+                    # Screen is static - track duration
+                    self.static_ocr_count += 1
+                    if self.static_since_time == 0:
+                        self.static_since_time = now
+
+                # Check if we should suppress blocking due to static screen
+                static_time = (now - self.static_since_time) if self.static_since_time > 0 else 0
+
+                if static_time >= self.STATIC_TIME_THRESHOLD or self.static_ocr_count >= self.STATIC_OCR_THRESHOLD:
+                    if not self.static_blocking_suppressed:
+                        logger.info(f"[Static] Screen static for {static_time:.1f}s / {self.static_ocr_count} OCR cycles - suppressing blocking")
+                        self.static_blocking_suppressed = True
+                        self.screen_became_dynamic_time = 0  # Reset cooldown timer
+                        # Save screenshot as non-ad training data (still ads shouldn't be blocked)
+                        if self.ad_detected:
+                            self._save_static_ad_screenshot(frame)
+                        # If currently blocking, hide the overlay
+                        if self.ad_detected:
+                            self._update_blocking_state()
+                elif self.screen_became_dynamic_time > 0:
+                    # In cooldown period after screen became dynamic
+                    cooldown_elapsed = now - self.screen_became_dynamic_time
+                    if cooldown_elapsed >= self.DYNAMIC_COOLDOWN:
+                        logger.info(f"[Static] Cooldown complete - blocking re-enabled")
+                        self.static_blocking_suppressed = False
+                        self.screen_became_dynamic_time = 0
+                elif not self.static_blocking_suppressed:
+                    # Normal state - not suppressed and not in cooldown
+                    pass
+
+                # Skip OCR processing if scene unchanged (unless forced or was blocking)
+                if not self.ad_detected and not scene_changed and not self.prev_frame_had_ad:
                     self.scene_skip_count += 1
                     # Cap consecutive skips to catch ads that appear without scene change
                     if self.scene_skip_count < self.max_scene_skip:
@@ -1075,7 +1134,9 @@ class StreamSentry:
                 total_time = (time.time() - start_time) * 1000
                 blocking_info = ""
                 if self.ad_detected:
-                    if self.ocr_ad_detected and self.vlm_ad_detected:
+                    if self.static_blocking_suppressed:
+                        blocking_info = " [AD DETECTED - STATIC SUPPRESSED]"
+                    elif self.ocr_ad_detected and self.vlm_ad_detected:
                         blocking_info = " [BLOCKING OCR+VLM]"
                     elif self.ocr_ad_detected:
                         blocking_info = " [BLOCKING OCR]"
@@ -1155,6 +1216,12 @@ class StreamSentry:
                         self.add_detection('VLM', [response[:100]] if response else [])
                 else:
                     self.vlm_no_ad_count += 1
+
+                    # VLM "spastic" detection: if VLM detected ads 2-5 times then changed its mind,
+                    # save screenshot for training - this might be a false positive case
+                    if 2 <= self.vlm_consecutive_ad_count <= 5:
+                        self._save_vlm_spastic_screenshot(frame, self.vlm_consecutive_ad_count)
+
                     self.vlm_consecutive_ad_count = 0
 
                     if self.vlm_ad_detected and self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD:
@@ -1229,6 +1296,51 @@ class StreamSentry:
         except Exception as e:
             logger.error(f"[WebUI] Failed to save non-ad screenshot: {e}")
 
+    def _save_static_ad_screenshot(self, frame):
+        """
+        Save screenshot when static screen suppression kicks in (for VLM training).
+
+        These screenshots represent still/static ads that should NOT trigger blocking
+        (e.g., paused video with ad overlay, YouTube landing page with sponsored content).
+        Training the VLM on these helps it learn to NOT classify static ads as blockable.
+        """
+        try:
+            if frame is None:
+                return
+
+            self.non_ad_screenshot_count += 1
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = f"static_ad_{timestamp}_{self.non_ad_screenshot_count:04d}.png"
+            filepath = self.non_ad_screenshot_dir / filename
+
+            cv2.imwrite(str(filepath), frame)
+            logger.info(f"[Static] Saved static ad screenshot for training: {filename}")
+
+        except Exception as e:
+            logger.error(f"[Static] Failed to save static ad screenshot: {e}")
+
+    def _save_vlm_spastic_screenshot(self, frame, consecutive_count):
+        """
+        Save screenshot when VLM is "spastic" - detected ads 2-5 times then changed its mind.
+
+        This captures potential false positive cases where VLM was uncertain.
+        These screenshots can be used to improve VLM training.
+        """
+        try:
+            if frame is None:
+                return
+
+            self.non_ad_screenshot_count += 1
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            filename = f"vlm_spastic_{consecutive_count}x_{timestamp}_{self.non_ad_screenshot_count:04d}.png"
+            filepath = self.non_ad_screenshot_dir / filename
+
+            cv2.imwrite(str(filepath), frame)
+            logger.info(f"[VLM] Saved spastic screenshot ({consecutive_count}x ad then no-ad): {filename}")
+
+        except Exception as e:
+            logger.error(f"[VLM] Failed to save spastic screenshot: {e}")
+
     def _save_screenshot(self, frame, matched_keywords, all_texts):
         """Save screenshot when ad detected (with deduplication)."""
         # Check for duplicate using perceptual hash
@@ -1236,8 +1348,10 @@ class StreamSentry:
         if img_hash is not None and img_hash in self.screenshot_hashes:
             return  # Skip duplicate
 
-        # Add hash to set
+        # Add hash to set (cap at 1000 entries to prevent unbounded memory growth)
         if img_hash is not None:
+            if len(self.screenshot_hashes) >= 1000:
+                self.screenshot_hashes.clear()  # Reset when full
             self.screenshot_hashes.add(img_hash)
 
         self.screenshot_count += 1
@@ -1368,12 +1482,25 @@ class StreamSentry:
 
         # Monitor ustreamer
         try:
+            restart_failures = 0
             while self.running:
+                # Skip main loop restart if HDMI recovery is in progress (health monitor handles it)
+                if self._hdmi_recovery_in_progress:
+                    time.sleep(1)
+                    continue
+
                 if self.ustreamer_process and self.ustreamer_process.poll() is not None:
                     logger.warning("ustreamer process died, restarting...")
                     if not self.start_display():
-                        logger.error("Failed to restart display")
-                        break
+                        restart_failures += 1
+                        logger.error(f"Failed to restart display (attempt {restart_failures})")
+                        # Don't exit - wait and retry (health monitor may also be handling this)
+                        if restart_failures >= 5:
+                            logger.error("Too many restart failures, exiting")
+                            break
+                        time.sleep(5)  # Wait before retry
+                    else:
+                        restart_failures = 0  # Reset on success
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
