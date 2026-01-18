@@ -163,6 +163,40 @@ class WebUI:
                 logger.error(f"Error disabling preview: {e}")
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/debug-overlay')
+        def api_debug_overlay_status():
+            """Get debug overlay status."""
+            try:
+                enabled = False
+                if self.minus.ad_blocker:
+                    enabled = self.minus.ad_blocker.is_debug_overlay_enabled()
+                return jsonify({'debug_overlay_enabled': enabled})
+            except Exception as e:
+                logger.error(f"Error getting debug overlay status: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/debug-overlay/enable', methods=['POST'])
+        def api_debug_overlay_enable():
+            """Enable the debug overlay."""
+            try:
+                if self.minus.ad_blocker:
+                    self.minus.ad_blocker.set_debug_overlay_enabled(True)
+                return jsonify({'success': True, 'debug_overlay_enabled': True})
+            except Exception as e:
+                logger.error(f"Error enabling debug overlay: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/debug-overlay/disable', methods=['POST'])
+        def api_debug_overlay_disable():
+            """Disable the debug overlay."""
+            try:
+                if self.minus.ad_blocker:
+                    self.minus.ad_blocker.set_debug_overlay_enabled(False)
+                return jsonify({'success': True, 'debug_overlay_enabled': False})
+            except Exception as e:
+                logger.error(f"Error disabling debug overlay: {e}")
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/stream')
         def stream_proxy():
             """Proxy the MJPEG stream from ustreamer (for CORS bypass)."""

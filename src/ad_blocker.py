@@ -241,6 +241,16 @@ class DRMAdBlocker:
         self._preview_interval = 0.5  # Update every 0.5 seconds (~2fps)
         self._preview_enabled = True  # Preview window enabled by default
 
+        # Debug overlay settings
+        self._debug_overlay_enabled = True  # Debug dashboard enabled by default
+        self._debug_thread = None
+        self._stop_debug = threading.Event()
+        self._debug_interval = 2.0  # Update every 2 seconds
+        self._total_blocking_time = 0.0  # Total seconds spent blocking ads
+        self._current_block_start = None  # When current blocking session started
+        self._total_ads_blocked = 0  # Number of ad blocking sessions
+        self.debugoverlay = None  # GStreamer text overlay element
+
         # Create initial placeholder preview image
         self._create_placeholder_preview()
 
@@ -270,6 +280,14 @@ class DRMAdBlocker:
             preview_x = self.output_width - preview_w - preview_padding
             preview_y = self.output_height - preview_h - preview_padding
 
+            # Debug overlay font size - scales with resolution
+            # 12pt at 1080p, 24pt at 4K (proportional scaling)
+            debug_font_size = max(12, int(24 * self.output_height / 2160))
+            # Debug overlay padding (scaled with resolution)
+            debug_padding = int(self.output_height * 0.01)  # 1% padding
+
+            logger.info(f"[DRMAdBlocker] Main font size: {font_size}, Debug font size: {debug_font_size}")
+
             pipeline_str = (
                 f"input-selector name=sel ! "
                 f"identity name=fpsprobe ! "
@@ -289,6 +307,11 @@ class DRMAdBlocker:
                 f"offset-x={preview_x} offset-y={preview_y} overlay-width={preview_w} overlay-height={preview_h} ! "
                 f"textoverlay name=blocktext text='BLOCKING AD' font-desc='Sans Bold {font_size}' "
                 f"valignment=center halignment=center shaded-background=true ! "
+                # Debug dashboard overlay (bottom-left corner, very small text)
+                # Use explicit Pango font string with auto-resize disabled
+                f"textoverlay name=debugtext text='' font-desc='Monospace {debug_font_size}' "
+                f"valignment=bottom halignment=left xpad={debug_padding} ypad={debug_padding} "
+                f"shaded-background=true auto-resize=false ! "
                 f"queue name=blockqueue ! sel.sink_1"
             )
 
@@ -299,6 +322,14 @@ class DRMAdBlocker:
             self.selector = self.pipeline.get_by_name('sel')
             self.textoverlay = self.pipeline.get_by_name('blocktext')
             self.previewoverlay = self.pipeline.get_by_name('previewoverlay')
+            self.debugoverlay = self.pipeline.get_by_name('debugtext')
+
+            # Set debug overlay font size explicitly (must be done after element creation)
+            if self.debugoverlay:
+                debug_font = f'Monospace {debug_font_size}'
+                self.debugoverlay.set_property('font-desc', debug_font)
+                self.debugoverlay.set_property('auto-resize', False)
+                logger.info(f"[DRMAdBlocker] Debug overlay font set to: {debug_font} (main font: Sans Bold {font_size})")
 
             # Get the pads for switching
             self.video_pad = self.selector.get_static_pad('sink_0')
@@ -803,6 +834,102 @@ class DRMAdBlocker:
                 if self.previewoverlay:
                     self.previewoverlay.set_property('alpha', 0.0)
 
+    def _get_debug_text(self):
+        """Generate debug dashboard text with current stats."""
+        # Get uptime from minus instance
+        uptime_str = "N/A"
+        if self.minus:
+            uptime_secs = int(time.time() - self.minus.start_time) if hasattr(self.minus, 'start_time') else 0
+            hours, remainder = divmod(uptime_secs, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            uptime_str = f"{hours}h {minutes}m {seconds}s"
+
+        # Calculate current blocking session time
+        current_block_time = 0
+        if self._current_block_start:
+            current_block_time = time.time() - self._current_block_start
+
+        # Total blocking time (including current session)
+        total_block_secs = int(self._total_blocking_time + current_block_time)
+        block_mins, block_secs = divmod(total_block_secs, 60)
+        block_hours, block_mins = divmod(block_mins, 60)
+        if block_hours > 0:
+            block_time_str = f"{block_hours}h {block_mins}m {block_secs}s"
+        else:
+            block_time_str = f"{block_mins}m {block_secs}s"
+
+        # Format debug text (compact multi-line format to fit in corner)
+        debug_text = (
+            f"Uptime: {uptime_str}\n"
+            f"Ads blocked: {self._total_ads_blocked}\n"
+            f"Block time: {block_time_str}"
+        )
+        return debug_text
+
+    def _debug_loop(self):
+        """Background thread to periodically update the debug overlay."""
+        logger.debug("[DRMAdBlocker] Debug update thread started")
+        while not self._stop_debug.is_set():
+            try:
+                if self.debugoverlay and self._debug_overlay_enabled:
+                    text = self._get_debug_text()
+                    self.debugoverlay.set_property('text', text)
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] Debug update error: {e}")
+
+            # Wait before next update
+            self._stop_debug.wait(self._debug_interval)
+
+        logger.debug("[DRMAdBlocker] Debug update thread stopped")
+
+    def _start_debug(self):
+        """Start the debug update thread (if debug overlay is enabled)."""
+        if not self._debug_overlay_enabled:
+            # Still need to hide the overlay if disabled
+            if self.debugoverlay:
+                self.debugoverlay.set_property('text', '')
+            return
+
+        self._stop_debug.clear()
+        self._debug_thread = threading.Thread(
+            target=self._debug_loop,
+            daemon=True,
+            name="DebugUpdate"
+        )
+        self._debug_thread.start()
+
+    def _stop_debug_thread(self):
+        """Stop the debug update thread."""
+        self._stop_debug.set()
+        if self._debug_thread:
+            self._debug_thread.join(timeout=2.0)
+            self._debug_thread = None
+
+    def is_debug_overlay_enabled(self):
+        """Check if debug overlay is enabled."""
+        return self._debug_overlay_enabled
+
+    def set_debug_overlay_enabled(self, enabled):
+        """Enable or disable the debug overlay.
+
+        Args:
+            enabled: True to enable debug overlay, False to disable
+        """
+        self._debug_overlay_enabled = enabled
+        logger.info(f"[DRMAdBlocker] Debug overlay {'enabled' if enabled else 'disabled'}")
+
+        if self.is_visible:
+            # Currently blocking - apply change immediately
+            if enabled:
+                # Start debug thread if not running
+                if not self._debug_thread or not self._debug_thread.is_alive():
+                    self._start_debug()
+            else:
+                # Stop debug thread and clear text
+                self._stop_debug_thread()
+                if self.debugoverlay:
+                    self.debugoverlay.set_property('text', '')
+
     def set_minus(self, minus_instance):
         """Set reference to Minus instance."""
         self.minus = minus_instance
@@ -853,6 +980,11 @@ class DRMAdBlocker:
             if self.previewoverlay:
                 self.previewoverlay.set_property('alpha', 1.0 if self._preview_enabled else 0.0)
 
+            # Start debug overlay thread and track blocking stats
+            self._current_block_start = time.time()
+            self._total_ads_blocked += 1
+            self._start_debug()
+
             # Set flag to prevent external restarts
             if self.minus:
                 self.minus.blocking_active = True
@@ -875,6 +1007,12 @@ class DRMAdBlocker:
 
             # Stop preview update thread
             self._stop_preview_thread()
+
+            # Stop debug overlay thread and accumulate blocking time
+            self._stop_debug_thread()
+            if self._current_block_start:
+                self._total_blocking_time += time.time() - self._current_block_start
+                self._current_block_start = None
 
             # Unmute audio (important even if pipeline is unavailable)
             if self.audio:
@@ -919,6 +1057,9 @@ class DRMAdBlocker:
 
             # Stop preview thread
             self._stop_preview_thread()
+
+            # Stop debug thread
+            self._stop_debug_thread()
 
             if self.pipeline:
                 try:

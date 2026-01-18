@@ -101,6 +101,13 @@
                     <span class="toggle-slider"></span>
                 </label>
             </div>
+            <div class="setting-item">
+                <span class="setting-label">Debug Dashboard</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="debug-toggle" checked onchange="toggleDebugOverlay(this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
         </section>
 
         <!-- System Info -->
@@ -287,6 +294,32 @@
             }
         }
 
+        // Toggle debug overlay
+        async function toggleDebugOverlay(enabled) {
+            try {
+                const endpoint = enabled ? '/api/debug-overlay/enable' : '/api/debug-overlay/disable';
+                const response = await fetch(endpoint, { method: 'POST' });
+                if (!response.ok) throw new Error('Debug overlay toggle failed');
+            } catch (error) {
+                console.error('Debug overlay toggle failed:', error);
+                // Revert checkbox on error
+                document.getElementById('debug-toggle').checked = !enabled;
+                alert('Failed to toggle debug overlay');
+            }
+        }
+
+        // Fetch initial debug overlay state
+        async function fetchDebugOverlayState() {
+            try {
+                const response = await fetch('/api/debug-overlay');
+                if (!response.ok) throw new Error('Debug overlay state fetch failed');
+                const data = await response.json();
+                document.getElementById('debug-toggle').checked = data.debug_overlay_enabled;
+            } catch (error) {
+                console.error('Debug overlay state fetch failed:', error);
+            }
+        }
+
         // Toggle logs
         function toggleLogs() {
             logsVisible = !logsVisible;
@@ -341,6 +374,7 @@
         updateStatus();
         updateDetections();
         fetchPreviewState();
+        fetchDebugOverlayState();
 
         setInterval(updateStatus, 1000);
         setInterval(updateDetections, 5000);

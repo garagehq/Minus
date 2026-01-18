@@ -422,6 +422,11 @@ header h1 {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    margin-bottom: 0.75rem;
+}
+
+.setting-item:last-child {
+    margin-bottom: 0;
 }
 
 .setting-label {
