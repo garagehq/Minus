@@ -15,6 +15,8 @@ import threading
 import time
 import random
 import logging
+import urllib.request
+import shutil
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -232,6 +234,16 @@ class DRMAdBlocker:
         self._stop_rotation = threading.Event()
         self._current_vocab_index = 0
 
+        # Preview image update thread
+        self._preview_thread = None
+        self._stop_preview = threading.Event()
+        self._preview_path = "/tmp/minus_preview.jpg"
+        self._preview_interval = 0.5  # Update every 0.5 seconds (~2fps)
+        self._preview_enabled = True  # Preview window enabled by default
+
+        # Create initial placeholder preview image
+        self._create_placeholder_preview()
+
         # Initialize GStreamer
         Gst.init(None)
         self._init_pipeline()
@@ -240,7 +252,7 @@ class DRMAdBlocker:
         """Initialize GStreamer pipeline with input-selector for instant switching."""
         try:
             # Build pipeline with input-selector
-            # sink_0 = video stream, sink_1 = blocking pattern
+            # sink_0 = video stream, sink_1 = blocking pattern with live preview
             #
             # Color correction via videobalance (HDMI-RX doesn't support V4L2 image controls):
             # - saturation=0.85: reduce oversaturation (default 1.0, range 0-2)
@@ -248,6 +260,15 @@ class DRMAdBlocker:
             # - brightness=0.0: keep default
             # Calculate font size based on output resolution (48 at 4K, scaled down for smaller displays)
             font_size = max(24, int(48 * self.output_height / 2160))
+
+            # Preview window size and position (corner of blocking overlay)
+            # Scale with output resolution: 20% of output size
+            # At 1080p: 384x216, at 4K: 768x432
+            preview_w = int(self.output_width * 0.20)
+            preview_h = int(self.output_height * 0.20)
+            preview_padding = int(self.output_height * 0.02)  # 2% padding
+            preview_x = self.output_width - preview_w - preview_padding
+            preview_y = self.output_height - preview_h - preview_padding
 
             pipeline_str = (
                 f"input-selector name=sel ! "
@@ -260,10 +281,12 @@ class DRMAdBlocker:
                 f"videobalance saturation=0.85 name=colorbalance ! "
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! sel.sink_0 "
 
-                # Blocking input (sink_1) - black screen with text
-                # Resolution matches the output display for proper overlay
+                # Blocking input (sink_1) - black screen with text + small preview image in corner
+                # Uses gdkpixbufoverlay to show a periodically-updated preview image
                 f"videotestsrc pattern=2 is-live=true ! "
                 f"video/x-raw,format=NV12,width={self.output_width},height={self.output_height},framerate=30/1 ! "
+                f"gdkpixbufoverlay name=previewoverlay location=/tmp/minus_preview.jpg "
+                f"offset-x={preview_x} offset-y={preview_y} overlay-width={preview_w} overlay-height={preview_h} ! "
                 f"textoverlay name=blocktext text='BLOCKING AD' font-desc='Sans Bold {font_size}' "
                 f"valignment=center halignment=center shaded-background=true ! "
                 f"queue name=blockqueue ! sel.sink_1"
@@ -275,6 +298,7 @@ class DRMAdBlocker:
             # Get references to key elements
             self.selector = self.pipeline.get_by_name('sel')
             self.textoverlay = self.pipeline.get_by_name('blocktext')
+            self.previewoverlay = self.pipeline.get_by_name('previewoverlay')
 
             # Get the pads for switching
             self.video_pad = self.selector.get_static_pad('sink_0')
@@ -657,6 +681,128 @@ class DRMAdBlocker:
             self._rotation_thread.join(timeout=1.0)
             self._rotation_thread = None
 
+    def _create_placeholder_preview(self):
+        """Create a placeholder preview image (small black rectangle)."""
+        try:
+            # Create a minimal valid JPEG (1x1 black pixel)
+            # This is just a placeholder until the first real snapshot
+            placeholder_data = bytes([
+                0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01,
+                0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43,
+                0x00, 0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09,
+                0x09, 0x08, 0x0A, 0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12,
+                0x13, 0x0F, 0x14, 0x1D, 0x1A, 0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20,
+                0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23, 0x1C, 0x1C, 0x28, 0x37, 0x29,
+                0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39, 0x3D, 0x38, 0x32,
+                0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01,
+                0x00, 0x01, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00,
+                0x01, 0x05, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+                0x09, 0x0A, 0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03,
+                0x03, 0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x7D,
+                0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06,
+                0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1, 0x08,
+                0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72,
+                0x82, 0x09, 0x0A, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28,
+                0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3A, 0x43, 0x44, 0x45,
+                0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59,
+                0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75,
+                0x76, 0x77, 0x78, 0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+                0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0xA2, 0xA3,
+                0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6,
+                0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9,
+                0xCA, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2,
+                0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xF1, 0xF2, 0xF3, 0xF4,
+                0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01,
+                0x00, 0x00, 0x3F, 0x00, 0xFB, 0xD5, 0xDB, 0x20, 0xA8, 0xF1, 0x9E, 0xDF,
+                0xFF, 0xD9
+            ])
+            with open(self._preview_path, 'wb') as f:
+                f.write(placeholder_data)
+            logger.debug(f"[DRMAdBlocker] Created placeholder preview at {self._preview_path}")
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] Failed to create placeholder preview: {e}")
+
+    def _preview_loop(self):
+        """Background thread to periodically update the preview image from ustreamer."""
+        logger.debug("[DRMAdBlocker] Preview update thread started")
+        while not self._stop_preview.is_set():
+            try:
+                # Fetch snapshot from ustreamer
+                url = f"http://localhost:{self.ustreamer_port}/snapshot"
+                temp_path = self._preview_path + ".tmp"
+
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    with open(temp_path, 'wb') as f:
+                        shutil.copyfileobj(response, f)
+
+                # Atomic rename to avoid partial reads
+                os.rename(temp_path, self._preview_path)
+
+                # Trigger gdkpixbufoverlay to reload the image by re-setting location
+                if self.previewoverlay:
+                    try:
+                        self.previewoverlay.set_property('location', self._preview_path)
+                    except Exception as e:
+                        logger.debug(f"[DRMAdBlocker] Preview overlay update error: {e}")
+
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] Preview update error: {e}")
+
+            # Wait before next update
+            self._stop_preview.wait(self._preview_interval)
+
+        logger.debug("[DRMAdBlocker] Preview update thread stopped")
+
+    def _start_preview(self):
+        """Start the preview update thread (if preview is enabled)."""
+        if not self._preview_enabled:
+            return
+
+        self._stop_preview.clear()
+        self._preview_thread = threading.Thread(
+            target=self._preview_loop,
+            daemon=True,
+            name="PreviewUpdate"
+        )
+        self._preview_thread.start()
+
+    def _stop_preview_thread(self):
+        """Stop the preview update thread."""
+        self._stop_preview.set()
+        if self._preview_thread:
+            self._preview_thread.join(timeout=2.0)
+            self._preview_thread = None
+
+    def is_preview_enabled(self):
+        """Check if preview window is enabled."""
+        return self._preview_enabled
+
+    def set_preview_enabled(self, enabled):
+        """Enable or disable the preview window.
+
+        Args:
+            enabled: True to enable preview, False to disable
+        """
+        self._preview_enabled = enabled
+        logger.info(f"[DRMAdBlocker] Preview window {'enabled' if enabled else 'disabled'}")
+
+        if self.is_visible:
+            # Currently blocking - apply change immediately
+            if enabled:
+                # Start preview thread if not running
+                if not self._preview_thread or not self._preview_thread.is_alive():
+                    self._start_preview()
+                # Show the overlay
+                if self.previewoverlay:
+                    self.previewoverlay.set_property('alpha', 1.0)
+            else:
+                # Stop preview thread
+                self._stop_preview_thread()
+                # Hide the overlay by setting alpha to 0
+                if self.previewoverlay:
+                    self.previewoverlay.set_property('alpha', 0.0)
+
     def set_minus(self, minus_instance):
         """Set reference to Minus instance."""
         self.minus = minus_instance
@@ -702,6 +848,11 @@ class DRMAdBlocker:
             # Start vocabulary rotation
             self._start_rotation(source)
 
+            # Start preview update thread and set initial visibility
+            self._start_preview()
+            if self.previewoverlay:
+                self.previewoverlay.set_property('alpha', 1.0 if self._preview_enabled else 0.0)
+
             # Set flag to prevent external restarts
             if self.minus:
                 self.minus.blocking_active = True
@@ -721,6 +872,9 @@ class DRMAdBlocker:
 
             # Stop vocabulary rotation (safe to call even if not running)
             self._stop_rotation_thread()
+
+            # Stop preview update thread
+            self._stop_preview_thread()
 
             # Unmute audio (important even if pipeline is unavailable)
             if self.audio:
@@ -762,6 +916,9 @@ class DRMAdBlocker:
 
             # Stop rotation thread
             self._stop_rotation_thread()
+
+            # Stop preview thread
+            self._stop_preview_thread()
 
             if self.pipeline:
                 try:

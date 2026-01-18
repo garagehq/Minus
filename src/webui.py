@@ -129,6 +129,40 @@ class WebUI:
                 logger.error(f"Error reading logs: {e}")
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/preview')
+        def api_preview_status():
+            """Get preview window status."""
+            try:
+                enabled = False
+                if self.minus.ad_blocker:
+                    enabled = self.minus.ad_blocker.is_preview_enabled()
+                return jsonify({'preview_enabled': enabled})
+            except Exception as e:
+                logger.error(f"Error getting preview status: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/preview/enable', methods=['POST'])
+        def api_preview_enable():
+            """Enable the preview window."""
+            try:
+                if self.minus.ad_blocker:
+                    self.minus.ad_blocker.set_preview_enabled(True)
+                return jsonify({'success': True, 'preview_enabled': True})
+            except Exception as e:
+                logger.error(f"Error enabling preview: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/preview/disable', methods=['POST'])
+        def api_preview_disable():
+            """Disable the preview window."""
+            try:
+                if self.minus.ad_blocker:
+                    self.minus.ad_blocker.set_preview_enabled(False)
+                return jsonify({'success': True, 'preview_enabled': False})
+            except Exception as e:
+                logger.error(f"Error disabling preview: {e}")
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/stream')
         def stream_proxy():
             """Proxy the MJPEG stream from ustreamer (for CORS bypass)."""

@@ -92,6 +92,17 @@
             </div>
         </section>
 
+        <!-- Settings -->
+        <section class="settings-section">
+            <div class="setting-item">
+                <span class="setting-label">Ad Preview Window</span>
+                <label class="toggle-switch">
+                    <input type="checkbox" id="preview-toggle" checked onchange="togglePreview(this.checked)">
+                    <span class="toggle-slider"></span>
+                </label>
+            </div>
+        </section>
+
         <!-- System Info -->
         <section class="system-section">
             <div class="system-info">
@@ -250,6 +261,32 @@
             }
         }
 
+        // Toggle preview window
+        async function togglePreview(enabled) {
+            try {
+                const endpoint = enabled ? '/api/preview/enable' : '/api/preview/disable';
+                const response = await fetch(endpoint, { method: 'POST' });
+                if (!response.ok) throw new Error('Preview toggle failed');
+            } catch (error) {
+                console.error('Preview toggle failed:', error);
+                // Revert checkbox on error
+                document.getElementById('preview-toggle').checked = !enabled;
+                alert('Failed to toggle preview');
+            }
+        }
+
+        // Fetch initial preview state
+        async function fetchPreviewState() {
+            try {
+                const response = await fetch('/api/preview');
+                if (!response.ok) throw new Error('Preview state fetch failed');
+                const data = await response.json();
+                document.getElementById('preview-toggle').checked = data.preview_enabled;
+            } catch (error) {
+                console.error('Preview state fetch failed:', error);
+            }
+        }
+
         // Toggle logs
         function toggleLogs() {
             logsVisible = !logsVisible;
@@ -303,6 +340,7 @@
         // Initial load and intervals
         updateStatus();
         updateDetections();
+        fetchPreviewState();
 
         setInterval(updateStatus, 1000);
         setInterval(updateDetections, 5000);
