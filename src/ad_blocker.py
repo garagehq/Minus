@@ -238,7 +238,7 @@ class DRMAdBlocker:
         self._preview_thread = None
         self._stop_preview = threading.Event()
         self._preview_path = "/tmp/minus_preview.jpg"
-        self._preview_interval = 0.5  # Update every 0.5 seconds (~2fps)
+        self._preview_interval = 0.25  # Update every 0.25 seconds (~4fps)
         self._preview_enabled = True  # Preview window enabled by default
 
         # Debug overlay settings
@@ -250,6 +250,19 @@ class DRMAdBlocker:
         self._current_block_start = None  # When current blocking session started
         self._total_ads_blocked = 0  # Number of ad blocking sessions
         self.debugoverlay = None  # GStreamer text overlay element
+
+        # Animation settings
+        self._animation_thread = None
+        self._stop_animation = threading.Event()
+        self._animation_duration = 1.5  # seconds
+        self._animating = False
+        self._animation_source = None  # Store source during animation
+
+        # Preview corner position/size (set in _init_pipeline, reused for animation)
+        self._preview_corner_x = 0
+        self._preview_corner_y = 0
+        self._preview_corner_w = 0
+        self._preview_corner_h = 0
 
         # Create initial placeholder preview image
         self._create_placeholder_preview()
@@ -279,6 +292,12 @@ class DRMAdBlocker:
             preview_padding = int(self.output_height * 0.02)  # 2% padding
             preview_x = self.output_width - preview_w - preview_padding
             preview_y = self.output_height - preview_h - preview_padding
+
+            # Store corner position/size for animation
+            self._preview_corner_x = preview_x
+            self._preview_corner_y = preview_y
+            self._preview_corner_w = preview_w
+            self._preview_corner_h = preview_h
 
             # Debug overlay font size - scales with resolution
             # 12pt at 1080p, 24pt at 4K (proportional scaling)
@@ -930,6 +949,159 @@ class DRMAdBlocker:
                 if self.debugoverlay:
                     self.debugoverlay.set_property('text', '')
 
+    # Animation methods
+    def _ease_out(self, t):
+        """Ease-out function: fast start, slow finish (quadratic)."""
+        return 1 - (1 - t) ** 2
+
+    def _ease_in(self, t):
+        """Ease-in function: slow start, fast finish (quadratic)."""
+        return t ** 2
+
+    def _stop_animation_thread(self):
+        """Stop any running animation thread."""
+        self._stop_animation.set()
+        if self._animation_thread:
+            self._animation_thread.join(timeout=2.0)
+            self._animation_thread = None
+        self._animating = False
+
+    def _start_animation(self, direction, source=None):
+        """Start animation thread.
+
+        Args:
+            direction: 'start' (full-screen to corner) or 'end' (corner to full-screen)
+            source: Detection source (only used for 'start' direction)
+        """
+        self._stop_animation_thread()
+        self._stop_animation.clear()
+        self._animation_source = source
+        self._animating = True
+
+        self._animation_thread = threading.Thread(
+            target=self._animation_loop,
+            args=(direction,),
+            daemon=True,
+            name=f"Animation-{direction}"
+        )
+        self._animation_thread.start()
+
+    def _animation_loop(self, direction):
+        """Animation loop that interpolates preview position/size.
+
+        Args:
+            direction: 'start' (shrink to corner) or 'end' (grow to full-screen)
+        """
+        start_time = time.time()
+
+        # Full-screen position
+        full_x, full_y = 0, 0
+        full_w, full_h = self.output_width, self.output_height
+
+        # Corner position
+        corner_x = self._preview_corner_x
+        corner_y = self._preview_corner_y
+        corner_w = self._preview_corner_w
+        corner_h = self._preview_corner_h
+
+        logger.debug(f"[DRMAdBlocker] Animation '{direction}' starting")
+
+        # Track when we last updated the preview image (for live feel during animation)
+        last_preview_update = start_time
+        preview_update_interval = self._preview_interval  # ~4fps
+
+        while not self._stop_animation.is_set():
+            current_time = time.time()
+            elapsed = current_time - start_time
+            progress = min(1.0, elapsed / self._animation_duration)
+
+            if direction == 'start':
+                t = self._ease_out(progress)
+                # Interpolate from full to corner
+                x = int(full_x + (corner_x - full_x) * t)
+                y = int(full_y + (corner_y - full_y) * t)
+                w = int(full_w + (corner_w - full_w) * t)
+                h = int(full_h + (corner_h - full_h) * t)
+            else:  # 'end'
+                t = self._ease_in(progress)
+                # Interpolate from corner to full
+                x = int(corner_x + (full_x - corner_x) * t)
+                y = int(corner_y + (full_y - corner_y) * t)
+                w = int(corner_w + (full_w - corner_w) * t)
+                h = int(corner_h + (full_h - corner_h) * t)
+
+            # Update preview image periodically for live feel during animation
+            if current_time - last_preview_update >= preview_update_interval:
+                try:
+                    url = f"http://localhost:{self.ustreamer_port}/snapshot"
+                    temp_path = self._preview_path + ".tmp"
+                    with urllib.request.urlopen(url, timeout=1) as response:
+                        with open(temp_path, 'wb') as f:
+                            shutil.copyfileobj(response, f)
+                    os.rename(temp_path, self._preview_path)
+                    if self.previewoverlay:
+                        self.previewoverlay.set_property('location', self._preview_path)
+                    last_preview_update = current_time
+                except Exception:
+                    pass  # Don't let preview update failures interrupt animation
+
+            # Update preview overlay properties
+            try:
+                if self.previewoverlay:
+                    self.previewoverlay.set_property('offset-x', x)
+                    self.previewoverlay.set_property('offset-y', y)
+                    self.previewoverlay.set_property('overlay-width', w)
+                    self.previewoverlay.set_property('overlay-height', h)
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] Animation property update error: {e}")
+
+            if progress >= 1.0:
+                break
+
+            time.sleep(0.033)  # ~30fps animation
+
+        # Animation complete - trigger final state
+        self._animating = False
+        if direction == 'start':
+            self._on_start_animation_complete()
+        else:
+            self._on_end_animation_complete()
+
+    def _on_start_animation_complete(self):
+        """Called when start animation (shrink to corner) completes."""
+        logger.debug("[DRMAdBlocker] Start animation complete")
+
+        source = self._animation_source or 'default'
+
+        # Show language learning text
+        text = self._get_blocking_text(source)
+        if self.textoverlay:
+            self.textoverlay.set_property('text', text)
+
+        # Start vocabulary rotation
+        self._start_rotation(source)
+
+        # Start live preview updates
+        self._start_preview()
+
+        # Start debug overlay
+        self._current_block_start = time.time()
+        self._total_ads_blocked += 1
+        self._start_debug()
+
+    def _on_end_animation_complete(self):
+        """Called when end animation (grow to full-screen) completes."""
+        logger.debug("[DRMAdBlocker] End animation complete")
+
+        # Switch to video input
+        if self.selector and self.video_pad:
+            logger.info("[DRMAdBlocker] Switching to video stream")
+            self.selector.set_property('active-pad', self.video_pad)
+
+        # Unmute audio
+        if self.audio:
+            self.audio.unmute()
+
     def set_minus(self, minus_instance):
         """Set reference to Minus instance."""
         self.minus = minus_instance
@@ -939,7 +1111,7 @@ class DRMAdBlocker:
         self.audio = audio
 
     def show(self, source='default'):
-        """Switch to blocking overlay - INSTANT, no pipeline restart.
+        """Switch to blocking overlay with animation.
 
         Args:
             source: Detection source - 'ocr', 'vlm', 'both', or 'default'
@@ -949,48 +1121,60 @@ class DRMAdBlocker:
                 logger.warning("[DRMAdBlocker] Pipeline not initialized")
                 return
 
-            # If already blocking, just update the source for rotation
-            if self.is_visible:
+            # If already blocking (or animating to block), just update the source
+            if self.is_visible or self._animating:
                 if self.current_source != source:
                     self.current_source = source
-                    # Rotation thread will pick up the new source
                 return
 
-            # Set initial text
-            text = self._get_blocking_text(source)
-            if self.textoverlay:
-                self.textoverlay.set_property('text', text)
+            logger.info(f"[DRMAdBlocker] Starting blocking animation ({source})")
 
-            # Switch to blocking input - INSTANT!
-            logger.info(f"[DRMAdBlocker] Switching to blocking overlay ({source})")
+            # Capture current frame for animation (update preview image first)
+            try:
+                url = f"http://localhost:{self.ustreamer_port}/snapshot"
+                temp_path = self._preview_path + ".tmp"
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    with open(temp_path, 'wb') as f:
+                        shutil.copyfileobj(response, f)
+                os.rename(temp_path, self._preview_path)
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] Failed to capture animation frame: {e}")
+
+            # Switch to blocking input
             self.selector.set_property('active-pad', self.blocking_pad)
 
-            # Mute audio during ad blocking
+            # Mute audio immediately
             if self.audio:
                 self.audio.mute()
 
+            # Hide text overlays during animation
+            if self.textoverlay:
+                self.textoverlay.set_property('text', '')
+            if self.debugoverlay:
+                self.debugoverlay.set_property('text', '')
+
+            # Set preview to full-screen for animation start
+            if self.previewoverlay:
+                self.previewoverlay.set_property('offset-x', 0)
+                self.previewoverlay.set_property('offset-y', 0)
+                self.previewoverlay.set_property('overlay-width', self.output_width)
+                self.previewoverlay.set_property('overlay-height', self.output_height)
+                self.previewoverlay.set_property('alpha', 1.0)
+                # Trigger reload of the captured frame
+                self.previewoverlay.set_property('location', self._preview_path)
+
             self.is_visible = True
             self.current_source = source
-
-            # Start vocabulary rotation
-            self._start_rotation(source)
-
-            # Start preview update thread and set initial visibility
-            self._start_preview()
-            if self.previewoverlay:
-                self.previewoverlay.set_property('alpha', 1.0 if self._preview_enabled else 0.0)
-
-            # Start debug overlay thread and track blocking stats
-            self._current_block_start = time.time()
-            self._total_ads_blocked += 1
-            self._start_debug()
 
             # Set flag to prevent external restarts
             if self.minus:
                 self.minus.blocking_active = True
 
+            # Start animation (will trigger _on_start_animation_complete when done)
+            self._start_animation('start', source)
+
     def hide(self):
-        """Switch back to video stream - INSTANT, no pipeline restart."""
+        """Switch back to video stream with animation."""
         with self._lock:
             # Always update visibility state first, even if pipeline is unavailable
             # This ensures _restart_pipeline() doesn't restore blocking when it shouldn't
@@ -1005,7 +1189,7 @@ class DRMAdBlocker:
             # Stop vocabulary rotation (safe to call even if not running)
             self._stop_rotation_thread()
 
-            # Stop preview update thread
+            # Stop preview update thread (freeze current frame for animation)
             self._stop_preview_thread()
 
             # Stop debug overlay thread and accumulate blocking time
@@ -1014,21 +1198,31 @@ class DRMAdBlocker:
                 self._total_blocking_time += time.time() - self._current_block_start
                 self._current_block_start = None
 
-            # Unmute audio (important even if pipeline is unavailable)
-            if self.audio:
-                self.audio.unmute()
+            # Hide text overlays immediately for animation
+            if self.textoverlay:
+                self.textoverlay.set_property('text', '')
+            if self.debugoverlay:
+                self.debugoverlay.set_property('text', '')
 
             if not self.pipeline or not self.selector:
                 if was_visible:
                     logger.warning("[DRMAdBlocker] Pipeline not initialized, but marking as hidden")
+                # Still unmute even without pipeline
+                if self.audio:
+                    self.audio.unmute()
                 return
 
-            if not was_visible:
+            if not was_visible and not self._animating:
                 return  # Was already hidden, nothing to do with pipeline
 
-            # Switch to video input - INSTANT!
-            logger.info("[DRMAdBlocker] Switching to video stream")
-            self.selector.set_property('active-pad', self.video_pad)
+            # If currently animating (e.g., start animation), cancel it
+            if self._animating:
+                self._stop_animation_thread()
+
+            logger.info("[DRMAdBlocker] Starting end blocking animation")
+
+            # Start end animation (will switch to video and unmute when complete)
+            self._start_animation('end', None)
 
     def update(self, ad_detected, is_skippable=False, skip_location=None,
                ocr_detected=False, vlm_detected=False):
@@ -1060,6 +1254,9 @@ class DRMAdBlocker:
 
             # Stop debug thread
             self._stop_debug_thread()
+
+            # Stop animation thread
+            self._stop_animation_thread()
 
             if self.pipeline:
                 try:
