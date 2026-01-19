@@ -119,11 +119,10 @@ This allows Minus to work with different displays without manual configuration.
 | Metric | Value |
 |--------|-------|
 | Display (video) | **30fps** (GStreamer kmssink, MJPEG → NV12 → plane 72) |
-| Display (blocking) | 2-3fps (videotestsrc + textoverlay) |
-| Ad blocking switch | **1.5s animation** (shrink/grow transition) |
+| Display (blocking) | **60fps** (ustreamer MPP blocking mode with FreeType) |
+| Preview window | **60fps** (hardware-scaled in MPP encoder) |
+| Blocking composite | **~0.5ms** per frame overhead |
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
-| Preview window | **~4fps** (gdkpixbufoverlay, 20% of screen) |
-| Animation framerate | **~30fps** (smooth ease-in/ease-out) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
 | VLM latency | 1.3-1.5s per frame |
@@ -142,9 +141,11 @@ This allows Minus to work with different displays without manual configuration.
 We use a patched version of ustreamer from `garagehq/ustreamer` that adds:
 - **NV12/NV16/NV24 format support** for RK3588 HDMI-RX devices
 - **MPP hardware JPEG encoding** using RK3588 VPU (~60fps at 4K!)
+- **Blocking mode system** with FreeType TrueType rendering for ad blocking overlays
 - **Extended timeouts** for RK3588 HDMI-RX driver compatibility
 - **Multi-worker MPP support** (4 parallel encoders optimal)
 - **Cache sync fix** for DMA-related visual artifacts
+- **Thread-safe FreeType** mutex for multi-worker encoding
 
 **Why patched ustreamer?**
 The stock PiKVM ustreamer doesn't support NV12 format or RK3588 hardware encoding.
@@ -194,8 +195,10 @@ cp ustreamer /home/radxa/ustreamer-patched
 ```
 
 **Key changes in garagehq/ustreamer:**
-- `src/ustreamer/encoders/mpp/encoder.c` - MPP hardware JPEG encoder with cache sync
+- `src/ustreamer/encoders/mpp/encoder.c` - MPP hardware JPEG encoder with cache sync, blocking composite
 - `src/libs/capture.c` - NV12/NV16/NV24 format support, extended timeouts
+- `src/libs/blocking.c` - FreeType text rendering, NV12 compositing, thread-safe mutex
+- `src/ustreamer/http/server.c` - Blocking API endpoints (`/blocking`, `/blocking/set`, `/blocking/background`)
 - `src/ustreamer/encoder.c` - MPP encoder integration, multi-worker support
 - `src/ustreamer/options.c` - `--encoder=mpp-jpeg` CLI option
 
@@ -266,14 +269,22 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 ## Blocking Overlay
 
-When ads are detected, the screen shows:
+When ads are detected, the screen shows a full blocking overlay **rendered at 60fps via ustreamer's native MPP blocking mode**:
 - **Pixelated Background**: Blurred/pixelated version of the screen from ~6 seconds before the ad
 - **Header**: `BLOCKING (OCR)`, `BLOCKING (VLM)`, or `BLOCKING (OCR+VLM)`
-- **Spanish vocabulary**: Random intermediate-level word with translation
+- **Spanish vocabulary**: Random intermediate-level word with translation (DejaVu Sans Bold)
 - **Example sentence**: Shows the word in context
 - **Rotation**: New vocabulary every 11-15 seconds
-- **Ad Preview Window**: Live preview of the blocked ad in bottom-right corner (~4fps)
-- **Debug Dashboard**: Stats overlay in bottom-left corner (uptime, ads blocked, block time)
+- **Ad Preview Window**: Live preview of the blocked ad in bottom-right corner (60fps!)
+- **Debug Dashboard**: Stats overlay in bottom-left corner (DejaVu Sans Mono)
+
+**Rendering Pipeline:**
+All overlay rendering is done inside ustreamer's MPP encoder, NOT GStreamer:
+1. `ad_blocker.py` captures pre-ad frame and creates pixelated NV12 background
+2. Background uploaded via `POST /blocking/background`
+3. Text and preview configured via `GET /blocking/set`
+4. FreeType renders TrueType fonts directly to NV12 planes at encoder resolution
+5. Composite runs at 60fps with ~0.5ms overhead per frame
 
 **Pixelated Background:**
 Instead of a plain black background, the blocking overlay shows a heavily pixelated (20x downscale) and darkened (60% brightness) version of what was on screen before the ad appeared. This provides visual context while clearly indicating blocking is active.
@@ -282,12 +293,13 @@ Implementation (`src/ad_blocker.py`):
 - Rolling 6-second snapshot buffer (3 frames at 2-second intervals)
 - Uses oldest frame when blocking starts (ensures pre-ad content)
 - OpenCV pixelation: downscale by 20x, upscale with INTER_NEAREST
-- Saved to `/tmp/minus_bg_pixelated.jpg` and loaded via `gdkpixbufoverlay`
+- Converted to NV12 and uploaded via `/blocking/background` POST API
 
-**Transition Animations (1.5s):**
-- **Start blocking**: Ad video shrinks from full-screen to corner preview (ease-out)
-- **End blocking**: Preview grows from corner to full-screen, then switches to video (ease-in)
-- Preview updates at ~4fps during animation for responsive feel
+**Preview Window:**
+Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mode provides:
+- Full 60fps live preview of the blocked ad
+- Hardware-accelerated scaling in the MPP encoder
+- Automatic resolution handling (works at 1080p, 2K, 4K)
 
 Example display:
 ```
@@ -355,10 +367,14 @@ Example display:
 # System
 sudo apt install -y imagemagick ffmpeg curl
 
-# Build ustreamer with MPP hardware encoding
+# Build ustreamer with MPP hardware encoding and FreeType fonts
+sudo apt install -y librockchip-mpp-dev libfreetype-dev libjpeg-dev libevent-dev
 git clone https://github.com/garagehq/ustreamer.git /home/radxa/ustreamer-garagehq
 cd /home/radxa/ustreamer-garagehq && make WITH_MPP=1
 cp ustreamer /home/radxa/ustreamer-patched
+
+# Fonts for blocking overlay (DejaVu recommended)
+sudo apt install -y fonts-dejavu-core
 
 # Python
 pip3 install --break-system-packages pyclipper shapely numpy opencv-python pexpect PyGObject flask requests androidtv
@@ -428,7 +444,21 @@ The blocking overlay system uses ustreamer's native MPP blocking mode (`/blockin
 - Simple GStreamer pipeline with `queue max-size-buffers=3 leaky=downstream` for smooth video
 - All blocking compositing (background, preview, text) done in ustreamer's MPP encoder at 60fps
 - Control via HTTP API: `/blocking/set`, `/blocking/background`
-- FreeType font rendering for proper TrueType fonts (Sans Bold for vocab, Monospace for stats)
+- FreeType TrueType font rendering:
+  - **DejaVu Sans Bold** for vocabulary text (centered, large)
+  - **DejaVu Sans Mono** for stats dashboard (bottom-left, monospace)
+- Thread-safe with mutex protection for 4 parallel MPP encoder workers
+
+**Resolution Flexibility:**
+The blocking system automatically handles resolution mismatches:
+- API calls may specify 4K dimensions (3840x2160)
+- Encoder may output at 1080p due to `--encode-scale native`
+- Preview dimensions are scaled proportionally to fit
+- Positions are clamped to valid ranges
+- All coordinates aligned to even values for NV12
+
+**Thread Safety:**
+FreeType is NOT thread-safe. With 4 parallel MPP encoder workers, a `pthread_mutex_t _ft_mutex` serializes all FreeType calls in the composite function to prevent crashes. Without this, concurrent FT_Set_Pixel_Sizes/FT_Load_Glyph calls corrupt FreeType's internal state.
 
 **Why NOT GStreamer textoverlay:**
 - Caused pipeline stalls every ~12 seconds
@@ -438,7 +468,7 @@ The blocking overlay system uses ustreamer's native MPP blocking mode (`/blockin
 - Complex input-selector switching logic
 
 **Key files:**
-- `ustreamer-garagehq/src/libs/blocking.c` - NV12 compositing with FreeType
+- `ustreamer-garagehq/src/libs/blocking.c` - NV12 compositing with FreeType, mutex protection
 - `ustreamer-garagehq/src/libs/blocking.h` - Blocking mode API
 - `src/ad_blocker.py` - Python client using blocking API
 
