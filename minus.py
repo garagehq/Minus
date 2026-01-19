@@ -421,11 +421,18 @@ class MinusConfig:
 
 
 class UstreamerCapture:
-    """Frame capture using ustreamer's HTTP snapshot endpoint."""
+    """Frame capture using ustreamer's HTTP snapshot endpoint.
+
+    Uses /snapshot/raw which:
+    - Returns raw video when blocking is active (for OCR to see ad content)
+    - Redirects to /snapshot when not blocking (normal operation)
+    """
 
     def __init__(self, port=9090):
         self.port = port
-        self.snapshot_url = f'http://localhost:{port}/snapshot'
+        # Use /snapshot/raw to always get raw video, even during blocking
+        # This is critical for OCR to detect when ads end
+        self.snapshot_url = f'http://localhost:{port}/snapshot/raw'
         # Use PID-based filename to avoid conflicts with root-owned stale files
         self.screenshot_path = f'/dev/shm/minus_frame_{os.getpid()}.jpg'
 
@@ -439,8 +446,9 @@ class UstreamerCapture:
     def capture(self):
         """Capture frame via HTTP snapshot and return as numpy array."""
         try:
+            # Use -L to follow redirects (when not blocking, /snapshot/raw redirects to /snapshot)
             result = subprocess.run(
-                ['curl', '-s', '-o', self.screenshot_path, self.snapshot_url],
+                ['curl', '-s', '-L', '-o', self.screenshot_path, self.snapshot_url],
                 capture_output=True, timeout=3
             )
 
@@ -504,6 +512,15 @@ class Minus:
         self.vlm_frame_count = 0
         self.vlm_consecutive_ad_count = 0
         self.vlm_no_ad_count = 0
+
+        # VLM waffle detection - prevent rapid ad/no-ad oscillation
+        # When VLM waffles (ad->no-ad->ad repeatedly), increase threshold for state changes
+        self.vlm_waffle_count = 0           # How many times VLM has flip-flopped recently
+        self.vlm_last_state = None          # Last VLM state ('ad' or 'no-ad')
+        self.vlm_state_change_time = 0      # When state last changed
+        self.vlm_waffle_decay_time = 30.0   # Decay waffle count if consistent for this long
+        self.vlm_max_waffle_penalty = 6     # Max extra no-ads required when waffling
+        self.vlm_consistent_count = 0       # Consecutive same-state responses
 
         # Combined ad detection state
         self.ad_detected = False
@@ -1643,6 +1660,32 @@ class Minus:
                 cv2.imwrite(vlm_image_path, frame)
                 is_ad, response, elapsed = self.vlm.detect_ad(vlm_image_path)
 
+                # Track VLM state changes for waffle detection
+                current_state = 'ad' if is_ad else 'no-ad'
+                now = time.time()
+
+                # Detect state change (waffle)
+                if self.vlm_last_state is not None and current_state != self.vlm_last_state:
+                    # State changed - this is a potential waffle
+                    time_since_last_change = now - self.vlm_state_change_time
+                    if time_since_last_change < 10.0:  # Quick flip-flop (within 10s)
+                        self.vlm_waffle_count = min(self.vlm_waffle_count + 1, self.vlm_max_waffle_penalty)
+                        logger.warning(f"VLM waffle detected ({current_state}), waffle_count={self.vlm_waffle_count}")
+                    self.vlm_state_change_time = now
+                    self.vlm_consistent_count = 1
+                else:
+                    # Same state - increase consistency, potentially decay waffle count
+                    self.vlm_consistent_count += 1
+                    if self.vlm_consistent_count >= 5 and self.vlm_waffle_count > 0:
+                        # Been consistent for 5+ frames, reduce waffle penalty
+                        self.vlm_waffle_count = max(0, self.vlm_waffle_count - 1)
+                        logger.info(f"VLM consistent (x{self.vlm_consistent_count}), reduced waffle_count to {self.vlm_waffle_count}")
+
+                self.vlm_last_state = current_state
+
+                # Calculate effective stop threshold with waffle penalty
+                effective_vlm_stop_threshold = self.VLM_STOP_THRESHOLD + self.vlm_waffle_count
+
                 if is_ad:
                     self.vlm_consecutive_ad_count += 1
                     self.vlm_no_ad_count = 0
@@ -1661,9 +1704,10 @@ class Minus:
 
                     self.vlm_consecutive_ad_count = 0
 
-                    if self.vlm_ad_detected and self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD:
+                    # Use effective threshold (with waffle penalty) for stopping
+                    if self.vlm_ad_detected and self.vlm_no_ad_count >= effective_vlm_stop_threshold:
                         self.vlm_ad_detected = False
-                        logger.info(f"VLM: ad no longer detected (after {self.VLM_STOP_THRESHOLD} no-ads)")
+                        logger.info(f"VLM: ad no longer detected (after {self.vlm_no_ad_count} no-ads, threshold={effective_vlm_stop_threshold})")
 
                 self._update_blocking_state()
 
