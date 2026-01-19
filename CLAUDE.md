@@ -418,17 +418,42 @@ curl "http://localhost:9090/overlay/set?clear=true"
 - `ustreamer-garagehq/src/libs/overlay.h` - API definitions
 - `src/overlay.py` - Python wrapper for ustreamer overlay API
 
+## CRITICAL: Blocking Mode Architecture
+
+**NEVER REVERT TO GSTREAMER TEXTOVERLAY FOR BLOCKING OVERLAYS.**
+
+The blocking overlay system uses ustreamer's native MPP blocking mode (`/blocking/*` API), NOT GStreamer's input-selector or textoverlay. This is a one-way migration - we only move forward.
+
+**Current Architecture:**
+- Simple GStreamer pipeline with `queue max-size-buffers=3 leaky=downstream` for smooth video
+- All blocking compositing (background, preview, text) done in ustreamer's MPP encoder at 60fps
+- Control via HTTP API: `/blocking/set`, `/blocking/background`
+- FreeType font rendering for proper TrueType fonts (Sans Bold for vocab, Monospace for stats)
+
+**Why NOT GStreamer textoverlay:**
+- Caused pipeline stalls every ~12 seconds
+- NV12 format incompatibility issues
+- 4K→1080p resolution mismatch problems
+- gdkpixbufoverlay limited to ~4fps for preview updates
+- Complex input-selector switching logic
+
+**Key files:**
+- `ustreamer-garagehq/src/libs/blocking.c` - NV12 compositing with FreeType
+- `ustreamer-garagehq/src/libs/blocking.h` - Blocking mode API
+- `src/ad_blocker.py` - Python client using blocking API
+
 ## Known Issues / TODO
 
 ### GStreamer Video Path Overlay (Historical - FIXED)
 
 **Previous problem:** Adding a `textoverlay` element to the GStreamer video path caused pipeline stalls every ~12 seconds due to NV12 format incompatibility and 4K→1080p resolution mismatch.
 
-**Solution implemented:** Text overlay is now rendered directly in ustreamer's MPP encoder via the `/overlay/set` HTTP API. This:
-- Draws text directly on NV12 frames before JPEG encoding
+**Solution implemented:** Text overlay is now rendered directly in ustreamer's MPP encoder via the blocking mode API. This:
+- Composites directly on NV12 frames in the encoder
 - Has minimal CPU impact (~0.5ms per frame)
 - Works at any resolution without GStreamer pipeline changes
-- Supports multiple positions, colors, and backgrounds
+- Supports pixelated background, live preview window, and text overlays
+- Uses FreeType for proper TrueType font rendering
 
 ### Fire TV Setup
 
