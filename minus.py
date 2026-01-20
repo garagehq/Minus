@@ -1535,10 +1535,15 @@ class Minus:
                         self.last_skip_text = skip_text
                         self.last_skip_time = time.time()
                         self.skip_attempts += 1
-                        logger.warning(f"[SKIP] >>> SKIP BUTTON READY! Would skip now. Text: '{skip_text}' (attempt #{self.skip_attempts})")
-                        # Update overlay to show skip available
-                        if self.ad_blocker:
-                            self.ad_blocker.set_skip_status(True, skip_text)
+                        logger.warning(f"[SKIP] >>> SKIP BUTTON READY! Pressing CENTER to skip. Text: '{skip_text}' (attempt #{self.skip_attempts})")
+                        # Actually skip the ad by pressing the center/select button
+                        if self.try_skip_ad():
+                            logger.info(f"[SKIP] Skip command sent successfully!")
+                            # Record time saved (estimate ~30s per skipped ad)
+                            if self.ad_blocker:
+                                self.ad_blocker.add_time_saved(30.0)
+                        else:
+                            logger.warning(f"[SKIP] Skip command failed or Fire TV not connected")
                     self.skip_countdown = 0
                 elif is_skippable and not skip_delay_passed:
                     # Skip button visible but delay not passed yet

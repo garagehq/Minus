@@ -165,6 +165,9 @@ class DRMAdBlocker:
         self._skip_available = False
         self._skip_text = None
 
+        # Time saved tracking
+        self._total_time_saved = 0.0
+
         # Animation settings
         self._animation_thread = None
         self._stop_animation = threading.Event()
@@ -467,10 +470,19 @@ class DRMAdBlocker:
         block_hours, block_mins = divmod(block_mins, 60)
         block_time_str = f"{block_hours}h {block_mins}m {block_secs}s" if block_hours > 0 else f"{block_mins}m {block_secs}s"
 
-        debug_text = f"Uptime: {uptime_str}\nAds blocked: {self._total_ads_blocked}\nBlock time: {block_time_str}"
-        if self._skip_available:
-            debug_text += "\n>>> SKIP NOW! <<<"
-        elif self._skip_text:
+        # Format time saved
+        time_saved_secs = int(self._total_time_saved)
+        saved_mins, saved_secs = divmod(time_saved_secs, 60)
+        saved_hours, saved_mins = divmod(saved_mins, 60)
+        if saved_hours > 0:
+            time_saved_str = f"{saved_hours}h {saved_mins}m {saved_secs}s"
+        elif saved_mins > 0:
+            time_saved_str = f"{saved_mins}m {saved_secs}s"
+        else:
+            time_saved_str = f"{saved_secs}s"
+
+        debug_text = f"Uptime: {uptime_str}\nAds blocked: {self._total_ads_blocked}\nBlock time: {block_time_str}\nTime saved: {time_saved_str}"
+        if self._skip_text:
             debug_text += f"\n{self._skip_text}"
         return debug_text
 
@@ -689,6 +701,15 @@ class DRMAdBlocker:
 
     def get_skip_status(self) -> tuple:
         return (self._skip_available, self._skip_text)
+
+    def add_time_saved(self, seconds: float):
+        """Add to the total time saved by skipping ads."""
+        self._total_time_saved += seconds
+        logger.info(f"[DRMAdBlocker] Time saved: +{seconds:.0f}s (total: {self._total_time_saved:.0f}s)")
+
+    def get_time_saved(self) -> float:
+        """Get total time saved in seconds."""
+        return self._total_time_saved
 
     def set_test_mode(self, duration_seconds: float):
         self._test_blocking_until = time.time() + duration_seconds
