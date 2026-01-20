@@ -1889,8 +1889,12 @@ class Minus:
                     # Poll for HDMI signal every 2 seconds
                     self.running = True
                     try:
+                        poll_count = 0
                         while self.running:
                             time.sleep(2)
+                            poll_count += 1
+                            if poll_count % 15 == 0:  # Log every 30 seconds
+                                logger.info("Still waiting for HDMI input...")
                             signal_info = self.check_hdmi_signal()
                             if signal_info:
                                 width, height, fps = signal_info

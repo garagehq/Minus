@@ -384,26 +384,51 @@ class DRMAdBlocker:
         threading.Thread(target=self._restart_pipeline, daemon=True).start()
 
     def start_no_signal_mode(self):
-        if not self.pipeline:
-            return False
+        """Start a standalone display for 'No HDMI Input' message.
+
+        This creates a simple pipeline using videotestsrc that doesn't depend on ustreamer.
+        """
         try:
-            self._blocking_api_call('/blocking/set', {
-                'enabled': 'true',
-                'text_vocab': 'NO HDMI INPUT\n\nWaiting for HDMI signal...',
-                'text_scale': '3',
-                'preview_enabled': 'false'
-            }, timeout=1.0)
+            # Stop existing pipeline if any
+            if self.pipeline:
+                try:
+                    if self.bus:
+                        self.bus.remove_signal_watch()
+                        self.bus = None
+                    self.pipeline.set_state(Gst.State.NULL)
+                except Exception:
+                    pass
+                self.pipeline = None
+
+            # Create a simple standalone pipeline for no-signal display
+            # Uses videotestsrc with textoverlay - doesn't need ustreamer
+            no_signal_pipeline = (
+                f"videotestsrc pattern=black ! "
+                f"video/x-raw,width=1920,height=1080,framerate=30/1 ! "
+                f"textoverlay text=\"NO HDMI INPUT\" "
+                f"valignment=center halignment=center font-desc=\"Sans Bold 24\" ! "
+                f"videoconvert ! video/x-raw,format=NV12 ! "
+                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
+            )
+
+            logger.debug("[DRMAdBlocker] Creating no-signal pipeline...")
+            self.pipeline = Gst.parse_launch(no_signal_pipeline)
+
+            self.bus = self.pipeline.get_bus()
+            self.bus.add_signal_watch()
+            self.bus.connect('message::error', self._on_error)
 
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
+                logger.error("[DRMAdBlocker] Failed to start no-signal pipeline")
                 return False
 
             self.is_visible = True
             self.current_source = 'no_hdmi_device'
-            logger.info("[DRMAdBlocker] Pipeline started in no-signal mode")
+            logger.info("[DRMAdBlocker] No-signal display started")
             return True
         except Exception as e:
-            logger.error(f"[DRMAdBlocker] Failed to start in no-signal mode: {e}")
+            logger.error(f"[DRMAdBlocker] Failed to start no-signal mode: {e}")
             return False
 
     def _on_error(self, bus, message):
