@@ -7,3 +7,13 @@ ALL ALL=(ALL) NOPASSWD: /usr/bin/rm -f /tmp/minus.log
 ALL ALL=(ALL) NOPASSWD: /usr/bin/rm -f /tmp/minus.log.*
 ALL ALL=(ALL) NOPASSWD: /usr/bin/touch /tmp/minus.log
 ALL ALL=(ALL) NOPASSWD: /usr/bin/chmod 666 /tmp/minus.log
+
+# Allow all users to manage the minus systemd service
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minus
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl start minus *
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop minus
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop minus *
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart minus
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart minus *
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl status minus
+radxa ALL=(ALL) NOPASSWD: /usr/bin/systemctl status minus *
