@@ -262,19 +262,48 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 ## Ad Detection Logic (Weighted Model)
 
-**OCR (Primary - High Trust):**
+**OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
-- Needs 3 consecutive no-ads to stop (`OCR_STOP_THRESHOLD`)
+- Stops blocking after 3 consecutive no-ads (`OCR_STOP_THRESHOLD`)
+- **Authoritative for stopping** - VLM cannot delay unblocking
 - Tracks `last_ocr_ad_time` for VLM context
 
-**VLM (Secondary - Contextual Trust):**
-- If OCR detected within 5s (`OCR_TRUST_WINDOW`): VLM is trusted
-- If no recent OCR: needs 5 consecutive detections (`VLM_ALONE_THRESHOLD`)
-- Needs 2 consecutive no-ads to stop (`VLM_STOP_THRESHOLD`)
+**VLM (Secondary - Anti-Waffle Protected):**
+- Uses sliding window of last 45 seconds of VLM decisions (`vlm_history_window`)
+- Only triggers blocking alone if 80%+ of recent decisions are "ad" (`vlm_start_agreement`)
+- Hysteresis: needs 90% agreement to START (80% + 10% boost for state change)
+- Minimum 4 decisions in window before VLM can act (`vlm_min_decisions`)
+- 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
+- **VLM cannot delay stopping** - only affects starting blocking
+
+**Sliding Window Parameters:**
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `vlm_history_window` | 45s | How far back to look at VLM decisions |
+| `vlm_min_decisions` | 4 | Minimum decisions needed before acting |
+| `vlm_start_agreement` | 80% | Agreement threshold to start blocking |
+| `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
+| `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
+
+**Starting Blocking:**
+1. OCR detects ad → blocking starts immediately
+2. VLM detects ad (no OCR) → needs 80%+ agreement in sliding window
+3. VLM with recent OCR → trusted, triggers blocking
+
+**Stopping Blocking:**
+1. **If OCR triggered** (source=ocr or both): OCR says stop (3 no-ads) → ends immediately (~2-3s)
+2. **If VLM triggered alone** (source=vlm): VLM says stop (2 no-ads) → ends (~4s after ad ends)
+3. VLM history cleared on stop → prevents immediate re-trigger
+4. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
+
+**Why This Design:**
+- VLM anti-waffle prevents erratic false-positive blocking
+- OCR authority for stopping ensures we unblock ASAP after ad ends
+- Clearing VLM history on stop prevents "waffle memory" from causing re-triggers
 
 **Anti-flicker:**
 - Minimum 3s blocking duration (`MIN_BLOCKING_DURATION`)
-- Both must agree to stop when VLM has OCR context
+- VLM history cleared on stop prevents false re-triggers
 
 ## Blocking Overlay
 

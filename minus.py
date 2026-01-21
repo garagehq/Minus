@@ -221,14 +221,24 @@ class Minus:
         self.vlm_consecutive_ad_count = 0
         self.vlm_no_ad_count = 0
 
-        # VLM waffle detection - prevent rapid ad/no-ad oscillation
-        # When VLM waffles (ad->no-ad->ad repeatedly), increase threshold for state changes
-        self.vlm_waffle_count = 0           # How many times VLM has flip-flopped recently
+        # VLM stability system - sliding window approach to prevent waffling
+        # Tracks recent VLM decisions and requires sustained agreement to change state
+        self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
+        self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
+        self.vlm_min_decisions = 4          # Need at least 4 decisions to act
+        self.vlm_start_agreement = 0.80     # Need 80% ad agreement to START blocking
+        self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
+        self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
+
+        # State change rate limiting
+        self.vlm_last_state_change = 0      # When VLM state last changed
+        self.vlm_min_state_duration = 8.0   # Min seconds before allowing state change
+        self.vlm_cooldown_active = False    # Currently in cooldown period
+
+        # Legacy counters (still used for some logic)
+        self.vlm_waffle_count = 0           # How many recent flip-flops (used for logging)
         self.vlm_last_state = None          # Last VLM state ('ad' or 'no-ad')
         self.vlm_state_change_time = 0      # When state last changed
-        self.vlm_waffle_decay_time = 30.0   # Decay waffle count if consistent for this long
-        self.vlm_max_waffle_penalty = 6     # Max extra no-ads required when waffling
-        self.vlm_consistent_count = 0       # Consecutive same-state responses
 
         # Combined ad detection state
         self.ad_detected = False
@@ -808,6 +818,98 @@ class Minus:
             return True
         return self._compare_frames(frame, self.vlm_prev_frame) > self.scene_change_threshold
 
+    def _add_vlm_decision(self, is_ad: bool):
+        """Add a VLM decision to the sliding window history."""
+        now = time.time()
+        self.vlm_decision_history.append((now, is_ad))
+
+        # Prune old decisions outside the window
+        cutoff = now - self.vlm_history_window
+        self.vlm_decision_history = [
+            (t, decision) for t, decision in self.vlm_decision_history
+            if t >= cutoff
+        ]
+
+    def _get_vlm_agreement(self) -> tuple:
+        """
+        Calculate VLM agreement percentage from sliding window.
+
+        Returns:
+            (ad_ratio, no_ad_ratio, total_decisions)
+            - ad_ratio: fraction of decisions that were 'ad' (0.0-1.0)
+            - no_ad_ratio: fraction of decisions that were 'no-ad' (0.0-1.0)
+            - total_decisions: number of decisions in window
+        """
+        if not self.vlm_decision_history:
+            return 0.0, 0.0, 0
+
+        now = time.time()
+        cutoff = now - self.vlm_history_window
+
+        # Filter to recent decisions
+        recent = [(t, decision) for t, decision in self.vlm_decision_history if t >= cutoff]
+
+        if not recent:
+            return 0.0, 0.0, 0
+
+        total = len(recent)
+        ad_count = sum(1 for _, is_ad in recent if is_ad)
+        no_ad_count = total - ad_count
+
+        return ad_count / total, no_ad_count / total, total
+
+    def _should_vlm_start_blocking(self) -> bool:
+        """
+        Determine if VLM should trigger blocking based on sliding window agreement.
+
+        Uses hysteresis: if we're NOT currently blocking, we need higher agreement to START.
+        """
+        ad_ratio, _, total = self._get_vlm_agreement()
+
+        if total < self.vlm_min_decisions:
+            return False  # Not enough data
+
+        # Check cooldown
+        now = time.time()
+        if self.vlm_cooldown_active:
+            time_since_change = now - self.vlm_last_state_change
+            if time_since_change < self.vlm_min_state_duration:
+                return False  # Still in cooldown
+
+        # Need strong ad agreement to start
+        threshold = self.vlm_start_agreement
+        if not self.vlm_ad_detected:
+            # Not currently detecting - need even stronger evidence to start
+            threshold += self.vlm_hysteresis_boost
+
+        return ad_ratio >= threshold
+
+    def _should_vlm_stop_blocking(self) -> bool:
+        """
+        Determine if VLM should stop blocking based on sliding window agreement.
+
+        Uses hysteresis: if we ARE currently blocking, we need higher agreement to STOP.
+        """
+        _, no_ad_ratio, total = self._get_vlm_agreement()
+
+        if total < self.vlm_min_decisions:
+            return False  # Not enough data - keep current state
+
+        # Check cooldown
+        now = time.time()
+        if self.vlm_cooldown_active:
+            time_since_change = now - self.vlm_last_state_change
+            if time_since_change < self.vlm_min_state_duration:
+                return False  # Still in cooldown
+
+        # Need strong no-ad agreement to stop
+        threshold = self.vlm_stop_agreement
+        if self.vlm_ad_detected:
+            # Currently detecting - need even stronger evidence to stop
+            threshold += self.vlm_hysteresis_boost
+
+        return no_ad_ratio >= threshold
+
     def check_hdmi_signal(self):
         """Check HDMI signal and return resolution."""
         try:
@@ -1018,16 +1120,16 @@ class Minus:
                 source = None
 
                 if self.ocr_ad_detected:
+                    # OCR is primary - always trust it immediately
                     should_start = True
                     source = "both" if self.vlm_ad_detected else "ocr"
-                elif self.vlm_ad_detected and not ocr_recent:
-                    if self.vlm_consecutive_ad_count >= self.VLM_ALONE_THRESHOLD:
-                        should_start = True
-                        source = "vlm"
-                        logger.info(f"VLM triggered alone after {self.vlm_consecutive_ad_count} consecutive detections")
-                elif self.vlm_ad_detected and ocr_recent:
+                elif self.vlm_ad_detected:
+                    # VLM alone - vlm_ad_detected is now managed by sliding window
+                    # which already requires sustained agreement before setting True
                     should_start = True
                     source = "vlm"
+                    ad_ratio, _, total = self._get_vlm_agreement()
+                    logger.info(f"VLM triggered alone (agreement: {ad_ratio*100:.0f}% of {total} decisions)")
 
                 if should_start:
                     self.ad_detected = True
@@ -1049,17 +1151,28 @@ class Minus:
 
                 if blocking_elapsed >= self.MIN_BLOCKING_DURATION:
                     ocr_says_stop = (self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD)
+                    # For VLM stopping, use consecutive no-ad count (not sliding window)
+                    # This ensures responsive stopping after ad ends
+                    vlm_says_stop = (self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD)
 
-                    if ocr_recent:
-                        vlm_says_stop = (self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD)
-                        should_stop = ocr_says_stop and vlm_says_stop
+                    if self.blocking_source == "vlm":
+                        # VLM triggered alone - VLM must also agree to stop
+                        # (OCR never detected the ad, so OCR's opinion is unreliable here)
+                        # Use simple consecutive count, not sliding window (for responsiveness)
+                        should_stop = vlm_says_stop
                     else:
+                        # OCR triggered (alone or with VLM) - OCR is authoritative for stopping
+                        # This ensures we don't block longer than necessary after ad ends
                         should_stop = ocr_says_stop
 
                 if should_stop:
                     self.ad_detected = False
+                    source_was = self.blocking_source
                     self.blocking_source = None
-                    logger.warning(f"AD BLOCKING ENDED after {blocking_elapsed:.1f}s")
+                    # Also clear VLM state so it doesn't immediately re-trigger
+                    self.vlm_ad_detected = False
+                    self.vlm_decision_history.clear()
+                    logger.warning(f"AD BLOCKING ENDED after {blocking_elapsed:.1f}s (stopped by {source_was.upper() if source_was else 'unknown'})")
 
             # Update overlay (respect pause state and static screen suppression)
             # Static screen suppression: don't block still ads (paused video, landing pages)
@@ -1349,54 +1462,56 @@ class Minus:
                 cv2.imwrite(vlm_image_path, frame)
                 is_ad, response, elapsed = self.vlm.detect_ad(vlm_image_path)
 
-                # Track VLM state changes for waffle detection
-                current_state = 'ad' if is_ad else 'no-ad'
+                # Add decision to sliding window history
                 now = time.time()
+                self._add_vlm_decision(is_ad)
 
-                # Detect state change (waffle)
+                # Track state changes for waffle detection and logging
+                current_state = 'ad' if is_ad else 'no-ad'
                 if self.vlm_last_state is not None and current_state != self.vlm_last_state:
-                    # State changed - this is a potential waffle
                     time_since_last_change = now - self.vlm_state_change_time
-                    if time_since_last_change < 10.0:  # Quick flip-flop (within 10s)
-                        self.vlm_waffle_count = min(self.vlm_waffle_count + 1, self.vlm_max_waffle_penalty)
-                        logger.warning(f"VLM waffle detected ({current_state}), waffle_count={self.vlm_waffle_count}")
+                    if time_since_last_change < 15.0:  # Quick flip-flop
+                        self.vlm_waffle_count = min(self.vlm_waffle_count + 1, 10)
                     self.vlm_state_change_time = now
-                    self.vlm_consistent_count = 1
-                else:
-                    # Same state - increase consistency, potentially decay waffle count
-                    self.vlm_consistent_count += 1
-                    if self.vlm_consistent_count >= 5 and self.vlm_waffle_count > 0:
-                        # Been consistent for 5+ frames, reduce waffle penalty
-                        self.vlm_waffle_count = max(0, self.vlm_waffle_count - 1)
-                        logger.info(f"VLM consistent (x{self.vlm_consistent_count}), reduced waffle_count to {self.vlm_waffle_count}")
-
                 self.vlm_last_state = current_state
 
-                # Calculate effective stop threshold with waffle penalty
-                effective_vlm_stop_threshold = self.VLM_STOP_THRESHOLD + self.vlm_waffle_count
-
+                # Update legacy counters (for logging and spastic detection)
                 if is_ad:
                     self.vlm_consecutive_ad_count += 1
                     self.vlm_no_ad_count = 0
-
-                    if not self.vlm_ad_detected:
-                        self.vlm_ad_detected = True
-                        logger.info(f"VLM detected ad (x{self.vlm_consecutive_ad_count}): \"{response[:50]}\"")
-                        self.add_detection('VLM', [response[:100]] if response else [])
                 else:
                     self.vlm_no_ad_count += 1
-
-                    # VLM "spastic" detection: if VLM detected ads 2-5 times then changed its mind,
-                    # save screenshot for training - this might be a false positive case
+                    # VLM "spastic" detection: save screenshot for training
                     if 2 <= self.vlm_consecutive_ad_count <= 5:
                         self.screenshot_manager.save_vlm_spastic_screenshot(frame, self.vlm_consecutive_ad_count)
-
                     self.vlm_consecutive_ad_count = 0
 
-                    # Use effective threshold (with waffle penalty) for stopping
-                    if self.vlm_ad_detected and self.vlm_no_ad_count >= effective_vlm_stop_threshold:
+                # Get current agreement stats for logging
+                ad_ratio, no_ad_ratio, total_decisions = self._get_vlm_agreement()
+
+                # Use sliding window approach for state changes
+                prev_vlm_ad_detected = self.vlm_ad_detected
+
+                if not self.vlm_ad_detected:
+                    # Not currently detecting - check if we should START
+                    if self._should_vlm_start_blocking():
+                        self.vlm_ad_detected = True
+                        self.vlm_last_state_change = now
+                        self.vlm_cooldown_active = True
+                        logger.warning(f"VLM detected ad (agreement: {ad_ratio*100:.0f}% of {total_decisions} decisions): \"{response[:50]}\"")
+                        self.add_detection('VLM', [response[:100]] if response else [])
+                else:
+                    # Currently detecting - check if we should STOP
+                    if self._should_vlm_stop_blocking():
                         self.vlm_ad_detected = False
-                        logger.info(f"VLM: ad no longer detected (after {self.vlm_no_ad_count} no-ads, threshold={effective_vlm_stop_threshold})")
+                        self.vlm_last_state_change = now
+                        self.vlm_cooldown_active = True
+                        self.vlm_waffle_count = max(0, self.vlm_waffle_count - 1)  # Decay on stable stop
+                        logger.warning(f"VLM: ad no longer detected (agreement: {no_ad_ratio*100:.0f}% no-ad of {total_decisions} decisions)")
+
+                # Clear cooldown after minimum state duration
+                if self.vlm_cooldown_active and (now - self.vlm_last_state_change) >= self.vlm_min_state_duration:
+                    self.vlm_cooldown_active = False
 
                 self._update_blocking_state()
 
