@@ -74,8 +74,8 @@ class NotificationOverlay:
         self._auto_hide_timer: Optional[threading.Timer] = None
         self._default_duration = 10.0  # Default auto-hide after 10s
 
-        # Default styling
-        self._scale = 3  # Text scale factor
+        # Default styling (scale increased 20% from 3 to 4)
+        self._scale = 4  # Text scale factor
         self._bg_alpha = 200  # Background transparency
 
         # API endpoint
@@ -250,8 +250,8 @@ class FireTVNotification(NotificationOverlay):
 
     def __init__(self, ustreamer_port: int = 9090):
         super().__init__(ustreamer_port=ustreamer_port, position=NotificationOverlay.POS_TOP_RIGHT)
-        # Use slightly smaller scale for Fire TV notifications
-        self._scale = 2
+        # Scale increased 20% from 2 to 3
+        self._scale = 3
 
     def show_scanning(self):
         """Show 'Scanning for Fire TV...' notification."""
@@ -310,4 +310,38 @@ class FireTVNotification(NotificationOverlay):
     def show_skipped(self):
         """Show setup skipped notification."""
         text = "Fire TV setup skipped.\n\nManual skip unavailable."
+        self.show(text, duration=5.0)
+
+
+class SystemNotification(NotificationOverlay):
+    """
+    System notification overlay for status updates.
+
+    Shows system status like VLM initialization progress
+    in the top-right corner without blocking video content.
+    """
+
+    def __init__(self, ustreamer_port: int = 9090):
+        super().__init__(ustreamer_port=ustreamer_port, position=NotificationOverlay.POS_TOP_RIGHT)
+        # Scale increased 20% from 2 to 3
+        self._scale = 3
+
+    def show_vlm_loading(self):
+        """Show VLM loading notification."""
+        text = "Loading VLM model...\n\nQwen3-VL-2B-INT4"
+        self.show(text, duration=None)
+
+    def show_vlm_ready(self):
+        """Show VLM ready notification (auto-hides)."""
+        text = "VLM Ready\n\nAd detection active"
+        self.show(text, duration=5.0)
+
+    def show_vlm_failed(self):
+        """Show VLM load failure notification (auto-hides)."""
+        text = "VLM Load Failed\n\nOCR-only mode"
+        self.show(text, duration=8.0)
+
+    def show_system_ready(self):
+        """Show system ready notification (auto-hides)."""
+        text = "Minus Ready\n\nAd blocking active"
         self.show(text, duration=5.0)

@@ -150,6 +150,14 @@ except ImportError as e:
     logger.warning(f"Fire TV module not available: {e}")
     HAS_FIRE_TV = False
 
+# Import Notification Overlay
+try:
+    from overlay import NotificationOverlay, SystemNotification
+    HAS_OVERLAY = True
+except ImportError as e:
+    logger.warning(f"Overlay module not available: {e}")
+    HAS_OVERLAY = False
+
 
 def probe_drm_output() -> dict:
     """
@@ -683,6 +691,16 @@ class Minus:
             except Exception as e:
                 logger.warning(f"Health monitor init failed: {e}")
                 self.health_monitor = None
+
+        # Initialize System Notification overlay (for VLM status, etc.)
+        self.system_notification = None
+        if HAS_OVERLAY:
+            try:
+                self.system_notification = SystemNotification(ustreamer_port=config.ustreamer_port)
+                logger.info("System notification overlay initialized")
+            except Exception as e:
+                logger.warning(f"System notification init failed: {e}")
+                self.system_notification = None
 
     def _find_model_paths(self):
         """Find PaddleOCR model paths."""
@@ -1972,15 +1990,27 @@ class Minus:
 
         # Load VLM model (takes ~40s, so start after WebUI is up)
         if self.vlm:
+            # Show loading notification
+            if self.system_notification:
+                self.system_notification.show_vlm_loading()
+
             logger.info("Loading VLM model (Qwen3-VL-2B-INT4)...")
             if self.vlm.load_model():
                 logger.info("VLM model loaded successfully")
                 self.vlm_thread = threading.Thread(target=self.vlm_worker, daemon=True)
                 self.vlm_thread.start()
                 logger.info(f"VLM worker started with prompt: \"{self.vlm.AD_PROMPT}\"")
+
+                # Show success notification (auto-hides after 5s)
+                if self.system_notification:
+                    self.system_notification.show_vlm_ready()
             else:
                 logger.warning("VLM model failed to load - VLM detection disabled")
                 self.vlm = None
+
+                # Show failure notification (auto-hides after 8s)
+                if self.system_notification:
+                    self.system_notification.show_vlm_failed()
 
         logger.info("Minus running - press Ctrl+C to stop")
 

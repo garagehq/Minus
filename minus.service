@@ -32,7 +32,8 @@ ExecStartPre=/bin/bash -c 'fuser -k /dev/video0 2>/dev/null || true'
 ExecStartPre=/bin/bash -c 'rm -f /dev/shm/minus_frame*.jpg /dev/shm/minus_vlm_frame*.jpg 2>/dev/null || true'
 # Switch to VT1 and wait for cleanup
 ExecStartPre=/bin/bash -c 'chvt 1 2>/dev/null || true'
-ExecStartPre=/bin/sleep 2
+# 5 second delay before starting to help with stabilization
+ExecStartPre=/bin/sleep 5
 
 # Main process
 ExecStart=/usr/bin/python3 /home/radxa/Minus/minus.py
