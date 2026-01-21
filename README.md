@@ -111,18 +111,33 @@ python3 minus.py --check-signal
 
 ## Ad Detection Logic (Weighted Model)
 
-**OCR is PRIMARY (high trust):**
+**OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
-- Needs 3 consecutive no-ads to stop blocking
+- Stops blocking after 3 consecutive no-ads
+- **Authoritative for stopping** when OCR triggered the block
 
-**VLM is SECONDARY (contextual trust):**
-- If OCR detected within last 5s: VLM is trusted
-- If no recent OCR: VLM needs 5 consecutive detections to trigger alone
-- Needs 2 consecutive no-ads to stop
+**VLM (Secondary - Anti-Waffle Protected):**
+- Uses sliding window of last 45 seconds of decisions
+- Needs 80%+ ad agreement to trigger blocking alone (prevents waffling)
+- If OCR detected within 5s: VLM is trusted more quickly
+- Stops after 2 consecutive no-ads (when VLM triggered alone)
 
-**Anti-flicker protection:**
+**Starting Blocking:**
+| Trigger | Time to block |
+|---------|---------------|
+| OCR detects ad | ~0.7s (immediate) |
+| VLM alone (no OCR) | ~8s (needs 80% agreement) |
+| VLM with recent OCR | ~2s (trusted) |
+
+**Stopping Blocking:**
+| Trigger Source | Time after ad ends |
+|----------------|-------------------|
+| OCR triggered | ~2-3s (3 no-ads) |
+| VLM triggered alone | ~4s (2 no-ads) |
+
+**Anti-flicker:**
 - Minimum 3 seconds blocking duration
-- Both OCR and VLM must agree to stop (when VLM has context)
+- VLM history cleared on stop (prevents re-trigger)
 
 ## Blocking Overlay
 

@@ -265,7 +265,7 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 **OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
 - Stops blocking after 3 consecutive no-ads (`OCR_STOP_THRESHOLD`)
-- **Authoritative for stopping** - VLM cannot delay unblocking
+- **Authoritative for stopping** when OCR triggered the block
 - Tracks `last_ocr_ad_time` for VLM context
 
 **VLM (Secondary - Anti-Waffle Protected):**
@@ -274,7 +274,7 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 - Hysteresis: needs 90% agreement to START (80% + 10% boost for state change)
 - Minimum 4 decisions in window before VLM can act (`vlm_min_decisions`)
 - 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
-- **VLM cannot delay stopping** - only affects starting blocking
+- **Sliding window only for starting** - stopping uses simple consecutive count
 
 **Sliding Window Parameters:**
 | Parameter | Value | Purpose |
@@ -297,9 +297,11 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 4. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
 
 **Why This Design:**
-- VLM anti-waffle prevents erratic false-positive blocking
-- OCR authority for stopping ensures we unblock ASAP after ad ends
+- VLM sliding window prevents erratic false-positive blocking when acting alone
+- OCR is authoritative for stopping OCR-triggered blocks (fast unblock)
+- VLM-triggered blocks require VLM to confirm ad ended (since OCR never saw it)
 - Clearing VLM history on stop prevents "waffle memory" from causing re-triggers
+- VLM stopping uses simple consecutive count (not sliding window) for responsiveness
 
 **Anti-flicker:**
 - Minimum 3s blocking duration (`MIN_BLOCKING_DURATION`)
