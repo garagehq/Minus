@@ -120,11 +120,15 @@ class DRMAdBlocker:
         # Animation settings
         self._animation_thread = None
         self._stop_animation = threading.Event()
-        self._animation_duration_start = 1.5
-        self._animation_duration_end = 1.0
+        self._animation_duration_start = 1.25
+        self._animation_duration_end = 0.5
         self._animating = False
         self._animation_direction = None
         self._animation_source = None
+
+        # Text background box opacity (0=transparent, 255=opaque)
+        # Default was 180, increased for better readability
+        self._box_alpha = 220
 
         # Test mode
         self._test_blocking_until = 0
@@ -851,7 +855,8 @@ class DRMAdBlocker:
                 'preview_x': '0', 'preview_y': '0',
                 'preview_w': str(self._frame_width), 'preview_h': str(self._frame_height),
                 'preview_enabled': 'true' if self._preview_enabled else 'false',
-                'text_vocab': '', 'text_stats': ''
+                'text_vocab': '', 'text_stats': '',
+                'box_alpha': str(self._box_alpha)
             }, timeout=0.5)
 
             self.is_visible = True
