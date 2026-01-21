@@ -1214,6 +1214,10 @@ class Minus:
 
         logger.info(f"Using HTTP snapshot at {self.frame_capture.snapshot_url}")
 
+        # Create a single ThreadPoolExecutor for OCR timeout handling
+        # CRITICAL: Creating this inside the loop caused massive memory/FD leak!
+        ocr_executor = ThreadPoolExecutor(max_workers=1)
+
         while self.running:
             try:
                 start_time = time.time()
@@ -1284,20 +1288,19 @@ class Minus:
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Run OCR with timeout
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self.ocr.ocr, frame_rgb)
-                    try:
-                        ocr_results = future.result(timeout=self.config.ocr_timeout)
-                    except FuturesTimeoutError:
-                        logger.warning(f"OCR #{self.frame_count}: TIMEOUT ({self.config.ocr_timeout}s) - assuming no ad")
-                        self.ocr_no_ad_count += 1
-                        self.ocr_ad_detection_count = 0
-                        if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
-                            self.ocr_ad_detected = False
-                            logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} timeouts)")
-                            self._update_blocking_state()
-                        continue
+                # Run OCR with timeout using pre-created executor
+                future = ocr_executor.submit(self.ocr.ocr, frame_rgb)
+                try:
+                    ocr_results = future.result(timeout=self.config.ocr_timeout)
+                except FuturesTimeoutError:
+                    logger.warning(f"OCR #{self.frame_count}: TIMEOUT ({self.config.ocr_timeout}s) - assuming no ad")
+                    self.ocr_no_ad_count += 1
+                    self.ocr_ad_detection_count = 0
+                    if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
+                        self.ocr_ad_detected = False
+                        logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} timeouts)")
+                        self._update_blocking_state()
+                    continue
 
                 ocr_time = (time.time() - start_time) * 1000 - capture_time
 
@@ -1415,6 +1418,7 @@ class Minus:
             time.sleep(0.1)
 
         logger.info("OCR worker thread stopped")
+        ocr_executor.shutdown(wait=False)
 
     def vlm_worker(self):
         """VLM processing thread."""

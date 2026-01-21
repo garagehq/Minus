@@ -553,6 +553,11 @@ FreeType is NOT thread-safe. With 4 parallel MPP encoder workers, a `pthread_mut
 - Health monitor triggers emergency cleanup at 90% memory usage
 - Frame buffers (`prev_frame`, `vlm_prev_frame`) are cleared during memory critical events
 
+**ThreadPoolExecutor fix (Jan 2026):**
+- **CRITICAL:** The OCR worker was creating a new `ThreadPoolExecutor` on every iteration, causing massive file descriptor and memory leaks (~12GB after 12 hours)
+- Fixed by creating a single `ocr_executor` before the loop and reusing it
+- Symptom: "Too many open files" errors, display goes blank, memory exhaustion
+
 **Memory monitoring:**
 - Health monitor checks memory every 5 seconds
 - Warning logged at 80% usage
