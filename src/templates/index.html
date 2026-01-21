@@ -11,122 +11,305 @@
         <!-- Header -->
         <header>
             <h1>Minus</h1>
-            <div id="connection-status" class="status-dot"></div>
+            <div class="header-controls">
+                <div id="connection-status" class="status-dot" title="Connection status"></div>
+            </div>
         </header>
 
-        <!-- Live Video -->
-        <section class="video-section">
-            <div class="video-container">
-                <img id="video-feed" src="/stream" alt="Live Feed">
-                <div id="video-overlay" class="video-overlay hidden">
-                    <span>NO SIGNAL</span>
-                </div>
-            </div>
-        </section>
+        <!-- Tab Navigation -->
+        <nav class="tab-nav">
+            <button class="tab-nav-btn active" onclick="showTab('home')">Home</button>
+            <button class="tab-nav-btn" onclick="showTab('remote')">Remote</button>
+            <button class="tab-nav-btn" onclick="showTab('screenshots')">Screenshots</button>
+            <button class="tab-nav-btn" onclick="showTab('settings')">Settings</button>
+        </nav>
 
-        <!-- Status -->
-        <section class="status-section">
-            <div id="blocking-status" class="blocking-status">
-                <span class="status-label">Status:</span>
-                <span id="status-text" class="status-value">Loading...</span>
-            </div>
-            <div class="status-details">
-                <div class="stat">
-                    <span class="stat-label">FPS</span>
-                    <span id="fps-value" class="stat-value">--</span>
+        <!-- ===== HOME TAB ===== -->
+        <div id="tab-home" class="tab-content active">
+            <!-- Live Video -->
+            <section class="video-section">
+                <div class="video-container" id="video-container">
+                    <img id="video-feed" src="/stream" alt="Live Feed">
+                    <div id="video-overlay" class="video-overlay hidden">
+                        <span>NO SIGNAL</span>
+                    </div>
+                    <div id="audio-mute-indicator" class="audio-indicator hidden">
+                        <span>&#128263;</span>
+                    </div>
+                    <button id="fullscreen-btn" class="fullscreen-btn" onclick="toggleFullscreen()" title="Fullscreen">&#x26F6;</button>
                 </div>
-                <div class="stat">
-                    <span class="stat-label">HDMI</span>
-                    <span id="hdmi-value" class="stat-value">--</span>
-                </div>
-                <div class="stat">
-                    <span class="stat-label">Uptime</span>
-                    <span id="uptime-value" class="stat-value">--</span>
-                </div>
-                <div class="stat">
-                    <span class="stat-label">Detected</span>
-                    <span id="detections-value" class="stat-value">--</span>
-                </div>
-            </div>
-        </section>
+            </section>
 
-        <!-- Pause Controls -->
-        <section class="pause-section">
-            <div id="pause-controls" class="pause-controls">
-                <span class="pause-label">Pause blocking:</span>
-                <div class="pause-buttons">
-                    <button onclick="pauseBlocking(1)" class="pause-btn">1m</button>
-                    <button onclick="pauseBlocking(2)" class="pause-btn">2m</button>
-                    <button onclick="pauseBlocking(5)" class="pause-btn">5m</button>
-                    <button onclick="pauseBlocking(10)" class="pause-btn">10m</button>
+            <!-- Status -->
+            <section class="status-section">
+                <div id="blocking-status" class="blocking-status">
+                    <span class="status-label">Status:</span>
+                    <span id="status-text" class="status-value">Loading...</span>
+                    <span id="blocking-timer" class="blocking-timer hidden"></span>
                 </div>
-            </div>
-            <div id="resume-controls" class="resume-controls hidden">
-                <div class="paused-info">
-                    <span class="paused-icon">&#9208;</span>
-                    <span id="pause-remaining">Paused</span>
+                <div class="status-details">
+                    <div class="stat">
+                        <span class="stat-label">FPS</span>
+                        <span id="fps-value" class="stat-value">--</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Ads Blocked</span>
+                        <span id="ads-blocked-value" class="stat-value">0</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Time Saved</span>
+                        <span id="time-saved-value" class="stat-value">0s</span>
+                    </div>
+                    <div class="stat">
+                        <span class="stat-label">Uptime</span>
+                        <span id="uptime-value" class="stat-value">--</span>
+                    </div>
                 </div>
-                <button onclick="resumeBlocking()" class="resume-btn">Resume Now</button>
-            </div>
-        </section>
+            </section>
 
-        <!-- Recent Detections -->
-        <section class="detections-section">
-            <h2>Recent Detections</h2>
-            <div id="detections-list" class="detections-list">
-                <div class="empty-state">No detections yet</div>
-            </div>
-        </section>
+            <!-- Current Vocabulary (shown when blocking) -->
+            <section id="vocabulary-section" class="vocabulary-section hidden">
+                <h2>Current Word</h2>
+                <div class="vocabulary-card">
+                    <div id="vocab-word" class="vocab-word">--</div>
+                    <div id="vocab-pronunciation" class="vocab-pronunciation"></div>
+                    <div id="vocab-translation" class="vocab-translation">--</div>
+                    <div id="vocab-example" class="vocab-example"></div>
+                </div>
+            </section>
 
-        <!-- Logs (Collapsible) -->
-        <section class="logs-section">
-            <button class="logs-toggle" onclick="toggleLogs()">
-                <span>View Logs</span>
-                <span id="logs-arrow" class="arrow">&#9660;</span>
-            </button>
-            <div id="logs-container" class="logs-container hidden">
+            <!-- Pause Controls -->
+            <section class="pause-section">
+                <div id="pause-controls" class="pause-controls">
+                    <span class="pause-label">Pause blocking:</span>
+                    <div class="pause-buttons">
+                        <button onclick="pauseBlocking(1)" class="pause-btn">1m</button>
+                        <button onclick="pauseBlocking(2)" class="pause-btn">2m</button>
+                        <button onclick="pauseBlocking(5)" class="pause-btn">5m</button>
+                        <button onclick="pauseBlocking(10)" class="pause-btn">10m</button>
+                        <input type="number" id="custom-pause" class="custom-pause-input" min="1" max="60" placeholder="min">
+                        <button onclick="pauseCustom()" class="pause-btn custom">Go</button>
+                    </div>
+                </div>
+                <div id="resume-controls" class="resume-controls hidden">
+                    <div class="paused-info">
+                        <span class="paused-icon">&#9208;</span>
+                        <span id="pause-remaining">Paused</span>
+                    </div>
+                    <button onclick="resumeBlocking()" class="resume-btn">Resume Now</button>
+                </div>
+            </section>
+
+            <!-- Test Controls -->
+            <section class="test-section">
+                <div class="test-controls">
+                    <span class="test-label">Test blocking:</span>
+                    <div class="test-buttons">
+                        <button onclick="testBlock(10, 'ocr')" class="test-btn">OCR 10s</button>
+                        <button onclick="testBlock(10, 'vlm')" class="test-btn">VLM 10s</button>
+                        <button onclick="testBlock(20, 'both')" class="test-btn">Both 20s</button>
+                        <button onclick="stopTestBlock()" class="test-btn stop">Stop</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Recent Detections -->
+            <section class="detections-section">
+                <h2>Recent Detections</h2>
+                <div id="detections-list" class="detections-list">
+                    <div class="empty-state">No detections yet</div>
+                </div>
+            </section>
+
+            <!-- System Info -->
+            <section class="system-section">
+                <div class="system-info">
+                    <span id="vlm-status" class="system-badge">VLM: --</span>
+                    <span id="memory-status" class="system-badge">Mem: --</span>
+                    <span id="hdmi-status" class="system-badge">HDMI: --</span>
+                </div>
+            </section>
+        </div>
+
+        <!-- ===== REMOTE TAB ===== -->
+        <div id="tab-remote" class="tab-content">
+            <section class="firetv-section">
+                <div class="firetv-header">
+                    <h2>Fire TV Remote</h2>
+                    <span id="firetv-status" class="connection-badge disconnected">Disconnected</span>
+                </div>
+                <div class="remote-grid">
+                    <div class="remote-row">
+                        <button class="remote-btn" onclick="sendFireTVCommand('back')">&#8592; Back</button>
+                        <button class="remote-btn nav" onclick="sendFireTVCommand('up')">&#9650;</button>
+                        <button class="remote-btn" onclick="sendFireTVCommand('home')">&#8962; Home</button>
+                    </div>
+                    <div class="remote-row">
+                        <button class="remote-btn nav" onclick="sendFireTVCommand('left')">&#9664;</button>
+                        <button class="remote-btn select" onclick="sendFireTVCommand('select')">OK</button>
+                        <button class="remote-btn nav" onclick="sendFireTVCommand('right')">&#9654;</button>
+                    </div>
+                    <div class="remote-row">
+                        <button class="remote-btn" onclick="sendFireTVCommand('rewind')">&#9194;</button>
+                        <button class="remote-btn nav" onclick="sendFireTVCommand('down')">&#9660;</button>
+                        <button class="remote-btn" onclick="sendFireTVCommand('fast_forward')">&#9193;</button>
+                    </div>
+                    <div class="remote-row media">
+                        <button class="remote-btn" onclick="sendFireTVCommand('play_pause')">&#9199; Play/Pause</button>
+                        <button class="remote-btn" onclick="sendFireTVCommand('menu')">&#9776; Menu</button>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- ===== SCREENSHOTS TAB ===== -->
+        <div id="tab-screenshots" class="tab-content">
+            <section class="screenshots-section">
+                <h2>Screenshots</h2>
+                <div class="screenshot-tabs">
+                    <button class="tab-btn active" onclick="showScreenshotTab('ocr')">Ad Screenshots</button>
+                    <button class="tab-btn" onclick="showScreenshotTab('non_ad')">Non-Ad</button>
+                </div>
+                <div id="screenshots-grid" class="screenshots-grid">
+                    <div class="empty-state">Select a tab to load</div>
+                </div>
+            </section>
+        </div>
+
+        <!-- ===== SETTINGS TAB ===== -->
+        <div id="tab-settings" class="tab-content">
+            <!-- Display Settings -->
+            <section class="settings-section">
+                <h2>Display Settings</h2>
+                <div class="setting-item">
+                    <span class="setting-label">Ad Preview Window</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="preview-toggle" checked onchange="togglePreview(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="setting-item">
+                    <span class="setting-label">Debug Dashboard</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="debug-toggle" checked onchange="toggleDebugOverlay(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="setting-item">
+                    <span class="setting-label">Browser Notifications</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="notifications-toggle" onchange="toggleNotifications(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </section>
+
+            <!-- WiFi Management -->
+            <section class="wifi-section">
+                <h2>WiFi Networks</h2>
+                <div class="wifi-tabs">
+                    <button class="tab-btn active" onclick="showWifiTab('saved')">Saved</button>
+                    <button class="tab-btn" onclick="showWifiTab('scan')">Scan</button>
+                </div>
+                <div id="wifi-saved" class="wifi-list">
+                    <div class="empty-state">Loading...</div>
+                </div>
+                <div id="wifi-scan" class="wifi-list hidden">
+                    <button onclick="scanWifi()" class="scan-btn">Scan for Networks</button>
+                    <div id="wifi-scan-results"></div>
+                </div>
+            </section>
+
+            <!-- ADB Keys -->
+            <section class="adb-section">
+                <h2>ADB Keys (Fire TV)</h2>
+                <div id="adb-key-info" class="adb-key-info">
+                    <div class="empty-state">Loading...</div>
+                </div>
+                <button onclick="revokeAdbKeys()" class="danger-btn">Revoke ADB Keys</button>
+                <p class="help-text">Revoking keys will require re-authorization on the Fire TV.</p>
+            </section>
+
+            <!-- Logs -->
+            <section class="logs-section">
+                <h2>Logs</h2>
                 <div id="logs-content" class="logs-content">
                     Loading logs...
                 </div>
-                <button onclick="refreshLogs()" class="refresh-btn">Refresh</button>
-            </div>
-        </section>
+                <button onclick="refreshLogs()" class="refresh-btn">Refresh Logs</button>
+            </section>
+        </div>
 
-        <!-- Settings -->
-        <section class="settings-section">
-            <div class="setting-item">
-                <span class="setting-label">Ad Preview Window</span>
-                <label class="toggle-switch">
-                    <input type="checkbox" id="preview-toggle" checked onchange="togglePreview(this.checked)">
-                    <span class="toggle-slider"></span>
-                </label>
-            </div>
-            <div class="setting-item">
-                <span class="setting-label">Debug Dashboard</span>
-                <label class="toggle-switch">
-                    <input type="checkbox" id="debug-toggle" checked onchange="toggleDebugOverlay(this.checked)">
-                    <span class="toggle-slider"></span>
-                </label>
-            </div>
-        </section>
+        <!-- Keyboard Shortcuts Help -->
+        <div id="shortcuts-help" class="shortcuts-help hidden">
+            <h3>Keyboard Shortcuts</h3>
+            <ul>
+                <li><kbd>P</kbd> Pause (5 min)</li>
+                <li><kbd>R</kbd> Resume</li>
+                <li><kbd>T</kbd> Test block</li>
+                <li><kbd>F</kbd> Fullscreen</li>
+                <li><kbd>?</kbd> Show shortcuts</li>
+                <li><kbd>Esc</kbd> Close dialogs</li>
+            </ul>
+        </div>
+    </div>
 
-        <!-- System Info -->
-        <section class="system-section">
-            <div class="system-info">
-                <span id="vlm-status" class="system-badge">VLM: --</span>
-                <span id="memory-status" class="system-badge">Mem: --</span>
+    <!-- WiFi Password Modal -->
+    <div id="wifi-modal" class="modal hidden">
+        <div class="modal-content">
+            <h3>Connect to <span id="wifi-modal-ssid"></span></h3>
+            <input type="password" id="wifi-password" placeholder="Password" class="modal-input">
+            <div class="modal-buttons">
+                <button onclick="closeWifiModal()" class="modal-btn cancel">Cancel</button>
+                <button onclick="connectWifi()" class="modal-btn confirm">Connect</button>
             </div>
-        </section>
+        </div>
     </div>
 
     <script>
         // State
         let isPaused = false;
         let pauseRemaining = 0;
-        let logsVisible = false;
         let lastStatus = null;
+        let currentScreenshotTab = 'ocr';
+        let currentWifiTab = 'saved';
+        let notificationsEnabled = false;
+        let pendingWifiSSID = null;
+        let currentTab = 'home';
 
-        // Update status every second
+        // =========================================================================
+        // Tab Navigation
+        // =========================================================================
+
+        function showTab(tabName) {
+            currentTab = tabName;
+
+            // Update nav buttons
+            document.querySelectorAll('.tab-nav-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.textContent.toLowerCase() === tabName);
+            });
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => {
+                content.classList.toggle('active', content.id === 'tab-' + tabName);
+            });
+
+            // Load data for specific tabs
+            if (tabName === 'screenshots') {
+                loadScreenshots();
+            } else if (tabName === 'settings') {
+                loadWifiConnections();
+                loadAdbKeys();
+                refreshLogs();
+            } else if (tabName === 'remote') {
+                updateFireTVStatus();
+            }
+        }
+
+        // =========================================================================
+        // Status Updates
+        // =========================================================================
+
         async function updateStatus() {
             try {
                 const response = await fetch('/api/status');
@@ -142,6 +325,8 @@
                 // Blocking status
                 const statusEl = document.getElementById('blocking-status');
                 const statusText = document.getElementById('status-text');
+                const blockingTimer = document.getElementById('blocking-timer');
+                const vocabSection = document.getElementById('vocabulary-section');
 
                 if (status.paused) {
                     statusEl.className = 'blocking-status paused';
@@ -150,15 +335,26 @@
                     statusText.textContent = `PAUSED (${mins}:${secs.toString().padStart(2, '0')})`;
                     isPaused = true;
                     pauseRemaining = status.pause_remaining;
+                    blockingTimer.classList.add('hidden');
+                    vocabSection.classList.add('hidden');
                 } else if (status.blocking) {
                     statusEl.className = 'blocking-status blocking';
                     const source = status.blocking_source ? status.blocking_source.toUpperCase() : '';
-                    statusText.textContent = `BLOCKING (${source})`;
+                    statusText.textContent = `BLOCKING${source ? ' (' + source + ')' : ''}`;
                     isPaused = false;
+                    blockingTimer.classList.remove('hidden');
+                    vocabSection.classList.remove('hidden');
+
+                    // Send notification
+                    if (notificationsEnabled && Notification.permission === 'granted') {
+                        new Notification('Minus - Ad Detected', { body: `Blocking via ${source}` });
+                    }
                 } else {
                     statusEl.className = 'blocking-status normal';
                     statusText.textContent = 'Normal';
                     isPaused = false;
+                    blockingTimer.classList.add('hidden');
+                    vocabSection.classList.add('hidden');
                 }
 
                 // Update pause/resume visibility
@@ -172,10 +368,8 @@
                 }
 
                 // Stats
-                document.getElementById('fps-value').textContent = status.fps || '--';
-                document.getElementById('hdmi-value').textContent = status.hdmi_signal ? 'OK' : 'NO SIGNAL';
+                document.getElementById('fps-value').textContent = Math.round(status.fps) || '--';
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
-                document.getElementById('detections-value').textContent = status.total_detections || '0';
 
                 // Video overlay
                 const overlay = document.getElementById('video-overlay');
@@ -203,6 +397,10 @@
                 memStatus.textContent = `Mem: ${memPercent}%`;
                 memStatus.className = memPercent > 80 ? 'system-badge warning' : 'system-badge ok';
 
+                const hdmiStatus = document.getElementById('hdmi-status');
+                hdmiStatus.textContent = status.hdmi_signal ? 'HDMI: OK' : 'HDMI: No Signal';
+                hdmiStatus.className = status.hdmi_signal ? 'system-badge ok' : 'system-badge warning';
+
             } catch (error) {
                 console.error('Status update failed:', error);
                 document.getElementById('connection-status').classList.remove('connected');
@@ -210,7 +408,95 @@
             }
         }
 
-        // Update detections
+        async function updateStats() {
+            try {
+                const response = await fetch('/api/stats');
+                if (!response.ok) return;
+
+                const stats = await response.json();
+                document.getElementById('ads-blocked-value').textContent = stats.ads_blocked_today || '0';
+
+                // Format time saved
+                const timeSaved = Math.round(stats.time_saved || 0);
+                if (timeSaved >= 3600) {
+                    const h = Math.floor(timeSaved / 3600);
+                    const m = Math.floor((timeSaved % 3600) / 60);
+                    document.getElementById('time-saved-value').textContent = `${h}h ${m}m`;
+                } else if (timeSaved >= 60) {
+                    const m = Math.floor(timeSaved / 60);
+                    const s = timeSaved % 60;
+                    document.getElementById('time-saved-value').textContent = `${m}m ${s}s`;
+                } else {
+                    document.getElementById('time-saved-value').textContent = `${timeSaved}s`;
+                }
+
+                // Update blocking timer
+                if (stats.current_blocking_duration > 0) {
+                    const duration = Math.round(stats.current_blocking_duration);
+                    document.getElementById('blocking-timer').textContent = `(${duration}s)`;
+                }
+            } catch (error) {
+                console.error('Stats update failed:', error);
+            }
+        }
+
+        async function updateVocabulary() {
+            try {
+                const response = await fetch('/api/vocabulary');
+                if (!response.ok) return;
+
+                const vocab = await response.json();
+                if (vocab.word) {
+                    document.getElementById('vocab-word').textContent = vocab.word;
+                    document.getElementById('vocab-pronunciation').textContent = vocab.pronunciation ? `(${vocab.pronunciation})` : '';
+                    document.getElementById('vocab-translation').textContent = `= ${vocab.translation}`;
+                    document.getElementById('vocab-example').textContent = vocab.example || '';
+                }
+            } catch (error) {
+                console.error('Vocabulary update failed:', error);
+            }
+        }
+
+        async function updateAudioStatus() {
+            try {
+                const response = await fetch('/api/audio/status');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const indicator = document.getElementById('audio-mute-indicator');
+                if (data.muted) {
+                    indicator.classList.remove('hidden');
+                } else {
+                    indicator.classList.add('hidden');
+                }
+            } catch (error) {
+                console.error('Audio status update failed:', error);
+            }
+        }
+
+        async function updateFireTVStatus() {
+            try {
+                const response = await fetch('/api/firetv/status');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const badge = document.getElementById('firetv-status');
+                if (data.connected) {
+                    badge.textContent = 'Connected';
+                    badge.className = 'connection-badge connected';
+                } else {
+                    badge.textContent = data.state === 'not_initialized' ? 'Not Setup' : 'Disconnected';
+                    badge.className = 'connection-badge disconnected';
+                }
+            } catch (error) {
+                console.error('Fire TV status update failed:', error);
+            }
+        }
+
+        // =========================================================================
+        // Detections
+        // =========================================================================
+
         async function updateDetections() {
             try {
                 const response = await fetch('/api/detections');
@@ -238,13 +524,14 @@
             }
         }
 
-        // Pause blocking
+        // =========================================================================
+        // Pause Controls
+        // =========================================================================
+
         async function pauseBlocking(minutes) {
             try {
                 const response = await fetch(`/api/pause/${minutes}`, { method: 'POST' });
                 if (!response.ok) throw new Error('Pause failed');
-
-                // Immediate UI feedback
                 isPaused = true;
                 pauseRemaining = minutes * 60;
                 updateStatus();
@@ -254,12 +541,21 @@
             }
         }
 
-        // Resume blocking
+        function pauseCustom() {
+            const input = document.getElementById('custom-pause');
+            const minutes = parseInt(input.value);
+            if (minutes >= 1 && minutes <= 60) {
+                pauseBlocking(minutes);
+                input.value = '';
+            } else {
+                alert('Enter 1-60 minutes');
+            }
+        }
+
         async function resumeBlocking() {
             try {
                 const response = await fetch('/api/resume', { method: 'POST' });
                 if (!response.ok) throw new Error('Resume failed');
-
                 isPaused = false;
                 updateStatus();
             } catch (error) {
@@ -268,7 +564,57 @@
             }
         }
 
-        // Toggle preview window
+        // =========================================================================
+        // Test Controls
+        // =========================================================================
+
+        async function testBlock(duration, source) {
+            try {
+                const response = await fetch('/api/test/trigger-block', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ duration, source })
+                });
+                if (!response.ok) throw new Error('Test block failed');
+            } catch (error) {
+                console.error('Test block failed:', error);
+                alert('Failed to trigger test block');
+            }
+        }
+
+        async function stopTestBlock() {
+            try {
+                const response = await fetch('/api/test/stop-block', { method: 'POST' });
+                if (!response.ok) throw new Error('Stop test failed');
+            } catch (error) {
+                console.error('Stop test failed:', error);
+            }
+        }
+
+        // =========================================================================
+        // Fire TV Remote
+        // =========================================================================
+
+        async function sendFireTVCommand(command) {
+            try {
+                const response = await fetch('/api/firetv/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command })
+                });
+                if (!response.ok) {
+                    const data = await response.json();
+                    throw new Error(data.error || 'Command failed');
+                }
+            } catch (error) {
+                console.error('Fire TV command failed:', error);
+            }
+        }
+
+        // =========================================================================
+        // Settings Toggles
+        // =========================================================================
+
         async function togglePreview(enabled) {
             try {
                 const endpoint = enabled ? '/api/preview/enable' : '/api/preview/disable';
@@ -276,25 +622,10 @@
                 if (!response.ok) throw new Error('Preview toggle failed');
             } catch (error) {
                 console.error('Preview toggle failed:', error);
-                // Revert checkbox on error
                 document.getElementById('preview-toggle').checked = !enabled;
-                alert('Failed to toggle preview');
             }
         }
 
-        // Fetch initial preview state
-        async function fetchPreviewState() {
-            try {
-                const response = await fetch('/api/preview');
-                if (!response.ok) throw new Error('Preview state fetch failed');
-                const data = await response.json();
-                document.getElementById('preview-toggle').checked = data.preview_enabled;
-            } catch (error) {
-                console.error('Preview state fetch failed:', error);
-            }
-        }
-
-        // Toggle debug overlay
         async function toggleDebugOverlay(enabled) {
             try {
                 const endpoint = enabled ? '/api/debug-overlay/enable' : '/api/debug-overlay/disable';
@@ -302,17 +633,41 @@
                 if (!response.ok) throw new Error('Debug overlay toggle failed');
             } catch (error) {
                 console.error('Debug overlay toggle failed:', error);
-                // Revert checkbox on error
                 document.getElementById('debug-toggle').checked = !enabled;
-                alert('Failed to toggle debug overlay');
             }
         }
 
-        // Fetch initial debug overlay state
+        function toggleNotifications(enabled) {
+            if (enabled && Notification.permission !== 'granted') {
+                Notification.requestPermission().then(permission => {
+                    if (permission === 'granted') {
+                        notificationsEnabled = true;
+                        localStorage.setItem('notificationsEnabled', 'true');
+                    } else {
+                        document.getElementById('notifications-toggle').checked = false;
+                    }
+                });
+            } else {
+                notificationsEnabled = enabled;
+                localStorage.setItem('notificationsEnabled', enabled ? 'true' : 'false');
+            }
+        }
+
+        async function fetchPreviewState() {
+            try {
+                const response = await fetch('/api/preview');
+                if (!response.ok) return;
+                const data = await response.json();
+                document.getElementById('preview-toggle').checked = data.preview_enabled;
+            } catch (error) {
+                console.error('Preview state fetch failed:', error);
+            }
+        }
+
         async function fetchDebugOverlayState() {
             try {
                 const response = await fetch('/api/debug-overlay');
-                if (!response.ok) throw new Error('Debug overlay state fetch failed');
+                if (!response.ok) return;
                 const data = await response.json();
                 document.getElementById('debug-toggle').checked = data.debug_overlay_enabled;
             } catch (error) {
@@ -320,17 +675,227 @@
             }
         }
 
-        // Toggle logs
-        function toggleLogs() {
-            logsVisible = !logsVisible;
-            document.getElementById('logs-container').classList.toggle('hidden', !logsVisible);
-            document.getElementById('logs-arrow').textContent = logsVisible ? '\u25B2' : '\u25BC';
-            if (logsVisible) {
-                refreshLogs();
+        // =========================================================================
+        // Screenshots
+        // =========================================================================
+
+        async function loadScreenshots() {
+            try {
+                const response = await fetch('/api/screenshots');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const grid = document.getElementById('screenshots-grid');
+                const screenshots = data[currentScreenshotTab] || [];
+
+                if (screenshots.length > 0) {
+                    grid.innerHTML = screenshots.map(s =>
+                        `<div class="screenshot-item" onclick="window.open('${s.path}', '_blank')">
+                            <img src="${s.path}" alt="${s.name}" loading="lazy">
+                            <span class="screenshot-name">${s.name.substring(0, 20)}...</span>
+                        </div>`
+                    ).join('');
+                } else {
+                    grid.innerHTML = '<div class="empty-state">No screenshots</div>';
+                }
+            } catch (error) {
+                console.error('Screenshots load failed:', error);
             }
         }
 
-        // Refresh logs
+        function showScreenshotTab(tab) {
+            currentScreenshotTab = tab;
+            document.querySelectorAll('.screenshots-section .tab-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.textContent.toLowerCase().includes(tab === 'ocr' ? 'ad' : 'non'));
+            });
+            loadScreenshots();
+        }
+
+        // =========================================================================
+        // WiFi Management
+        // =========================================================================
+
+        async function loadWifiConnections() {
+            try {
+                const response = await fetch('/api/wifi/connections');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const list = document.getElementById('wifi-saved');
+
+                if (data.connections && data.connections.length > 0) {
+                    list.innerHTML = data.connections.map(c =>
+                        `<div class="wifi-item ${c.device ? 'connected' : ''}">
+                            <div class="wifi-info">
+                                <span class="wifi-name">${c.name}</span>
+                                <span class="wifi-details">Priority: ${c.priority} ${c.device ? '(Connected)' : ''}</span>
+                            </div>
+                            <div class="wifi-actions">
+                                <button onclick="deleteWifiConnection('${c.name}')" class="small-btn danger">Delete</button>
+                            </div>
+                        </div>`
+                    ).join('');
+                } else {
+                    list.innerHTML = '<div class="empty-state">No saved WiFi connections</div>';
+                }
+            } catch (error) {
+                console.error('WiFi connections load failed:', error);
+            }
+        }
+
+        async function scanWifi() {
+            const results = document.getElementById('wifi-scan-results');
+            results.innerHTML = '<div class="empty-state">Scanning...</div>';
+
+            try {
+                const response = await fetch('/api/wifi/scan');
+                if (!response.ok) throw new Error('Scan failed');
+
+                const data = await response.json();
+                if (data.networks && data.networks.length > 0) {
+                    results.innerHTML = data.networks.map(n =>
+                        `<div class="wifi-item" onclick="promptWifiConnect('${n.ssid}', '${n.security}')">
+                            <div class="wifi-info">
+                                <span class="wifi-name">${n.ssid}</span>
+                                <span class="wifi-details">${n.signal}% - ${n.security}</span>
+                            </div>
+                        </div>`
+                    ).join('');
+                } else {
+                    results.innerHTML = '<div class="empty-state">No networks found</div>';
+                }
+            } catch (error) {
+                console.error('WiFi scan failed:', error);
+                results.innerHTML = '<div class="error-state">Scan failed</div>';
+            }
+        }
+
+        function promptWifiConnect(ssid, security) {
+            if (security === 'Open' || security === '') {
+                connectWifiDirect(ssid, '');
+            } else {
+                pendingWifiSSID = ssid;
+                document.getElementById('wifi-modal-ssid').textContent = ssid;
+                document.getElementById('wifi-password').value = '';
+                document.getElementById('wifi-modal').classList.remove('hidden');
+            }
+        }
+
+        function closeWifiModal() {
+            document.getElementById('wifi-modal').classList.add('hidden');
+            pendingWifiSSID = null;
+        }
+
+        async function connectWifi() {
+            const password = document.getElementById('wifi-password').value;
+            await connectWifiDirect(pendingWifiSSID, password);
+            closeWifiModal();
+        }
+
+        async function connectWifiDirect(ssid, password) {
+            try {
+                const response = await fetch('/api/wifi/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ssid, password })
+                });
+                const data = await response.json();
+                if (response.ok) {
+                    alert(data.message || 'Connected!');
+                    loadWifiConnections();
+                } else {
+                    alert(data.error || 'Connection failed');
+                }
+            } catch (error) {
+                console.error('WiFi connect failed:', error);
+                alert('Connection failed');
+            }
+        }
+
+        async function deleteWifiConnection(name) {
+            if (!confirm(`Delete "${name}"?`)) return;
+
+            try {
+                const response = await fetch('/api/wifi/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name })
+                });
+                if (response.ok) {
+                    loadWifiConnections();
+                } else {
+                    const data = await response.json();
+                    alert(data.error || 'Delete failed');
+                }
+            } catch (error) {
+                console.error('WiFi delete failed:', error);
+            }
+        }
+
+        function showWifiTab(tab) {
+            currentWifiTab = tab;
+            document.querySelectorAll('.wifi-section .tab-btn').forEach(btn => {
+                btn.classList.toggle('active', btn.textContent.toLowerCase() === tab);
+            });
+            document.getElementById('wifi-saved').classList.toggle('hidden', tab !== 'saved');
+            document.getElementById('wifi-scan').classList.toggle('hidden', tab !== 'scan');
+            if (tab === 'saved') loadWifiConnections();
+        }
+
+        // =========================================================================
+        // ADB Keys
+        // =========================================================================
+
+        async function loadAdbKeys() {
+            try {
+                const response = await fetch('/api/adb/keys');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const info = document.getElementById('adb-key-info');
+
+                if (data.exists) {
+                    info.innerHTML = `
+                        <div class="adb-key-item">
+                            <span class="key-label">Status:</span>
+                            <span class="key-value ok">Keys exist</span>
+                        </div>
+                        <div class="adb-key-item">
+                            <span class="key-label">Fingerprint:</span>
+                            <span class="key-value mono">${data.fingerprint}</span>
+                        </div>
+                    `;
+                } else {
+                    info.innerHTML = '<div class="empty-state">No ADB keys found</div>';
+                }
+            } catch (error) {
+                console.error('ADB keys load failed:', error);
+            }
+        }
+
+        async function revokeAdbKeys() {
+            if (!confirm('Revoke ADB keys? You will need to re-authorize on the Fire TV.')) return;
+
+            try {
+                const response = await fetch('/api/adb/keys/revoke', { method: 'POST' });
+                const data = await response.json();
+                if (response.ok) {
+                    alert(data.message);
+                    loadAdbKeys();
+                    updateFireTVStatus();
+                } else {
+                    alert(data.error || 'Revoke failed');
+                }
+            } catch (error) {
+                console.error('ADB revoke failed:', error);
+                alert('Revoke failed');
+            }
+        }
+
+        // =========================================================================
+        // Logs
+        // =========================================================================
+
         async function refreshLogs() {
             try {
                 const response = await fetch('/api/logs');
@@ -340,10 +905,9 @@
                 const content = document.getElementById('logs-content');
 
                 if (data.lines && data.lines.length > 0) {
-                    content.innerHTML = data.lines.map(line =>
+                    content.innerHTML = data.lines.slice(-50).map(line =>
                         `<div class="log-line">${escapeHtml(line)}</div>`
                     ).join('');
-                    // Scroll to bottom
                     content.scrollTop = content.scrollHeight;
                 } else {
                     content.innerHTML = '<div class="empty-state">No logs available</div>';
@@ -355,29 +919,97 @@
             }
         }
 
-        // Escape HTML for safe display
+        // =========================================================================
+        // UI Helpers
+        // =========================================================================
+
+        function toggleFullscreen() {
+            const container = document.getElementById('video-container');
+            if (document.fullscreenElement) {
+                document.exitFullscreen();
+            } else {
+                container.requestFullscreen();
+            }
+        }
+
         function escapeHtml(text) {
             const div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
         }
 
-        // Handle video feed errors
+        // =========================================================================
+        // Keyboard Shortcuts
+        // =========================================================================
+
+        document.addEventListener('keydown', (e) => {
+            if (e.target.tagName === 'INPUT') return;
+
+            switch (e.key.toLowerCase()) {
+                case 'p':
+                    if (!isPaused) pauseBlocking(5);
+                    break;
+                case 'r':
+                    if (isPaused) resumeBlocking();
+                    break;
+                case 't':
+                    testBlock(10, 'ocr');
+                    break;
+                case 'f':
+                    toggleFullscreen();
+                    break;
+                case '?':
+                    document.getElementById('shortcuts-help').classList.toggle('hidden');
+                    break;
+                case 'escape':
+                    document.getElementById('shortcuts-help').classList.add('hidden');
+                    document.getElementById('wifi-modal').classList.add('hidden');
+                    break;
+            }
+        });
+
+        // =========================================================================
+        // Pull to Refresh (Mobile)
+        // =========================================================================
+
+        let touchStartY = 0;
+        document.addEventListener('touchstart', (e) => { touchStartY = e.touches[0].clientY; });
+        document.addEventListener('touchend', (e) => {
+            const touchEndY = e.changedTouches[0].clientY;
+            if (touchEndY - touchStartY > 100 && window.scrollY === 0) {
+                updateStatus();
+                updateStats();
+                updateDetections();
+            }
+        });
+
+        // =========================================================================
+        // Video Feed Error Handling
+        // =========================================================================
+
         document.getElementById('video-feed').onerror = function() {
-            console.log('Video feed error, retrying...');
-            setTimeout(() => {
-                this.src = '/stream?' + Date.now();
-            }, 2000);
+            setTimeout(() => { this.src = '/stream?' + Date.now(); }, 2000);
         };
 
-        // Initial load and intervals
+        // =========================================================================
+        // Initialization
+        // =========================================================================
+
+        notificationsEnabled = localStorage.getItem('notificationsEnabled') === 'true';
+        document.getElementById('notifications-toggle').checked = notificationsEnabled;
+
         updateStatus();
+        updateStats();
         updateDetections();
         fetchPreviewState();
         fetchDebugOverlayState();
+        updateFireTVStatus();
 
         setInterval(updateStatus, 1000);
+        setInterval(updateStats, 2000);
         setInterval(updateDetections, 5000);
+        setInterval(updateVocabulary, 3000);
+        setInterval(updateAudioStatus, 2000);
     </script>
 </body>
 </html>

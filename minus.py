@@ -21,6 +21,7 @@ Performance:
 """
 
 import argparse
+import gc
 import os
 import sys
 import signal
@@ -752,9 +753,15 @@ class Minus:
 
         uptime = int(time.time() - self.start_time)
 
+        # Check if blocking is active (either via detection or test mode)
+        is_blocking = (self.ad_detected and not self.is_blocking_paused() and not self.static_blocking_suppressed)
+        # Also check if ad_blocker is directly visible (test mode)
+        if self.ad_blocker and self.ad_blocker.is_visible:
+            is_blocking = True
+
         return {
             # Blocking state
-            'blocking': self.ad_detected and not self.is_blocking_paused() and not self.static_blocking_suppressed,
+            'blocking': is_blocking,
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
@@ -765,7 +772,7 @@ class Minus:
             'vlm_detected': self.vlm_ad_detected,
             'ocr_frame_count': self.frame_count,
             'vlm_frame_count': self.vlm_frame_count,
-            'total_detections': self.screenshot_count,
+            'total_detections': self.screenshot_manager.screenshot_count if self.screenshot_manager else 0,
 
             # System status
             'fps': fps,

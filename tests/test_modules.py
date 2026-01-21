@@ -1035,6 +1035,18 @@ class TestWebUI:
             assert "blocking" in data
             assert "fps" in data
 
+    def test_webui_pause_valid_duration(self):
+        """Test pause endpoint with valid duration (1-60 minutes)."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.blocking_paused_until = 0
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            # 30 is valid (1-60 range)
+            response = client.post('/api/pause/30')
+            assert response.status_code == 200
+
     def test_webui_pause_invalid_duration(self):
         """Test pause endpoint with invalid duration."""
         from webui import WebUI
@@ -1042,8 +1054,240 @@ class TestWebUI:
         ui = WebUI(mock_minus)
 
         with ui.app.test_client() as client:
-            response = client.post('/api/pause/3')  # 3 is not in [1,2,5,10]
+            # 0 and 61 are out of range
+            response = client.post('/api/pause/0')
             assert response.status_code == 400
+            response = client.post('/api/pause/61')
+            assert response.status_code == 400
+
+    def test_webui_new_routes_registered(self):
+        """Test that new API routes are registered."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        ui = WebUI(mock_minus)
+
+        routes = [rule.rule for rule in ui.app.url_map.iter_rules()]
+        # New endpoints
+        assert '/api/stats' in routes
+        assert '/api/vocabulary' in routes
+        assert '/api/firetv/status' in routes
+        assert '/api/firetv/command' in routes
+        assert '/api/screenshots' in routes
+        assert '/api/wifi/connections' in routes
+        assert '/api/wifi/scan' in routes
+        assert '/api/adb/keys' in routes
+        assert '/api/audio/status' in routes
+        assert '/api/test/trigger-block' in routes
+        assert '/api/test/stop-block' in routes
+
+    def test_webui_api_stats(self):
+        """Test the /api/stats endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_ad_blocker = MagicMock()
+        mock_ad_blocker._total_ads_blocked = 5
+        mock_ad_blocker._total_blocking_time = 120.0
+        mock_ad_blocker._total_time_saved = 60.0
+        mock_ad_blocker.is_visible = False
+        mock_minus.ad_blocker = mock_ad_blocker
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/stats')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'ads_blocked_today' in data
+            assert 'total_blocking_time' in data
+            assert 'time_saved' in data
+
+    def test_webui_api_vocabulary(self):
+        """Test the /api/vocabulary endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.get_current_vocabulary.return_value = {
+            'word': 'hola',
+            'pronunciation': 'OH-lah',
+            'translation': 'hello',
+            'example': 'Hola, como estas?'
+        }
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/vocabulary')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['word'] == 'hola'
+            assert data['translation'] == 'hello'
+
+    def test_webui_api_firetv_status(self):
+        """Test the /api/firetv/status endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_setup = MagicMock()
+        mock_setup.state = 'connected'
+        mock_setup.is_connected.return_value = True
+        mock_setup.device_ip = '192.168.1.100'
+        mock_minus.fire_tv_setup = mock_setup
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/firetv/status')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['connected'] is True
+            assert data['state'] == 'connected'
+
+    def test_webui_api_firetv_command(self):
+        """Test the /api/firetv/command endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_setup = MagicMock()
+        mock_controller = MagicMock()
+        mock_controller.is_connected = True
+        mock_controller.send_command.return_value = True
+        mock_setup.get_controller.return_value = mock_controller
+        mock_minus.fire_tv_setup = mock_setup
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/firetv/command',
+                                   json={'command': 'select'},
+                                   content_type='application/json')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+
+    def test_webui_api_audio_status(self):
+        """Test the /api/audio/status endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_audio = MagicMock()
+        mock_audio._muted = False
+        mock_minus.audio = mock_audio
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/audio/status')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['muted'] is False
+
+    def test_webui_api_screenshots(self):
+        """Test the /api/screenshots endpoint."""
+        from webui import WebUI
+        import os
+        mock_minus = MagicMock()
+        # Create temp screenshot dirs
+        test_dir = '/tmp/test_screenshots_webui'
+        ocr_dir = os.path.join(test_dir, 'ocr')
+        non_ad_dir = os.path.join(test_dir, 'non_ad')
+        os.makedirs(ocr_dir, exist_ok=True)
+        os.makedirs(non_ad_dir, exist_ok=True)
+
+        # Create test files
+        with open(os.path.join(ocr_dir, 'test1.png'), 'w') as f:
+            f.write('test')
+
+        mock_minus.config = MagicMock()
+        mock_minus.config.screenshot_dir = test_dir
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/screenshots')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'ocr' in data
+            assert 'non_ad' in data
+
+        # Cleanup
+        import shutil
+        shutil.rmtree(test_dir, ignore_errors=True)
+
+    def test_webui_api_test_trigger_block(self):
+        """Test the /api/test/trigger-block endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/test/trigger-block',
+                                   json={'duration': 10, 'source': 'ocr'},
+                                   content_type='application/json')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+            assert data['duration'] == 10
+            mock_minus.ad_blocker.set_test_mode.assert_called_once_with(10)
+            mock_minus.ad_blocker.show.assert_called_once()
+
+    def test_webui_api_test_stop_block(self):
+        """Test the /api/test/stop-block endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/test/stop-block')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+            mock_minus.ad_blocker.clear_test_mode.assert_called_once()
+            mock_minus.ad_blocker.hide.assert_called_once()
+
+    @patch('subprocess.run')
+    def test_webui_api_wifi_connections(self, mock_run):
+        """Test the /api/wifi/connections endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_run.return_value = MagicMock(
+            stdout='MyWifi:yes:50\nOtherWifi:no:30\n',
+            returncode=0
+        )
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/wifi/connections')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'connections' in data
+
+    @patch('subprocess.run')
+    def test_webui_api_wifi_scan(self, mock_run):
+        """Test the /api/wifi/scan endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_run.return_value = MagicMock(
+            stdout='TestNetwork:80:WPA2\nOpenNetwork:60:\n',
+            returncode=0
+        )
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/wifi/scan')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'networks' in data
+
+    def test_webui_api_adb_keys(self):
+        """Test the /api/adb/keys endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        ui = WebUI(mock_minus)
+
+        # Test that endpoint returns expected structure
+        with ui.app.test_client() as client:
+            response = client.get('/api/adb/keys')
+            assert response.status_code == 200
+            data = response.get_json()
+            # Response should have these fields
+            assert 'exists' in data
+            # If key exists, it should have public_key and fingerprint
+            if data['exists']:
+                assert 'public_key' in data
+                assert 'fingerprint' in data
 
 
 # ============================================================================

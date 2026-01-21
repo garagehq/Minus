@@ -130,6 +130,9 @@ class DRMAdBlocker:
         # Default was 180, increased for better readability
         self._box_alpha = 220
 
+        # Current vocabulary word tracking
+        self._current_vocab = None  # (spanish, pronunciation, english, example)
+
         # Test mode
         self._test_blocking_until = 0
 
@@ -552,6 +555,7 @@ class DRMAdBlocker:
             header = "BLOCKING AD"
         vocab = random.choice(SPANISH_VOCABULARY)
         spanish, pronunciation, english, example = vocab
+        self._current_vocab = vocab  # Track current word for API
         return f"{header}\n\n{spanish}\n({pronunciation})\n= {english}\n\n{example}"
 
     def _get_debug_text(self):
@@ -811,6 +815,18 @@ class DRMAdBlocker:
     def get_time_saved(self) -> float:
         """Get total time saved in seconds."""
         return self._total_time_saved
+
+    def get_current_vocabulary(self) -> dict:
+        """Get the current vocabulary word being displayed."""
+        if self._current_vocab and self.is_visible:
+            spanish, pronunciation, english, example = self._current_vocab
+            return {
+                'word': spanish,
+                'pronunciation': pronunciation,
+                'translation': english,
+                'example': example,
+            }
+        return {'word': None, 'pronunciation': None, 'translation': None, 'example': None}
 
     def set_test_mode(self, duration_seconds: float):
         self._test_blocking_until = time.time() + duration_seconds
