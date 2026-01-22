@@ -97,7 +97,7 @@ class TestConfig:
         assert config.screenshot_dir == "screenshots"
         assert config.ocr_timeout == 1.5
         assert config.ustreamer_port == 9090
-        assert config.max_screenshots == 50
+        assert config.max_screenshots == 0  # 0 = unlimited for training
         assert config.webui_port == 8080
 
     def test_config_custom_values(self):
@@ -210,8 +210,7 @@ class TestScreenshots:
     def setup_method(self):
         """Set up test fixtures."""
         self.test_dir = tempfile.mkdtemp()
-        self.screenshot_dir = Path(self.test_dir) / "ocr"
-        self.non_ad_dir = Path(self.test_dir) / "non_ad"
+        self.base_dir = Path(self.test_dir)
 
     def teardown_method(self):
         """Clean up test fixtures."""
@@ -226,15 +225,16 @@ class TestScreenshots:
         """Test ScreenshotManager initialization."""
         from screenshots import ScreenshotManager
         manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir,
+            base_dir=self.base_dir,
             max_screenshots=10
         )
-        assert manager.screenshot_dir == self.screenshot_dir
-        assert manager.non_ad_dir == self.non_ad_dir
+        assert manager.ads_dir == self.base_dir / "ads"
+        assert manager.non_ads_dir == self.base_dir / "non_ads"
+        assert manager.vlm_spastic_dir == self.base_dir / "vlm_spastic"
+        assert manager.static_dir == self.base_dir / "static"
         assert manager.max_screenshots == 10
-        assert self.screenshot_dir.exists()
-        assert self.non_ad_dir.exists()
+        assert manager.ads_dir.exists()
+        assert manager.non_ads_dir.exists()
 
     def test_compute_image_hash(self):
         """Test image hash computation."""
@@ -242,10 +242,7 @@ class TestScreenshots:
             return  # Skip if numpy not available
 
         from screenshots import ScreenshotManager
-        manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir
-        )
+        manager = ScreenshotManager(base_dir=self.base_dir)
 
         # Create a test image
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
@@ -267,15 +264,12 @@ class TestScreenshots:
             return
 
         from screenshots import ScreenshotManager
-        manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir
-        )
+        manager = ScreenshotManager(base_dir=self.base_dir)
 
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         manager.save_ad_screenshot(test_image, [("skip", "skip ad")], ["skip ad", "some text"])
 
-        screenshots = list(self.screenshot_dir.glob("ad_*.png"))
+        screenshots = list(manager.ads_dir.glob("ad_*.png"))
         assert len(screenshots) == 1
 
     def test_save_ad_screenshot_deduplication(self):
@@ -284,16 +278,15 @@ class TestScreenshots:
             return
 
         from screenshots import ScreenshotManager
-        manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir
-        )
+        manager = ScreenshotManager(base_dir=self.base_dir)
+        # Set rate limit to 0 for testing
+        manager._min_screenshot_interval = 0
 
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         manager.save_ad_screenshot(test_image, [("skip", "skip")], ["skip"])
         manager.save_ad_screenshot(test_image, [("skip", "skip")], ["skip"])
 
-        screenshots = list(self.screenshot_dir.glob("ad_*.png"))
+        screenshots = list(manager.ads_dir.glob("ad_*.png"))
         assert len(screenshots) == 1  # Only one saved due to deduplication
 
     def test_save_non_ad_screenshot(self):
@@ -302,15 +295,12 @@ class TestScreenshots:
             return
 
         from screenshots import ScreenshotManager
-        manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir
-        )
+        manager = ScreenshotManager(base_dir=self.base_dir)
 
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         manager.save_non_ad_screenshot(test_image)
 
-        screenshots = list(self.non_ad_dir.glob("non_ad_*.png"))
+        screenshots = list(manager.non_ads_dir.glob("non_ad_*.png"))
         assert len(screenshots) == 1
 
     def test_save_static_ad_screenshot(self):
@@ -319,15 +309,12 @@ class TestScreenshots:
             return
 
         from screenshots import ScreenshotManager
-        manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir
-        )
+        manager = ScreenshotManager(base_dir=self.base_dir)
 
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         manager.save_static_ad_screenshot(test_image)
 
-        screenshots = list(self.non_ad_dir.glob("static_ad_*.png"))
+        screenshots = list(manager.static_dir.glob("static_*.png"))
         assert len(screenshots) == 1
 
     def test_save_vlm_spastic_screenshot(self):
@@ -336,15 +323,12 @@ class TestScreenshots:
             return
 
         from screenshots import ScreenshotManager
-        manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir
-        )
+        manager = ScreenshotManager(base_dir=self.base_dir)
 
         test_image = np.zeros((100, 100, 3), dtype=np.uint8)
         manager.save_vlm_spastic_screenshot(test_image, 3)
 
-        screenshots = list(self.non_ad_dir.glob("vlm_spastic_3x_*.png"))
+        screenshots = list(manager.vlm_spastic_dir.glob("vlm_spastic_3x_*.png"))
         assert len(screenshots) == 1
 
     def test_truncate_screenshots(self):
@@ -354,10 +338,11 @@ class TestScreenshots:
 
         from screenshots import ScreenshotManager
         manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_dir,
+            base_dir=self.base_dir,
             max_screenshots=3
         )
+        # Disable rate limiting for test
+        manager._min_screenshot_interval = 0
 
         # Save more than max screenshots
         for i in range(5):
@@ -365,7 +350,7 @@ class TestScreenshots:
             manager.save_ad_screenshot(test_image, [("skip", f"skip{i}")], [f"skip{i}"])
             time.sleep(0.01)  # Ensure different timestamps
 
-        screenshots = list(self.screenshot_dir.glob("ad_*.png"))
+        screenshots = list(manager.ads_dir.glob("ad_*.png"))
         assert len(screenshots) == 3  # Truncated to max
 
 

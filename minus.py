@@ -195,6 +195,7 @@ class Minus:
         self.running = False
         self.blocking_active = False
         self._hdmi_recovery_in_progress = False  # Prevent main loop interference during HDMI recovery
+        self._hdmi_signal_lost = False  # Pause detection workers when HDMI signal is lost
 
         # ML processing
         self.ocr = None
@@ -279,12 +280,9 @@ class Minus:
         self.vlm_scene_skip_count = 0
         self.vlm_max_scene_skip = 10  # Force VLM after this many consecutive skips
 
-        # Screenshot manager
-        self.screenshot_dir = Path(config.screenshot_dir) / "ocr"
-        self.non_ad_screenshot_dir = Path(config.screenshot_dir) / "non_ad"
+        # Screenshot manager (organizes into ads/, non_ads/, vlm_spastic/, static/ subdirs)
         self.screenshot_manager = ScreenshotManager(
-            screenshot_dir=self.screenshot_dir,
-            non_ad_dir=self.non_ad_screenshot_dir,
+            base_dir=Path(config.screenshot_dir),
             max_screenshots=config.max_screenshots
         )
 
@@ -436,6 +434,8 @@ class Minus:
     def _on_hdmi_lost(self):
         """Handle HDMI signal loss."""
         logger.warning("[Recovery] HDMI signal lost - showing NO SIGNAL display")
+        # Pause detection workers to prevent memory leak from repeated snapshot timeouts
+        self._hdmi_signal_lost = True
         # Switch to standalone NO SIGNAL display (doesn't depend on ustreamer)
         if self.ad_blocker:
             self.ad_blocker.start_no_signal_mode()
@@ -445,6 +445,9 @@ class Minus:
     def _on_hdmi_restored(self):
         """Handle HDMI signal restoration."""
         logger.info("[Recovery] HDMI signal restored - showing loading screen")
+
+        # Resume detection workers
+        self._hdmi_signal_lost = False
 
         # Set flag to prevent main loop from interfering with recovery
         self._hdmi_recovery_in_progress = True
@@ -772,7 +775,7 @@ class Minus:
             'vlm_detected': self.vlm_ad_detected,
             'ocr_frame_count': self.frame_count,
             'vlm_frame_count': self.vlm_frame_count,
-            'total_detections': self.screenshot_manager.screenshot_count if self.screenshot_manager else 0,
+            'total_detections': self.screenshot_manager.ads_count if self.screenshot_manager else 0,
 
             # System status
             'fps': fps,
@@ -1227,6 +1230,11 @@ class Minus:
 
         while self.running:
             try:
+                # Pause when HDMI signal is lost to prevent memory leak from repeated timeouts
+                if self._hdmi_signal_lost:
+                    time.sleep(1.0)
+                    continue
+
                 start_time = time.time()
                 frame = self.frame_capture.capture()
                 capture_time = (time.time() - start_time) * 1000
@@ -1449,6 +1457,11 @@ class Minus:
 
         while self.running:
             try:
+                # Pause when HDMI signal is lost to prevent memory leak from repeated timeouts
+                if self._hdmi_signal_lost:
+                    time.sleep(1.0)
+                    continue
+
                 start_time = time.time()
                 frame = self.frame_capture.capture()
 
@@ -1772,8 +1785,8 @@ def main():
     parser.add_argument(
         '--max-screenshots',
         type=int,
-        default=50,
-        help='Keep only this many recent screenshots (0=unlimited, default: 50)'
+        default=0,
+        help='Keep only this many recent screenshots (0=unlimited for training, default: 0)'
     )
     parser.add_argument(
         '--connector-id',

@@ -12,7 +12,7 @@ class MinusConfig:
     screenshot_dir: str = "screenshots"
     ocr_timeout: float = 1.5
     ustreamer_port: int = 9090
-    max_screenshots: int = 50
+    max_screenshots: int = 0  # 0 = unlimited (keep all for training)
     drm_connector_id: int = None  # Auto-detect HDMI output connector
     drm_plane_id: int = None  # Auto-detect NV12-capable overlay plane
     output_width: int = None  # Auto-detect from display EDID

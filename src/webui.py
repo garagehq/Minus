@@ -385,17 +385,18 @@ class WebUI:
             """Get list of screenshots with pagination.
 
             Query params:
-            - type: 'ocr' or 'non_ad' (default: 'ocr')
+            - type: 'ads', 'non_ads', 'vlm_spastic', 'static' (default: 'ads')
             - page: page number starting from 1 (default: 1)
             - limit: items per page (default: 5, max: 20)
             """
             try:
-                screenshot_type = request.args.get('type', 'ocr')
+                screenshot_type = request.args.get('type', 'ads')
                 page = max(1, int(request.args.get('page', 1)))
                 limit = min(20, max(1, int(request.args.get('limit', 5))))
 
-                if screenshot_type not in ['ocr', 'non_ad']:
-                    screenshot_type = 'ocr'
+                valid_types = ['ads', 'non_ads', 'vlm_spastic', 'static']
+                if screenshot_type not in valid_types:
+                    screenshot_type = 'ads'
 
                 screenshots_dir = Path(__file__).parent.parent / 'screenshots' / screenshot_type
 
@@ -435,7 +436,8 @@ class WebUI:
         def api_screenshot_file(subdir, filename):
             """Serve a screenshot file."""
             try:
-                if subdir not in ['ocr', 'non_ad']:
+                valid_subdirs = ['ads', 'non_ads', 'vlm_spastic', 'static']
+                if subdir not in valid_subdirs:
                     return Response(status=404)
                 # Sanitize filename
                 if '..' in filename or '/' in filename:

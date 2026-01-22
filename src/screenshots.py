@@ -2,9 +2,11 @@
 Screenshot management for Minus.
 
 Handles saving screenshots for ad detection and VLM training data collection.
+Organizes screenshots into separate folders by type for easy training data preparation.
 """
 
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -14,31 +16,50 @@ logger = logging.getLogger(__name__)
 
 
 class ScreenshotManager:
-    """Manages screenshot saving for ad detection and training data collection."""
+    """Manages screenshot saving for ad detection and training data collection.
 
-    def __init__(self, screenshot_dir: Path, non_ad_dir: Path, max_screenshots: int = 50):
+    Screenshots are organized into separate directories:
+    - ads/         OCR-detected ads (for training ad detection)
+    - non_ads/     User paused = false positives (for training non-ad detection)
+    - vlm_spastic/ VLM uncertainty cases (for analyzing VLM behavior)
+    - static/      Static screen suppression (still frames with ad text)
+    """
+
+    def __init__(self, base_dir: Path, max_screenshots: int = 0):
         """
         Initialize the screenshot manager.
 
         Args:
-            screenshot_dir: Directory to save ad screenshots
-            non_ad_dir: Directory to save non-ad training screenshots
-            max_screenshots: Maximum screenshots to keep (0 = unlimited)
+            base_dir: Base directory for all screenshots (e.g., screenshots/)
+            max_screenshots: Maximum screenshots to keep per folder (0 = unlimited)
         """
-        self.screenshot_dir = screenshot_dir
-        self.non_ad_dir = non_ad_dir
+        self.base_dir = Path(base_dir)
         self.max_screenshots = max_screenshots
 
-        # Counters
-        self.screenshot_count = 0
-        self.non_ad_count = 0
+        # Organized subdirectories
+        self.ads_dir = self.base_dir / "ads"
+        self.non_ads_dir = self.base_dir / "non_ads"
+        self.vlm_spastic_dir = self.base_dir / "vlm_spastic"
+        self.static_dir = self.base_dir / "static"
 
-        # Deduplication
+        # Counters (per type)
+        self.ads_count = 0
+        self.non_ads_count = 0
+        self.vlm_spastic_count = 0
+        self.static_count = 0
+
+        # Deduplication for ads (prevents saving same frame multiple times)
         self.screenshot_hashes = set()
 
+        # Rate limiting - max 1 ad screenshot per 5 seconds to prevent flooding
+        self._last_ad_screenshot_time = 0
+        self._min_screenshot_interval = 5.0  # seconds
+
         # Ensure directories exist
-        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        self.non_ad_dir.mkdir(parents=True, exist_ok=True)
+        self.ads_dir.mkdir(parents=True, exist_ok=True)
+        self.non_ads_dir.mkdir(parents=True, exist_ok=True)
+        self.vlm_spastic_dir.mkdir(parents=True, exist_ok=True)
+        self.static_dir.mkdir(parents=True, exist_ok=True)
 
     def compute_image_hash(self, frame):
         """Compute a fast perceptual hash for deduplication.
@@ -55,7 +76,15 @@ class ScreenshotManager:
             return None
 
     def save_ad_screenshot(self, frame, matched_keywords, all_texts):
-        """Save screenshot when ad detected (with deduplication)."""
+        """Save screenshot when ad detected (with deduplication and rate limiting)."""
+        if frame is None:
+            return
+
+        # Rate limiting - prevent flooding during long ads
+        now = time.time()
+        if now - self._last_ad_screenshot_time < self._min_screenshot_interval:
+            return
+
         # Check for duplicate using perceptual hash
         img_hash = self.compute_image_hash(frame)
         if img_hash is not None and img_hash in self.screenshot_hashes:
@@ -67,10 +96,11 @@ class ScreenshotManager:
                 self.screenshot_hashes.clear()
             self.screenshot_hashes.add(img_hash)
 
-        self.screenshot_count += 1
+        self._last_ad_screenshot_time = now
+        self.ads_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        filename = f"ad_{timestamp}_{self.screenshot_count:04d}.png"
-        filepath = self.screenshot_dir / filename
+        filename = f"ad_{timestamp}_{self.ads_count:04d}.png"
+        filepath = self.ads_dir / filename
 
         cv2.imwrite(str(filepath), frame)
 
@@ -80,7 +110,7 @@ class ScreenshotManager:
         logger.info(f"  All texts: {all_texts}")
 
         if self.max_screenshots > 0:
-            self._truncate_screenshots()
+            self._truncate_dir(self.ads_dir)
 
     def save_non_ad_screenshot(self, frame):
         """
@@ -93,13 +123,16 @@ class ScreenshotManager:
             return
 
         try:
-            self.non_ad_count += 1
+            self.non_ads_count += 1
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"non_ad_{timestamp}_{self.non_ad_count:04d}.png"
-            filepath = self.non_ad_dir / filename
+            filename = f"non_ad_{timestamp}_{self.non_ads_count:04d}.png"
+            filepath = self.non_ads_dir / filename
 
             cv2.imwrite(str(filepath), frame)
-            logger.info(f"[Screenshot] Non-ad screenshot saved: {filename}")
+            logger.info(f"[Screenshot] Non-ad screenshot saved: non_ads/{filename}")
+
+            if self.max_screenshots > 0:
+                self._truncate_dir(self.non_ads_dir)
 
         except Exception as e:
             logger.error(f"[Screenshot] Failed to save non-ad screenshot: {e}")
@@ -115,16 +148,19 @@ class ScreenshotManager:
             return
 
         try:
-            self.non_ad_count += 1
+            self.static_count += 1
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"static_ad_{timestamp}_{self.non_ad_count:04d}.png"
-            filepath = self.non_ad_dir / filename
+            filename = f"static_{timestamp}_{self.static_count:04d}.png"
+            filepath = self.static_dir / filename
 
             cv2.imwrite(str(filepath), frame)
-            logger.info(f"[Screenshot] Saved static ad screenshot for training: {filename}")
+            logger.info(f"[Screenshot] Saved static screenshot: static/{filename}")
+
+            if self.max_screenshots > 0:
+                self._truncate_dir(self.static_dir)
 
         except Exception as e:
-            logger.error(f"[Screenshot] Failed to save static ad screenshot: {e}")
+            logger.error(f"[Screenshot] Failed to save static screenshot: {e}")
 
     def save_vlm_spastic_screenshot(self, frame, consecutive_count):
         """
@@ -136,24 +172,38 @@ class ScreenshotManager:
             return
 
         try:
-            self.non_ad_count += 1
+            self.vlm_spastic_count += 1
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"vlm_spastic_{consecutive_count}x_{timestamp}_{self.non_ad_count:04d}.png"
-            filepath = self.non_ad_dir / filename
+            filename = f"vlm_spastic_{consecutive_count}x_{timestamp}_{self.vlm_spastic_count:04d}.png"
+            filepath = self.vlm_spastic_dir / filename
 
             cv2.imwrite(str(filepath), frame)
-            logger.info(f"[Screenshot] Saved spastic screenshot ({consecutive_count}x ad then no-ad): {filename}")
+            logger.info(f"[Screenshot] Saved spastic screenshot ({consecutive_count}x ad then no-ad): vlm_spastic/{filename}")
+
+            if self.max_screenshots > 0:
+                self._truncate_dir(self.vlm_spastic_dir)
 
         except Exception as e:
             logger.error(f"[Screenshot] Failed to save spastic screenshot: {e}")
 
-    def _truncate_screenshots(self):
-        """Remove oldest screenshots if we exceed the max limit."""
+    def _truncate_dir(self, directory: Path):
+        """Remove oldest screenshots in a directory if we exceed the max limit."""
         try:
-            screenshots = sorted(self.screenshot_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)
+            screenshots = sorted(directory.glob("*.png"), key=lambda p: p.stat().st_mtime)
             excess = len(screenshots) - self.max_screenshots
             if excess > 0:
                 for old_file in screenshots[:excess]:
                     old_file.unlink()
         except Exception as e:
-            logger.warning(f"[Screenshot] Failed to truncate screenshots: {e}")
+            logger.warning(f"[Screenshot] Failed to truncate {directory}: {e}")
+
+    # Legacy property for backward compatibility
+    @property
+    def screenshot_dir(self):
+        """Backward compatibility: returns ads directory."""
+        return self.ads_dir
+
+    @property
+    def non_ad_dir(self):
+        """Backward compatibility: returns non_ads directory."""
+        return self.non_ads_dir

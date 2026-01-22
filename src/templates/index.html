@@ -179,8 +179,10 @@
             <section class="screenshots-section">
                 <h2>Screenshots</h2>
                 <div class="screenshot-tabs">
-                    <button class="tab-btn active" onclick="showScreenshotTab('ocr')">Ad Screenshots</button>
-                    <button class="tab-btn" onclick="showScreenshotTab('non_ad')">Non-Ad</button>
+                    <button class="tab-btn active" onclick="showScreenshotTab('ads')">Ads</button>
+                    <button class="tab-btn" onclick="showScreenshotTab('non_ads')">Non-Ads</button>
+                    <button class="tab-btn" onclick="showScreenshotTab('vlm_spastic')">VLM Spastic</button>
+                    <button class="tab-btn" onclick="showScreenshotTab('static')">Static</button>
                 </div>
                 <div id="screenshots-grid" class="screenshots-grid">
                     <div class="empty-state">Select a tab to load</div>
@@ -310,7 +312,7 @@
         let isPaused = false;
         let pauseRemaining = 0;
         let lastStatus = null;
-        let currentScreenshotTab = 'ocr';
+        let currentScreenshotTab = 'ads';
         let currentWifiTab = 'saved';
         let notificationsEnabled = false;
         let pendingWifiSSID = null;
@@ -769,8 +771,16 @@
         function showScreenshotTab(tab) {
             currentScreenshotTab = tab;
             currentScreenshotPage = 1;
+            // Map tab names to button text
+            const tabToText = {
+                'ads': 'ads',
+                'non_ads': 'non-ads',
+                'vlm_spastic': 'vlm spastic',
+                'static': 'static'
+            };
             document.querySelectorAll('.screenshots-section .tab-btn').forEach(btn => {
-                btn.classList.toggle('active', btn.textContent.toLowerCase().includes(tab === 'ocr' ? 'ad' : 'non'));
+                const btnText = btn.textContent.toLowerCase();
+                btn.classList.toggle('active', btnText === tabToText[tab]);
             });
             loadScreenshots();
         }
