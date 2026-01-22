@@ -236,8 +236,9 @@ class DRMAdBlocker:
             return self._current_fps
 
     def start(self):
-        # Stop any loading animation before starting normal pipeline
+        # Stop any animations before starting normal pipeline
         self._stop_loading_animation()
+        self._stop_no_signal_animation()
 
         # If we're in loading or no-signal mode, need to reinitialize the normal pipeline
         if self.current_source in ('loading', 'no_hdmi_device'):
@@ -363,13 +364,15 @@ class DRMAdBlocker:
         threading.Thread(target=self._restart_pipeline, daemon=True).start()
 
     def start_no_signal_mode(self):
-        """Start a standalone display for 'No HDMI Input' message.
+        """Start a standalone display for 'No Signal' message with DVD-style bouncing.
 
         This creates a simple pipeline using videotestsrc that doesn't depend on ustreamer.
+        The text bounces around the screen like the classic DVD screensaver.
         """
         try:
-            # Stop any existing loading animation
+            # Stop any existing animations
             self._stop_loading_animation()
+            self._stop_no_signal_animation()
 
             # Stop existing pipeline if any
             if self.pipeline:
@@ -382,23 +385,27 @@ class DRMAdBlocker:
                     pass
                 self.pipeline = None
 
-            # Create a simple standalone pipeline for no-signal display
-            # Uses videotestsrc with textoverlay - doesn't need ustreamer
+            # Create a standalone pipeline for no-signal display with positioned text
+            # Uses valignment=position and halignment=position to enable xpos/ypos control
             no_signal_pipeline = (
                 f"videotestsrc pattern=black ! "
                 f"video/x-raw,width=1920,height=1080,framerate=30/1 ! "
-                f"textoverlay text=\"NO HDMI INPUT\" "
-                f"valignment=center halignment=center font-desc=\"Sans Bold 24\" ! "
+                f"textoverlay name=no_signal_text text=\"NO SIGNAL\" "
+                f"valignment=position halignment=position xpos=0.5 ypos=0.5 "
+                f"font-desc=\"Sans Bold 24\" ! "
                 f"videoconvert ! video/x-raw,format=NV12 ! "
                 f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
             )
 
-            logger.debug("[DRMAdBlocker] Creating no-signal pipeline...")
+            logger.debug("[DRMAdBlocker] Creating no-signal pipeline with bounce animation...")
             self.pipeline = Gst.parse_launch(no_signal_pipeline)
 
             self.bus = self.pipeline.get_bus()
             self.bus.add_signal_watch()
             self.bus.connect('message::error', self._on_error)
+
+            # Get the textoverlay element for animation
+            self._no_signal_textoverlay = self.pipeline.get_by_name('no_signal_text')
 
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
@@ -407,11 +414,94 @@ class DRMAdBlocker:
 
             self.is_visible = True
             self.current_source = 'no_hdmi_device'
+
+            # Start the bouncing animation
+            self._start_no_signal_animation()
+
             logger.info("[DRMAdBlocker] No-signal display started")
             return True
         except Exception as e:
             logger.error(f"[DRMAdBlocker] Failed to start no-signal mode: {e}")
             return False
+
+    def _start_no_signal_animation(self):
+        """Start the DVD-style bouncing animation thread."""
+        self._stop_no_signal_anim = threading.Event()
+        self._no_signal_anim_thread = threading.Thread(
+            target=self._no_signal_animation_loop,
+            daemon=True,
+            name="NoSignalBounce"
+        )
+        self._no_signal_anim_thread.start()
+
+    def _stop_no_signal_animation(self):
+        """Stop the bouncing animation thread."""
+        if hasattr(self, '_stop_no_signal_anim'):
+            self._stop_no_signal_anim.set()
+        if hasattr(self, '_no_signal_anim_thread') and self._no_signal_anim_thread:
+            self._no_signal_anim_thread.join(timeout=1.0)
+            self._no_signal_anim_thread = None
+        self._no_signal_textoverlay = None
+
+    def _no_signal_animation_loop(self):
+        """Animate the NO SIGNAL text bouncing around like DVD screensaver."""
+        import time
+
+        # Position and velocity (0.0 to 1.0 range)
+        x, y = 0.5, 0.5
+        vx, vy = 0.008, 0.006  # Velocity per frame
+
+        # Boundaries (leave margin for text size)
+        min_x, max_x = 0.1, 0.9
+        min_y, max_y = 0.1, 0.9
+
+        # Corner hit celebration
+        corner_hit_frames = 0
+        spin_angle = 0
+
+        while not self._stop_no_signal_anim.is_set():
+            try:
+                # Update position
+                x += vx
+                y += vy
+
+                # Track if we hit edges
+                hit_x = False
+                hit_y = False
+
+                # Bounce off edges
+                if x <= min_x or x >= max_x:
+                    vx = -vx
+                    x = max(min_x, min(max_x, x))
+                    hit_x = True
+                if y <= min_y or y >= max_y:
+                    vy = -vy
+                    y = max(min_y, min(max_y, y))
+                    hit_y = True
+
+                # Corner hit! Start celebration spin
+                if hit_x and hit_y:
+                    corner_hit_frames = 30  # Celebrate for 30 frames (~1 second)
+                    logger.info("[DRMAdBlocker] NO SIGNAL hit corner! 🎉")
+
+                # Update textoverlay
+                if self._no_signal_textoverlay:
+                    self._no_signal_textoverlay.set_property('xpos', x)
+                    self._no_signal_textoverlay.set_property('ypos', y)
+
+                    # During corner celebration, cycle through spin text
+                    if corner_hit_frames > 0:
+                        spin_chars = ['|', '/', '-', '\\']
+                        spin_idx = (30 - corner_hit_frames) % 4
+                        spin_text = f"{spin_chars[spin_idx]} NO SIGNAL {spin_chars[spin_idx]}"
+                        self._no_signal_textoverlay.set_property('text', spin_text)
+                        corner_hit_frames -= 1
+                    else:
+                        self._no_signal_textoverlay.set_property('text', 'NO SIGNAL')
+
+                time.sleep(0.033)  # ~30fps animation
+            except Exception:
+                break
 
     def start_loading_mode(self):
         """Start a standalone display for 'Loading' with animated ellipses.
@@ -420,8 +510,9 @@ class DRMAdBlocker:
         animated dots (0-4 dots, increasing then decreasing).
         """
         try:
-            # Stop any existing loading animation
+            # Stop any existing animations
             self._stop_loading_animation()
+            self._stop_no_signal_animation()
 
             # Stop existing pipeline if any
             if self.pipeline:
@@ -544,7 +635,7 @@ class DRMAdBlocker:
         if source == 'hdmi_lost':
             return "NO SIGNAL\n\nHDMI disconnected\n\nWaiting for signal..."
         if source == 'no_hdmi_device':
-            return "NO HDMI INPUT\n\nWaiting for HDMI signal..."
+            return "NO SIGNAL\n\nWaiting for HDMI signal..."
         if source == 'ocr':
             header = "BLOCKING (OCR)"
         elif source == 'vlm':
@@ -945,6 +1036,7 @@ class DRMAdBlocker:
             self._stop_animation_thread()
             self._stop_snapshot_buffer_thread()
             self._stop_loading_animation()
+            self._stop_no_signal_animation()
 
             self._blocking_api_call('/blocking/set', {'clear': 'true'}, timeout=0.5)
 

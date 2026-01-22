@@ -1575,7 +1575,7 @@ class Minus:
             # Start display in no-signal mode to show "NO HDMI INPUT"
             if self.ad_blocker:
                 if self.ad_blocker.start_no_signal_mode():
-                    logger.info("Display showing NO HDMI INPUT message - waiting for HDMI...")
+                    logger.info("Display showing NO SIGNAL message - waiting for HDMI...")
                     # Poll for HDMI signal every 2 seconds
                     self.running = True
                     try:
