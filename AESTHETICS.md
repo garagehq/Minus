@@ -7,6 +7,8 @@
 
 ## Color Palette
 
+### Dark Mode (Default)
+
 | Color | Hex | Usage |
 |-------|-----|-------|
 | **Background** | `#000000` | Primary background (pure black) |
@@ -21,6 +23,33 @@
 | **Text Muted** | `#505050` | Disabled, timestamps |
 | **Border** | `#1a1a1a` | Default borders |
 | **Border Highlight** | `#333333` | Hover/focus borders |
+
+### Light Mode
+
+| Color | Hex | Usage |
+|-------|-----|-------|
+| **Background** | `#f5f5f5` | Primary background (off-white) |
+| **Card Background** | `#ffffff` | Section/card backgrounds |
+| **Secondary Background** | `#ffffff` | Nested elements, inputs |
+| **Accent Green** | `#00aa2e` | Primary accent (darker for readability) |
+| **Danger Red** | `#cc0033` | Blocking state, errors |
+| **Purple** | `#9333ea` | VLM indicators, vocabulary highlights |
+| **Warning Yellow** | `#cc9900` | Paused state, warnings |
+| **Text Primary** | `#1a1a1a` | Main text (dark) |
+| **Text Secondary** | `#666666` | Labels, secondary info |
+| **Text Muted** | `#999999` | Disabled, timestamps |
+| **Border** | `#e0e0e0` | Default borders |
+| **Border Highlight** | `#cccccc` | Hover/focus borders |
+
+### Theme Toggle
+
+The web UI includes a theme toggle button in the header (moon/sun icon):
+- **Default**: Dark mode
+- **Persistence**: User preference saved to localStorage
+- **Toggle**: Click the moon (dark) or sun (light) icon to switch
+- **Transition**: Smooth 0.3s transitions between themes
+
+**Note**: The log viewer and terminal-style outputs remain dark even in light mode for readability.
 
 ## Typography
 
@@ -44,21 +73,31 @@
 
 ## Visual Effects
 
-### Glows & Shadows
+### Glows & Shadows (Dark Mode)
 - Active elements: `box-shadow: 0 0 15px rgba(color, 0.3)`
 - Text glow: `text-shadow: 0 0 8px rgba(color, 0.4)`
 - Blocking state: Red glow on borders and background
+
+### Light Mode Adjustments
+- Text glows disabled for cleaner appearance
+- Subtle drop shadows instead of glow effects
+- Grid pattern uses darker green: `rgba(0, 170, 46, 0.05)`
+- Scanline overlay disabled (opacity: 0)
 
 ### Animations
 - **Cursor blink**: 1s step-end infinite (logo cursor)
 - **Pulse**: 1s infinite opacity (status indicators)
 - **Glow pulse**: 2s infinite (connected status)
 - **Blocking pulse**: 1s infinite background color shift
+- **Theme transition**: 0.3s ease for smooth mode switching
 
 ### Background
-- Pure black with subtle matrix grid pattern
-- Grid: 20px spacing, `rgba(0, 255, 65, 0.03)` lines
-- Scanline overlay: 30% opacity horizontal lines
+- **Dark mode**: Pure black with subtle matrix grid pattern
+  - Grid: 20px spacing, `rgba(0, 255, 65, 0.03)` lines
+  - Scanline overlay: 30% opacity horizontal lines
+- **Light mode**: Off-white with subtle green grid
+  - Grid: 20px spacing, `rgba(0, 170, 46, 0.05)` lines
+  - No scanline overlay
 
 ## Component Styling
 
@@ -205,6 +244,7 @@ The blocking overlay appears on the TV when ads are detected.
 
 ## State Colors Summary
 
+### Dark Mode
 | State | Primary Color | Background Tint |
 |-------|--------------|-----------------|
 | Normal/Monitoring | Green `#00ff41` | None |
@@ -213,6 +253,18 @@ The blocking overlay appears on the TV when ads are detected.
 | VLM Active | Purple `#a855f7` | `rgba(168, 85, 247, 0.1)` |
 | Error | Red `#ff0040` | None |
 | Loading | Green (pulsing) | None |
+
+### Light Mode
+| State | Primary Color | Background Tint |
+|-------|--------------|-----------------|
+| Normal/Monitoring | Green `#00aa2e` | None |
+| Blocking | Red `#cc0033` | `rgba(204, 0, 51, 0.1)` |
+| Paused | Yellow `#cc9900` | `rgba(204, 153, 0, 0.05)` |
+| VLM Active | Purple `#9333ea` | `rgba(147, 51, 234, 0.1)` |
+| Error | Red `#cc0033` | None |
+| Loading | Green (pulsing) | None |
+
+*Note: Light mode uses darker accent colors for better contrast on light backgrounds.*
 
 ## Responsive Considerations
 

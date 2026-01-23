@@ -4,6 +4,7 @@
 @import url('https://fonts.googleapis.com/css2?family=VT323&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
 
 :root {
+    /* Dark theme (default) */
     --bg-primary: #000000;
     --bg-secondary: #0a0a0a;
     --bg-card: #0d0d0d;
@@ -25,6 +26,43 @@
     /* Fonts */
     --font-display: 'VT323', monospace;
     --font-body: 'IBM Plex Mono', monospace;
+
+    /* Theme-specific */
+    --grid-color: rgba(0, 255, 65, 0.03);
+    --scanline-opacity: 0.3;
+    --logo-gradient: linear-gradient(90deg, #ff0040 0%, #ff6666 50%, #ffffff 100%);
+    --modal-bg: rgba(0, 0, 0, 0.9);
+    --scrollbar-track: var(--bg-secondary);
+    --scrollbar-thumb: var(--border-highlight);
+}
+
+/* Light theme */
+[data-theme="light"] {
+    --bg-primary: #f5f5f5;
+    --bg-secondary: #ffffff;
+    --bg-card: #ffffff;
+    --bg-card-hover: #fafafa;
+    --text-primary: #1a1a1a;
+    --text-secondary: #666666;
+    --text-muted: #999999;
+    --accent: #00aa2e;          /* Darker green for light bg */
+    --accent-dim: #008822;
+    --success: #00aa2e;
+    --warning: #cc9900;
+    --danger: #cc0033;
+    --border: #e0e0e0;
+    --border-highlight: #cccccc;
+    --purple: #9333ea;
+    --red: #cc0033;
+    --green: #00aa2e;
+
+    /* Theme-specific */
+    --grid-color: rgba(0, 170, 46, 0.05);
+    --scanline-opacity: 0;
+    --logo-gradient: linear-gradient(90deg, #cc0033 0%, #ff4466 50%, #1a1a1a 100%);
+    --modal-bg: rgba(255, 255, 255, 0.95);
+    --scrollbar-track: #e0e0e0;
+    --scrollbar-thumb: #cccccc;
 }
 
 * {
@@ -42,9 +80,10 @@ body {
     font-size: 14px;
     line-height: 1.5;
     background-image:
-        linear-gradient(rgba(0, 255, 65, 0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(0, 255, 65, 0.03) 1px, transparent 1px);
+        linear-gradient(var(--grid-color) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
     background-size: 20px 20px;
+    transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 /* Scanline effect overlay */
@@ -64,7 +103,8 @@ body::before {
         transparent 2px
     );
     z-index: 1000;
-    opacity: 0.3;
+    opacity: var(--scanline-opacity);
+    transition: opacity 0.3s ease;
 }
 
 .container {
@@ -89,7 +129,7 @@ header h1 {
     font-size: 2.5rem;
     font-weight: 400;
     letter-spacing: 0.1em;
-    background: linear-gradient(90deg, #ff0040 0%, #ff6666 50%, #ffffff 100%);
+    background: var(--logo-gradient);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -1484,7 +1524,7 @@ input:checked + .toggle-slider:before {
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.9);
+    background: var(--modal-bg);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1813,11 +1853,11 @@ input:checked + .toggle-slider:before {
 }
 
 ::-webkit-scrollbar-track {
-    background: var(--bg-secondary);
+    background: var(--scrollbar-track);
 }
 
 ::-webkit-scrollbar-thumb {
-    background: var(--border-highlight);
+    background: var(--scrollbar-thumb);
 }
 
 ::-webkit-scrollbar-thumb:hover {
@@ -1878,4 +1918,86 @@ input:checked + .toggle-slider:before {
 /* Add padding to container to account for footer */
 .container {
     padding-bottom: 3rem;
+}
+
+/* ==================== THEME TOGGLE ==================== */
+.theme-toggle {
+    background: none;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-size: 1.25rem;
+    cursor: pointer;
+    padding: 0.25rem 0.5rem;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 36px;
+    min-height: 36px;
+}
+
+.theme-toggle:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+/* Light theme specific adjustments */
+[data-theme="light"] .video-container {
+    border-color: var(--border);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+[data-theme="light"] .logs-content {
+    background: #1a1a1a;
+    color: #00ff41;
+}
+
+[data-theme="light"] .log-viewer {
+    background: #1a1a1a;
+    color: #00ff41;
+}
+
+[data-theme="light"] .remote-grid {
+    background: linear-gradient(145deg, #f0f0f0 0%, #e5e5e5 100%);
+}
+
+[data-theme="light"] .stat-value {
+    text-shadow: none;
+}
+
+[data-theme="light"] .detection-source.ocr {
+    text-shadow: none;
+}
+
+[data-theme="light"] .detection-source.vlm {
+    text-shadow: none;
+}
+
+[data-theme="light"] .detection-source.both {
+    text-shadow: none;
+}
+
+[data-theme="light"] .vocab-word {
+    text-shadow: none;
+}
+
+[data-theme="light"] header h1 .cursor {
+    -webkit-text-fill-color: #1a1a1a;
+}
+
+[data-theme="light"] .shortcuts-help {
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.15);
+}
+
+[data-theme="light"] .modal-content {
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+}
+
+/* Smooth transitions for theme switching */
+.status-section, .pause-section, .test-section, .debug-section, .detections-section,
+.vocabulary-section, .firetv-section, .apps-section, .screenshots-section,
+.settings-section, .wifi-section, .network-section, .adb-section,
+.service-section, .logs-section, .debug-snapshots-section, .video-container,
+.modal-content, .shortcuts-help, .system-footer, header, .tab-nav {
+    transition: background-color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
 }

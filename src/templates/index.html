@@ -12,6 +12,9 @@
         <header>
             <h1>MINUS<span class="cursor">_</span></h1>
             <div class="header-controls">
+                <button id="theme-toggle" class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode">
+                    <span id="theme-icon">&#9790;</span>
+                </button>
                 <div id="connection-status" class="status-dot" title="Connection status"></div>
             </div>
         </header>
@@ -1344,6 +1347,43 @@
             div.textContent = text;
             return div.innerHTML;
         }
+
+        // =========================================================================
+        // Theme Toggle
+        // =========================================================================
+
+        function getPreferredTheme() {
+            // Check localStorage for saved preference, default to dark
+            const saved = localStorage.getItem('theme');
+            return saved || 'dark';
+        }
+
+        function setTheme(theme) {
+            document.documentElement.setAttribute('data-theme', theme);
+            localStorage.setItem('theme', theme);
+
+            // Update toggle button icon
+            const icon = document.getElementById('theme-icon');
+            if (theme === 'light') {
+                icon.innerHTML = '&#9728;';  // Sun
+                icon.title = 'Switch to dark mode';
+            } else {
+                icon.innerHTML = '&#9790;';  // Moon
+                icon.title = 'Switch to light mode';
+            }
+        }
+
+        function toggleTheme() {
+            const current = document.documentElement.getAttribute('data-theme') || 'dark';
+            const newTheme = current === 'dark' ? 'light' : 'dark';
+            setTheme(newTheme);
+        }
+
+        // Initialize theme on page load
+        (function() {
+            const theme = getPreferredTheme();
+            setTheme(theme);
+        })();
 
         // =========================================================================
         // Keyboard Shortcuts
