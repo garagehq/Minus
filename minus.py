@@ -336,6 +336,7 @@ class Minus:
 
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
+        self.auto_skip_enabled = True  # Enable auto-skip (fixed: now properly detects countdown)
         self.skip_available = False  # True when "Skip" button is ready (no countdown)
         self.skip_countdown = None   # Current countdown value (for tracking transitions)
         self.last_skip_countdown = None  # Previous countdown value (for detecting 1->0 transition)
@@ -1506,17 +1507,25 @@ class Minus:
                 if should_skip:
                     self.skip_available = True
                     self.last_skip_text = skip_text
-                    self.skip_attempted_this_ad = True  # Mark as attempted - NO RETRIES
-                    self.last_skip_attempt_time = time.time()
 
-                    logger.warning(f"[SKIP] >>> Attempting skip (ONE attempt only). Text: '{skip_text}'")
-
-                    if self.try_skip_ad():
-                        logger.info(f"[SKIP] Skip command sent! Waiting to see if it worked...")
+                    # Check if auto-skip is enabled
+                    if not self.auto_skip_enabled:
+                        logger.info(f"[SKIP] Skip available but auto-skip DISABLED. Text: '{skip_text}'")
                         if self.ad_blocker:
-                            self.ad_blocker.add_time_saved(30.0)
+                            self.ad_blocker.set_skip_status(True, "Manual skip")
                     else:
-                        logger.warning(f"[SKIP] Skip command failed (Fire TV not connected?)")
+                        self.skip_attempted_this_ad = True  # Mark as attempted - NO RETRIES
+                        self.last_skip_attempt_time = time.time()
+
+                        logger.warning(f"[SKIP] >>> Attempting skip (ONE attempt only). Text: '{skip_text}'")
+
+                        if self.try_skip_ad():
+                            logger.info(f"[SKIP] Skip command sent! Waiting to see if it worked...")
+                            self.last_skip_success_time = time.time()
+                            if self.ad_blocker:
+                                self.ad_blocker.add_time_saved(30.0)
+                        else:
+                            logger.warning(f"[SKIP] Skip command failed (Fire TV not connected?)")
 
                 elif is_skippable and not skip_delay_passed:
                     wait_remaining = int(self.SKIP_DELAY_SECONDS - time_since_blocking)

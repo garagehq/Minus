@@ -41,6 +41,10 @@ body {
     -webkit-font-smoothing: antialiased;
     font-size: 14px;
     line-height: 1.5;
+    background-image:
+        linear-gradient(rgba(0, 255, 65, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 255, 65, 0.03) 1px, transparent 1px);
+    background-size: 20px 20px;
 }
 
 /* Scanline effect overlay */
@@ -224,6 +228,17 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     background: #000;
     border: 1px solid var(--border);
     overflow: hidden;
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+.video-container.blocking {
+    border-color: var(--danger);
+    box-shadow: 0 0 20px rgba(255, 0, 64, 0.4), inset 0 0 30px rgba(255, 0, 64, 0.1);
+}
+
+.video-container.paused {
+    border-color: var(--warning);
+    box-shadow: 0 0 15px rgba(255, 204, 0, 0.3);
 }
 
 .video-container img {
@@ -294,6 +309,23 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     border-color: var(--accent);
 }
 
+/* ==================== CARD HOVER EFFECTS ==================== */
+.status-section, .pause-section, .test-section, .detections-section,
+.vocabulary-section, .firetv-section, .apps-section, .screenshots-section,
+.settings-section, .wifi-section, .network-section, .adb-section,
+.service-section, .logs-section {
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.status-section:hover, .pause-section:hover, .test-section:hover,
+.detections-section:hover, .firetv-section:hover, .apps-section:hover,
+.screenshots-section:hover, .settings-section:hover, .wifi-section:hover,
+.network-section:hover, .adb-section:hover, .service-section:hover,
+.logs-section:hover {
+    border-color: var(--border-highlight);
+    box-shadow: 0 0 15px rgba(0, 255, 65, 0.05);
+}
+
 /* ==================== STATUS SECTION ==================== */
 .status-section {
     background: var(--bg-card);
@@ -323,8 +355,25 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
 }
 
 @keyframes blocking-pulse {
-    0%, 100% { background: rgba(255, 0, 64, 0.1); }
-    50% { background: rgba(255, 0, 64, 0.15); }
+    0%, 100% {
+        background: rgba(255, 0, 64, 0.1);
+        border-left-color: var(--danger);
+    }
+    50% {
+        background: rgba(255, 0, 64, 0.2);
+        border-left-color: #ff4d6d;
+    }
+}
+
+/* Loading state */
+.stat-value.loading {
+    color: var(--text-muted);
+    animation: loading-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes loading-pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 0.8; }
 }
 
 .blocking-status.paused {
@@ -377,8 +426,19 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
 .stat-value {
     display: block;
     font-family: var(--font-display);
-    font-size: 1.3rem;
+    font-size: 1.4rem;
     color: var(--accent);
+    text-shadow: 0 0 8px rgba(0, 255, 65, 0.4);
+}
+
+.stat:nth-child(2) .stat-value {
+    color: var(--danger);
+    text-shadow: 0 0 8px rgba(255, 0, 64, 0.4);
+}
+
+.stat:nth-child(3) .stat-value {
+    color: var(--purple);
+    text-shadow: 0 0 8px rgba(168, 85, 247, 0.4);
 }
 
 /* ==================== VOCABULARY SECTION ==================== */
@@ -558,6 +618,18 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     transform: scale(0.98);
 }
 
+.resume-btn kbd, .pause-btn kbd, .test-btn kbd {
+    display: inline-block;
+    padding: 0.1rem 0.4rem;
+    margin-left: 0.5rem;
+    font-family: var(--font-display);
+    font-size: 0.9rem;
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid currentColor;
+    opacity: 0.7;
+    vertical-align: middle;
+}
+
 .hidden {
     display: none !important;
 }
@@ -607,8 +679,12 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     display: flex;
     flex-direction: column;
     gap: 0.5rem;
-    max-width: 300px;
+    max-width: 280px;
     margin: 0 auto;
+    padding: 1rem;
+    background: linear-gradient(145deg, #0a0a0a 0%, #111111 100%);
+    border: 1px solid var(--border-highlight);
+    border-radius: 12px;
 }
 
 .remote-row {
@@ -707,11 +783,22 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
 .detection-source.ocr {
     border: 1px solid var(--accent);
     color: var(--accent);
+    background: rgba(0, 255, 65, 0.1);
+    text-shadow: 0 0 5px rgba(0, 255, 65, 0.5);
 }
 
 .detection-source.vlm {
     border: 1px solid var(--purple);
     color: var(--purple);
+    background: rgba(168, 85, 247, 0.1);
+    text-shadow: 0 0 5px rgba(168, 85, 247, 0.5);
+}
+
+.detection-source.both {
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    background: rgba(255, 0, 64, 0.1);
+    text-shadow: 0 0 5px rgba(255, 0, 64, 0.5);
 }
 
 .detection-text {
@@ -1521,4 +1608,54 @@ input:checked + .toggle-slider:before {
 ::selection {
     background: var(--accent);
     color: #000;
+}
+
+/* ==================== SYSTEM FOOTER ==================== */
+.system-footer {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: var(--bg-card);
+    border-top: 1px solid var(--border);
+    padding: 0.5rem 1rem;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 0.75rem;
+    font-family: var(--font-body);
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    z-index: 50;
+}
+
+.footer-item {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.footer-separator {
+    color: var(--border-highlight);
+}
+
+.footer-item .blink {
+    animation: pulse 1s infinite;
+}
+
+.footer-item .status-ok {
+    color: var(--success);
+}
+
+.footer-item .status-blocking {
+    color: var(--danger);
+}
+
+.footer-item .status-paused {
+    color: var(--warning);
+}
+
+/* Add padding to container to account for footer */
+.container {
+    padding-bottom: 3rem;
 }

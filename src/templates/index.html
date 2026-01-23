@@ -96,7 +96,7 @@
                         <span class="paused-icon">&#9208;</span>
                         <span id="pause-remaining">Paused</span>
                     </div>
-                    <button onclick="resumeBlocking()" class="resume-btn">Resume Now</button>
+                    <button onclick="resumeBlocking()" class="resume-btn">Resume Now <kbd>R</kbd></button>
                 </div>
             </section>
 
@@ -161,7 +161,7 @@
                 </div>
             </section>
 
-            <section class="apps-section">
+            <section class="apps-section" id="apps-section">
                 <h2>Quick Launch</h2>
                 <div class="apps-grid">
                     <button class="app-btn" onclick="launchApp('youtube')">YouTube</button>
@@ -465,6 +465,15 @@
                 hdmiStatus.textContent = status.hdmi_signal ? 'HDMI: OK' : 'HDMI: No Signal';
                 hdmiStatus.className = status.hdmi_signal ? 'system-badge ok' : 'system-badge warning';
 
+                // Video container glow effect
+                const videoContainer = document.getElementById('video-container');
+                videoContainer.classList.remove('blocking', 'paused');
+                if (status.blocking) {
+                    videoContainer.classList.add('blocking');
+                } else if (status.paused) {
+                    videoContainer.classList.add('paused');
+                }
+
                 // Footer status
                 const footerStatus = document.getElementById('footer-status');
                 if (status.blocking) {
@@ -558,12 +567,16 @@
 
                 const data = await response.json();
                 const badge = document.getElementById('firetv-status');
+                const appsSection = document.getElementById('apps-section');
+
                 if (data.connected) {
                     badge.textContent = 'Connected';
                     badge.className = 'connection-badge connected';
+                    if (appsSection) appsSection.classList.remove('hidden');
                 } else {
                     badge.textContent = data.state === 'not_initialized' ? 'Not Setup' : 'Disconnected';
                     badge.className = 'connection-badge disconnected';
+                    if (appsSection) appsSection.classList.add('hidden');
                 }
             } catch (error) {
                 console.error('Fire TV status update failed:', error);
@@ -1244,6 +1257,7 @@
         setInterval(updateDetections, 5000);
         setInterval(updateVocabulary, 3000);
         setInterval(updateAudioStatus, 2000);
+        setInterval(updateFireTVStatus, 5000);
     </script>
 </body>
 </html>
