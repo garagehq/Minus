@@ -1,9 +1,9 @@
 """
 VLM (Vision Language Model) integration for Minus.
 
-Uses FastVLM-0.5B on Axera LLM 8850 NPU for ad detection.
+Uses FastVLM-1.5B on Axera LLM 8850 NPU for ad detection.
 Model is loaded ONCE at startup and kept running for fast inference.
-Each inference takes ~0.62 seconds (2x faster than Qwen3-VL-2B).
+1.5B model is smarter than 0.5B with fewer false positives.
 """
 
 import os
@@ -29,12 +29,12 @@ from PIL import Image
 
 logger = logging.getLogger('Minus.VLM')
 
-# Model paths - FastVLM-0.5B
-FASTVLM_MODEL_DIR = Path("/home/radxa/axera_models/FastVLM-0.5B")
-LLM_MODEL_PATH = FASTVLM_MODEL_DIR / "fastvlm_C128_CTX1024_P640_ax650"
+# Model paths - FastVLM-1.5B (smarter, fewer false positives than 0.5B)
+FASTVLM_MODEL_DIR = Path("/home/radxa/axera_models/FastVLM-1.5B")
+LLM_MODEL_PATH = FASTVLM_MODEL_DIR / "fastvlm_ax650_context_1k_prefill_640_int4"
 TOKENIZER_PATH = FASTVLM_MODEL_DIR / "fastvlm_tokenizer"
-VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512_0.5b_ax650.axmodel"
-EMBEDS_PATH = FASTVLM_MODEL_DIR / "embeds" / "model.embed_tokens.weight.npy"
+VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512.axmodel"
+EMBEDS_PATH = LLM_MODEL_PATH / "model.embed_tokens.weight.npy"
 
 # Add utils path for LlavaConfig and InferManager
 UTILS_PATH = FASTVLM_MODEL_DIR / "utils"
@@ -42,11 +42,11 @@ UTILS_PATH = FASTVLM_MODEL_DIR / "utils"
 
 class VLMManager:
     """
-    FastVLM-0.5B manager for ad detection on Axera LLM 8850.
+    FastVLM-1.5B manager for ad detection on Axera LLM 8850.
 
     The model is loaded once at initialization and kept running.
     Uses Python axengine for inference.
-    Each inference takes ~0.62 seconds (2x faster than Qwen3-VL-2B).
+    1.5B model is smarter with fewer false positives than 0.5B.
     """
 
     # Simple prompt per original benchmark (94.7% accuracy)
@@ -70,7 +70,7 @@ class VLMManager:
 
         # Validate paths
         if not FASTVLM_MODEL_DIR.exists():
-            logger.error(f"FastVLM-0.5B not found at: {FASTVLM_MODEL_DIR}")
+            logger.error(f"FastVLM-1.5B not found at: {FASTVLM_MODEL_DIR}")
             return
 
         if not LLM_MODEL_PATH.exists():
@@ -85,7 +85,7 @@ class VLMManager:
             logger.error(f"Embeddings not found: {EMBEDS_PATH}")
             return
 
-        logger.info(f"VLM using FastVLM-0.5B at: {FASTVLM_MODEL_DIR}")
+        logger.info(f"VLM using FastVLM-1.5B at: {FASTVLM_MODEL_DIR}")
 
     def load_model(self):
         """Load the model - initializes all components."""
@@ -94,7 +94,7 @@ class VLMManager:
             return True
 
         try:
-            logger.info("Starting FastVLM-0.5B model (takes ~13s)...")
+            logger.info("Starting FastVLM-1.5B model...")
             start_time = time.time()
 
             # Add utils path to sys.path for imports
@@ -175,12 +175,12 @@ class VLMManager:
             )
 
             load_time = time.time() - start_time
-            logger.info(f"FastVLM-0.5B loaded in {load_time:.1f}s")
+            logger.info(f"FastVLM-1.5B loaded in {load_time:.1f}s")
             self.is_ready = True
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load FastVLM-0.5B: {e}")
+            logger.error(f"Failed to load FastVLM-1.5B: {e}")
             import traceback
             tb_str = traceback.format_exc()
             logger.error(f"Traceback:\n{tb_str}")
