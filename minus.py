@@ -225,13 +225,13 @@ class Minus:
 
         # VLM stability system - sliding window approach to prevent waffling
         # Tracks recent VLM decisions and requires sustained agreement to change state
-        # NOTE: Thresholds increased to reduce false positives with FastVLM-0.5B
+        # NOTE: FastVLM-1.5B is smarter, so thresholds can be more relaxed
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
         self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
-        self.vlm_min_decisions = 6          # Need at least 6 decisions to act (was 4)
-        self.vlm_start_agreement = 0.90     # Need 90% ad agreement to START blocking (was 80%)
+        self.vlm_min_decisions = 4          # Need at least 4 decisions to act
+        self.vlm_start_agreement = 0.80     # Need 80% ad agreement to START blocking
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
-        self.vlm_hysteresis_boost = 0.05    # Extra agreement needed to change current state (was 10%)
+        self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
 
         # State change rate limiting
         self.vlm_last_state_change = 0      # When VLM state last changed
@@ -252,7 +252,7 @@ class Minus:
             'continue watching', 'recommended', 'trending', 'popular', 'new releases',
             'categories', 'genres', 'apps', 'channels', 'live tv',
             # Fire TV specific
-            'try ai art', 'surprise me', 'see more', 'for you', 'free with ads',
+            'surprise me', 'see more', 'for you',
             'recently added', 'top picks', 'movies', 'tv shows'
         }
         self.last_ocr_texts = []            # Last OCR detected texts

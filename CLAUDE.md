@@ -4,7 +4,7 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame)
-- **FastVLM-0.5B** on Axera LLM 8850 NPU (~0.6s per frame)
+- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame)
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Architecture
@@ -72,7 +72,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | `src/ad_blocker.py` | GStreamer video pipeline with input-selector |
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
-| `src/vlm.py` | FastVLM-0.5B on Axera NPU |
+| `src/vlm.py` | FastVLM-1.5B on Axera NPU |
 | `src/health.py` | Unified health monitor for all subsystems |
 | `src/webui.py` | Flask web UI for remote monitoring/control |
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
@@ -136,7 +136,7 @@ This allows Minus to work with different displays without manual configuration.
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
-| VLM latency | **0.6s per frame** (2x faster with FastVLM-0.5B) |
+| VLM latency | **~0.9s per frame** (FastVLM-1.5B, smarter than 0.5B) |
 | VLM model load | **~13s** (once at startup, 3x faster than Qwen3) |
 | Snapshot capture | **~150ms** (4K JPEG download) |
 | OCR image size | 960x540 (downscaled from 4K for speed) |
@@ -282,15 +282,16 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `vlm_history_window` | 45s | How far back to look at VLM decisions |
-| `vlm_min_decisions` | 6 | Minimum decisions needed before acting |
-| `vlm_start_agreement` | 90% | Agreement threshold to start blocking |
-| `vlm_hysteresis_boost` | 5% | Extra agreement needed to change state |
+| `vlm_min_decisions` | 4 | Minimum decisions needed before acting |
+| `vlm_start_agreement` | 80% | Agreement threshold to start blocking |
+| `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
 
 **Starting Blocking:**
-1. OCR detects ad → blocking starts immediately
-2. VLM detects ad (no OCR) → needs 90%+ agreement in sliding window (6+ decisions)
+1. OCR detects ad → blocking starts immediately (unless home screen detected)
+2. VLM detects ad (no OCR) → needs 80%+ agreement in sliding window (4+ decisions)
 3. VLM with recent OCR → trusted, triggers blocking
+4. Home screen detection suppresses both OCR and VLM blocking on streaming interfaces
 
 **Stopping Blocking:**
 1. **If OCR triggered** (source=ocr or both): OCR says stop (3 no-ads) → ends immediately (~2-3s)
@@ -390,32 +391,30 @@ Example display:
 
 ## VLM Model
 
-**FastVLM-0.5B** on Axera LLM 8850 NPU:
-- 94.7% accuracy on ad detection benchmark
-- **0.62s** inference time (2x faster than Qwen3-VL-2B!)
-- **~13s** model load time (3x faster than Qwen3-VL-2B!)
-- 98.6% precision, 90.7% recall
+**FastVLM-1.5B** on Axera LLM 8850 NPU:
+- Smarter than 0.5B with fewer false positives on streaming interfaces
+- **~0.9s** inference time
+- **~47s** model load time (once at startup)
 - Uses Python axengine + transformers tokenizer
+- Home screen detection provides additional safety net
 
 ```
-/home/radxa/axera_models/FastVLM-0.5B/
-├── fastvlm_C128_CTX1024_P640_ax650/   # LLM decoder models
-│   ├── image_encoder_512x512_0.5b_ax650.axmodel  # Vision encoder
-│   ├── llava_qwen2_layer*.axmodel     # 24 decoder layers
-│   └── ...
-├── fastvlm_tokenizer/                  # Tokenizer files
-├── embeds/
-│   └── model.embed_tokens.weight.npy   # Embeddings (float32)
-└── utils/                              # LlavaConfig and InferManager
+/home/radxa/axera_models/FastVLM-1.5B/
+├── fastvlm_ax650_context_1k_prefill_640_int4/  # LLM decoder models
+│   ├── image_encoder_512x512.axmodel           # Vision encoder
+│   ├── llava_qwen2_p128_l*.axmodel             # 28 decoder layers
+│   └── model.embed_tokens.weight.npy           # Embeddings (float32)
+├── fastvlm_tokenizer/                           # Tokenizer files
+└── utils/                                       # LlavaConfig and InferManager
 ```
 
-**Why FastVLM-0.5B instead of Qwen3-VL-2B?**
-| Aspect | Qwen3-VL-2B | FastVLM-0.5B |
-|--------|-------------|--------------|
-| Accuracy | 96.0% | 94.7% |
-| Inference Time | 1.33s | **0.62s** |
-| Model Load Time | 38.9s | **12.6s** |
-| Parameters | 2B | **0.5B** |
+**Why FastVLM-1.5B instead of 0.5B?**
+| Aspect | FastVLM-0.5B | FastVLM-1.5B |
+|--------|--------------|--------------|
+| Inference Time | 0.7s | 0.9s |
+| False Positive Rate | ~88% on home screens | ~36% on home screens |
+| Intelligence | Basic | **Much smarter** |
+| Parameters | 0.5B | **1.5B** |
 
 ## Dependencies
 
@@ -468,7 +467,7 @@ pkill -9 ustreamer    # Kill orphaned ustreamer
 
 **VLM not loading:**
 - Check Axera card: `axcl_smi`
-- Verify model files exist in `/home/radxa/axera_models/FastVLM-0.5B/`
+- Verify model files exist in `/home/radxa/axera_models/FastVLM-1.5B/`
 - Ensure Python dependencies: `pip3 show axengine transformers ml_dtypes`
 
 **OCR not detecting:**
