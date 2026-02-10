@@ -343,6 +343,7 @@ class Minus:
         self.last_skip_text = None   # The detected skip text
         self.skip_attempted_this_ad = False  # Have we already tried to skip this ad?
         self.last_skip_attempt_time = 0  # When we last attempted a skip
+        self.last_skip_success_time = 0  # When we last successfully skipped an ad
         self.SKIP_ATTEMPT_COOLDOWN = 10.0  # Don't try again for 10s after ANY attempt (prevents pause spam)
 
         # Accidental pause detection

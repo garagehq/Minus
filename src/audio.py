@@ -73,36 +73,17 @@ class AudioPassthrough:
     def _init_pipeline(self):
         """Initialize GStreamer audio pipeline."""
         try:
-            # Audio passthrough pipeline with silent keepalive:
-            # - audiomixer combines HDMI input with inaudible tone
-            # - This prevents pipeline stalls when HDMI source has silence
-            # - The keepalive tone is at -60dB (0.001 volume) - completely inaudible
-            #
-            # Pipeline structure:
-            #   alsasrc (HDMI) ──┐
-            #                    ├──► audiomixer ──► volume ──► alsasink
-            #   audiotestsrc ────┘
-            #   (silent keepalive)
-            #
+            # Simple audio passthrough pipeline with generous buffering
+            # Direct path: alsasrc → queue → audioconvert → volume → queue → alsasink
+            # Large buffers prevent underruns during system load spikes from NPU inference
             pipeline_str = (
-                # HDMI audio input
-                f"alsasrc device={self.capture_device} ! "
+                f"alsasrc device={self.capture_device} buffer-time=500000 ! "
                 f"audio/x-raw,rate=48000,channels=2,format=S16LE ! "
-                f"queue max-size-buffers=10 leaky=downstream name=audioqueue ! "
-                f"audioconvert ! audioresample ! "
-                f"audio/x-raw,rate=48000,channels=2,format=F32LE ! "
-                f"mix. "
-
-                # Silent keepalive tone (inaudible - prevents pipeline stalls)
-                f"audiotestsrc wave=silence is-live=true ! "
-                f"audio/x-raw,rate=48000,channels=2,format=F32LE ! "
-                f"mix. "
-
-                # Mix and output
-                f"audiomixer name=mix ! "
-                f"volume name=vol volume=1.0 mute=false ! "
+                f"queue max-size-buffers=200 max-size-time=1000000000 leaky=downstream name=audioqueue ! "
                 f"audioconvert ! "
-                f"alsasink device={self.playback_device} sync=false"
+                f"volume name=vol volume=1.0 mute=false ! "
+                f"queue max-size-buffers=200 max-size-time=1000000000 leaky=downstream ! "
+                f"alsasink device={self.playback_device} buffer-time=300000 latency-time=30000 sync=false"
             )
 
             logger.debug(f"[AudioPassthrough] Creating pipeline: {pipeline_str}")
