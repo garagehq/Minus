@@ -73,17 +73,17 @@ class AudioPassthrough:
     def _init_pipeline(self):
         """Initialize GStreamer audio pipeline."""
         try:
-            # Ultra low-latency audio passthrough pipeline
+            # Low-latency audio passthrough pipeline
             # Direct path: alsasrc → queue → audioconvert → volume → alsasink
-            # Minimal buffers for best A/V sync (~50-80ms total)
+            # Balanced buffers for good A/V sync (~80-120ms total) without glitches
             # Using provide-clock=false to prevent alsasrc from being clock master
             pipeline_str = (
-                f"alsasrc device={self.capture_device} buffer-time=20000 latency-time=5000 provide-clock=false ! "
+                f"alsasrc device={self.capture_device} buffer-time=35000 latency-time=10000 provide-clock=false ! "
                 f"audio/x-raw,rate=48000,channels=2,format=S16LE ! "
-                f"queue max-size-buffers=3 max-size-time=30000000 leaky=downstream name=audioqueue ! "
+                f"queue max-size-buffers=5 max-size-time=50000000 leaky=downstream name=audioqueue ! "
                 f"audioconvert ! "
                 f"volume name=vol volume=1.0 mute=false ! "
-                f"alsasink device={self.playback_device} buffer-time=20000 latency-time=5000 sync=false"
+                f"alsasink device={self.playback_device} buffer-time=35000 latency-time=10000 sync=false"
             )
 
             logger.debug(f"[AudioPassthrough] Creating pipeline: {pipeline_str}")
