@@ -25,7 +25,7 @@ import sys
 import time
 
 # Add src to path
-sys.path.insert(0, '/home/radxa/Minus')
+sys.path.insert(0, '')
 
 from src.fire_tv import FireTVController, quick_connect, auto_setup, KEY_CODES
 
