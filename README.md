@@ -1,8 +1,156 @@
 # Minus
 
-HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
-- **PaddleOCR** on RK3588 NPU (~300ms per frame)
-- **Qwen3-VL-2B** on Axera LLM 8850 NPU (~1.5s per frame)
+HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs on embedded hardware.
+
+## Overview
+
+Minus is an embedded system that captures HDMI input, detects advertisements using machine learning models, and blocks them in real-time. The system leverages:
+
+- **RK3588 NPU**: Runs PaddleOCR for text detection (~300ms per frame)
+- **Axera LLM 8850 NPU**: Runs Qwen2.5-VL-2B for visual language modeling (~1.5s per frame)
+- **Fire TV Integration**: Controls connected Fire TV devices
+- **GStreamer Pipeline**: Video processing and overlay rendering
+
+## Architecture
+
+The system consists of:
+
+1. **Video Capture**: ustreamer captures from HDMI-RX and serves MJPEG stream
+2. **Processing**: GStreamer with input-selector for video pipeline
+3. **ML Detection**: Dual NPU setup for OCR and visual language analysis
+4. **Ad Blocking**: Overlay system to block detected ads
+5. **Control**: Fire TV controller for device management
+6. **Web UI**: HTTP API for status and control
+
+## Installation
+
+### Prerequisites
+
+- RK3588-based embedded hardware with HDMI-RX
+- Axera LLM 8850 NPU
+- Fire TV device (optional, for control integration)
+- Python 3.12+
+
+### Dependencies
+
+Install system packages:
+
+```bash
+sudo apt install python3-gi gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+Install Python dependencies:
+
+```bash
+pip3 install --break-system-packages -r requirements.txt
+```
+
+Or with sudo:
+
+```bash
+sudo pip3 install --break-system-packages -r requirements.txt
+```
+
+### Model Files
+
+The executable requires external model files at runtime:
+
+- **PaddleOCR models**: Standard location (installed with rknn-toolkit-lite2)
+- **VLM models**: `/home/radxa/axera_models/Qwen2.5-VL-2B/`
+
+## Usage
+
+### Starting the System
+
+```bash
+python3 minus.py
+```
+
+### Using Shell Scripts
+
+```bash
+# Start the system
+bash start.sh
+
+# Stop the system
+bash stop.sh
+
+# Install (requires sudo)
+bash install.sh
+
+# Uninstall (requires sudo)
+bash uninstall.sh
+```
+
+### Fire TV Controller
+
+Test the Fire TV controller:
+
+```bash
+python3 test_fire_tv.py
+```
+
+Connect to a specific Fire TV:
+
+```bash
+python3 test_fire_tv.py <fire_tv_ip>
+```
+
+Interactive mode:
+
+```bash
+python3 test_fire_tv.py --interactive
+```
+
+Demo mode:
+
+```bash
+python3 test_fire_tv.py --demo
+```
+
+### Web UI
+
+Access the web interface at:
+
+- Status endpoint: `http://<host>:<port>/api/status`
+
+## Testing
+
+### Python Tests
+
+```bash
+python3 -m pytest test_fire_tv.py -v
+```
+
+### Shell Tests
+
+Run video processing tests:
+
+```bash
+bash tests/test_mpv_buffered.sh
+bash tests/test_fps.sh
+bash tests/test_direct.sh
+bash tests/test_single.sh
+bash tests/test_vlc.sh
+bash tests/test_h264.sh
+bash tests/test_rkx.sh
+```
+
+Compare colors:
+
+```bash
+bash compare_colors.sh
+```
+
+Test overlay:
+
+```bash
+bash test_overlay.sh
+```
+
+## License
+
+MIT
 - **Audio passthrough** with auto-mute during ads
 - **Spanish vocabulary practice** during ad blocks!
 - **Web UI** for remote monitoring and control via Tailscale
@@ -41,7 +189,7 @@ Minus captures video from HDMI-RX, displays it via GStreamer kmssink at 30fps, w
               │                               │
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
-     │   PaddleOCR     │           │   Qwen3-VL-2B       │
+     │   PaddleOCR     │           │   Qwen2.5-VL-2B     │
      │   RK3588 NPU    │           │   Axera LLM 8850    │
      │   ~400ms        │           │   ~1.5s             │
      └─────────────────┘           └─────────────────────┘
