@@ -908,42 +908,46 @@ def quick_connect(ip_address: Optional[str] = None) -> Optional[FireTVController
     Returns:
         Connected FireTVController or None if failed
     """
-    controller = FireTVController()
+    try:
+        controller = FireTVController()
 
-    if not ip_address:
-        # Auto-detect Fire TV on network
-        logger.info("[FireTV] No IP provided, searching for Fire TV on network...")
-        fire_tv = controller.detect_fire_tv(timeout=10.0)
+        if not ip_address:
+            # Auto-detect Fire TV on network
+            logger.info("[FireTV] No IP provided, searching for Fire TV on network...")
+            fire_tv = controller.detect_fire_tv(timeout=10.0)
 
-        if not fire_tv:
-            # detect_fire_tv already printed helpful messages
-            return None
+            if not fire_tv:
+                # detect_fire_tv already printed helpful messages
+                return None
 
-        logger.info(f"[FireTV] Found and connected to Fire TV at {fire_tv['ip']}")
-        return controller
-    else:
-        # Connect to specified IP
-        if controller.connect(ip_address):
-            # Verify it's a Fire TV
-            info = controller.get_device_info()
-            if info:
-                manufacturer = info.get("manufacturer", "")
-                model = info.get("model", "")
-                if controller._is_fire_tv_device(manufacturer, model):
-                    logger.info(f"[FireTV] Connected to Fire TV: {manufacturer} {model}")
-                    return controller
+            logger.info(f"[FireTV] Found and connected to Fire TV at {fire_tv['ip']}")
+            return controller
+        else:
+            # Connect to specified IP
+            if controller.connect(ip_address):
+                # Verify it's a Fire TV
+                info = controller.get_device_info()
+                if info:
+                    manufacturer = info.get("manufacturer", "")
+                    model = info.get("model", "")
+                    if controller._is_fire_tv_device(manufacturer, model):
+                        logger.info(f"[FireTV] Connected to Fire TV: {manufacturer} {model}")
+                        return controller
+                    else:
+                        logger.warning(f"[FireTV] Device at {ip_address} is not a Fire TV: {manufacturer} {model}")
+                        print(f"\nNote: The device at {ip_address} appears to be a {manufacturer} {model}")
+                        print("This module is designed for Fire TV devices.")
+                        controller.disconnect()
+                        return None
                 else:
-                    logger.warning(f"[FireTV] Device at {ip_address} is not a Fire TV: {manufacturer} {model}")
-                    print(f"\nNote: The device at {ip_address} appears to be a {manufacturer} {model}")
-                    print("This module is designed for Fire TV devices.")
-                    controller.disconnect()
-                    return None
-            else:
-                # Couldn't get info but connected - might still be Fire TV
-                logger.warning("[FireTV] Connected but couldn't verify device type")
-                return controller
+                    # Couldn't get info but connected - might still be Fire TV
+                    logger.warning("[FireTV] Connected but couldn't verify device type")
+                    return controller
 
-    return None
+        return None
+    except Exception as e:
+        logger.error(f"[FireTV] Quick connect failed with error: {e}")
+        return None
 
 
 def auto_setup() -> Optional[FireTVController]:

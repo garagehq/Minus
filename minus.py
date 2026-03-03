@@ -2048,17 +2048,25 @@ def main():
 
     args = parser.parse_args()
 
-    config = MinusConfig(
-        device=args.device,
-        screenshot_dir=args.screenshot_dir,
-        ocr_timeout=args.ocr_timeout,
-        max_screenshots=args.max_screenshots,
-        drm_connector_id=args.connector_id,
-        drm_plane_id=args.plane_id,
-        webui_port=args.webui_port,
-    )
+    try:
+        config = MinusConfig(
+            device=args.device,
+            screenshot_dir=args.screenshot_dir,
+            ocr_timeout=args.ocr_timeout,
+            max_screenshots=args.max_screenshots,
+            drm_connector_id=args.connector_id,
+            drm_plane_id=args.plane_id,
+            webui_port=args.webui_port,
+        )
+    except Exception as e:
+        logger.error(f"Failed to create MinusConfig: {e}")
+        sys.exit(1)
 
-    minus = Minus(config)
+    try:
+        minus = Minus(config)
+    except Exception as e:
+        logger.error(f"Failed to initialize Minus: {e}")
+        sys.exit(1)
 
     if args.check_signal:
         signal_info = minus.check_hdmi_signal()
@@ -2072,13 +2080,20 @@ def main():
 
     def signal_handler(sig, frame):
         logger.info("Shutting down...")
-        minus.stop()
+        try:
+            minus.stop()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    minus.run()
+    try:
+        minus.run()
+    except Exception as e:
+        logger.error(f"Unexpected error during Minus run: {e}")
+        sys.exit(1)
 
 
 if __name__ == '__main__':
