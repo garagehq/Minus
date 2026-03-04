@@ -187,6 +187,14 @@ class PaddleOCR:
 
     def __init__(self, det_model_path, rec_model_path, dict_path,
                  cls_model_path=None):
+        """Initialize PaddleOCR with model paths.
+        
+        Args:
+            det_model_path: Path to detection RKNN model
+            rec_model_path: Path to recognition RKNN model
+            dict_path: Path to character dictionary
+            cls_model_path: Optional path to classification RKNN model
+        """
         self.det_model_path = det_model_path
         self.rec_model_path = rec_model_path
         self.cls_model_path = cls_model_path
@@ -196,6 +204,7 @@ class PaddleOCR:
         self.rec_rknn = None
         self.cls_rknn = None
 
+        # Model input dimensions
         self.det_input_h = 960
         self.det_input_w = 960
         self.rec_input_h = 48
@@ -204,50 +213,87 @@ class PaddleOCR:
         self.db_postprocess = DBPostProcessor() if HAS_POSTPROCESS else None
         self.ctc_decode = None
         self.initialized = False
+        self._model_load_errors = []
 
     def load_models(self):
-        """Load all RKNN models."""
+        """Load all RKNN models with detailed error tracking.
+        
+        Returns:
+            bool: True if all models loaded successfully, False otherwise
+        """
         if not HAS_POSTPROCESS:
-            print("[OCR] Cannot load models without pyclipper/shapely")
+            logger.error("[OCR] Cannot load models without pyclipper/shapely")
+            self._model_load_errors.append("Missing pyclipper/shapely dependencies")
             return False
 
-        print("[OCR] Loading PaddleOCR models...")
+        logger.info("[OCR] Loading PaddleOCR models...")
+        self._model_load_errors = []
 
         # Load detection model
-        print(f"[OCR]   Loading detection model...")
-        self.det_rknn = RKNNLite()
-        ret = self.det_rknn.load_rknn(self.det_model_path)
-        if ret != 0:
-            print(f"[OCR]   Failed to load detection model: {ret}")
-            return False
-        ret = self.det_rknn.init_runtime()
-        if ret != 0:
-            print(f"[OCR]   Failed to init detection runtime: {ret}")
+        logger.info("[OCR]   Loading detection model...")
+        try:
+            self.det_rknn = RKNNLite()
+            ret = self.det_rknn.load_rknn(self.det_model_path)
+            if ret != 0:
+                self._model_load_errors.append(f"Detection model load failed: {ret}")
+                logger.error(f"[OCR]   Failed to load detection model: {ret}")
+                return False
+            ret = self.det_rknn.init_runtime()
+            if ret != 0:
+                self._model_load_errors.append(f"Detection runtime init failed: {ret}")
+                logger.error(f"[OCR]   Failed to init detection runtime: {ret}")
+                return False
+            logger.info("[OCR]   Detection model loaded successfully")
+        except Exception as e:
+            self._model_load_errors.append(f"Detection model error: {str(e)}")
+            logger.error(f"[OCR]   Exception loading detection model: {e}")
             return False
 
         # Load recognition model
-        print(f"[OCR]   Loading recognition model...")
-        self.rec_rknn = RKNNLite()
-        ret = self.rec_rknn.load_rknn(self.rec_model_path)
-        if ret != 0:
-            print(f"[OCR]   Failed to load recognition model: {ret}")
-            return False
-        ret = self.rec_rknn.init_runtime()
-        if ret != 0:
-            print(f"[OCR]   Failed to init recognition runtime: {ret}")
+        logger.info("[OCR]   Loading recognition model...")
+        try:
+            self.rec_rknn = RKNNLite()
+            ret = self.rec_rknn.load_rknn(self.rec_model_path)
+            if ret != 0:
+                self._model_load_errors.append(f"Recognition model load failed: {ret}")
+                logger.error(f"[OCR]   Failed to load recognition model: {ret}")
+                return False
+            ret = self.rec_rknn.init_runtime()
+            if ret != 0:
+                self._model_load_errors.append(f"Recognition runtime init failed: {ret}")
+                logger.error(f"[OCR]   Failed to init recognition runtime: {ret}")
+                return False
+            logger.info("[OCR]   Recognition model loaded successfully")
+        except Exception as e:
+            self._model_load_errors.append(f"Recognition model error: {str(e)}")
+            logger.error(f"[OCR]   Exception loading recognition model: {e}")
             return False
 
         # Initialize CTC decoder
         if os.path.exists(self.dict_path):
-            self.ctc_decode = CTCLabelDecode(self.dict_path)
-            print(f"[OCR]   Dictionary loaded: {len(self.ctc_decode.character)} characters")
+            try:
+                self.ctc_decode = CTCLabelDecode(self.dict_path)
+                logger.info(f"[OCR]   Dictionary loaded: {len(self.ctc_decode.character)} characters")
+            except Exception as e:
+                self._model_load_errors.append(f"Dictionary load error: {str(e)}")
+                logger.error(f"[OCR]   Failed to initialize CTC decoder: {e}")
+                return False
         else:
-            print(f"[OCR]   Dictionary not found: {self.dict_path}")
+            self._model_load_errors.append(f"Dictionary not found: {self.dict_path}")
+            logger.error(f"[OCR]   Dictionary not found: {self.dict_path}")
             return False
 
         self.initialized = True
-        print("[OCR] Models loaded successfully")
+        logger.info("[OCR] All models loaded successfully")
         return True
+
+    def get_load_errors(self):
+        """Get list of model load errors.
+        
+        Returns:
+            list: List of error messages from model loading
+        """
+        return self._model_load_errors.copy()
 
     def preprocess_det(self, img):
         """Preprocess image for detection."""

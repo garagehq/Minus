@@ -36,6 +36,15 @@ class VLMManager:
         self.is_ready = False
         self._lock = threading.Lock()
         self.process = None
+        self._performance_stats = {
+            'inference_count': 0,
+            'total_time': 0.0,
+            'min_time': float('inf'),
+            'max_time': 0.0,
+            'avg_time': 0.0,
+            'errors': [],
+            'max_error_history': 10,
+        }
 
         # Validate paths
         if not QWEN3_MODEL_DIR.exists():
@@ -163,18 +172,51 @@ class VLMManager:
                 elapsed = time.time() - start_time
                 is_ad = self._is_ad_response(response)
 
+                # Update performance stats
+                self._update_performance_stats(elapsed, is_ad)
+
                 return is_ad, response, elapsed
 
             except pexpect.TIMEOUT:
+                elapsed = time.time() - start_time
+                self._update_performance_stats(elapsed, False, error=True)
                 logger.error(f"VLM timeout on {image_path}")
-                return False, "TIMEOUT", time.time() - start_time
+                return False, "TIMEOUT", elapsed
             except pexpect.EOF:
                 logger.error("VLM process ended unexpectedly")
                 self.is_ready = False
                 return False, "EOF", 0
             except Exception as e:
+                elapsed = time.time() - start_time
+                self._update_performance_stats(elapsed, False, error=True)
                 logger.error(f"VLM inference error: {e}")
-                return False, str(e), 0
+                return False, str(e), elapsed
+
+    def _update_performance_stats(self, elapsed: float, is_ad: bool, error: bool = False):
+        """Update performance statistics."""
+        stats = self._performance_stats
+        stats['inference_count'] += 1
+        stats['total_time'] += elapsed
+        stats['avg_time'] = stats['total_time'] / stats['inference_count']
+        stats['min_time'] = min(stats['min_time'], elapsed)
+        stats['max_time'] = max(stats['max_time'], elapsed)
+
+        if error:
+            error_info = {
+                'timestamp': time.time(),
+                'elapsed': elapsed,
+            }
+            stats['errors'].append(error_info)
+            if len(stats['errors']) > stats['max_error_history']:
+                stats['errors'] = stats['errors'][-stats['max_error_history']:]
+
+    def get_performance_stats(self) -> dict:
+        """Get VLM performance statistics."""
+        stats = self._performance_stats.copy()
+        if stats['inference_count'] == 0:
+            stats['min_time'] = 0.0
+            stats['max_time'] = 0.0
+        return stats
 
     def _parse_response(self, output):
         """Parse the model output to extract Yes/No response."""

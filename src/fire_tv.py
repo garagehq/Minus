@@ -124,6 +124,15 @@ class FireTVController:
         # Connection callback
         self._on_connection_change: Optional[Callable[[bool], None]] = None
 
+        # Command statistics
+        self._command_stats = {
+            'total': 0,
+            'success': 0,
+            'failed': 0,
+            'last_command': None,
+            'last_command_time': None,
+        }
+
         # Ensure ADB keys exist
         self._ensure_adb_keys()
 
@@ -846,7 +855,17 @@ class FireTVController:
             "ip_address": self._ip_address,
             "auto_reconnect": self._auto_reconnect,
             "reconnect_failures": self._consecutive_failures,
+            "command_stats": self._command_stats,
         }
+
+    def get_command_stats(self) -> dict:
+        """Get command statistics."""
+        stats = self._command_stats.copy()
+        if stats['total'] > 0:
+            stats['success_rate'] = stats['success'] / stats['total'] * 100
+        else:
+            stats['success_rate'] = 0.0
+        return stats
 
     def wake_up(self) -> bool:
         """Wake up Fire TV from sleep."""

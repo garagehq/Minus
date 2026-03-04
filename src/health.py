@@ -82,6 +82,12 @@ class HealthMonitor:
         self.disk_warning_mb = 500
         self.vlm_timeout_threshold = 3  # consecutive timeouts before action
         self.startup_grace_period = 30.0  # Don't check ustreamer for first 30s
+        
+        # Health status tracking
+        self._health_history = []
+        self._max_history_length = 100
+        self._recovery_actions = []
+        self._last_recovery_time = 0
 
     def start(self):
         """Start the health monitor thread."""
@@ -135,7 +141,54 @@ class HealthMonitor:
         status.memory_percent = self._get_memory_percent()
         status.disk_free_mb = self._get_disk_free_mb()
 
+        # Record status in history
+        self._record_status(status)
+
         return status
+
+    def _record_status(self, status: HealthStatus):
+        """Record current status in history."""
+        self._health_history.append({
+            'timestamp': time.time(),
+            'uptime': status.uptime_seconds,
+            'hdmi': status.hdmi_signal,
+            'fps': status.output_fps,
+            'memory': status.memory_percent,
+            'vlm_ready': status.vlm_ready,
+        })
+        # Keep history bounded
+        if len(self._health_history) > self._max_history_length:
+            self._health_history = self._health_history[-self._max_history_length:]
+
+    def get_health_history(self, minutes: int = 5) -> list:
+        """Get health status history for specified time period.
+        
+        Args:
+            minutes: Number of minutes of history to return
+            
+        Returns:
+            list: List of status records
+        """
+        cutoff = time.time() - (minutes * 60)
+        return [
+            record for record in self._health_history
+            if record['timestamp'] >= cutoff
+        ]
+
+    def get_recovery_actions(self, minutes: int = 5) -> list:
+        """Get recovery actions taken in specified time period.
+        
+        Args:
+            minutes: Number of minutes of history to return
+            
+        Returns:
+            list: List of recovery action records
+        """
+        cutoff = time.time() - (minutes * 60)
+        return [
+            action for action in self._recovery_actions
+            if action['timestamp'] >= cutoff
+        ]
 
     def _monitor_loop(self):
         """Main monitoring loop."""
@@ -154,12 +207,14 @@ class HealthMonitor:
     def _check_and_recover(self):
         """Check health and trigger recovery if needed."""
         status = self.get_status()
+        uptime = time.time() - self._start_time
 
         # HDMI signal monitoring
         if not status.hdmi_signal and self._last_hdmi_signal:
             # Signal just lost
             self._hdmi_lost_time = time.time()
             logger.warning("[HealthMonitor] HDMI signal LOST")
+            self._log_recovery_action("hdmi_lost", uptime)
             if self._on_hdmi_lost:
                 self._on_hdmi_lost()
 
@@ -167,16 +222,17 @@ class HealthMonitor:
             # Signal just restored
             lost_duration = time.time() - self._hdmi_lost_time
             logger.info(f"[HealthMonitor] HDMI signal RESTORED (was lost {lost_duration:.1f}s)")
+            self._log_recovery_action("hdmi_restored", uptime, {"lost_duration": lost_duration})
             if self._on_hdmi_restored:
                 self._on_hdmi_restored()
 
         self._last_hdmi_signal = status.hdmi_signal
 
         # ustreamer health (skip during startup grace period)
-        uptime = time.time() - self._start_time
         if uptime > self.startup_grace_period:
             if status.ustreamer_alive and not status.ustreamer_responding:
                 logger.warning("[HealthMonitor] ustreamer not responding to HTTP requests")
+                self._log_recovery_action("ustreamer_stall", uptime)
                 if self._on_ustreamer_stall:
                     self._on_ustreamer_stall()
                 # Also trigger video pipeline restart after ustreamer restart
@@ -196,6 +252,7 @@ class HealthMonitor:
             if status.output_fps == 0 and status.video_pipeline_ok:
                 # Pipeline thinks it's OK but no frames flowing
                 logger.warning("[HealthMonitor] Video pipeline has 0 FPS - may be stalled")
+                self._log_recovery_action("video_pipeline_stall", uptime)
                 if self._on_video_pipeline_stall:
                     self._on_video_pipeline_stall()
 
@@ -208,16 +265,19 @@ class HealthMonitor:
             if not is_blocking and is_muted:
                 logger.warning("[HealthMonitor] Audio stuck muted while not blocking - forcing unmute")
                 self.minus.audio.unmute()
+                self._log_recovery_action("audio_unmute", uptime)
 
         # VLM health
         if status.vlm_consecutive_timeouts >= self.vlm_timeout_threshold:
             logger.warning(f"[HealthMonitor] VLM failing ({status.vlm_consecutive_timeouts} consecutive timeouts)")
+            self._log_recovery_action("vlm_failure", uptime, {"timeouts": status.vlm_consecutive_timeouts})
             if self._on_vlm_failure:
                 self._on_vlm_failure()
 
         # Memory check
         if status.memory_percent >= self.memory_critical_percent:
             logger.error(f"[HealthMonitor] CRITICAL memory usage: {status.memory_percent:.1f}%")
+            self._log_recovery_action("memory_critical", uptime, {"percent": status.memory_percent})
             if self._on_memory_critical:
                 self._on_memory_critical()
         elif status.memory_percent >= self.memory_warning_percent:
@@ -237,6 +297,19 @@ class HealthMonitor:
         # Periodic status log (every 5 minutes)
         if int(status.uptime_seconds) % 300 < self.check_interval:
             self._log_status(status)
+
+    def _log_recovery_action(self, action_type: str, uptime: float, details: dict = None):
+        """Log a recovery action."""
+        action = {
+            'timestamp': time.time(),
+            'uptime': uptime,
+            'action': action_type,
+            'details': details or {}
+        }
+        self._recovery_actions.append(action)
+        # Keep history bounded
+        if len(self._recovery_actions) > self._max_history_length:
+            self._recovery_actions = self._recovery_actions[-self._max_history_length:]
 
     def _log_status(self, status: HealthStatus):
         """Log periodic health status."""
