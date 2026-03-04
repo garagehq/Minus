@@ -3,3 +3,16 @@ __pycache__/
 __pycache__
 *.log
 minus.log
+
+# Auto-added by Marisol pipeline
+node_modules/
+*.pyc
+.pytest_cache/
+*.o
+*.so
+.env
+debug_*.py
+.cache/
+dist/
+build/
+*.egg-info/

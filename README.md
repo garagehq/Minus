@@ -287,6 +287,8 @@ python3 test_fire_tv.py --interactive
 When connecting for the first time, your Fire TV will show an "Allow USB Debugging?" dialog.
 Look at your TV and press **Allow** (check "Always allow" for permanent authorization).
 
+**Note:** The test script `test_fire_tv.py` requires a live Fire TV device on the network. It cannot run in isolation without hardware. The script will fail at connection time if no Fire TV device is found.
+
 **Available Commands:**
 - Navigation: up, down, left, right, select, back, home
 - Media: play, pause, play_pause, fast_forward, rewind
@@ -298,6 +300,36 @@ Look at your TV and press **Allow** (check "Always allow" for permanent authoriz
 ```bash
 # System packages
 sudo apt install -y imagemagick ffmpeg curl libevent-dev libjpeg-dev libbsd-dev
+```
+
+## Testing
+
+**Note:** This project requires specialized hardware (RK3588 NPU, Axera LLM 8850) and cannot be fully tested in a standard development environment.
+
+### Test Scripts
+
+- **Fire TV Controller Test**: `python3 test_fire_tv.py`
+  - Requires a live Fire TV device on the same network
+  - Cannot run in isolated container without hardware passthrough
+  - Options: `--setup` for guided setup, `--interactive` for remote control
+
+### Hardware Requirements for Testing
+
+- RK3588 board with HDMI-RX input
+- Axera M5 LLM 8850 (AX650N) NPU card
+- Fire TV device with ADB debugging enabled
+- HDMI source for video input
+
+### Known Test Limitations
+
+1. **No pytest tests**: The project uses standalone test scripts, not pytest
+2. **Hardware dependencies**: OCR, VLM, and ad blocking require actual NPU hardware
+3. **Network dependencies**: Fire TV control requires live device on network
+4. **Model files**: External model files required at runtime:
+   - PaddleOCR models in standard location
+   - VLM models in `/home/radxa/axera_models/Qwen3-VL-2B/`
+
+## Troubleshooting
 
 # Build ustreamer with MPP hardware encoding
 git clone https://github.com/garagehq/ustreamer.git /home/radxa/ustreamer-garagehq
