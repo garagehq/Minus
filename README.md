@@ -553,3 +553,120 @@ pyinstaller minus.spec
 ## License
 
 MIT
+
+## Hardware Requirements
+
+This project requires embedded hardware with NPU support:
+- **RK3588** (for PaddleOCR inference)
+- **Axera LLM 8850** (for Qwen3-VL-2B inference)
+
+## System Setup
+
+### Prerequisites
+
+1. Install system packages:
+```bash
+sudo apt install python3-gi gstreamer1.0-tools gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+```
+
+2. Install Python dependencies:
+```bash
+pip3 install --break-system-packages -r requirements.txt
+```
+
+### Model Configuration
+
+The executable requires external model files at runtime:
+- **PaddleOCR models**: Standard PaddleOCR model location (configure via config.yaml)
+- **Qwen3-VL-2B models**: `/home/radxa/axera_models/Qwen3-VL-2B/` (Axera-specific path)
+
+### Environment Variables
+
+No environment variables are strictly required, but you may configure:
+- `MINUS_CONFIG`: Path to custom config.yaml (default: ./config.yaml)
+
+## Usage
+
+### Basic Operation
+
+Run the main application:
+```bash
+python3 minus.py
+```
+
+### Systemd Service
+
+For automatic startup on boot:
+```bash
+sudo cp minus.service /etc/systemd/system/
+sudo systemctl enable minus
+sudo systemctl start minus
+```
+
+### Web Interface
+
+Access the web UI at `http://localhost:8080` (default port, configurable in config.yaml)
+
+## Testing
+
+### Manual Testing
+
+Due to hardware dependencies, testing must be performed on target hardware:
+1. Verify GStreamer pipeline: `gst-inspect-1.0` and `gst-launch-1.0`
+2. Test OCR module: `python3 src/ocr.py` (with sample video)
+3. Test VLM module: `python3 src/vlm.py` (with sample images)
+
+### Unit Tests
+
+If pytest is available:
+```bash
+python3 -m pytest tests/ -v
+```
+
+Note: Tests may fail in containerized environments without embedded hardware.
+
+## Troubleshooting
+
+### Common Issues
+
+1. **GStreamer pipeline fails**: Ensure gstreamer plugins are installed (`gstreamer1.0-plugins-good`, `gstreamer1.0-plugins-bad`)
+2. **NPU inference errors**: Verify rknn-toolkit-lite2 is installed and NPU drivers are loaded
+3. **Model not found**: Check that model files exist at configured paths
+4. **Fire TV integration fails**: Verify Fire TV device is on same network and credentials are correct
+
+### Debug Mode
+
+Enable verbose logging:
+```bash
+python3 minus.py --verbose
+```
+
+## Contributing
+
+Contributions are welcome! Please note:
+- This project requires embedded hardware for testing
+- Pull requests should include hardware test results where applicable
+- Document any hardware-specific changes in the PR description
+
+## Architecture
+
+The system uses a dual-NPU architecture:
+- **RK3588 NPU**: PaddleOCR for text detection (~300ms per frame)
+- **Axera LLM 8850 NPU**: Qwen3-VL-2B for visual understanding (~1.5s per frame)
+
+Video flows through GStreamer pipelines, with ad detection running in parallel on both NPUs. Detected ads are blocked via overlay techniques.
+
+## Files Overview
+
+- **minus.py**: Main entry point
+- **src/ocr.py**: PaddleOCR integration module
+- **src/vlm.py**: Vision-language model module
+- **src/ad_blocker.py**: Ad detection and blocking logic
+- **src/fire_tv.py**: Fire TV integration
+- **src/overlay.py**: Video overlay operations
+- **src/audio.py**: Audio processing
+- **src/webui.py**: Web interface backend
+- **config.yaml**: Configuration file
+- **minus.service**: Systemd service file
+- **tests/**: Test scripts for streaming scenarios
+
