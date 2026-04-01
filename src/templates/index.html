@@ -248,6 +248,16 @@
                 </div>
             </section>
 
+            <!-- Audio Settings -->
+            <section class="settings-section">
+                <h2>Audio Settings</h2>
+                <div class="setting-item">
+                    <span class="setting-label">A/V Sync</span>
+                    <button onclick="resetAVSync()" class="action-btn" id="av-sync-btn">Reset Sync</button>
+                </div>
+                <p class="help-text">If audio is out of sync with video, click to reset. Causes ~300ms audio dropout.</p>
+            </section>
+
             <!-- Fire TV Settings -->
             <section class="settings-section">
                 <h2>Fire TV Settings</h2>
@@ -844,6 +854,35 @@
                 console.error('Keep-alive toggle failed:', error);
                 document.getElementById('keepalive-toggle').checked = !enabled;
             }
+        }
+
+        async function resetAVSync() {
+            const btn = document.getElementById('av-sync-btn');
+            const originalText = btn.textContent;
+
+            btn.disabled = true;
+            btn.textContent = 'Resetting...';
+
+            try {
+                const response = await fetch('/api/audio/sync-reset', { method: 'POST' });
+                const data = await response.json();
+
+                if (data.success) {
+                    btn.textContent = '✓ Done!';
+                    console.log('A/V sync reset:', data.message);
+                } else {
+                    btn.textContent = '✗ Failed';
+                    console.error('A/V sync reset failed:', data.error);
+                }
+            } catch (error) {
+                btn.textContent = '✗ Error';
+                console.error('A/V sync reset error:', error);
+            }
+
+            setTimeout(() => {
+                btn.textContent = originalText;
+                btn.disabled = false;
+            }, 2000);
         }
 
         async function fetchKeepaliveState() {
