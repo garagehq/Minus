@@ -201,7 +201,7 @@ class DRMAdBlocker:
                 f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream "
                 f"is-live=true blocksize=262144 timeout=10 retries=-1 keep-alive=true ! "
                 f"multipartdemux ! jpegparse ! mppjpegdec ! video/x-raw,format=NV12 ! "
-                f"videobalance saturation=0.85 name=colorbalance ! "
+                f"videobalance saturation=1.25 brightness=0.0 contrast=1.0 hue=0.0 name=colorbalance ! "
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "
                 f"identity name=fpsprobe ! "
                 f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
@@ -248,6 +248,84 @@ class DRMAdBlocker:
     def get_fps(self):
         with self._fps_lock:
             return self._current_fps
+
+    # =========================================================================
+    # Color Balance Controls
+    # =========================================================================
+
+    def get_color_settings(self):
+        """Get current color balance settings.
+
+        Returns:
+            dict with saturation, brightness, contrast, hue values
+        """
+        defaults = {
+            'saturation': 1.25,
+            'brightness': 0.0,
+            'contrast': 1.0,
+            'hue': 0.0
+        }
+
+        if not self.pipeline:
+            return defaults
+
+        colorbalance = self.pipeline.get_by_name('colorbalance')
+        if not colorbalance:
+            return defaults
+
+        return {
+            'saturation': colorbalance.get_property('saturation'),
+            'brightness': colorbalance.get_property('brightness'),
+            'contrast': colorbalance.get_property('contrast'),
+            'hue': colorbalance.get_property('hue')
+        }
+
+    def set_color_settings(self, saturation=None, brightness=None, contrast=None, hue=None):
+        """Set color balance settings dynamically.
+
+        Args:
+            saturation: 0.0-2.0 (default 1.0, higher = more saturated)
+            brightness: -1.0 to 1.0 (default 0.0)
+            contrast: 0.0-2.0 (default 1.0)
+            hue: -1.0 to 1.0 (default 0.0)
+
+        Returns:
+            dict with success status and current values
+        """
+        if not self.pipeline:
+            return {'success': False, 'error': 'Pipeline not running'}
+
+        colorbalance = self.pipeline.get_by_name('colorbalance')
+        if not colorbalance:
+            return {'success': False, 'error': 'Color balance element not found'}
+
+        try:
+            if saturation is not None:
+                saturation = max(0.0, min(2.0, float(saturation)))
+                colorbalance.set_property('saturation', saturation)
+
+            if brightness is not None:
+                brightness = max(-1.0, min(1.0, float(brightness)))
+                colorbalance.set_property('brightness', brightness)
+
+            if contrast is not None:
+                contrast = max(0.0, min(2.0, float(contrast)))
+                colorbalance.set_property('contrast', contrast)
+
+            if hue is not None:
+                hue = max(-1.0, min(1.0, float(hue)))
+                colorbalance.set_property('hue', hue)
+
+            current = self.get_color_settings()
+            logger.info(f"[DRMAdBlocker] Color settings updated: sat={current['saturation']:.2f} "
+                       f"bright={current['brightness']:.2f} contrast={current['contrast']:.2f} "
+                       f"hue={current['hue']:.2f}")
+
+            return {'success': True, **current}
+
+        except Exception as e:
+            logger.error(f"[DRMAdBlocker] Error setting color: {e}")
+            return {'success': False, 'error': str(e)}
 
     def start(self):
         # Stop any animations before starting normal pipeline

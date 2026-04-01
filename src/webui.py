@@ -1003,6 +1003,56 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # Video Color Settings
+        # =========================================================================
+
+        @self.app.route('/api/video/color')
+        def api_video_color_get():
+            """Get current video color balance settings.
+
+            Returns saturation, brightness, contrast, hue values.
+            """
+            try:
+                if hasattr(self.minus, 'ad_blocker') and self.minus.ad_blocker:
+                    settings = self.minus.ad_blocker.get_color_settings()
+                    return jsonify(settings)
+                return jsonify({'error': 'Ad blocker not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error getting color settings: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/video/color', methods=['POST'])
+        def api_video_color_set():
+            """Set video color balance settings.
+
+            JSON body can include any of:
+            - saturation: 0.0-2.0 (default 1.0, higher = more saturated)
+            - brightness: -1.0 to 1.0 (default 0.0)
+            - contrast: 0.0-2.0 (default 1.0)
+            - hue: -1.0 to 1.0 (default 0.0)
+            """
+            try:
+                if not hasattr(self.minus, 'ad_blocker') or not self.minus.ad_blocker:
+                    return jsonify({'success': False, 'error': 'Ad blocker not initialized'}), 500
+
+                data = request.get_json() or {}
+
+                result = self.minus.ad_blocker.set_color_settings(
+                    saturation=data.get('saturation'),
+                    brightness=data.get('brightness'),
+                    contrast=data.get('contrast'),
+                    hue=data.get('hue')
+                )
+
+                if result.get('success'):
+                    return jsonify(result)
+                else:
+                    return jsonify(result), 500
+            except Exception as e:
+                logger.error(f"Error setting color: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # OCR/VLM Testing
         # =========================================================================
 
