@@ -686,16 +686,34 @@ Color correction is done via GStreamer's `videobalance` element in the pipeline.
 The HDMI-RX device doesn't support V4L2 image controls (saturation, contrast, brightness).
 Only read-only controls are available: `audio_sampling_rate`, `audio_present`, `power_present`.
 
-**Current settings (in `src/ad_blocker.py`):**
+**Default settings (in `src/ad_blocker.py`):**
 ```
-videobalance saturation=0.85  # Reduce oversaturation (default 1.0, range 0-2)
+videobalance saturation=1.25 brightness=0.0 contrast=1.0 hue=0.0
 ```
 
-**To adjust colors:**
-Edit the `videobalance` element in `_init_pipeline()` in `src/ad_blocker.py`:
-- `saturation`: 0.0-2.0 (default 1.0, lower = less saturated)
+**Web UI Controls:**
+Color settings can be adjusted in real-time via the Settings tab in the web UI:
+- **Saturation**: 0.5-1.5 slider (default 1.25, higher = more vivid)
+- **Brightness**: -0.5 to 0.5 slider (default 0.0)
+- **Contrast**: 0.5-1.5 slider (default 1.0)
+- **Hue**: -0.5 to 0.5 slider (default 0.0)
+
+**API Endpoints:**
+```bash
+# Get current color settings
+curl http://localhost/api/video/color
+
+# Set color settings (any combination)
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"saturation": 1.3, "brightness": 0.1}' \
+  http://localhost/api/video/color
+```
+
+**GStreamer ranges (for advanced use):**
+- `saturation`: 0.0-2.0 (default 1.0)
 - `contrast`: 0.0-2.0 (default 1.0)
 - `brightness`: -1.0 to 1.0 (default 0.0)
+- `hue`: -1.0 to 1.0 (default 0.0)
 
 ## Running as a Service
 
