@@ -105,7 +105,7 @@ python3 minus.py
 --check-signal            # Just check HDMI signal and exit
 --connector-id 231        # DRM connector ID (auto-detected if not specified)
 --plane-id 192            # DRM plane ID (auto-detected if not specified)
---webui-port 8080         # Web UI port (default: 8080)
+--webui-port 80         # Web UI port (default: 80)
 ```
 
 **Auto-detection at startup:**
@@ -611,10 +611,10 @@ For development and testing ad blocking without waiting for real ads:
 # Trigger blocking for 20 seconds (max 60)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"duration": 20, "source": "ocr"}' \
-  http://localhost:8080/api/test/trigger-block
+  http://localhost:80/api/test/trigger-block
 
 # Stop blocking immediately
-curl -X POST http://localhost:8080/api/test/stop-block
+curl -X POST http://localhost:80/api/test/stop-block
 ```
 
 Parameters for trigger-block:
@@ -624,8 +624,8 @@ Parameters for trigger-block:
 Test mode prevents the detection loop from canceling the blocking, allowing full testing of pixelated background, animations, and audio muting.
 
 **Access URLs:**
-- Local: `http://localhost:8080`
-- Tailscale: `http://<tailscale-hostname>:8080`
+- Local: `http://localhost:80`
+- Tailscale: `http://<tailscale-hostname>:80`
 - Direct stream: `http://<hostname>:9090/stream`
 
 **Security:**

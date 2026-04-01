@@ -2062,8 +2062,8 @@ def main():
     parser.add_argument(
         '--webui-port',
         type=int,
-        default=8080,
-        help='Web UI port (default: 8080)'
+        default=80,
+        help='Web UI port (default: 80, requires root)'
     )
     parser.add_argument(
         '--no-ocr',

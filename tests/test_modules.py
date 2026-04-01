@@ -98,7 +98,7 @@ class TestConfig:
         assert config.ocr_timeout == 1.5
         assert config.ustreamer_port == 9090
         assert config.max_screenshots == 0  # 0 = unlimited for training
-        assert config.webui_port == 8080
+        assert config.webui_port == 80
 
     def test_config_custom_values(self):
         """Test that MinusConfig accepts custom values."""
@@ -991,8 +991,8 @@ class TestWebUI:
         """Test WebUI initialization."""
         from webui import WebUI
         mock_minus = MagicMock()
-        ui = WebUI(mock_minus, port=8080, ustreamer_port=9090)
-        assert ui.port == 8080
+        ui = WebUI(mock_minus, port=80, ustreamer_port=9090)
+        assert ui.port == 80
         assert ui.ustreamer_port == 9090
         assert ui.running is False
 

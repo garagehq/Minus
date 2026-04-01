@@ -38,7 +38,7 @@ fi
 systemctl enable avahi-daemon 2>/dev/null || true
 systemctl restart avahi-daemon 2>/dev/null || true
 echo "    Hostname set to: ${HOSTNAME}"
-echo "    Access via: http://${HOSTNAME}.local:8080"
+echo "    Access via: http://${HOSTNAME}.local:80"
 
 # Stop existing service if running
 echo "[2/7] Stopping existing service..."
@@ -75,7 +75,7 @@ echo ""
 echo "=== Installation Complete ==="
 echo ""
 echo "Access:"
-echo "  Web UI:  http://${HOSTNAME}.local:8080"
+echo "  Web UI:  http://${HOSTNAME}.local:80"
 echo "  Stream:  http://${HOSTNAME}.local:9090/stream"
 echo ""
 echo "Commands:"

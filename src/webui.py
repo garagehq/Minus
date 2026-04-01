@@ -34,7 +34,7 @@ logger = logging.getLogger('Minus.WebUI')
 class WebUI:
     """Web UI server for Minus."""
 
-    def __init__(self, minus_instance, port: int = 8080, ustreamer_port: int = 9090):
+    def __init__(self, minus_instance, port: int = 80, ustreamer_port: int = 9090):
         """
         Initialize web UI.
 

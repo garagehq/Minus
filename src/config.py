@@ -19,7 +19,7 @@ class MinusConfig:
     output_height: int = None  # Auto-detect from display EDID
     audio_capture_device: str = "auto"  # HDMI-RX audio input - auto-detected from /proc/asound/cards
     audio_playback_device: str = None  # Auto-detect based on connected HDMI output
-    webui_port: int = 8080  # Web UI port
+    webui_port: int = 80  # Web UI port (port 80 requires root)
     no_ocr: bool = False  # Disable OCR processing (for testing)
     no_vlm: bool = False  # Disable VLM processing (for testing)
     no_blocking: bool = False  # Disable blocking overlays (for testing)

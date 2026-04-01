@@ -90,7 +90,7 @@ python3 minus.py --check-signal
 | `--check-signal` | Check HDMI signal and exit |
 | `--connector-id N` | DRM connector ID (default: 215) |
 | `--plane-id N` | DRM plane ID (default: 72) |
-| `--webui-port N` | Web UI port (default: 8080) |
+| `--webui-port N` | Web UI port (default: 80) |
 
 ## Performance
 
@@ -479,9 +479,9 @@ Minus includes a unified health monitor that runs in the background:
 Minus includes a mobile-friendly web UI for remote monitoring and control:
 
 **Access:**
-- Local: `http://localhost:8080`
-- mDNS: `http://minus.local:8080` (from any device on same network)
-- Tailscale: `http://<tailscale-hostname>:8080`
+- Local: `http://localhost:80`
+- mDNS: `http://minus.local:80` (from any device on same network)
+- Tailscale: `http://<tailscale-hostname>:80`
 - Direct video stream: `http://minus.local:9090/stream`
 
 **Features:**
@@ -505,10 +505,10 @@ For development and testing, you can manually trigger ad blocking:
 # Trigger blocking for 20 seconds (source: ocr, vlm, both, or default)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"duration": 20, "source": "ocr"}' \
-  http://localhost:8080/api/test/trigger-block
+  http://localhost:80/api/test/trigger-block
 
 # Stop blocking immediately
-curl -X POST http://localhost:8080/api/test/stop-block
+curl -X POST http://localhost:80/api/test/stop-block
 ```
 
 Test mode prevents the detection loop from canceling the blocking, allowing you to test the full blocking experience including pixelated background and animations.

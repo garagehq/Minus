@@ -20,7 +20,7 @@ class StabilityMonitor:
     def __init__(self, test_duration=1800):
         self.test_duration = test_duration
         self.stream_url = "http://localhost:9090/stream"
-        self.api_url = "http://localhost:8080/api/status"
+        self.api_url = "http://localhost:80/api/status"
 
         # Video monitoring
         self.frame_times = deque(maxlen=1000)
