@@ -716,6 +716,13 @@ The service:
 
 ## Development Notes
 
+**CRITICAL: Always verify fixes work before claiming completion:**
+- After implementing a fix, TEST it by observing actual behavior
+- Do not claim "fixed" until you have verified the fix works
+- Create innovative ways to test when direct observation isn't possible (e.g., check logs, API responses, file changes, process state)
+- Continue iterating on solutions until they demonstrably work
+- If you cannot verify a fix, clearly state that it needs user verification
+
 - Do NOT create v2, v3, v4 files - update existing files directly
 - VLM uses Python axengine for inference (not pexpect/C++ binary)
 - Both NPUs run in parallel without resource contention
