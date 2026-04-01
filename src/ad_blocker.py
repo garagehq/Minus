@@ -910,9 +910,7 @@ class DRMAdBlocker:
 
     def _on_end_animation_complete(self):
         logger.debug("[DRMAdBlocker] End animation complete")
-        # CRITICAL: Use 'clear' to fully reset blocking state including background
-        # Just setting 'enabled: false' can leave stale background/preview showing
-        self._blocking_api_call('/blocking/set', {'clear': 'true'}, timeout=0.5)
+        self._blocking_api_call('/blocking/set', {'enabled': 'false'}, timeout=0.5)
 
         # Write blocking state to file for zero-overhead checks (avoids HTTP)
         try:
