@@ -379,7 +379,9 @@ class Minus:
                 config.audio_playback_device = config.audio_playback_device or 'hw:0,0'
 
         # Initialize OCR
-        if HAS_OCR:
+        if config.no_ocr:
+            logger.info("OCR disabled via --no-ocr flag")
+        elif HAS_OCR:
             det_model, rec_model, dict_path = self._find_model_paths()
             if det_model:
                 self.ocr = PaddleOCR(
@@ -409,7 +411,9 @@ class Minus:
                 logger.exception(f"AdBlocker init failed: {e}")
 
         # Initialize VLM
-        if HAS_VLM:
+        if config.no_vlm:
+            logger.info("VLM disabled via --no-vlm flag")
+        elif HAS_VLM:
             try:
                 self.vlm = VLMManager()
                 logger.info("VLM manager initialized")
@@ -573,6 +577,7 @@ class Minus:
                 '--quality=80',
                 '--workers=4',             # 4 parallel MPP encoders (optimal)
                 '--buffers=5',
+                '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
             ]
 
             logger.info(f"[Recovery] Starting ustreamer: {' '.join(ustreamer_cmd)}")
@@ -1172,6 +1177,7 @@ class Minus:
             '--quality=80',
             '--workers=4',             # 4 parallel MPP encoders (optimal)
             '--buffers=5',
+            '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
         ]
 
         logger.info(f"Starting ustreamer: {' '.join(ustreamer_cmd)}")
@@ -1342,7 +1348,8 @@ class Minus:
                 self.ad_detected and
                 self.blocking_source and
                 not self.is_blocking_paused() and
-                not self.static_blocking_suppressed
+                not self.static_blocking_suppressed and
+                not self.config.no_blocking  # Allow disabling for testing
             )
 
             if self.ad_blocker:
@@ -1922,7 +1929,7 @@ class Minus:
         # 5 second delay ensures display is stable before scanning
         self._start_fire_tv_setup_delayed(delay_seconds=5.0)
 
-        # Load VLM model (takes ~40s, so start after WebUI is up)
+        # Load VLM model and start worker thread
         if self.vlm:
             # Show loading notification
             if self.system_notification:
@@ -2073,6 +2080,21 @@ def main():
         default=8080,
         help='Web UI port (default: 8080)'
     )
+    parser.add_argument(
+        '--no-ocr',
+        action='store_true',
+        help='Disable OCR processing (for testing)'
+    )
+    parser.add_argument(
+        '--no-vlm',
+        action='store_true',
+        help='Disable VLM processing (for testing)'
+    )
+    parser.add_argument(
+        '--no-blocking',
+        action='store_true',
+        help='Disable all blocking overlays (for testing)'
+    )
 
     args = parser.parse_args()
 
@@ -2084,6 +2106,9 @@ def main():
         drm_connector_id=args.connector_id,
         drm_plane_id=args.plane_id,
         webui_port=args.webui_port,
+        no_ocr=args.no_ocr,
+        no_vlm=args.no_vlm,
+        no_blocking=args.no_blocking,
     )
 
     minus = Minus(config)

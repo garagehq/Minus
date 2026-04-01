@@ -105,6 +105,9 @@ class DRMAdBlocker:
 
         # Preview settings - use actual capture resolution for positioning
         self._preview_enabled = True
+
+        # Pixelated background - disabled to test if it causes remaining glitches
+        self._pixelated_background_enabled = False  # DISABLED for glitch testing
         self._frame_width, self._frame_height = self._detect_frame_resolution()
         self._preview_w = int(self._frame_width * 0.20)
         self._preview_h = int(self._frame_height * 0.20)
@@ -125,6 +128,8 @@ class DRMAdBlocker:
         self._animating = False
         self._animation_direction = None
         self._animation_source = None
+        # Animation can be disabled to prevent glitches (rapid API calls cause stream hiccups)
+        self._animation_enabled = True  # Re-enabled with 10fps to reduce HTTP calls
 
         # Text background box opacity (0=transparent, 255=opaque)
         # Default was 180, increased for better readability
@@ -189,12 +194,17 @@ class DRMAdBlocker:
     def _init_pipeline(self):
         """Initialize simple GStreamer display pipeline with queue element."""
         try:
-            # Simple pipeline with queue element to prevent buffer buildup
+            # Pipeline with larger buffer to absorb periodic hiccups
+            # - souphttpsrc: keep-alive, infinite retries, larger blocksize
+            # - Single queue with more buffers (500ms worth at 30fps)
+            # - leaky=downstream ensures no latency accumulation
+            # Pipeline with optimal settings
             pipeline_str = (
-                f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream blocksize=524288 ! "
+                f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream "
+                f"is-live=true blocksize=262144 timeout=10 retries=-1 keep-alive=true ! "
                 f"multipartdemux ! jpegparse ! mppjpegdec ! video/x-raw,format=NV12 ! "
                 f"videobalance saturation=0.85 name=colorbalance ! "
-                f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "
+                f"queue max-size-buffers=20 max-size-time=500000000 leaky=downstream name=videoqueue ! "
                 f"identity name=fpsprobe ! "
                 f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
             )
@@ -876,7 +886,7 @@ class DRMAdBlocker:
 
             if progress >= 1.0:
                 break
-            time.sleep(0.016)
+            time.sleep(0.1)  # 10fps animation (was 0.016 = 60fps) - reduces HTTP calls from ~19 to ~3
 
         # Set final position
         if direction == 'start':
@@ -903,6 +913,14 @@ class DRMAdBlocker:
     def _on_end_animation_complete(self):
         logger.debug("[DRMAdBlocker] End animation complete")
         self._blocking_api_call('/blocking/set', {'enabled': 'false'}, timeout=0.5)
+
+        # Write blocking state to file for zero-overhead checks (avoids HTTP)
+        try:
+            with open('/dev/shm/minus_blocking_state', 'w') as f:
+                f.write('0')
+        except Exception:
+            pass
+
         if self.audio:
             self.audio.unmute()
 
@@ -934,6 +952,13 @@ class DRMAdBlocker:
             else:
                 self._stop_debug_thread()
                 self._blocking_api_call('/blocking/set', {'text_stats': ''})
+
+    def is_pixelated_background_enabled(self):
+        return self._pixelated_background_enabled
+
+    def set_pixelated_background_enabled(self, enabled):
+        self._pixelated_background_enabled = enabled
+        logger.info(f"[DRMAdBlocker] Pixelated background {'enabled' if enabled else 'disabled'}")
 
     def set_skip_status(self, available: bool, text: str = None):
         self._skip_available = available
@@ -1016,13 +1041,35 @@ class DRMAdBlocker:
             self.is_visible = True
             self.current_source = source
 
+            # Write blocking state to file for zero-overhead checks (avoids HTTP)
+            try:
+                with open('/dev/shm/minus_blocking_state', 'w') as f:
+                    f.write('1')
+            except Exception:
+                pass
+
             if self.minus:
                 self.minus.blocking_active = True
 
             # Upload background asynchronously (don't block animation start)
-            threading.Thread(target=self._upload_background, daemon=True, name="BackgroundUpload").start()
+            if self._pixelated_background_enabled:
+                threading.Thread(target=self._upload_background, daemon=True, name="BackgroundUpload").start()
 
-            self._start_animation('start', source)
+            if self._animation_enabled:
+                self._start_animation('start', source)
+            else:
+                # Skip animation - set final position directly to avoid glitches
+                # Animation causes ~19 rapid API calls which creates stream hiccups
+                corner_x = self._frame_width - self._preview_w - self._preview_padding
+                corner_y = self._frame_height - self._preview_h - self._preview_padding
+                self._blocking_api_call('/blocking/set', {
+                    'preview_x': str(corner_x),
+                    'preview_y': str(corner_y),
+                    'preview_w': str(self._preview_w),
+                    'preview_h': str(self._preview_h)
+                })
+                self._animation_source = source
+                self._on_start_animation_complete()
 
     def hide(self, force=False):
         if not force and self._test_blocking_until > time.time():
@@ -1061,8 +1108,13 @@ class DRMAdBlocker:
             if self._animating:
                 self._stop_animation_thread()
 
-            logger.info("[DRMAdBlocker] Starting end animation")
-            self._start_animation('end', None)
+            if self._animation_enabled:
+                logger.info("[DRMAdBlocker] Starting end animation")
+                self._start_animation('end', None)
+            else:
+                # Skip animation - disable blocking immediately to avoid glitches
+                logger.info("[DRMAdBlocker] Ending blocking (no animation)")
+                self._on_end_animation_complete()
 
     def update(self, ad_detected, is_skippable=False, skip_location=None, ocr_detected=False, vlm_detected=False):
         if ad_detected and not is_skippable:

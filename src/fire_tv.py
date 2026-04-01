@@ -213,13 +213,38 @@ class FireTVController:
         devices = []
 
         # Get local IP to determine network range
+        # Try multiple methods for resilience
+        local_ip = None
         try:
+            # Method 1: Connect to a LAN address (works without internet)
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
+            s.settimeout(1.0)
+            s.connect(("10.255.255.255", 1))
             local_ip = s.getsockname()[0]
             s.close()
-        except Exception as e:
-            logger.error(f"[FireTV] Failed to get local IP: {e}")
+        except Exception:
+            pass
+
+        if not local_ip or local_ip.startswith("127."):
+            try:
+                # Method 2: Try Google DNS (requires internet)
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.settimeout(2.0)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                pass
+
+        if not local_ip or local_ip.startswith("127."):
+            try:
+                # Method 3: Get from hostname
+                local_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                pass
+
+        if not local_ip or local_ip.startswith("127."):
+            logger.warning("[FireTV] No network connectivity - cannot discover devices")
             return devices
 
         # Get network prefix (assume /24)

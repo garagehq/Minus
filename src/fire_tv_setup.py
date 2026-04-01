@@ -2,11 +2,17 @@
 Fire TV Setup Manager for Minus.
 
 Handles the Fire TV connection flow with visual guidance on the HDMI output:
-1. Scans for Fire TV devices
-2. Shows guidance overlay if ADB debugging needs to be enabled
-3. Detects ADB authorization dialog via OCR
-4. Shows guidance overlay for authorization
-5. Auto-retries connection after user approves
+1. Waits for network connectivity (if unavailable)
+2. Scans for Fire TV devices
+3. Shows guidance overlay if ADB debugging needs to be enabled
+4. Detects ADB authorization dialog via OCR
+5. Shows guidance overlay for authorization
+6. Auto-retries connection after user approves
+
+Network resilience:
+- Checks network availability before scanning
+- Waits for network to become available (with periodic retries)
+- Automatically retries setup when network is restored
 
 Integrates with:
 - src/fire_tv.py - Fire TV controller
@@ -15,11 +21,43 @@ Integrates with:
 """
 
 import logging
+import socket
 import threading
 import time
 from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
+
+
+def check_network_available() -> bool:
+    """
+    Check if network connectivity is available.
+
+    Tries to create a socket connection to determine if we have a valid
+    network interface with an IP address. Does NOT require internet access,
+    just a working local network stack.
+
+    Returns:
+        True if network is available, False otherwise
+    """
+    try:
+        # First try to get local IP by connecting to a LAN address
+        # This works even without internet, just needs a network interface
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(1.0)
+        # Connect to a non-routable address just to get our local IP
+        # This doesn't actually send any packets
+        s.connect(("10.255.255.255", 1))
+        local_ip = s.getsockname()[0]
+        s.close()
+
+        # If we got an IP other than localhost, we have network
+        if local_ip and not local_ip.startswith("127."):
+            return True
+
+        return False
+    except Exception:
+        return False
 
 # Keywords for detecting ADB authorization dialog
 ADB_AUTH_KEYWORDS = [
@@ -44,6 +82,7 @@ class FireTVSetupManager:
 
     States:
     - IDLE: Not doing anything
+    - WAITING_NETWORK: Waiting for network connectivity
     - SCANNING: Scanning for Fire TV devices
     - WAITING_ADB_ENABLE: Showing instructions to enable ADB debugging
     - WAITING_AUTH: Waiting for user to authorize connection
@@ -52,6 +91,7 @@ class FireTVSetupManager:
     """
 
     STATE_IDLE = "idle"
+    STATE_WAITING_NETWORK = "waiting_network"
     STATE_SCANNING = "scanning"
     STATE_WAITING_ADB_ENABLE = "waiting_adb_enable"
     STATE_WAITING_AUTH = "waiting_auth"
@@ -193,6 +233,34 @@ class FireTVSetupManager:
             from src.fire_tv import FireTVController
 
             logger.info("[FireTVSetup] Starting Fire TV setup flow...")
+
+            # Phase 0: Wait for network connectivity
+            if not check_network_available():
+                self.state = self.STATE_WAITING_NETWORK
+                logger.info("[FireTVSetup] No network available, waiting for connectivity...")
+
+                network_check_interval = 10.0  # Check every 10 seconds
+                max_network_wait = 600.0  # Wait up to 10 minutes
+                network_wait_start = time.time()
+
+                while not self._stop_setup.is_set():
+                    if check_network_available():
+                        logger.info("[FireTVSetup] Network is now available")
+                        break
+
+                    # Check timeout
+                    if time.time() - network_wait_start > max_network_wait:
+                        logger.warning("[FireTVSetup] Timeout waiting for network, will retry later")
+                        self.state = self.STATE_IDLE
+                        # Schedule retry in 60 seconds
+                        threading.Timer(60.0, self._retry_setup_if_idle).start()
+                        return
+
+                    self._stop_setup.wait(network_check_interval)
+
+                if self._stop_setup.is_set():
+                    return
+
             self.controller = FireTVController()
 
             # Phase 1: Scan for devices
@@ -241,6 +309,12 @@ class FireTVSetupManager:
             traceback.print_exc()
             self._hide_guidance()
             self.state = self.STATE_IDLE
+
+    def _retry_setup_if_idle(self):
+        """Retry setup if still in IDLE state (called by timer after network timeout)."""
+        if self.state == self.STATE_IDLE and not self._stop_setup.is_set():
+            logger.info("[FireTVSetup] Retrying setup after network timeout...")
+            self.start_setup()
 
     def _scan_for_devices(self) -> list:
         """Scan network for devices with ADB port open."""

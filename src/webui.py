@@ -205,6 +205,40 @@ class WebUI:
                 logger.error(f"Error disabling debug overlay: {e}")
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/pixelated-background')
+        def api_pixelated_background_status():
+            """Get pixelated background status."""
+            try:
+                enabled = False
+                if self.minus.ad_blocker:
+                    enabled = self.minus.ad_blocker.is_pixelated_background_enabled()
+                return jsonify({'pixelated_background_enabled': enabled})
+            except Exception as e:
+                logger.error(f"Error getting pixelated background status: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/pixelated-background/enable', methods=['POST'])
+        def api_pixelated_background_enable():
+            """Enable pixelated background during ad blocking."""
+            try:
+                if self.minus.ad_blocker:
+                    self.minus.ad_blocker.set_pixelated_background_enabled(True)
+                return jsonify({'success': True, 'pixelated_background_enabled': True})
+            except Exception as e:
+                logger.error(f"Error enabling pixelated background: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/pixelated-background/disable', methods=['POST'])
+        def api_pixelated_background_disable():
+            """Disable pixelated background during ad blocking."""
+            try:
+                if self.minus.ad_blocker:
+                    self.minus.ad_blocker.set_pixelated_background_enabled(False)
+                return jsonify({'success': True, 'pixelated_background_enabled': False})
+            except Exception as e:
+                logger.error(f"Error disabling pixelated background: {e}")
+                return jsonify({'error': str(e)}), 500
+
         @self.app.route('/api/firetv-keepalive')
         def api_firetv_keepalive_status():
             """Get Fire TV keep-alive status."""
