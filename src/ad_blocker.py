@@ -194,17 +194,15 @@ class DRMAdBlocker:
     def _init_pipeline(self):
         """Initialize simple GStreamer display pipeline with queue element."""
         try:
-            # Pipeline with larger buffer to absorb periodic hiccups
-            # - souphttpsrc: keep-alive, infinite retries, larger blocksize
-            # - Single queue with more buffers (500ms worth at 30fps)
-            # - leaky=downstream ensures no latency accumulation
-            # Pipeline with optimal settings
+            # Simple pipeline with small queue for low latency
+            # - 3 buffer queue provides minimal latency while absorbing brief hiccups
+            # - leaky=downstream drops oldest frames if queue fills (prevents latency buildup)
             pipeline_str = (
                 f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream "
                 f"is-live=true blocksize=262144 timeout=10 retries=-1 keep-alive=true ! "
                 f"multipartdemux ! jpegparse ! mppjpegdec ! video/x-raw,format=NV12 ! "
                 f"videobalance saturation=0.85 name=colorbalance ! "
-                f"queue max-size-buffers=20 max-size-time=500000000 leaky=downstream name=videoqueue ! "
+                f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "
                 f"identity name=fpsprobe ! "
                 f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
             )
@@ -912,7 +910,9 @@ class DRMAdBlocker:
 
     def _on_end_animation_complete(self):
         logger.debug("[DRMAdBlocker] End animation complete")
-        self._blocking_api_call('/blocking/set', {'enabled': 'false'}, timeout=0.5)
+        # CRITICAL: Use 'clear' to fully reset blocking state including background
+        # Just setting 'enabled: false' can leave stale background/preview showing
+        self._blocking_api_call('/blocking/set', {'clear': 'true'}, timeout=0.5)
 
         # Write blocking state to file for zero-overhead checks (avoids HTTP)
         try:
