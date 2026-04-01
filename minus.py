@@ -639,23 +639,8 @@ class Minus:
         self.prev_frame = None
         self.vlm_prev_frame = None
 
-        # Clear old screenshots beyond minimum
-        try:
-            if self.screenshot_manager:
-                # Clean up all screenshot subdirectories
-                for subdir in ['ads', 'non_ads', 'vlm_spastic', 'static']:
-                    dir_path = self.screenshot_manager.base_dir / subdir
-                    if dir_path.exists():
-                        screenshots = sorted(
-                            dir_path.glob("*.png"),
-                            key=lambda p: p.stat().st_mtime
-                        )
-                        # Keep only last 10 in emergency
-                        for old_file in screenshots[:-10]:
-                            old_file.unlink()
-                            logger.debug(f"[Recovery] Deleted {old_file.name}")
-        except Exception as e:
-            logger.error(f"[Recovery] Error cleaning screenshots: {e}")
+        # NOTE: Screenshot cleanup removed - we want to keep ALL screenshots for training data
+        # The memory issue should be addressed by fixing actual memory leaks, not deleting training data
 
     # ===== Fire TV Setup Methods =====
 

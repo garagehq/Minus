@@ -551,7 +551,7 @@ The health monitor (`src/health.py`) runs in a background thread and checks:
 | Video pipeline | Buffer flow + FPS monitoring | Restart pipeline with exponential backoff |
 | Output FPS | GStreamer pad probe | Log warning if < 25fps |
 | VLM | Consecutive timeouts < 5 | Degrade to OCR-only, retry VLM after 30s |
-| Memory | Usage < 90% | Force GC, clean old screenshots |
+| Memory | Usage < 90% | Force GC, clear frame buffers |
 | Disk | Free > 500MB | Log warning |
 
 **HDMI Disconnect/Reconnect Recovery:**
