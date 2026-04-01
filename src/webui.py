@@ -940,6 +940,205 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # Health Check
+        # =========================================================================
+
+        @self.app.route('/api/health')
+        def api_health():
+            """Simple health check endpoint for uptime monitors.
+
+            Returns 200 OK if service is running, with basic status info.
+            """
+            try:
+                health = {
+                    'status': 'ok',
+                    'service': 'minus',
+                    'timestamp': time.time(),
+                }
+
+                # Check key subsystems
+                if hasattr(self.minus, 'ad_blocker') and self.minus.ad_blocker:
+                    health['video'] = 'ok' if self.minus.ad_blocker.pipeline else 'error'
+                else:
+                    health['video'] = 'not_initialized'
+
+                if hasattr(self.minus, 'audio') and self.minus.audio:
+                    health['audio'] = 'ok' if self.minus.audio.is_running else 'stopped'
+                else:
+                    health['audio'] = 'not_initialized'
+
+                if hasattr(self.minus, 'vlm_manager') and self.minus.vlm_manager:
+                    health['vlm'] = 'ok' if self.minus.vlm_manager.is_ready() else 'loading'
+                else:
+                    health['vlm'] = 'disabled'
+
+                # Overall status
+                if health.get('video') == 'error' or health.get('audio') == 'stopped':
+                    health['status'] = 'degraded'
+
+                return jsonify(health)
+            except Exception as e:
+                logger.error(f"Health check error: {e}")
+                return jsonify({'status': 'error', 'error': str(e)}), 500
+
+        # =========================================================================
+        # Video Pipeline Control
+        # =========================================================================
+
+        @self.app.route('/api/video/restart', methods=['POST'])
+        def api_video_restart():
+            """Force restart the video pipeline.
+
+            Use this when video is glitching or frozen without restarting the whole service.
+            """
+            try:
+                if hasattr(self.minus, 'ad_blocker') and self.minus.ad_blocker:
+                    logger.info("[WebUI] Video pipeline restart requested")
+                    # Restart the pipeline (runs in background thread)
+                    self.minus.ad_blocker.restart()
+                    return jsonify({'success': True, 'message': 'Video pipeline restart initiated'})
+                return jsonify({'success': False, 'error': 'Ad blocker not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error restarting video pipeline: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # OCR/VLM Testing
+        # =========================================================================
+
+        @self.app.route('/api/ocr/test', methods=['POST'])
+        def api_ocr_test():
+            """Run OCR on current frame and return detected text.
+
+            Does NOT save the screenshot (for testing only).
+            Returns detected text and any ad keywords found.
+            """
+            try:
+                if not hasattr(self.minus, 'ocr') or not self.minus.ocr:
+                    return jsonify({'success': False, 'error': 'OCR not initialized'}), 500
+
+                if not hasattr(self.minus, 'frame_capture') or not self.minus.frame_capture:
+                    return jsonify({'success': False, 'error': 'Capture not initialized'}), 500
+
+                # Capture snapshot
+                import cv2
+                start_time = time.time()
+                frame = self.minus.frame_capture.capture()
+                capture_time = time.time() - start_time
+
+                if frame is None:
+                    return jsonify({'success': False, 'error': 'Failed to capture frame'}), 500
+
+                # Convert to RGB for OCR
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+                # Run OCR
+                ocr_start = time.time()
+                ocr_results = self.minus.ocr.ocr(frame_rgb)
+                ocr_time = time.time() - ocr_start
+
+                # Check for ad keywords
+                ad_detected, matched_keywords, all_texts, is_terminal = self.minus.ocr.check_ad_keywords(ocr_results)
+
+                return jsonify({
+                    'success': True,
+                    'is_ad': ad_detected,
+                    'is_terminal': is_terminal,
+                    'texts': all_texts[:20] if all_texts else [],  # Limit to 20 text items
+                    'keywords': matched_keywords,
+                    'capture_time_ms': round(capture_time * 1000),
+                    'ocr_time_ms': round(ocr_time * 1000),
+                })
+            except Exception as e:
+                logger.error(f"OCR test error: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/vlm/test', methods=['POST'])
+        def api_vlm_test():
+            """Run VLM on current frame and return ad detection verdict.
+
+            Does NOT save the screenshot (for testing only).
+            Returns the VLM's verdict and confidence.
+            """
+            try:
+                if not hasattr(self.minus, 'vlm') or not self.minus.vlm:
+                    return jsonify({'success': False, 'error': 'VLM not initialized'}), 500
+
+                if not self.minus.vlm.is_ready:
+                    return jsonify({'success': False, 'error': 'VLM not ready (still loading)'}), 503
+
+                if not hasattr(self.minus, 'frame_capture') or not self.minus.frame_capture:
+                    return jsonify({'success': False, 'error': 'Capture not initialized'}), 500
+
+                # Capture snapshot
+                import cv2
+                import tempfile
+                start_time = time.time()
+                frame = self.minus.frame_capture.capture()
+                capture_time = time.time() - start_time
+
+                if frame is None:
+                    return jsonify({'success': False, 'error': 'Failed to capture frame'}), 500
+
+                # Save to temp file for VLM (VLM requires file path)
+                with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                    tmp_path = tmp.name
+                    cv2.imwrite(tmp_path, frame)
+
+                try:
+                    # Run VLM
+                    vlm_start = time.time()
+                    is_ad, raw_response, elapsed, confidence = self.minus.vlm.detect_ad(tmp_path)
+                    vlm_time = time.time() - vlm_start
+
+                    return jsonify({
+                        'success': True,
+                        'is_ad': is_ad,
+                        'confidence': confidence,
+                        'raw_response': raw_response[:200] if raw_response else None,  # Truncate
+                        'capture_time_ms': round(capture_time * 1000),
+                        'vlm_time_ms': round(vlm_time * 1000),
+                    })
+                finally:
+                    # Clean up temp file
+                    import os
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+            except Exception as e:
+                logger.error(f"VLM test error: {e}")
+                import traceback
+                traceback.print_exc()
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Blocking Control
+        # =========================================================================
+
+        @self.app.route('/api/blocking/skip', methods=['POST'])
+        def api_blocking_skip():
+            """Trigger Fire TV skip button press to skip current ad.
+
+            Sends the 'select' command to Fire TV which usually skips skippable ads.
+            """
+            try:
+                if not hasattr(self.minus, 'fire_tv_setup') or not self.minus.fire_tv_setup:
+                    return jsonify({'success': False, 'error': 'Fire TV not initialized'}), 500
+
+                controller = self.minus.fire_tv_setup.get_controller()
+                if not controller or not controller.is_connected:
+                    return jsonify({'success': False, 'error': 'Fire TV not connected'}), 503
+
+                # Send select command (usually skips ads)
+                controller.send_command('select')
+                logger.info("[WebUI] Skip ad command sent to Fire TV")
+                return jsonify({'success': True, 'message': 'Skip command sent'})
+            except Exception as e:
+                logger.error(f"Error sending skip command: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Network Info
         # =========================================================================
 
