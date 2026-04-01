@@ -412,11 +412,17 @@ The `audiomixer` with `audiotestsrc wave=silence` keeps the pipeline alive even 
 the HDMI source has no audio (between songs, during silence, etc.).
 
 **Color correction:**
-Adjust saturation/contrast/brightness in `src/ad_blocker.py` via the `videobalance` element:
-```python
-# In _init_pipeline(), modify:
-videobalance saturation=0.85  # Range 0-2, default 1.0
+Adjust video colors in real-time via the Web UI Settings tab, or via API:
+```bash
+# Get current color settings
+curl http://localhost/api/video/color
+
+# Set color settings (saturation, brightness, contrast, hue)
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"saturation": 1.25, "brightness": 0.0}' \
+  http://localhost/api/video/color
 ```
+Default: saturation=1.25, brightness=0.0, contrast=1.0, hue=0.0
 
 ## Running as a Service
 
@@ -488,7 +494,8 @@ Minus includes a mobile-friendly web UI for remote monitoring and control:
 - **Live video feed** - Real-time MJPEG stream from ustreamer
 - **Status display** - Blocking state, FPS, HDMI resolution, uptime
 - **Pause controls** - 1/2/5/10 minute presets to pause ad blocking
-- **Settings** - Toggle ad preview window and debug dashboard
+- **Video color controls** - Real-time saturation, brightness, contrast, hue sliders
+- **Settings** - Toggle ad preview window, debug dashboard, A/V sync reset
 - **Detection history** - Recent OCR/VLM detections with timestamps
 - **Log viewer** - Collapsible log output for debugging
 

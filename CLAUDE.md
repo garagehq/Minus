@@ -606,6 +606,7 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `GET /stream`, `/snapshot` - Proxy to ustreamer
 - `GET /api/health` - Health check for uptime monitors
 - `POST /api/video/restart` - Force restart video pipeline
+- `GET/POST /api/video/color` - Get/set color settings (saturation, brightness, contrast, hue)
 - `POST /api/ocr/test` - Run OCR on current frame (no screenshot save)
 - `POST /api/vlm/test` - Run VLM on current frame (no screenshot save)
 - `POST /api/blocking/skip` - Trigger Fire TV skip button
