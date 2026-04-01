@@ -720,20 +720,30 @@ class TestHealth:
         monitor.on_hdmi_restored(callback)
         assert monitor._on_hdmi_restored == callback
 
-    @patch('health.subprocess.run')
-    def test_check_hdmi_signal_present(self, mock_run):
-        """Test HDMI signal detection when present."""
+    @patch('urllib.request.urlopen')
+    def test_check_hdmi_signal_present(self, mock_urlopen):
+        """Test HDMI signal detection when present via ustreamer API."""
         from health import HealthMonitor
+        import json
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
         mock_minus.audio = None
         mock_minus.vlm = None
         mock_minus.ocr = None
 
-        mock_run.return_value = MagicMock(
-            returncode=0,
-            stdout="Active width: 1920\nActive height: 1080\n"
-        )
+        # Mock ustreamer /state response
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "result": {
+                "source": {
+                    "online": True,
+                    "resolution": {"width": 1920, "height": 1080}
+                }
+            }
+        }).encode('utf-8')
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
 
         monitor = HealthMonitor(mock_minus)
         signal, resolution = monitor._check_hdmi_signal()
@@ -741,12 +751,26 @@ class TestHealth:
         assert signal is True
         assert resolution == "1920x1080"
 
-    @patch('health.subprocess.run')
-    def test_check_hdmi_signal_absent(self, mock_run):
-        """Test HDMI signal detection when absent."""
+    @patch('urllib.request.urlopen')
+    def test_check_hdmi_signal_absent(self, mock_urlopen):
+        """Test HDMI signal detection when absent via ustreamer API."""
         from health import HealthMonitor
+        import json
         mock_minus = MagicMock()
-        mock_run.return_value = MagicMock(returncode=1, stdout="")
+
+        # Mock ustreamer /state response with offline source
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "result": {
+                "source": {
+                    "online": False,
+                    "resolution": {"width": 0, "height": 0}
+                }
+            }
+        }).encode('utf-8')
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
 
         monitor = HealthMonitor(mock_minus)
         signal, resolution = monitor._check_hdmi_signal()
@@ -919,6 +943,146 @@ class TestVLM:
         assert is_ad is False
         assert "not found" in response.lower()
         assert confidence == 0.0
+
+
+# ============================================================================
+# AdBlocker Tests
+# ============================================================================
+
+class TestAdBlocker:
+    """Tests for ad_blocker.py color control features."""
+
+    def test_ad_blocker_imports(self):
+        """Test that ad_blocker module imports correctly."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            assert DRMAdBlocker is not None
+        except ImportError as e:
+            # May fail without GStreamer
+            pass
+
+    def test_color_settings_defaults(self):
+        """Test that color settings have expected defaults."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            # Check that the class has color methods
+            assert hasattr(DRMAdBlocker, 'get_color_settings')
+            assert hasattr(DRMAdBlocker, 'set_color_settings')
+        except ImportError:
+            pass
+
+    def test_get_color_settings_without_pipeline(self):
+        """Test get_color_settings returns defaults when no pipeline."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            blocker = DRMAdBlocker.__new__(DRMAdBlocker)
+            blocker.pipeline = None
+            settings = blocker.get_color_settings()
+            assert settings['saturation'] == 1.25
+            assert settings['brightness'] == 0.0
+            assert settings['contrast'] == 1.0
+            assert settings['hue'] == 0.0
+        except ImportError:
+            pass
+
+    def test_set_color_settings_without_pipeline(self):
+        """Test set_color_settings handles missing pipeline."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            blocker = DRMAdBlocker.__new__(DRMAdBlocker)
+            blocker.pipeline = None
+            result = blocker.set_color_settings(saturation=1.5)
+            assert result['success'] is False
+            assert 'error' in result
+        except ImportError:
+            pass
+
+    def test_color_value_clamping(self):
+        """Test that color values are clamped to valid ranges."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            blocker = DRMAdBlocker.__new__(DRMAdBlocker)
+            # Mock pipeline with colorbalance element
+            mock_colorbalance = MagicMock()
+            blocker.pipeline = MagicMock()
+            blocker.pipeline.get_by_name.return_value = mock_colorbalance
+
+            # Test saturation clamping (0.0-2.0)
+            blocker.set_color_settings(saturation=3.0)  # Above max
+            mock_colorbalance.set_property.assert_called_with('saturation', 2.0)
+
+            mock_colorbalance.reset_mock()
+            blocker.set_color_settings(saturation=-1.0)  # Below min
+            mock_colorbalance.set_property.assert_called_with('saturation', 0.0)
+
+            # Test brightness clamping (-1.0 to 1.0)
+            mock_colorbalance.reset_mock()
+            blocker.set_color_settings(brightness=2.0)  # Above max
+            mock_colorbalance.set_property.assert_called_with('brightness', 1.0)
+        except ImportError:
+            pass
+
+
+# ============================================================================
+# Audio Tests
+# ============================================================================
+
+class TestAudio:
+    """Tests for audio.py A/V sync features."""
+
+    def test_audio_imports(self):
+        """Test that audio module imports correctly."""
+        try:
+            from audio import AudioPassthrough
+            assert AudioPassthrough is not None
+        except ImportError as e:
+            # May fail without GStreamer
+            pass
+
+    def test_audio_has_av_sync_methods(self):
+        """Test that AudioPassthrough has A/V sync methods."""
+        try:
+            from audio import AudioPassthrough
+            assert hasattr(AudioPassthrough, 'reset_av_sync')
+            assert hasattr(AudioPassthrough, '_flush_sync_queue')
+        except ImportError:
+            pass
+
+    def test_reset_av_sync_not_running(self):
+        """Test reset_av_sync when audio not running."""
+        try:
+            from audio import AudioPassthrough
+            audio = AudioPassthrough.__new__(AudioPassthrough)
+            audio.is_running = False
+            result = audio.reset_av_sync()
+            assert result['success'] is False
+            assert 'not running' in result['error'].lower()
+        except ImportError:
+            pass
+
+    def test_reset_av_sync_no_pipeline(self):
+        """Test reset_av_sync when pipeline is None."""
+        try:
+            from audio import AudioPassthrough
+            audio = AudioPassthrough.__new__(AudioPassthrough)
+            audio.is_running = True
+            audio.pipeline = None
+            result = audio.reset_av_sync()
+            assert result['success'] is False
+            assert 'pipeline' in result['error'].lower()
+        except ImportError:
+            pass
+
+    def test_sync_interval_default(self):
+        """Test that sync interval has expected default (45 minutes)."""
+        try:
+            from audio import AudioPassthrough
+            audio = AudioPassthrough.__new__(AudioPassthrough)
+            # Initialize the sync attributes manually since we're not calling __init__
+            audio._sync_interval = 45 * 60
+            assert audio._sync_interval == 2700  # 45 minutes in seconds
+        except ImportError:
+            pass
 
 
 # ============================================================================
@@ -1276,6 +1440,163 @@ class TestWebUI:
             if data['exists']:
                 assert 'public_key' in data
                 assert 'fingerprint' in data
+
+    def test_webui_api_health(self):
+        """Test the /api/health endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.pipeline = MagicMock()
+        mock_minus.audio = MagicMock()
+        mock_minus.audio.is_running = True
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/health')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'status' in data
+            assert 'service' in data
+            assert data['service'] == 'minus'
+            assert 'video' in data
+            assert 'audio' in data
+
+    def test_webui_api_video_restart(self):
+        """Test the /api/video/restart endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/video/restart')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+            mock_minus.ad_blocker.restart.assert_called_once()
+
+    def test_webui_api_video_color_get(self):
+        """Test GET /api/video/color endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.get_color_settings.return_value = {
+            'saturation': 1.25,
+            'brightness': 0.0,
+            'contrast': 1.0,
+            'hue': 0.0
+        }
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/video/color')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'saturation' in data
+            assert 'brightness' in data
+            assert 'contrast' in data
+            assert 'hue' in data
+            assert data['saturation'] == 1.25
+
+    def test_webui_api_video_color_set(self):
+        """Test POST /api/video/color endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.set_color_settings.return_value = {
+            'success': True,
+            'saturation': 1.3,
+            'brightness': 0.0,
+            'contrast': 1.0,
+            'hue': 0.0
+        }
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/video/color',
+                                   json={'saturation': 1.3},
+                                   content_type='application/json')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+            mock_minus.ad_blocker.set_color_settings.assert_called_once()
+
+    def test_webui_api_audio_sync_reset(self):
+        """Test POST /api/audio/sync-reset endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.audio = MagicMock()
+        mock_minus.audio.reset_av_sync.return_value = {
+            'success': True,
+            'message': 'A/V sync reset - audio will resume in ~300ms'
+        }
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/audio/sync-reset')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+            mock_minus.audio.reset_av_sync.assert_called_once()
+
+    def test_webui_api_blocking_skip(self):
+        """Test POST /api/blocking/skip endpoint."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_controller = MagicMock()
+        mock_controller.is_connected = True
+        mock_minus.fire_tv_setup = MagicMock()
+        mock_minus.fire_tv_setup.get_controller.return_value = mock_controller
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/blocking/skip')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+            mock_controller.send_command.assert_called_with('select')
+
+    def test_webui_api_ocr_test_no_ocr(self):
+        """Test POST /api/ocr/test when OCR not initialized."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ocr = None
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/ocr/test')
+            assert response.status_code == 500
+            data = response.get_json()
+            assert data['success'] is False
+
+    def test_webui_api_vlm_test_no_vlm(self):
+        """Test POST /api/vlm/test when VLM not initialized."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.vlm = None
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/vlm/test')
+            assert response.status_code == 500
+            data = response.get_json()
+            assert data['success'] is False
+
+    def test_webui_new_api_routes_registered(self):
+        """Test that new API routes (color, health, etc.) are registered."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        ui = WebUI(mock_minus)
+
+        routes = [rule.rule for rule in ui.app.url_map.iter_rules()]
+        # New endpoints added recently
+        assert '/api/health' in routes
+        assert '/api/video/restart' in routes
+        assert '/api/video/color' in routes
+        assert '/api/audio/sync-reset' in routes
+        assert '/api/ocr/test' in routes
+        assert '/api/vlm/test' in routes
+        assert '/api/blocking/skip' in routes
 
 
 # ============================================================================

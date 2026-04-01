@@ -79,7 +79,7 @@ See **[AESTHETICS.md](AESTHETICS.md)** for the complete visual design guide incl
 | `src/screenshots.py` | ScreenshotManager class with deduplication |
 | `src/skip_detection.py` | Skip button detection (regex patterns) |
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
-| `tests/test_modules.py` | Unit tests for all extracted modules (106 tests) |
+| `tests/test_modules.py` | Unit tests for all extracted modules (122 tests) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
 | `install.sh` | Install as systemd service |
@@ -784,7 +784,7 @@ The project includes a comprehensive test suite for all extracted modules.
 
 **Running Tests:**
 ```bash
-python3 tests/test_modules.py  # 106 tests
+python3 tests/test_modules.py  # 122 tests
 
 # Or with pytest (if installed)
 python3 -m pytest tests/test_modules.py -v
@@ -808,13 +808,16 @@ python3 -m pytest tests/test_modules.py -v
 | `src/vlm.py` | TestVLM | VLMManager, response parsing, 4-tuple returns |
 | `src/ocr.py` | TestOCR | Keywords, exclusions, terminal detection |
 | `src/webui.py` | TestWebUI | Flask routes, API endpoints |
+| `src/ad_blocker.py` | TestAdBlocker | Color controls, settings, value clamping |
+| `src/audio.py` | TestAudio | A/V sync, pipeline controls |
 | Integration | TestIntegration | Cross-module tests |
+| Memory | TestMemoryLeaks | Resource cleanup, executor reuse, watchdog |
 
 **Test Design:**
 - Tests are self-contained with temporary directories
 - Mock subprocess calls to avoid system dependencies
 - Fallback to manual test runner if pytest not installed
-- All 106 tests should pass on a clean system
+- All 122 tests should pass on a clean system
 
 ## Module Structure
 
