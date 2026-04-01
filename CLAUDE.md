@@ -729,6 +729,11 @@ The service:
 - Continue iterating on solutions until they demonstrably work
 - If you cannot verify a fix, clearly state that it needs user verification
 
+**Git commits:**
+- Do NOT add "Co-Authored-By" lines to commits
+- Do NOT add "Generated with Claude Code" lines to commits
+- Keep commit messages clean and professional - just the message, no AI attribution
+
 - Do NOT create v2, v3, v4 files - update existing files directly
 - VLM uses Python axengine for inference (not pexpect/C++ binary)
 - Both NPUs run in parallel without resource contention
