@@ -147,7 +147,7 @@ class UstreamerCapture:
 
         Uses dynamic rate limiting based on blocking state:
         - During normal operation: 500ms minimum between captures
-        - During blocking: 2s minimum (MPP encoder busy with overlays)
+        - During blocking: 1s minimum (MPP encoder busy with overlays)
 
         Uses persistent HTTP session with connection pooling to avoid
         subprocess overhead from curl.
@@ -162,18 +162,19 @@ class UstreamerCapture:
             min_interval = _MIN_CAPTURE_INTERVAL_BLOCKING if is_blocking else _MIN_CAPTURE_INTERVAL
 
             # Rate limit: ensure minimum gap between HTTP requests
-            # This serializes captures across all workers to prevent contention
+            # IMPORTANT: Only hold lock briefly for timing check, NOT during HTTP request
+            # Otherwise a slow/stuck HTTP request blocks all workers
             with _capture_lock:
                 now = time.time()
                 elapsed = now - _last_capture_time
                 if elapsed < min_interval:
                     wait_time = min_interval - elapsed
                     time.sleep(wait_time)
+                _last_capture_time = time.time()  # Mark time BEFORE request
 
-                # Use persistent session with connection pooling
-                session = _get_http_session()
-                response = session.get(self.snapshot_url, timeout=3, allow_redirects=True)
-                _last_capture_time = time.time()
+            # HTTP request OUTSIDE the lock - prevents cascade failure if ustreamer is slow
+            session = _get_http_session()
+            response = session.get(self.snapshot_url, timeout=2, allow_redirects=True)
 
             if response.status_code == 200:
                 # Decode JPEG directly from memory (no disk I/O)

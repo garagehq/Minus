@@ -123,23 +123,38 @@ class AudioPassthrough:
         self._restart_in_progress = False
         self._restart_lock = threading.Lock()  # Separate lock for restart coordination
 
+        # A/V sync watchdog - periodic pipeline restart to prevent drift
+        # The sync queue adds fixed delay but clock drift over time could cause issues
+        # Restarting every 12 minutes resets the sync queue and prevents accumulated drift
+        self._sync_interval = 12 * 60  # 12 minutes between sync resets
+        self._last_sync_reset = 0
+        self._sync_reset_enabled = True
+
         # Initialize GStreamer (may already be initialized by video pipeline)
         Gst.init(None)
 
     def _init_pipeline(self):
         """Initialize GStreamer audio pipeline."""
         try:
-            # Low-latency audio passthrough pipeline
-            # Direct path: alsasrc → queue → audioconvert → volume → alsasink
-            # Low-latency buffers for good A/V sync (~100-120ms total)
+            # Audio passthrough pipeline with A/V sync delay
+            # Video pipeline has ~350-500ms latency (HTTP streaming + decode + queue)
+            # Audio needs matching delay to stay in sync
             # Using provide-clock=false to prevent alsasrc from being clock master
+            #
+            # Latency breakdown:
+            #   - alsasrc: 50ms buffer
+            #   - syncqueue: 300ms delay (min-threshold-time forces buffering before output)
+            #   - audioqueue: up to 100ms for jitter absorption
+            #   - alsasink: 50ms buffer
+            #   Total: ~500ms to match video latency
             pipeline_str = (
-                f"alsasrc device={self.capture_device} buffer-time=35000 latency-time=10000 provide-clock=false ! "
+                f"alsasrc device={self.capture_device} buffer-time=50000 latency-time=10000 provide-clock=false ! "
                 f"audio/x-raw,rate=48000,channels=2,format=S16LE ! "
-                f"queue max-size-buffers=5 max-size-time=50000000 leaky=downstream name=audioqueue ! "
+                f"queue name=syncqueue min-threshold-time=300000000 max-size-time=500000000 max-size-buffers=0 max-size-bytes=0 ! "
+                f"queue max-size-buffers=10 max-size-time=100000000 leaky=downstream name=audioqueue ! "
                 f"audioconvert ! "
                 f"volume name=vol volume=1.0 mute=false ! "
-                f"alsasink device={self.playback_device} buffer-time=35000 latency-time=10000 sync=false"
+                f"alsasink device={self.playback_device} buffer-time=50000 latency-time=10000 sync=false"
             )
 
             logger.debug(f"[AudioPassthrough] Creating pipeline: {pipeline_str}")
@@ -335,6 +350,7 @@ class AudioPassthrough:
                         logger.info("[AudioPassthrough] Pipeline restarted successfully (async)")
                         self._last_buffer_time = time.time()
                         self._last_restart_time = time.time()
+                        self._last_sync_reset = time.time()  # Reset A/V sync timer
                         if self.is_muted and self.volume:
                             self.volume.set_property('mute', True)
                     else:
@@ -343,6 +359,7 @@ class AudioPassthrough:
                     logger.info("[AudioPassthrough] Pipeline restarted successfully")
                     self._last_buffer_time = time.time()
                     self._last_restart_time = time.time()
+                    self._last_sync_reset = time.time()  # Reset A/V sync timer
                     # Restore mute state
                     if self.is_muted and self.volume:
                         self.volume.set_property('mute', True)
@@ -387,6 +404,15 @@ class AudioPassthrough:
 
             needs_restart = False
             restart_reason = ""
+
+            # A/V Sync reset - periodically restart pipeline to prevent clock drift
+            # This is a low-power approach: just restart every 12 minutes
+            # The sync queue will refill with the correct delay automatically
+            if self._sync_reset_enabled and self._last_sync_reset > 0:
+                time_since_sync = time.time() - self._last_sync_reset
+                if time_since_sync >= self._sync_interval:
+                    needs_restart = True
+                    restart_reason = f"A/V sync reset (every {self._sync_interval // 60}min)"
 
             # Check if pipeline exists at all
             if not self.pipeline:
@@ -477,6 +503,7 @@ class AudioPassthrough:
                     # Success!
                     self.is_running = True
                     self._last_buffer_time = time.time()
+                    self._last_sync_reset = time.time()  # Start A/V sync timer
                     self._restart_count = 0
 
                     # Reorder candidates so working device is first
@@ -631,6 +658,7 @@ class AudioPassthrough:
                         if ret2 == Gst.StateChangeReturn.SUCCESS and state == Gst.State.PLAYING:
                             logger.info("[AudioPassthrough] Pipeline resumed successfully (async)")
                             self._last_buffer_time = time.time()
+                            self._last_sync_reset = time.time()  # Reset A/V sync timer
                             if self.is_muted and self.volume:
                                 self.volume.set_property('mute', True)
                         else:
@@ -638,6 +666,7 @@ class AudioPassthrough:
                     else:
                         logger.info("[AudioPassthrough] Pipeline resumed successfully")
                         self._last_buffer_time = time.time()
+                        self._last_sync_reset = time.time()  # Reset A/V sync timer
                         if self.is_muted and self.volume:
                             self.volume.set_property('mute', True)
                 else:
