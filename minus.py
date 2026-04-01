@@ -6,7 +6,7 @@ Architecture:
 - ustreamer captures from HDMI-RX and serves MJPEG stream + HTTP snapshot
 - GStreamer with input-selector for instant video/blocking switching
 - PaddleOCR on RKNN NPU detects ad-related text (~400ms)
-- Qwen3-VL-2B on Axera NPU provides visual understanding (~1.5s)
+- FastVLM-1.5B on Axera NPU provides visual understanding (~0.9s)
 - Spanish vocabulary practice during ad blocks!
 
 Key insight: Using GStreamer input-selector allows instant switching between
@@ -16,11 +16,12 @@ Performance:
 - Display: 30fps via GStreamer kmssink (NV12 → DRM plane 72)
 - Snapshot: ~150ms non-blocking HTTP capture
 - OCR: ~400-500ms per frame on RKNN NPU
-- VLM: ~1.5s per frame on Axera NPU
+- VLM: ~0.9s per frame on Axera NPU
 - Ad blocking: INSTANT switching via input-selector
 """
 
 import argparse
+import gc
 import os
 import sys
 import signal
@@ -30,13 +31,25 @@ import logging.handlers
 import threading
 import subprocess
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import numpy as np
 import cv2
+
+
+# =============================================================================
+# Console Blanking - Hide dmesg/login screen before GStreamer takes over
+# =============================================================================
+# Add src directory to path early so we can import console module
+sys.path.insert(0, str(Path(__file__).parent / 'src'))
+
+from console import blank_console, restore_console
+
+# Blank the console immediately on import (before any output)
+blank_console()
+
 
 # Note: Previously had SuppressLibjpegWarnings context manager here but it caused
 # file descriptor leaks over time (~500k calls over 13hrs exhausted FD limit).
@@ -91,8 +104,13 @@ logger = logging.getLogger('Minus')
 # Suppress OpenCV JPEG warnings (this only affects OpenCV's own logging, not libjpeg)
 os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
 
-# Add src directory to path
-sys.path.insert(0, str(Path(__file__).parent / 'src'))
+# Import extracted modules
+from drm import probe_drm_output
+from v4l2 import probe_v4l2_device
+from config import MinusConfig
+from capture import UstreamerCapture
+from screenshots import ScreenshotManager
+from skip_detection import check_skip_opportunity
 
 # Import OCR module
 try:
@@ -150,314 +168,13 @@ except ImportError as e:
     logger.warning(f"Fire TV module not available: {e}")
     HAS_FIRE_TV = False
 
-
-def probe_drm_output() -> dict:
-    """
-    Probe DRM outputs to find connected HDMI display and its preferred resolution.
-
-    Returns dict with:
-        - connector_id: int (e.g., 215 for HDMI-A-1, 231 for HDMI-A-2)
-        - connector_name: str (e.g., 'HDMI-A-1', 'HDMI-A-2')
-        - width: int (preferred resolution width)
-        - height: int (preferred resolution height)
-        - plane_id: int (suitable plane that supports NV12)
-        - crtc_id: int (CRTC connected to this connector)
-        - audio_device: str (ALSA playback device, e.g., 'hw:0,0' or 'hw:1,0')
-    """
-    result = {
-        'connector_id': None,
-        'connector_name': None,
-        'width': 1920,  # fallback
-        'height': 1080,  # fallback
-        'plane_id': 72,  # fallback (known to support NV12)
-        'crtc_id': None,
-        'audio_device': 'hw:0,0',  # fallback
-    }
-
-    try:
-        # Run modetest to get connector info
-        proc = subprocess.run(
-            ['modetest', '-M', 'rockchip', '-c'],
-            capture_output=True, text=True, timeout=5
-        )
-
-        if proc.returncode != 0:
-            logger.warning(f"modetest failed: {proc.stderr}")
-            return result
-
-        # Parse connectors - look for connected HDMI
-        # Format: "id  encoder  status  name  size (mm)  modes  encoders"
-        # Example: "231  230  connected  HDMI-A-2  1150x650  25  230"
-        lines = proc.stdout.split('\n')
-        in_connectors = False
-        connected_hdmi = None
-
-        for line in lines:
-            if 'Connectors:' in line:
-                in_connectors = True
-                continue
-            if in_connectors and line.strip() and not line.startswith(' ') and not line.startswith('\t'):
-                parts = line.split()
-                if len(parts) >= 4:
-                    try:
-                        conn_id = int(parts[0])
-                        status = parts[2]
-                        name = parts[3]
-                        if status == 'connected' and 'HDMI' in name:
-                            connected_hdmi = {'id': conn_id, 'name': name}
-                            logger.info(f"Found connected HDMI output: {name} (connector {conn_id})")
-                            break
-                    except (ValueError, IndexError):
-                        continue
-
-        if not connected_hdmi:
-            logger.warning("No connected HDMI output found")
-            return result
-
-        result['connector_id'] = connected_hdmi['id']
-        result['connector_name'] = connected_hdmi['name']
-
-        # Get preferred resolution from modetest
-        # Run modetest again to get modes for this connector
-        proc = subprocess.run(
-            ['modetest', '-M', 'rockchip', '-c'],
-            capture_output=True, text=True, timeout=5
-        )
-
-        # Look for preferred mode after the connector line
-        lines = proc.stdout.split('\n')
-        found_connector = False
-        for line in lines:
-            # Find our connector by ID
-            if line.strip().startswith(str(connected_hdmi['id'])):
-                found_connector = True
-                continue
-            if found_connector:
-                # Look for "preferred" in mode line
-                # Format: "#0 1920x1080 60.00 ... flags: phsync, pvsync; type: preferred, driver"
-                if 'preferred' in line and 'x' in line:
-                    # Extract resolution like "1920x1080"
-                    match = re.search(r'(\d+)x(\d+)', line)
-                    if match:
-                        result['width'] = int(match.group(1))
-                        result['height'] = int(match.group(2))
-                        logger.info(f"Found preferred resolution: {result['width']}x{result['height']}")
-                        break
-                # Stop if we hit next connector
-                elif line.strip() and not line.startswith(' ') and not line.startswith('\t') and not line.startswith('#'):
-                    if re.match(r'^\d+\s', line.strip()):
-                        break
-
-        # Find a suitable plane that supports NV12 and is an Overlay type
-        # On RK3588 VOP2:
-        #   - type=0 (Overlay) - best for video overlay
-        #   - type=1 (Primary) - typically doesn't support NV12
-        #   - type=2 (Cursor) - can work but not ideal
-        # Planes 192, 152, 112, 72 typically support NV12 on RK3588
-        proc = subprocess.run(
-            ['modetest', '-M', 'rockchip', '-p'],
-            capture_output=True, text=True, timeout=5
-        )
-
-        if proc.returncode == 0:
-            lines = proc.stdout.split('\n')
-            in_planes = False
-            best_plane = None
-            best_plane_type = 3  # Start with invalid type (lower is better: Overlay=0, Primary=1, Cursor=2)
-
-            i = 0
-            while i < len(lines):
-                line = lines[i]
-
-                if 'Planes:' in line:
-                    in_planes = True
-                    i += 1
-                    continue
-
-                if in_planes and line.strip() and not line.startswith(' ') and not line.startswith('\t'):
-                    # Plane header line: "192  0  0  0,0  0,0  0  0x00000007"
-                    parts = line.split()
-                    if len(parts) >= 2 and parts[0].isdigit():
-                        plane_id = int(parts[0])
-
-                        # Check next line for formats
-                        if i + 1 < len(lines) and 'formats:' in lines[i + 1]:
-                            has_nv12 = 'NV12' in lines[i + 1]
-
-                            # Check for plane type in subsequent lines
-                            plane_type = 3  # Default to invalid
-                            for j in range(i + 2, min(i + 15, len(lines))):
-                                if 'type:' in lines[j]:
-                                    # Next few lines should have the type value
-                                    for k in range(j + 1, min(j + 5, len(lines))):
-                                        if 'value:' in lines[k]:
-                                            try:
-                                                plane_type = int(lines[k].split(':')[1].strip())
-                                            except (ValueError, IndexError):
-                                                pass
-                                            break
-                                    break
-
-                            # Prefer Overlay planes (type=0) that support NV12
-                            if has_nv12 and plane_type < best_plane_type:
-                                best_plane = plane_id
-                                best_plane_type = plane_type
-                                type_name = {0: 'Overlay', 1: 'Primary', 2: 'Cursor'}.get(plane_type, 'Unknown')
-                                logger.info(f"Found NV12-capable {type_name} plane: {plane_id}")
-
-                i += 1
-
-            if best_plane is not None:
-                result['plane_id'] = best_plane
-                type_name = {0: 'Overlay', 1: 'Primary', 2: 'Cursor'}.get(best_plane_type, 'Unknown')
-                logger.info(f"Selected plane {best_plane} (type={type_name}) for NV12 output")
-
-        # Determine audio output device based on connector
-        # On RK3588: HDMI-A-1 -> hw:0,0 (rockchip-hdmi0), HDMI-A-2 -> hw:1,0 (rockchip-hdmi1)
-        if result['connector_name']:
-            if 'HDMI-A-1' in result['connector_name']:
-                result['audio_device'] = 'hw:0,0'
-            elif 'HDMI-A-2' in result['connector_name']:
-                result['audio_device'] = 'hw:1,0'
-            logger.info(f"Audio output device: {result['audio_device']} (based on {result['connector_name']})")
-
-        logger.info(f"DRM output probe result: connector={result['connector_id']} ({result['connector_name']}), "
-                   f"resolution={result['width']}x{result['height']}, plane={result['plane_id']}, "
-                   f"audio={result['audio_device']}")
-
-        return result
-
-    except subprocess.TimeoutExpired:
-        logger.warning("Timeout probing DRM output")
-        return result
-    except Exception as e:
-        logger.warning(f"Error probing DRM output: {e}")
-        return result
-
-
-def probe_v4l2_device(device: str) -> dict:
-    """
-    Probe a V4L2 device to get its current format and resolution.
-
-    Returns dict with:
-        - format: V4L2 pixel format string (e.g., 'NV12', 'BGR3', 'YUYV')
-        - width: int
-        - height: int
-        - ustreamer_format: format string for ustreamer (e.g., 'NV12', 'BGR24')
-    """
-    result = {
-        'format': None,
-        'width': 0,
-        'height': 0,
-        'ustreamer_format': None,
-    }
-
-    try:
-        # Run v4l2-ctl to get format info
-        proc = subprocess.run(
-            ['v4l2-ctl', '-d', device, '--get-fmt-video'],
-            capture_output=True, text=True, timeout=5
-        )
-
-        if proc.returncode != 0:
-            logger.warning(f"Failed to probe {device}: {proc.stderr}")
-            return result
-
-        output = proc.stdout
-
-        # Parse width/height
-        wh_match = re.search(r'Width/Height\s*:\s*(\d+)/(\d+)', output)
-        if wh_match:
-            result['width'] = int(wh_match.group(1))
-            result['height'] = int(wh_match.group(2))
-
-        # Parse pixel format - look for the 4-character code
-        # Example: "Pixel Format      : 'NV12' (Y/UV 4:2:0)"
-        # Example: "Pixel Format      : 'BGR3' (24-bit BGR 8-8-8)"
-        fmt_match = re.search(r"Pixel Format\s*:\s*'(\w+)'", output)
-        if fmt_match:
-            v4l2_format = fmt_match.group(1)
-            result['format'] = v4l2_format
-
-            # Map V4L2 format codes to ustreamer format names
-            format_map = {
-                'NV12': 'NV12',
-                'NV16': 'NV16',
-                'NV24': 'NV24',
-                'BGR3': 'BGR24',
-                'RGB3': 'RGB24',
-                'YUYV': 'YUYV',
-                'UYVY': 'UYVY',
-                'MJPG': 'MJPEG',
-                'JPEG': 'MJPEG',
-            }
-            result['ustreamer_format'] = format_map.get(v4l2_format, v4l2_format)
-
-        logger.info(f"Probed {device}: {result['width']}x{result['height']} format={result['format']} -> {result['ustreamer_format']}")
-
-    except subprocess.TimeoutExpired:
-        logger.warning(f"Timeout probing {device}")
-    except Exception as e:
-        logger.warning(f"Error probing {device}: {e}")
-
-    return result
-
-
-@dataclass
-class MinusConfig:
-    """Configuration for the Minus pipeline."""
-    device: str = "/dev/video0"
-    screenshot_dir: str = "screenshots"
-    ocr_timeout: float = 1.5
-    ustreamer_port: int = 9090
-    max_screenshots: int = 50
-    drm_connector_id: int = None  # Auto-detect HDMI output connector
-    drm_plane_id: int = None  # Auto-detect NV12-capable overlay plane
-    output_width: int = None  # Auto-detect from display EDID
-    output_height: int = None  # Auto-detect from display EDID
-    audio_capture_device: str = "hw:4,0"  # HDMI-RX audio input (always card 4)
-    audio_playback_device: str = None  # Auto-detect based on connected HDMI output
-    webui_port: int = 8080  # Web UI port
-
-
-class UstreamerCapture:
-    """Frame capture using ustreamer's HTTP snapshot endpoint."""
-
-    def __init__(self, port=9090):
-        self.port = port
-        self.snapshot_url = f'http://localhost:{port}/snapshot'
-        # Use PID-based filename to avoid conflicts with root-owned stale files
-        self.screenshot_path = f'/dev/shm/minus_frame_{os.getpid()}.jpg'
-
-    def cleanup(self):
-        """Remove the temporary screenshot file."""
-        try:
-            Path(self.screenshot_path).unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    def capture(self):
-        """Capture frame via HTTP snapshot and return as numpy array."""
-        try:
-            result = subprocess.run(
-                ['curl', '-s', '-o', self.screenshot_path, self.snapshot_url],
-                capture_output=True, timeout=3
-            )
-
-            if result.returncode == 0:
-                img = cv2.imread(self.screenshot_path)
-                if img is not None:
-                    # Scale to 960x540 for OCR - model uses 960x960 anyway
-                    # Using INTER_AREA for best quality downscaling, fast on 4K->540p
-                    h, w = img.shape[:2]
-                    if h > 540 or w > 960:
-                        img = cv2.resize(img, (960, 540), interpolation=cv2.INTER_AREA)
-                    return img
-
-            return None
-        except Exception as e:
-            logger.error(f"Snapshot capture error: {e}")
-            return None
+# Import Notification Overlay
+try:
+    from overlay import NotificationOverlay, SystemNotification
+    HAS_OVERLAY = True
+except ImportError as e:
+    logger.warning(f"Overlay module not available: {e}")
+    HAS_OVERLAY = False
 
 
 class Minus:
@@ -478,6 +195,7 @@ class Minus:
         self.running = False
         self.blocking_active = False
         self._hdmi_recovery_in_progress = False  # Prevent main loop interference during HDMI recovery
+        self._hdmi_signal_lost = False  # Pause detection workers when HDMI signal is lost
 
         # ML processing
         self.ocr = None
@@ -505,6 +223,61 @@ class Minus:
         self.vlm_consecutive_ad_count = 0
         self.vlm_no_ad_count = 0
 
+        # VLM stability system - sliding window approach to prevent waffling
+        # Tracks recent VLM decisions and requires sustained agreement to change state
+        # NOTE: FastVLM-1.5B is smarter, so thresholds can be more relaxed
+        self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
+        self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
+        self.vlm_min_decisions = 4          # Need at least 4 decisions to act
+        self.vlm_start_agreement = 0.80     # Need 80% ad agreement to START blocking
+        self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
+        self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
+
+        # State change rate limiting
+        self.vlm_last_state_change = 0      # When VLM state last changed
+        self.vlm_min_state_duration = 8.0   # Min seconds before allowing state change
+        self.vlm_cooldown_active = False    # Currently in cooldown period
+
+        # Legacy counters (still used for some logic)
+        self.vlm_waffle_count = 0           # How many recent flip-flops (used for logging)
+        self.vlm_last_state = None          # Last VLM state ('ad' or 'no-ad')
+        self.vlm_state_change_time = 0      # When state last changed
+
+        # Home screen detection - suppress ad detection on streaming app interfaces
+        # When OCR detects these keywords, both OCR and VLM ad detection is suppressed
+        # (e.g., "Sponsored" rows on Fire TV home are promotional but not video ads)
+        self.home_screen_keywords = {
+            'home', 'disney+', 'netflix', 'youtube', 'hulu', 'prime video',
+            'amazon', 'settings', 'search', 'library', 'watchlist', 'my stuff',
+            'continue watching', 'recommended', 'trending', 'popular', 'new releases',
+            'categories', 'genres', 'apps', 'channels', 'live tv',
+            # Fire TV specific
+            'surprise me', 'see more', 'for you',
+            'recently added', 'top picks', 'movies', 'tv shows'
+        }
+
+        # Video player interface keywords - suppress VLM false positives on video UIs
+        # VLM often thinks video player interfaces are ads
+        self.video_interface_keywords = {
+            # Video player controls/info
+            'subscribe', 'subscribed', 'description', 'comments',
+            'views', 'likes', 'share', 'save', 'download',
+            # Time indicators (e.g., "3 years ago", "5 months ago")
+            'ago', 'year', 'month', 'week', 'day', 'hour',
+            # Music/video platforms
+            'colors', 'vevo', 'official', 'music video', 'lyric',
+            # Channel indicators
+            'channel', 'playlist', 'queue', 'autoplay',
+            # YouTube specific
+            'show more', 'show less', 'read more',
+        }
+
+        self.last_ocr_texts = []            # Last OCR detected texts
+        self.home_screen_detected = False   # True if home screen keywords found
+        self.home_screen_detect_time = 0    # When home screen was last detected
+        self.video_interface_detected = False  # True if video player interface detected
+        self.video_interface_detect_time = 0   # When video interface was last detected
+
         # Combined ad detection state
         self.ad_detected = False
         self.frame_count = 0
@@ -517,7 +290,7 @@ class Minus:
         self.MIN_BLOCKING_DURATION = 3.0
         self.OCR_STOP_THRESHOLD = 3
         self.VLM_STOP_THRESHOLD = 2
-        self.SKIP_DELAY_SECONDS = 11.0  # Wait 11s after ad starts before attempting skip
+        self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
         self._state_lock = threading.Lock()
 
@@ -532,7 +305,7 @@ class Minus:
         # (e.g., paused video with ad, YouTube landing page with sponsored content)
         self.STATIC_TIME_THRESHOLD = 2.5  # Seconds of static screen to trigger suppression
         self.STATIC_OCR_THRESHOLD = 4     # OCR iterations without scene change
-        self.DYNAMIC_COOLDOWN = 1.5       # Keep suppression for this long after screen becomes dynamic
+        self.DYNAMIC_COOLDOWN = 0.5       # Keep suppression for this long after screen becomes dynamic (reduced from 1.5s)
         self.static_since_time = 0        # When screen became static (0 = not static)
         self.static_ocr_count = 0         # OCR iterations without scene change
         self.static_blocking_suppressed = False  # Currently suppressing due to static
@@ -543,14 +316,11 @@ class Minus:
         self.vlm_scene_skip_count = 0
         self.vlm_max_scene_skip = 10  # Force VLM after this many consecutive skips
 
-        # Screenshot directories
-        self.screenshot_dir = Path(config.screenshot_dir) / "ocr"
-        self.screenshot_dir.mkdir(parents=True, exist_ok=True)
-        self.non_ad_screenshot_dir = Path(config.screenshot_dir) / "non_ad"
-        self.non_ad_screenshot_dir.mkdir(parents=True, exist_ok=True)
-        self.screenshot_count = 0
-        self.non_ad_screenshot_count = 0
-        self.screenshot_hashes = set()  # For deduplication (O(1) lookup)
+        # Screenshot manager (organizes into ads/, non_ads/, vlm_spastic/, static/ subdirs)
+        self.screenshot_manager = ScreenshotManager(
+            base_dir=Path(config.screenshot_dir),
+            max_screenshots=config.max_screenshots
+        )
 
         # Web UI state
         self.webui = None
@@ -564,12 +334,22 @@ class Minus:
         self.fire_tv_controller = None
         self._fire_tv_setup_thread = None
 
-        # Skip opportunity state
+        # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
+        # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
+        self.auto_skip_enabled = True  # Enable auto-skip (fixed: now properly detects countdown)
         self.skip_available = False  # True when "Skip" button is ready (no countdown)
-        self.skip_countdown = None   # Countdown seconds if not yet skippable
+        self.skip_countdown = None   # Current countdown value (for tracking transitions)
+        self.last_skip_countdown = None  # Previous countdown value (for detecting 1->0 transition)
         self.last_skip_text = None   # The detected skip text
-        self.last_skip_time = 0      # When skip was last detected
-        self.skip_attempts = 0       # How many times we would have skipped
+        self.skip_attempted_this_ad = False  # Have we already tried to skip this ad?
+        self.last_skip_attempt_time = 0  # When we last attempted a skip
+        self.last_skip_success_time = 0  # When we last successfully skipped an ad
+        self.SKIP_ATTEMPT_COOLDOWN = 10.0  # Don't try again for 10s after ANY attempt (prevents pause spam)
+
+        # Accidental pause detection
+        self.blocking_end_time = 0  # When blocking last ended
+        self.PAUSE_DETECT_WINDOW = 1.5  # Window after skip to detect accidental pause
+        self.accidental_pause_detected = False
 
         # Probe DRM output to auto-detect connector, plane, resolution, and audio device
         if config.drm_connector_id is None or config.drm_plane_id is None or config.output_width is None or config.audio_playback_device is None:
@@ -599,7 +379,9 @@ class Minus:
                 config.audio_playback_device = config.audio_playback_device or 'hw:0,0'
 
         # Initialize OCR
-        if HAS_OCR:
+        if config.no_ocr:
+            logger.info("OCR disabled via --no-ocr flag")
+        elif HAS_OCR:
             det_model, rec_model, dict_path = self._find_model_paths()
             if det_model:
                 self.ocr = PaddleOCR(
@@ -629,7 +411,9 @@ class Minus:
                 logger.exception(f"AdBlocker init failed: {e}")
 
         # Initialize VLM
-        if HAS_VLM:
+        if config.no_vlm:
+            logger.info("VLM disabled via --no-vlm flag")
+        elif HAS_VLM:
             try:
                 self.vlm = VLMManager()
                 logger.info("VLM manager initialized")
@@ -667,6 +451,16 @@ class Minus:
                 logger.warning(f"Health monitor init failed: {e}")
                 self.health_monitor = None
 
+        # Initialize System Notification overlay (for VLM status, etc.)
+        self.system_notification = None
+        if HAS_OVERLAY:
+            try:
+                self.system_notification = SystemNotification(ustreamer_port=config.ustreamer_port)
+                logger.info("System notification overlay initialized")
+            except Exception as e:
+                logger.warning(f"System notification init failed: {e}")
+                self.system_notification = None
+
     def _find_model_paths(self):
         """Find PaddleOCR model paths."""
         search_paths = [
@@ -689,39 +483,46 @@ class Minus:
 
     def _on_hdmi_lost(self):
         """Handle HDMI signal loss."""
-        logger.warning("[Recovery] HDMI signal lost - showing placeholder")
-        # Show blocking screen with HDMI lost message
+        logger.warning("[Recovery] HDMI signal lost - showing NO SIGNAL display")
+        # Pause detection workers to prevent memory leak from repeated snapshot timeouts
+        self._hdmi_signal_lost = True
+        # Switch to standalone NO SIGNAL display (doesn't depend on ustreamer)
         if self.ad_blocker:
-            self.ad_blocker.show('hdmi_lost')
+            self.ad_blocker.start_no_signal_mode()
         if self.audio:
+            # Pause watchdog to prevent restart loops (source is unavailable)
+            self.audio.pause_watchdog()
             self.audio.mute()
 
     def _on_hdmi_restored(self):
         """Handle HDMI signal restoration."""
-        logger.info("[Recovery] HDMI signal restored - restarting capture")
+        logger.info("[Recovery] HDMI signal restored - showing loading screen")
+
+        # Resume detection workers
+        self._hdmi_signal_lost = False
 
         # Set flag to prevent main loop from interfering with recovery
         self._hdmi_recovery_in_progress = True
 
         try:
+            # Switch to loading display while we restart everything
+            if self.ad_blocker:
+                self.ad_blocker.start_loading_mode()
+
             # Restart ustreamer first to pick up new signal
             self._restart_ustreamer()
 
             # Wait for ustreamer to be fully ready before restarting video pipeline
             time.sleep(2)
 
-            # Restart video pipeline to reconnect to ustreamer
+            # Start the video pipeline (will transition from loading to live)
             if self.ad_blocker:
-                logger.info("[Recovery] Restarting video pipeline...")
-                self.ad_blocker.restart()
+                logger.info("[Recovery] Starting video pipeline...")
+                self.ad_blocker.start()
 
-            # Wait for pipeline restart to complete (it runs async with backoff)
-            time.sleep(3)
-
-            # Hide blocking screen and restore video after restart
-            if self.ad_blocker and not self.ad_detected:
-                self.ad_blocker.hide()
             if self.audio:
+                # Resume watchdog and restart pipeline (source is available again)
+                self.audio.resume_watchdog()
                 self.audio.unmute()
 
             logger.info("[Recovery] HDMI recovery complete")
@@ -730,9 +531,12 @@ class Minus:
 
     def _on_video_pipeline_stall(self):
         """Handle video pipeline stall detected by health monitor."""
-        logger.warning("[Recovery] Video pipeline stall detected - restarting pipeline")
+        logger.warning("[Recovery] Video pipeline stall detected - showing loading and restarting")
         if self.ad_blocker:
-            self.ad_blocker.restart()
+            # Show loading while we restart the pipeline
+            self.ad_blocker.start_loading_mode()
+            # Start will transition from loading to live
+            self.ad_blocker.start()
 
     def _restart_ustreamer(self):
         """Restart ustreamer process."""
@@ -773,6 +577,7 @@ class Minus:
                 '--quality=80',
                 '--workers=4',             # 4 parallel MPP encoders (optimal)
                 '--buffers=5',
+                '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
             ]
 
             logger.info(f"[Recovery] Starting ustreamer: {' '.join(ustreamer_cmd)}")
@@ -834,18 +639,8 @@ class Minus:
         self.prev_frame = None
         self.vlm_prev_frame = None
 
-        # Clear old screenshots beyond minimum
-        try:
-            screenshots = sorted(
-                self.screenshot_dir.glob("*.png"),
-                key=lambda p: p.stat().st_mtime
-            )
-            # Keep only last 10 in emergency
-            for old_file in screenshots[:-10]:
-                old_file.unlink()
-                logger.debug(f"[Recovery] Deleted {old_file.name}")
-        except Exception as e:
-            logger.error(f"[Recovery] Error cleaning screenshots: {e}")
+        # NOTE: Screenshot cleanup removed - we want to keep ALL screenshots for training data
+        # The memory issue should be addressed by fixing actual memory leaks, not deleting training data
 
     # ===== Fire TV Setup Methods =====
 
@@ -937,47 +732,6 @@ class Minus:
                 logger.warning(f"[FireTV] Skip command failed: {e}")
         return False
 
-    def check_skip_opportunity(self, all_texts: list) -> tuple:
-        """
-        Check OCR results for skippable "Skip" button (no countdown).
-
-        For YouTube ads:
-        - "Skip" alone = skippable NOW
-        - "Skip Ad" = skippable NOW
-        - "Skip 5" or "Skip Ad in 5" = NOT skippable (countdown active)
-
-        Args:
-            all_texts: List of detected text strings from OCR
-
-        Returns:
-            Tuple of (is_skippable, skip_text, countdown_seconds)
-            - is_skippable: True if skip button is ready to press
-            - skip_text: The detected skip-related text
-            - countdown_seconds: Countdown remaining (0 if skippable, >0 if countdown)
-        """
-        import re
-
-        for text in all_texts:
-            text_lower = text.lower().strip()
-
-            # Check for "Skip" with countdown number
-            # Patterns: "Skip 5", "Skip Ad in 5", "Skip in 5s", "Skip 10", etc.
-            countdown_match = re.search(r'skip\s*(?:ad\s*)?(?:in\s*)?(\d+)\s*s?', text_lower)
-            if countdown_match:
-                countdown = int(countdown_match.group(1))
-                return (False, text, countdown)
-
-            # Check for standalone "Skip" or "Skip Ad" (no number = skippable)
-            # Must be short text to avoid false positives like "Skip this step"
-            if re.search(r'^skip\s*(?:ad|ads)?$', text_lower) and len(text_lower) <= 10:
-                return (True, text, 0)
-
-            # Also check "Skip Ad" button variant
-            if text_lower in ['skip', 'skip ad', 'skip ads', 'skipad']:
-                return (True, text, 0)
-
-        return (False, None, None)
-
     # ===== Web UI Methods =====
 
     def pause_blocking(self, duration_seconds: int = 120):
@@ -988,7 +742,9 @@ class Minus:
 
         # Capture non-ad screenshot for future VLM training
         # This helps collect examples of content that should NOT be classified as ads
-        self._save_non_ad_screenshot()
+        if self.frame_capture:
+            frame = self.frame_capture.capture()
+            self.screenshot_manager.save_non_ad_screenshot(frame)
 
         # Immediately hide blocking overlay and unmute
         if self.ad_blocker:
@@ -1045,9 +801,15 @@ class Minus:
 
         uptime = int(time.time() - self.start_time)
 
+        # Check if blocking is active (either via detection or test mode)
+        is_blocking = (self.ad_detected and not self.is_blocking_paused() and not self.static_blocking_suppressed)
+        # Also check if ad_blocker is directly visible (test mode)
+        if self.ad_blocker and self.ad_blocker.is_visible:
+            is_blocking = True
+
         return {
             # Blocking state
-            'blocking': self.ad_detected and not self.is_blocking_paused() and not self.static_blocking_suppressed,
+            'blocking': is_blocking,
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
@@ -1058,7 +820,7 @@ class Minus:
             'vlm_detected': self.vlm_ad_detected,
             'ocr_frame_count': self.frame_count,
             'vlm_frame_count': self.vlm_frame_count,
-            'total_detections': self.screenshot_count,
+            'total_detections': self.screenshot_manager.ads_count if self.screenshot_manager else 0,
 
             # System status
             'fps': fps,
@@ -1077,7 +839,7 @@ class Minus:
             'skip_available': self.skip_available,
             'skip_countdown': self.skip_countdown,
             'skip_text': self.last_skip_text,
-            'skip_attempts': self.skip_attempts,
+            'skip_attempted': self.skip_attempted_this_ad,
 
             # Fire TV status
             'fire_tv_connected': self.fire_tv_controller is not None and self.fire_tv_controller.is_connected() if self.fire_tv_controller else False,
@@ -1110,6 +872,164 @@ class Minus:
         if self.vlm_prev_frame is None:
             return True
         return self._compare_frames(frame, self.vlm_prev_frame) > self.scene_change_threshold
+
+    def _add_vlm_decision(self, is_ad: bool, confidence: float = 0.75):
+        """Add a VLM decision to the sliding window history with confidence."""
+        now = time.time()
+        self.vlm_decision_history.append((now, is_ad, confidence))
+
+        # Prune old decisions outside the window
+        cutoff = now - self.vlm_history_window
+        self.vlm_decision_history = [
+            entry for entry in self.vlm_decision_history
+            if entry[0] >= cutoff
+        ]
+
+    def _is_transition_frame(self, frame, threshold=15, black_threshold=30, uniformity_threshold=0.95) -> tuple:
+        """
+        Detect if a frame is a transition screen (mostly black or single solid color).
+
+        These frames often appear between ads or between an ad and content.
+        When blocking, we should hold through these rather than unblocking.
+
+        Args:
+            frame: BGR image (numpy array)
+            threshold: Max std dev to consider "uniform" color
+            black_threshold: Max brightness to consider "black"
+            uniformity_threshold: Min fraction of pixels that must be similar
+
+        Returns:
+            (is_transition, reason) - reason is 'black', 'solid_color', or None
+        """
+        try:
+            import numpy as np
+
+            if frame is None or frame.size == 0:
+                return False, None
+
+            # Convert to grayscale for analysis
+            if len(frame.shape) == 3:
+                gray = np.mean(frame, axis=2)
+            else:
+                gray = frame
+
+            mean_brightness = np.mean(gray)
+            std_brightness = np.std(gray)
+
+            # Check if mostly black (common ad transition)
+            if mean_brightness < black_threshold and std_brightness < threshold:
+                return True, 'black'
+
+            # Check if solid/uniform color (fade transitions)
+            if std_brightness < threshold:
+                return True, 'solid_color'
+
+            # Check if most pixels are very similar (near-uniform with minor noise)
+            median_val = np.median(gray)
+            similar_pixels = np.sum(np.abs(gray - median_val) < 20) / gray.size
+            if similar_pixels > uniformity_threshold:
+                return True, 'uniform'
+
+            return False, None
+
+        except Exception as e:
+            logger.debug(f"Transition detection error: {e}")
+            return False, None
+
+    def _get_vlm_agreement(self) -> tuple:
+        """
+        Calculate VLM agreement percentage from sliding window using confidence-weighted votes.
+
+        High-confidence decisions count more than low-confidence ones.
+
+        Returns:
+            (ad_ratio, no_ad_ratio, total_decisions)
+            - ad_ratio: confidence-weighted fraction of 'ad' decisions (0.0-1.0)
+            - no_ad_ratio: confidence-weighted fraction of 'no-ad' decisions (0.0-1.0)
+            - total_decisions: number of decisions in window
+        """
+        if not self.vlm_decision_history:
+            return 0.0, 0.0, 0
+
+        now = time.time()
+        cutoff = now - self.vlm_history_window
+
+        # Filter to recent decisions (handle both old and new tuple formats)
+        recent = []
+        for entry in self.vlm_decision_history:
+            if entry[0] >= cutoff:
+                if len(entry) == 3:
+                    recent.append(entry)  # (time, is_ad, confidence)
+                else:
+                    # Legacy format without confidence - use default 0.75
+                    recent.append((entry[0], entry[1], 0.75))
+
+        if not recent:
+            return 0.0, 0.0, 0
+
+        total = len(recent)
+
+        # Confidence-weighted voting
+        ad_weight = sum(conf for _, is_ad, conf in recent if is_ad)
+        no_ad_weight = sum(conf for _, is_ad, conf in recent if not is_ad)
+        total_weight = ad_weight + no_ad_weight
+
+        if total_weight == 0:
+            return 0.0, 0.0, total
+
+        return ad_weight / total_weight, no_ad_weight / total_weight, total
+
+    def _should_vlm_start_blocking(self) -> bool:
+        """
+        Determine if VLM should trigger blocking based on sliding window agreement.
+
+        Uses hysteresis: if we're NOT currently blocking, we need higher agreement to START.
+        """
+        ad_ratio, _, total = self._get_vlm_agreement()
+
+        if total < self.vlm_min_decisions:
+            return False  # Not enough data
+
+        # Check cooldown
+        now = time.time()
+        if self.vlm_cooldown_active:
+            time_since_change = now - self.vlm_last_state_change
+            if time_since_change < self.vlm_min_state_duration:
+                return False  # Still in cooldown
+
+        # Need strong ad agreement to start
+        threshold = self.vlm_start_agreement
+        if not self.vlm_ad_detected:
+            # Not currently detecting - need even stronger evidence to start
+            threshold += self.vlm_hysteresis_boost
+
+        return ad_ratio >= threshold
+
+    def _should_vlm_stop_blocking(self) -> bool:
+        """
+        Determine if VLM should stop blocking based on sliding window agreement.
+
+        Uses hysteresis: if we ARE currently blocking, we need higher agreement to STOP.
+        """
+        _, no_ad_ratio, total = self._get_vlm_agreement()
+
+        if total < self.vlm_min_decisions:
+            return False  # Not enough data - keep current state
+
+        # Check cooldown
+        now = time.time()
+        if self.vlm_cooldown_active:
+            time_since_change = now - self.vlm_last_state_change
+            if time_since_change < self.vlm_min_state_duration:
+                return False  # Still in cooldown
+
+        # Need strong no-ad agreement to stop
+        threshold = self.vlm_stop_agreement
+        if self.vlm_ad_detected:
+            # Currently detecting - need even stronger evidence to stop
+            threshold += self.vlm_hysteresis_boost
+
+        return no_ad_ratio >= threshold
 
     def check_hdmi_signal(self):
         """Check HDMI signal and return resolution."""
@@ -1242,6 +1162,7 @@ class Minus:
             '--quality=80',
             '--workers=4',             # 4 parallel MPP encoders (optimal)
             '--buffers=5',
+            '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
         ]
 
         logger.info(f"Starting ustreamer: {' '.join(ustreamer_cmd)}")
@@ -1321,21 +1242,37 @@ class Minus:
                 source = None
 
                 if self.ocr_ad_detected:
+                    # OCR is primary - always trust it immediately
                     should_start = True
                     source = "both" if self.vlm_ad_detected else "ocr"
-                elif self.vlm_ad_detected and not ocr_recent:
-                    if self.vlm_consecutive_ad_count >= self.VLM_ALONE_THRESHOLD:
+                elif self.vlm_ad_detected:
+                    # VLM alone - vlm_ad_detected is now managed by sliding window
+                    # which already requires sustained agreement before setting True
+                    # BUT suppress if OCR recently detected home screen or video interface keywords
+                    # ALSO suppress if screen is static (prevents blocking on paused video interfaces)
+                    if self.home_screen_detected:
+                        ad_ratio, _, total = self._get_vlm_agreement()
+                        logger.info(f"VLM suppressed - home screen detected (OCR cross-validation). Agreement was {ad_ratio*100:.0f}% of {total}")
+                    elif self.video_interface_detected:
+                        ad_ratio, _, total = self._get_vlm_agreement()
+                        logger.info(f"VLM suppressed - video interface detected (prevents false positive on player UI). Agreement was {ad_ratio*100:.0f}% of {total}")
+                    elif self.static_blocking_suppressed:
+                        ad_ratio, _, total = self._get_vlm_agreement()
+                        logger.info(f"VLM suppressed - static screen detected (prevents false positive on paused content). Agreement was {ad_ratio*100:.0f}% of {total}")
+                    else:
                         should_start = True
                         source = "vlm"
-                        logger.info(f"VLM triggered alone after {self.vlm_consecutive_ad_count} consecutive detections")
-                elif self.vlm_ad_detected and ocr_recent:
-                    should_start = True
-                    source = "vlm"
+                        ad_ratio, _, total = self._get_vlm_agreement()
+                        logger.info(f"VLM triggered alone (agreement: {ad_ratio*100:.0f}% of {total} decisions)")
 
                 if should_start:
                     self.ad_detected = True
                     self.blocking_start_time = now
                     self.blocking_source = source
+                    # Reset skip and pause detection for new ad
+                    self.accidental_pause_detected = False
+                    self.skip_attempted_this_ad = False
+                    self.last_skip_countdown = None
                     source_display = source.upper() if source != "both" else "OCR+VLM"
                     logger.warning(f"AD BLOCKING STARTED ({source_display})")
 
@@ -1352,17 +1289,42 @@ class Minus:
 
                 if blocking_elapsed >= self.MIN_BLOCKING_DURATION:
                     ocr_says_stop = (self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD)
+                    # For VLM stopping, use consecutive no-ad count (not sliding window)
+                    # This ensures responsive stopping after ad ends
+                    vlm_says_stop = (self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD)
 
-                    if ocr_recent:
-                        vlm_says_stop = (self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD)
-                        should_stop = ocr_says_stop and vlm_says_stop
+                    if self.blocking_source == "vlm":
+                        # VLM triggered alone - VLM must also agree to stop
+                        # (OCR never detected the ad, so OCR's opinion is unreliable here)
+                        # Use simple consecutive count, not sliding window (for responsiveness)
+                        should_stop = vlm_says_stop
+
+                        # SAFEGUARD: Auto-stop VLM-only blocking after 90 seconds
+                        # This prevents extended false positives on video interfaces
+                        # Real ads rarely last more than 60-90 seconds
+                        if blocking_elapsed >= 90.0 and not should_stop:
+                            logger.warning(f"[VLM] Auto-stopping VLM-only blocking after {blocking_elapsed:.0f}s (safeguard)")
+                            should_stop = True
                     else:
+                        # OCR triggered (alone or with VLM) - OCR is authoritative for stopping
+                        # This ensures we don't block longer than necessary after ad ends
                         should_stop = ocr_says_stop
 
                 if should_stop:
                     self.ad_detected = False
+                    source_was = self.blocking_source
                     self.blocking_source = None
-                    logger.warning(f"AD BLOCKING ENDED after {blocking_elapsed:.1f}s")
+                    # Also clear VLM state so it doesn't immediately re-trigger
+                    self.vlm_ad_detected = False
+                    self.vlm_decision_history.clear()
+                    # Track when blocking ended (for accidental pause detection)
+                    self.blocking_end_time = time.time()
+                    # Reset skip state for next ad
+                    self.skip_available = False
+                    self.skip_attempted_this_ad = False
+                    self.last_skip_countdown = None
+                    self.skip_countdown = None
+                    logger.warning(f"AD BLOCKING ENDED after {blocking_elapsed:.1f}s (stopped by {source_was.upper() if source_was else 'unknown'})")
 
             # Update overlay (respect pause state and static screen suppression)
             # Static screen suppression: don't block still ads (paused video, landing pages)
@@ -1371,7 +1333,8 @@ class Minus:
                 self.ad_detected and
                 self.blocking_source and
                 not self.is_blocking_paused() and
-                not self.static_blocking_suppressed
+                not self.static_blocking_suppressed and
+                not self.config.no_blocking  # Allow disabling for testing
             )
 
             if self.ad_blocker:
@@ -1404,8 +1367,17 @@ class Minus:
 
         logger.info(f"Using HTTP snapshot at {self.frame_capture.snapshot_url}")
 
+        # Create a single ThreadPoolExecutor for OCR timeout handling
+        # CRITICAL: Creating this inside the loop caused massive memory/FD leak!
+        ocr_executor = ThreadPoolExecutor(max_workers=1)
+
         while self.running:
             try:
+                # Pause when HDMI signal is lost to prevent memory leak from repeated timeouts
+                if self._hdmi_signal_lost:
+                    time.sleep(1.0)
+                    continue
+
                 start_time = time.time()
                 frame = self.frame_capture.capture()
                 capture_time = (time.time() - start_time) * 1000
@@ -1443,9 +1415,26 @@ class Minus:
                         logger.info(f"[Static] Screen static for {static_time:.1f}s / {self.static_ocr_count} OCR cycles - suppressing blocking")
                         self.static_blocking_suppressed = True
                         self.screen_became_dynamic_time = 0  # Reset cooldown timer
+
+                        # Accidental pause detection: if screen went static right after we skipped,
+                        # we may have accidentally paused the video. Send PLAY to resume.
+                        time_since_blocking_end = now - self.blocking_end_time if self.blocking_end_time > 0 else float('inf')
+                        time_since_skip_success = now - self.last_skip_success_time if self.last_skip_success_time > 0 else float('inf')
+
+                        if (time_since_blocking_end < self.PAUSE_DETECT_WINDOW and
+                            time_since_skip_success < self.PAUSE_DETECT_WINDOW and
+                            not self.accidental_pause_detected):
+                            logger.warning(f"[PAUSE] Detected potential accidental pause! Screen static {time_since_blocking_end:.1f}s after blocking ended, {time_since_skip_success:.1f}s after skip. Sending PLAY...")
+                            self.accidental_pause_detected = True  # Only try once per ad
+                            if self.fire_tv_controller and self.fire_tv_controller.is_connected():
+                                if self.fire_tv_controller.send_command("play"):
+                                    logger.info("[PAUSE] PLAY command sent - video should resume")
+                                else:
+                                    logger.warning("[PAUSE] Failed to send PLAY command")
+
                         # Save screenshot as non-ad training data (still ads shouldn't be blocked)
                         if self.ad_detected:
-                            self._save_static_ad_screenshot(frame)
+                            self.screenshot_manager.save_static_ad_screenshot(frame)
                         # If currently blocking, hide the overlay
                         if self.ad_detected:
                             self._update_blocking_state()
@@ -1474,20 +1463,19 @@ class Minus:
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Run OCR with timeout
-                with ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self.ocr.ocr, frame_rgb)
-                    try:
-                        ocr_results = future.result(timeout=self.config.ocr_timeout)
-                    except FuturesTimeoutError:
-                        logger.warning(f"OCR #{self.frame_count}: TIMEOUT ({self.config.ocr_timeout}s) - assuming no ad")
-                        self.ocr_no_ad_count += 1
-                        self.ocr_ad_detection_count = 0
-                        if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
-                            self.ocr_ad_detected = False
-                            logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} timeouts)")
-                            self._update_blocking_state()
-                        continue
+                # Run OCR with timeout using pre-created executor
+                future = ocr_executor.submit(self.ocr.ocr, frame_rgb)
+                try:
+                    ocr_results = future.result(timeout=self.config.ocr_timeout)
+                except FuturesTimeoutError:
+                    logger.warning(f"OCR #{self.frame_count}: TIMEOUT ({self.config.ocr_timeout}s) - assuming no ad")
+                    self.ocr_no_ad_count += 1
+                    self.ocr_ad_detection_count = 0
+                    if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
+                        self.ocr_ad_detected = False
+                        logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} timeouts)")
+                        self._update_blocking_state()
+                    continue
 
                 ocr_time = (time.time() - start_time) * 1000 - capture_time
 
@@ -1500,44 +1488,118 @@ class Minus:
 
                 ad_detected, matched_keywords, all_texts, is_terminal = self.ocr.check_ad_keywords(ocr_results)
 
+                # Store OCR texts and check for home screen / video interface keywords
+                self.last_ocr_texts = all_texts
+                if all_texts:
+                    combined_text = ' '.join(all_texts).lower()
+
+                    # Home screen detection
+                    home_keywords_found = [kw for kw in self.home_screen_keywords if kw in combined_text]
+                    if len(home_keywords_found) >= 2:  # Require 2+ keywords to confirm home screen
+                        self.home_screen_detected = True
+                        self.home_screen_detect_time = time.time()
+                    elif time.time() - self.home_screen_detect_time > 5.0:  # Clear after 5s
+                        self.home_screen_detected = False
+
+                    # Video player interface detection (suppresses VLM false positives)
+                    video_keywords_found = [kw for kw in self.video_interface_keywords if kw in combined_text]
+                    if len(video_keywords_found) >= 2:  # Require 2+ keywords to confirm video interface
+                        self.video_interface_detected = True
+                        self.video_interface_detect_time = time.time()
+                    elif time.time() - self.video_interface_detect_time > 5.0:  # Clear after 5s
+                        self.video_interface_detected = False
+
                 # Check for skip opportunity (for Fire TV ad skipping)
-                # Only attempt skip after SKIP_DELAY_SECONDS since ad blocking started
-                is_skippable, skip_text, countdown = self.check_skip_opportunity(all_texts)
+                # CONSERVATIVE APPROACH: Only try to skip ONCE per ad to avoid accidental pauses
+                is_skippable, skip_text, countdown = check_skip_opportunity(all_texts)
 
                 # Calculate time since ad blocking started
                 time_since_blocking = 0
                 if self.ad_detected and self.blocking_start_time > 0:
                     time_since_blocking = time.time() - self.blocking_start_time
 
-                # Only allow skip after delay period (skip button never appears in first few seconds)
-                skip_delay_passed = time_since_blocking >= self.SKIP_DELAY_SECONDS
+                # Track countdown transitions (for pre-emptive skip at 1->0)
+                countdown_just_hit_zero = (
+                    self.last_skip_countdown is not None and
+                    self.last_skip_countdown == 1 and
+                    (countdown == 0 or is_skippable)
+                )
 
-                if is_skippable and skip_delay_passed:
-                    if not self.skip_available:
-                        self.skip_available = True
-                        self.last_skip_text = skip_text
-                        self.last_skip_time = time.time()
-                        self.skip_attempts += 1
-                        logger.warning(f"[SKIP] >>> SKIP BUTTON READY! Would skip now. Text: '{skip_text}' (attempt #{self.skip_attempts})")
-                        # Update overlay to show skip available
-                        if self.ad_blocker:
-                            self.ad_blocker.set_skip_status(True, skip_text)
-                    self.skip_countdown = 0
-                elif is_skippable and not skip_delay_passed:
-                    # Skip button visible but delay not passed yet
-                    wait_remaining = int(self.SKIP_DELAY_SECONDS - time_since_blocking)
-                    if wait_remaining > 0:
-                        logger.debug(f"[SKIP] Skip visible but waiting {wait_remaining}s more (delay: {self.SKIP_DELAY_SECONDS}s)")
-                        if self.ad_blocker:
-                            self.ad_blocker.set_skip_status(False, f"Wait {wait_remaining}s")
-                elif countdown is not None:
-                    self.skip_available = False
+                # Update countdown tracking
+                if countdown is not None:
+                    self.last_skip_countdown = countdown
                     self.skip_countdown = countdown
                     self.last_skip_text = skip_text
-                    logger.info(f"[SKIP] Skip countdown: {countdown}s remaining. Text: '{skip_text}'")
                     if self.ad_blocker:
-                        self.ad_blocker.set_skip_status(False, f"Skip in {countdown}s")
-                else:
+                        # 99 = special value meaning "OCR detected 'Skip in' but missed the digit"
+                        if countdown == 99:
+                            self.ad_blocker.set_skip_status(False, "Skip pending...")
+                        else:
+                            self.ad_blocker.set_skip_status(False, f"Skip in {countdown}s")
+                elif is_skippable:
+                    self.skip_countdown = 0
+                    self.last_skip_countdown = 0
+
+                # Only allow skip after delay period
+                skip_delay_passed = time_since_blocking >= self.SKIP_DELAY_SECONDS
+
+                # Check cooldown since last attempt
+                time_since_attempt = time.time() - self.last_skip_attempt_time
+                in_cooldown = time_since_attempt < self.SKIP_ATTEMPT_COOLDOWN
+
+                # Determine if we should try to skip
+                # Conditions: skippable, delay passed, haven't tried this ad, not in cooldown
+                should_skip = (
+                    is_skippable and
+                    skip_delay_passed and
+                    not self.skip_attempted_this_ad and
+                    not in_cooldown
+                )
+
+                # Also skip on countdown 1->0 transition (pre-emptive)
+                if countdown_just_hit_zero and not self.skip_attempted_this_ad and not in_cooldown:
+                    should_skip = True
+                    logger.info("[SKIP] Countdown hit zero - attempting skip")
+
+                if should_skip:
+                    self.skip_available = True
+                    self.last_skip_text = skip_text
+
+                    # Check if auto-skip is enabled
+                    if not self.auto_skip_enabled:
+                        logger.info(f"[SKIP] Skip available but auto-skip DISABLED. Text: '{skip_text}'")
+                        if self.ad_blocker:
+                            self.ad_blocker.set_skip_status(True, "Manual skip")
+                    else:
+                        self.skip_attempted_this_ad = True  # Mark as attempted - NO RETRIES
+                        self.last_skip_attempt_time = time.time()
+
+                        logger.warning(f"[SKIP] >>> Attempting skip (ONE attempt only). Text: '{skip_text}'")
+                        if self.ad_blocker:
+                            self.ad_blocker.set_skip_status(True, "Skipping...")
+
+                        if self.try_skip_ad():
+                            logger.info(f"[SKIP] Skip command sent! Waiting to see if it worked...")
+                            self.last_skip_success_time = time.time()
+                            if self.ad_blocker:
+                                self.ad_blocker.add_time_saved(30.0)
+                        else:
+                            logger.warning(f"[SKIP] Skip command failed (Fire TV not connected?)")
+
+                elif is_skippable and not skip_delay_passed:
+                    wait_remaining = int(self.SKIP_DELAY_SECONDS - time_since_blocking)
+                    if wait_remaining > 0 and self.ad_blocker:
+                        self.ad_blocker.set_skip_status(False, f"Wait {wait_remaining}s")
+
+                elif is_skippable and self.skip_attempted_this_ad:
+                    # Already tried - don't retry (this prevents pause spam)
+                    pass
+
+                elif is_skippable and in_cooldown:
+                    remaining = int(self.SKIP_ATTEMPT_COOLDOWN - time_since_attempt)
+                    logger.debug(f"[SKIP] In cooldown, {remaining}s remaining")
+
+                elif not is_skippable and countdown is None:
                     # No skip button detected
                     if self.skip_available:
                         logger.info("[SKIP] Skip button no longer visible")
@@ -1547,23 +1609,37 @@ class Minus:
                         self.ad_blocker.set_skip_status(False, None)
 
                 if ad_detected and not is_terminal:
-                    self.ocr_ad_detection_count += 1
-                    self.ocr_no_ad_count = 0
-                    self.last_ocr_ad_time = time.time()
+                    # Suppress OCR ad detection if home screen is detected
+                    # (e.g., "Sponsored" content rows on Fire TV home are not video ads)
+                    if self.home_screen_detected:
+                        keywords_found = [kw for kw, txt in matched_keywords]
+                        logger.info(f"OCR suppressed - home screen detected. Keywords would have been: {keywords_found}")
+                    else:
+                        self.ocr_ad_detection_count += 1
+                        self.ocr_no_ad_count = 0
+                        self.last_ocr_ad_time = time.time()
 
-                    if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
-                        self.ocr_ad_detected = True
+                        if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
+                            self.ocr_ad_detected = True
                         keywords_found = [kw for kw, txt in matched_keywords]
                         logger.info(f"OCR detected ad keywords: {keywords_found}")
-                        self._save_screenshot(frame, matched_keywords, all_texts)
+                        self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
                         self.add_detection('OCR', all_texts, matched_keywords)
                 else:
-                    self.ocr_no_ad_count += 1
-                    self.ocr_ad_detection_count = 0
+                    # Check if this is a transition frame (black/solid color)
+                    # If we're blocking and see a transition, hold through it
+                    is_transition, transition_type = self._is_transition_frame(frame)
 
-                    if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
-                        self.ocr_ad_detected = False
-                        logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} no-ads)")
+                    if self.ad_detected and is_transition:
+                        # Don't count transition frames as "no ad" - likely between ads
+                        logger.info(f"OCR #{self.frame_count}: Transition frame ({transition_type}) - holding block")
+                    else:
+                        self.ocr_no_ad_count += 1
+                        self.ocr_ad_detection_count = 0
+
+                        if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
+                            self.ocr_ad_detected = False
+                            logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} no-ads)")
 
                 self._update_blocking_state()
 
@@ -1590,12 +1666,17 @@ class Minus:
                 self.prev_frame_had_ad = ad_detected and not is_terminal
                 self.scene_skip_count = 0  # Reset skip counter after processing
 
+                # Periodic garbage collection to prevent memory leak
+                if self.frame_count % 100 == 0:
+                    gc.collect()
+
             except Exception as e:
                 logger.exception(f"OCR worker error: {e}")
 
             time.sleep(0.1)
 
         logger.info("OCR worker thread stopped")
+        ocr_executor.shutdown(wait=False)
 
     def vlm_worker(self):
         """VLM processing thread."""
@@ -1619,6 +1700,11 @@ class Minus:
 
         while self.running:
             try:
+                # Pause when HDMI signal is lost to prevent memory leak from repeated timeouts
+                if self._hdmi_signal_lost:
+                    time.sleep(1.0)
+                    continue
+
                 start_time = time.time()
                 frame = self.frame_capture.capture()
 
@@ -1641,39 +1727,88 @@ class Minus:
                         logger.debug(f"VLM #{self.vlm_frame_count}: Force run after {self.vlm_scene_skip_count} skips")
 
                 cv2.imwrite(vlm_image_path, frame)
-                is_ad, response, elapsed = self.vlm.detect_ad(vlm_image_path)
+                is_ad, response, elapsed, confidence = self.vlm.detect_ad(vlm_image_path)
 
+                # Discard slow VLM responses - scene likely changed during inference
+                VLM_MAX_RELEVANT_TIME = 2.0
+                if elapsed > VLM_MAX_RELEVANT_TIME:
+                    ad_status = "AD" if is_ad else "NO-AD"
+                    response_preview = response[:30] if response else "no response"
+                    logger.warning(f"VLM #{self.vlm_frame_count}: {elapsed:.1f}s [{ad_status}] DISCARDED (took >{VLM_MAX_RELEVANT_TIME}s) \"{response_preview}\"")
+                    self.vlm_prev_frame = frame.copy()
+                    self.vlm_scene_skip_count = 0
+                    time.sleep(0.5)
+                    continue
+
+                # Add decision to sliding window history with confidence
+                now = time.time()
+                self._add_vlm_decision(is_ad, confidence)
+
+                # Track state changes for waffle detection and logging
+                current_state = 'ad' if is_ad else 'no-ad'
+                if self.vlm_last_state is not None and current_state != self.vlm_last_state:
+                    time_since_last_change = now - self.vlm_state_change_time
+                    if time_since_last_change < 15.0:  # Quick flip-flop
+                        self.vlm_waffle_count = min(self.vlm_waffle_count + 1, 10)
+                    self.vlm_state_change_time = now
+                self.vlm_last_state = current_state
+
+                # Update legacy counters (for logging and spastic detection)
                 if is_ad:
                     self.vlm_consecutive_ad_count += 1
                     self.vlm_no_ad_count = 0
+                else:
+                    # Check for transition frame - don't count as "no ad" if blocking
+                    is_transition, transition_type = self._is_transition_frame(frame)
+                    if self.ad_detected and is_transition:
+                        logger.info(f"VLM #{self.vlm_frame_count}: Transition frame ({transition_type}) - holding block")
+                    else:
+                        self.vlm_no_ad_count += 1
+                        # VLM "spastic" detection: save screenshot for training
+                        if 2 <= self.vlm_consecutive_ad_count <= 5:
+                            self.screenshot_manager.save_vlm_spastic_screenshot(frame, self.vlm_consecutive_ad_count)
+                        self.vlm_consecutive_ad_count = 0
 
-                    if not self.vlm_ad_detected:
+                # Get current agreement stats for logging
+                ad_ratio, no_ad_ratio, total_decisions = self._get_vlm_agreement()
+
+                # Use sliding window approach for state changes
+                prev_vlm_ad_detected = self.vlm_ad_detected
+
+                if not self.vlm_ad_detected:
+                    # Not currently detecting - check if we should START
+                    if self._should_vlm_start_blocking():
                         self.vlm_ad_detected = True
-                        logger.info(f"VLM detected ad (x{self.vlm_consecutive_ad_count}): \"{response[:50]}\"")
+                        self.vlm_last_state_change = now
+                        self.vlm_cooldown_active = True
+                        logger.warning(f"VLM detected ad (agreement: {ad_ratio*100:.0f}% of {total_decisions} decisions): \"{response[:50]}\"")
                         self.add_detection('VLM', [response[:100]] if response else [])
                 else:
-                    self.vlm_no_ad_count += 1
-
-                    # VLM "spastic" detection: if VLM detected ads 2-5 times then changed its mind,
-                    # save screenshot for training - this might be a false positive case
-                    if 2 <= self.vlm_consecutive_ad_count <= 5:
-                        self._save_vlm_spastic_screenshot(frame, self.vlm_consecutive_ad_count)
-
-                    self.vlm_consecutive_ad_count = 0
-
-                    if self.vlm_ad_detected and self.vlm_no_ad_count >= self.VLM_STOP_THRESHOLD:
+                    # Currently detecting - check if we should STOP
+                    if self._should_vlm_stop_blocking():
                         self.vlm_ad_detected = False
-                        logger.info(f"VLM: ad no longer detected (after {self.VLM_STOP_THRESHOLD} no-ads)")
+                        self.vlm_last_state_change = now
+                        self.vlm_cooldown_active = True
+                        self.vlm_waffle_count = max(0, self.vlm_waffle_count - 1)  # Decay on stable stop
+                        logger.warning(f"VLM: ad no longer detected (agreement: {no_ad_ratio*100:.0f}% no-ad of {total_decisions} decisions)")
+
+                # Clear cooldown after minimum state duration
+                if self.vlm_cooldown_active and (now - self.vlm_last_state_change) >= self.vlm_min_state_duration:
+                    self.vlm_cooldown_active = False
 
                 self._update_blocking_state()
 
                 ad_status = "AD" if is_ad else "NO-AD"
                 response_preview = response[:40] if response else "no response"
-                logger.info(f"VLM #{self.vlm_frame_count}: {elapsed:.1f}s [{ad_status}] \"{response_preview}\"")
+                logger.info(f"VLM #{self.vlm_frame_count}: {elapsed:.1f}s [{ad_status}] conf={confidence:.0%} \"{response_preview}\"")
 
                 self.vlm_prev_frame = frame.copy()
                 self.vlm_prev_frame_had_ad = is_ad
                 self.vlm_scene_skip_count = 0  # Reset skip counter after processing
+
+                # Periodic garbage collection to prevent memory leak
+                if self.vlm_frame_count % 50 == 0:
+                    gc.collect()
 
             except Exception as e:
                 logger.exception(f"VLM worker error: {e}")
@@ -1688,135 +1823,6 @@ class Minus:
 
         logger.info("VLM worker thread stopped")
 
-    def _compute_image_hash(self, frame):
-        """Compute a fast perceptual hash for deduplication.
-
-        Resizes to 8x8 grayscale and hashes the bytes.
-        O(1) lookup in hash set, robust to minor variations.
-        """
-        try:
-            # Resize to 8x8 and convert to grayscale
-            small = cv2.resize(frame, (8, 8), interpolation=cv2.INTER_AREA)
-            if len(small.shape) == 3:
-                small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            # Return hash of the bytes
-            return hash(small.tobytes())
-        except Exception:
-            return None
-
-    def _save_non_ad_screenshot(self):
-        """
-        Save screenshot when user pauses blocking (for VLM training).
-
-        These screenshots represent content that should NOT be classified as ads.
-        When the user pauses blocking, they're indicating the current content
-        is NOT an ad (false positive), so we save it for training data.
-        """
-        try:
-            if self.frame_capture is None:
-                logger.warning("[WebUI] Cannot save non-ad screenshot: no frame capture")
-                return
-
-            frame = self.frame_capture.capture()
-            if frame is None:
-                logger.warning("[WebUI] Cannot save non-ad screenshot: capture failed")
-                return
-
-            self.non_ad_screenshot_count += 1
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"non_ad_{timestamp}_{self.non_ad_screenshot_count:04d}.png"
-            filepath = self.non_ad_screenshot_dir / filename
-
-            cv2.imwrite(str(filepath), frame)
-            logger.info(f"[WebUI] Non-ad screenshot saved: {filename}")
-
-        except Exception as e:
-            logger.error(f"[WebUI] Failed to save non-ad screenshot: {e}")
-
-    def _save_static_ad_screenshot(self, frame):
-        """
-        Save screenshot when static screen suppression kicks in (for VLM training).
-
-        These screenshots represent still/static ads that should NOT trigger blocking
-        (e.g., paused video with ad overlay, YouTube landing page with sponsored content).
-        Training the VLM on these helps it learn to NOT classify static ads as blockable.
-        """
-        try:
-            if frame is None:
-                return
-
-            self.non_ad_screenshot_count += 1
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"static_ad_{timestamp}_{self.non_ad_screenshot_count:04d}.png"
-            filepath = self.non_ad_screenshot_dir / filename
-
-            cv2.imwrite(str(filepath), frame)
-            logger.info(f"[Static] Saved static ad screenshot for training: {filename}")
-
-        except Exception as e:
-            logger.error(f"[Static] Failed to save static ad screenshot: {e}")
-
-    def _save_vlm_spastic_screenshot(self, frame, consecutive_count):
-        """
-        Save screenshot when VLM is "spastic" - detected ads 2-5 times then changed its mind.
-
-        This captures potential false positive cases where VLM was uncertain.
-        These screenshots can be used to improve VLM training.
-        """
-        try:
-            if frame is None:
-                return
-
-            self.non_ad_screenshot_count += 1
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-            filename = f"vlm_spastic_{consecutive_count}x_{timestamp}_{self.non_ad_screenshot_count:04d}.png"
-            filepath = self.non_ad_screenshot_dir / filename
-
-            cv2.imwrite(str(filepath), frame)
-            logger.info(f"[VLM] Saved spastic screenshot ({consecutive_count}x ad then no-ad): {filename}")
-
-        except Exception as e:
-            logger.error(f"[VLM] Failed to save spastic screenshot: {e}")
-
-    def _save_screenshot(self, frame, matched_keywords, all_texts):
-        """Save screenshot when ad detected (with deduplication)."""
-        # Check for duplicate using perceptual hash
-        img_hash = self._compute_image_hash(frame)
-        if img_hash is not None and img_hash in self.screenshot_hashes:
-            return  # Skip duplicate
-
-        # Add hash to set (cap at 1000 entries to prevent unbounded memory growth)
-        if img_hash is not None:
-            if len(self.screenshot_hashes) >= 1000:
-                self.screenshot_hashes.clear()  # Reset when full
-            self.screenshot_hashes.add(img_hash)
-
-        self.screenshot_count += 1
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        filename = f"ad_{timestamp}_{self.screenshot_count:04d}.png"
-        filepath = self.screenshot_dir / filename
-
-        cv2.imwrite(str(filepath), frame)
-
-        keywords_str = ', '.join([f"'{kw}' in '{txt}'" for kw, txt in matched_keywords])
-        logger.info(f"  Screenshot saved: {filename}")
-        logger.info(f"  Keywords: {keywords_str}")
-        logger.info(f"  All texts: {all_texts}")
-
-        if self.config.max_screenshots > 0:
-            self._truncate_screenshots()
-
-    def _truncate_screenshots(self):
-        """Remove oldest screenshots if we exceed the max limit."""
-        try:
-            screenshots = sorted(self.screenshot_dir.glob("*.png"), key=lambda p: p.stat().st_mtime)
-            excess = len(screenshots) - self.config.max_screenshots
-            if excess > 0:
-                for old_file in screenshots[:excess]:
-                    old_file.unlink()
-        except Exception as e:
-            logger.warning(f"Failed to truncate screenshots: {e}")
-
     def run(self):
         """Start the stream processing."""
         logger.info("Starting Minus...")
@@ -1828,29 +1834,22 @@ class Minus:
             # Start display in no-signal mode to show "NO HDMI INPUT"
             if self.ad_blocker:
                 if self.ad_blocker.start_no_signal_mode():
-                    logger.info("Display showing NO HDMI INPUT message - waiting for HDMI...")
+                    logger.info("Display showing NO SIGNAL message - waiting for HDMI...")
                     # Poll for HDMI signal every 2 seconds
                     self.running = True
                     try:
+                        poll_count = 0
                         while self.running:
                             time.sleep(2)
+                            poll_count += 1
+                            if poll_count % 15 == 0:  # Log every 30 seconds
+                                logger.info("Still waiting for HDMI input...")
                             signal_info = self.check_hdmi_signal()
                             if signal_info:
                                 width, height, fps = signal_info
-                                logger.info(f"HDMI signal detected: {width}x{height} @ {fps}fps - switching to normal mode")
-                                # Stop no-signal display and transition to normal operation
-                                self.ad_blocker.destroy()
-                                # Reinitialize ad_blocker for normal operation
-                                self.ad_blocker = AdBlocker(
-                                    connector_id=self.config.drm_connector_id,
-                                    plane_id=self.config.drm_plane_id,
-                                    minus_instance=self,
-                                    ustreamer_port=self.config.ustreamer_port,
-                                    output_width=self.config.output_width,
-                                    output_height=self.config.output_height
-                                )
-                                if self.audio:
-                                    self.ad_blocker.set_audio(self.audio)
+                                logger.info(f"HDMI signal detected: {width}x{height} @ {fps}fps - switching to loading mode")
+                                # Switch to loading mode while we start the display
+                                self.ad_blocker.start_loading_mode()
                                 break
                     except KeyboardInterrupt:
                         self.stop()
@@ -1869,7 +1868,13 @@ class Minus:
         width, height, fps = signal_info
         logger.info(f"HDMI signal: {width}x{height} @ {fps}fps")
 
-        # Start display
+        # If ad_blocker doesn't have a loading/no-signal screen showing, start loading now
+        # This ensures we always show loading during ustreamer startup
+        if self.ad_blocker and self.ad_blocker.current_source not in ('loading', 'no_hdmi_device'):
+            logger.info("Starting loading display while initializing...")
+            self.ad_blocker.start_loading_mode()
+
+        # Start display (will transition from loading to live when ready)
         if not self.start_display():
             logger.error("Failed to start display")
             return False
@@ -1909,17 +1914,29 @@ class Minus:
         # 5 second delay ensures display is stable before scanning
         self._start_fire_tv_setup_delayed(delay_seconds=5.0)
 
-        # Load VLM model (takes ~40s, so start after WebUI is up)
+        # Load VLM model and start worker thread
         if self.vlm:
-            logger.info("Loading VLM model (Qwen3-VL-2B-INT4)...")
+            # Show loading notification
+            if self.system_notification:
+                self.system_notification.show_vlm_loading()
+
+            logger.info("Loading VLM model (FastVLM-1.5B)...")
             if self.vlm.load_model():
                 logger.info("VLM model loaded successfully")
                 self.vlm_thread = threading.Thread(target=self.vlm_worker, daemon=True)
                 self.vlm_thread.start()
                 logger.info(f"VLM worker started with prompt: \"{self.vlm.AD_PROMPT}\"")
+
+                # Show success notification (auto-hides after 5s)
+                if self.system_notification:
+                    self.system_notification.show_vlm_ready()
             else:
                 logger.warning("VLM model failed to load - VLM detection disabled")
                 self.vlm = None
+
+                # Show failure notification (auto-hides after 8s)
+                if self.system_notification:
+                    self.system_notification.show_vlm_failed()
 
         logger.info("Minus running - press Ctrl+C to stop")
 
@@ -1993,6 +2010,9 @@ class Minus:
         if self.vlm:
             self.vlm.release()
 
+        # Restore console settings (show cursor, unblank, restore dmesg level)
+        restore_console()
+
         logger.info("Stopped")
 
 
@@ -2024,8 +2044,8 @@ def main():
     parser.add_argument(
         '--max-screenshots',
         type=int,
-        default=50,
-        help='Keep only this many recent screenshots (0=unlimited, default: 50)'
+        default=0,
+        help='Keep only this many recent screenshots (0=unlimited for training, default: 0)'
     )
     parser.add_argument(
         '--connector-id',
@@ -2042,8 +2062,23 @@ def main():
     parser.add_argument(
         '--webui-port',
         type=int,
-        default=8080,
-        help='Web UI port (default: 8080)'
+        default=80,
+        help='Web UI port (default: 80, requires root)'
+    )
+    parser.add_argument(
+        '--no-ocr',
+        action='store_true',
+        help='Disable OCR processing (for testing)'
+    )
+    parser.add_argument(
+        '--no-vlm',
+        action='store_true',
+        help='Disable VLM processing (for testing)'
+    )
+    parser.add_argument(
+        '--no-blocking',
+        action='store_true',
+        help='Disable all blocking overlays (for testing)'
     )
 
     args = parser.parse_args()
@@ -2056,6 +2091,9 @@ def main():
         drm_connector_id=args.connector_id,
         drm_plane_id=args.plane_id,
         webui_port=args.webui_port,
+        no_ocr=args.no_ocr,
+        no_vlm=args.no_vlm,
+        no_blocking=args.no_blocking,
     )
 
     minus = Minus(config)

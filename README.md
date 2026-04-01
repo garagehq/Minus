@@ -2,17 +2,18 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~300ms per frame)
-- **Qwen3-VL-2B** on Axera LLM 8850 NPU (~1.5s per frame)
+- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame)
 - **Audio passthrough** with auto-mute during ads
 - **Spanish vocabulary practice** during ad blocks!
 - **Web UI** for remote monitoring and control via Tailscale
 
 ## Overview
 
-Minus captures video from HDMI-RX, displays it via GStreamer kmssink at 30fps, while running two ML workers concurrently to detect ads. When ads are detected, **instantly** switches to a blocking overlay with Spanish vocabulary practice.
+Minus captures video from HDMI-RX, displays it via GStreamer kmssink at 30fps, while running two ML workers concurrently to detect ads. When ads are detected, enables a **60fps blocking overlay** with Spanish vocabulary practice.
 
 **Key features:**
-- **Instant ad blocking** - GStreamer input-selector switches in ~1 frame (no black screen!)
+- **60fps blocking overlay** - Native MPP compositing in ustreamer encoder (not GStreamer)
+- **Fast animations** - 0.3s blocking start, 0.25s unblocking
 - **Audio passthrough** - HDMI audio with instant mute during ads, silent keepalive prevents stalls
 - **Dual NPU inference** - OCR and VLM run concurrently on separate NPUs
 - **Web UI** - Remote monitoring/control via Tailscale (mobile-friendly)
@@ -22,28 +23,27 @@ Minus captures video from HDMI-RX, displays it via GStreamer kmssink at 30fps, w
 - **30fps display** - Smooth passthrough without stutter
 - **Set and forget** - systemd service, health monitoring, automatic recovery
 - **Fire TV control** - Auto-skip ads via ADB remote control (optional)
-- **Text overlay API** - Dynamic on-screen notifications via ustreamer
+- **Transition detection** - Holds blocking through black screens between ads
 
 ```
 ┌──────────────┐     ┌────────────────────┐     ┌─────────────────────┐
 │   HDMI-RX    │────▶│     ustreamer      │────▶│  GStreamer Pipeline │
-│ /dev/video0  │     │ (MJPEG encoding)   │     │  (input-selector)   │
+│ /dev/video0  │     │ (MJPEG + Blocking) │     │  (queue + kmssink)  │
 │  4K@30fps    │     │                    │     │                     │
-│              │     │   :9090/stream     │     │  Video ◄──► Blocking│
-│  Audio ──────┼─────┼────────────────────┼────▶│   INSTANT SWITCH!   │
-│  hw:4,0      │     │   :9090/snapshot   │     │         │           │
-└──────────────┘     └────────┬───────────┘     │    kmssink + audio  │
-                              │                 │   (auto-mute on ad) │
-                              │                 └─────────────────────┘
+│              │     │  :9090/stream      │     │                     │
+│  Audio ──────┼─────┼────────────────────┼────▶│    kmssink + audio  │
+│  hw:4,0      │     │  :9090/snapshot    │     │   (auto-mute on ad) │
+└──────────────┘     │  /blocking/* API   │     └─────────────────────┘
+                     └────────┬───────────┘
                               │
                               ▼ HTTP snapshot (~150ms)
               ┌───────────────┴───────────────┐
               │                               │
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
-     │   PaddleOCR     │           │   Qwen3-VL-2B       │
+     │   PaddleOCR     │           │   FastVLM-1.5B      │
      │   RK3588 NPU    │           │   Axera LLM 8850    │
-     │   ~400ms        │           │   ~1.5s             │
+     │   ~400ms        │           │   ~0.9s             │
      └─────────────────┘           └─────────────────────┘
 ```
 
@@ -86,79 +86,81 @@ python3 minus.py --check-signal
 | `--device PATH` | Video device (default: /dev/video0) |
 | `--screenshot-dir DIR` | Screenshot directory (default: screenshots) |
 | `--ocr-timeout SEC` | Skip OCR frames taking longer than this (default: 1.5s) |
-| `--max-screenshots N` | Keep only N recent screenshots (default: 50, 0=unlimited) |
+| `--max-screenshots N` | Keep only N recent screenshots per folder (default: 0=unlimited) |
 | `--check-signal` | Check HDMI signal and exit |
 | `--connector-id N` | DRM connector ID (default: 215) |
 | `--plane-id N` | DRM plane ID (default: 72) |
-| `--webui-port N` | Web UI port (default: 8080) |
+| `--webui-port N` | Web UI port (default: 80) |
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Display framerate | **30fps** (video), 2-3fps (blocking overlay) |
+| Display framerate | **30fps** (video), **60fps** (blocking overlay) |
 | ustreamer stream | **~60fps** (MPP hardware encoding at 4K) |
-| Ad blocking switch | **1.5s animated transition** |
-| Preview window | **~4fps** (live ad preview in corner) |
-| Animation framerate | **~30fps** (smooth ease-in/ease-out) |
+| Ad blocking transition | **0.3s start**, **0.25s end** (fast response) |
+| Preview window | **60fps** (hardware-scaled in MPP encoder) |
+| Blocking composite | **~0.5ms** per frame overhead |
 | Snapshot capture | ~150ms (4K JPEG download) |
-| OCR latency | 250-400ms per frame (960x540 input) |
-| VLM latency | 1.3-1.5s per frame |
-| VLM model load | ~40s (once at startup) |
+| OCR latency | 100-200ms capture + 250-400ms inference |
+| VLM latency | ~0.9s per frame |
+| VLM model load | ~13s (once at startup) |
 | JPEG quality | 80% (MPP hardware encoder) |
 
 **FPS Monitoring:** Output FPS is logged every 60 seconds via health monitor.
 
 ## Ad Detection Logic (Weighted Model)
 
-**OCR is PRIMARY (high trust):**
+**OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
-- Needs 3 consecutive no-ads to stop blocking
+- Stops blocking after 3 consecutive no-ads
+- **Authoritative for stopping** when OCR triggered the block
 
-**VLM is SECONDARY (contextual trust):**
-- If OCR detected within last 5s: VLM is trusted
-- If no recent OCR: VLM needs 5 consecutive detections to trigger alone
-- Needs 2 consecutive no-ads to stop
+**VLM (Secondary - Anti-Waffle Protected):**
+- Uses sliding window of last 45 seconds of decisions
+- Needs 80%+ ad agreement to trigger blocking alone (prevents waffling)
+- If OCR detected within 5s: VLM is trusted more quickly
+- Stops after 2 consecutive no-ads (when VLM triggered alone)
 
-**Anti-flicker protection:**
+**Transition Frame Detection:**
+When blocking is active, black/solid-color frames are detected as transitions between ads and held in blocking state to prevent premature unblocking.
+
+**Starting Blocking:**
+| Trigger | Time to block |
+|---------|---------------|
+| OCR detects ad | ~0.5s (immediate + 0.3s animation) |
+| VLM alone (no OCR) | ~8s (needs 80% agreement) |
+| VLM with recent OCR | ~2s (trusted) |
+
+**Stopping Blocking:**
+| Trigger Source | Time after ad ends |
+|----------------|-------------------|
+| OCR triggered | ~2-3s (3 no-ads) |
+| VLM triggered alone | ~4s (2 no-ads) |
+
+**Anti-flicker:**
 - Minimum 3 seconds blocking duration
-- Both OCR and VLM must agree to stop (when VLM has context)
+- VLM history cleared on stop (prevents re-trigger)
 
 ## Blocking Overlay
 
-When ads are detected, the screen shows:
-- **Pixelated Background**: Blurred/pixelated version of the screen from ~6 seconds before the ad
+When ads are detected, ustreamer's **native MPP blocking mode** renders at 60fps:
+- **Pixelated Background**: 20x downscaled, 60% darkened pre-ad frame
 - **Header**: `BLOCKING (OCR)`, `BLOCKING (VLM)`, or `BLOCKING (OCR+VLM)`
-- **Spanish word**: Random intermediate-level vocabulary
-- **Translation**: English meaning
-- **Example**: Sentence using the word
+- **Spanish word**: Random intermediate-level vocabulary (IBM Plex Mono Bold, purple)
+- **Translation**: English meaning (DejaVu Sans Bold, white)
+- **Example**: Sentence using the word (DejaVu Sans Bold, gray)
 - **Rotation**: New vocabulary every 11-15 seconds
-- **Ad Preview**: Live preview of blocked ad in bottom-right corner (~4fps)
-- **Debug Dashboard**: Stats in bottom-left (uptime, ads blocked, block time)
+- **Ad Preview**: Live 60fps preview in bottom-right corner
+- **Debug Dashboard**: Stats in bottom-left (IBM Plex Mono Regular)
+
+**Multi-color text per line:** Purple for Spanish word, white for header/translation, gray for pronunciation/example - matching the web UI aesthetic.
 
 **Pixelated Background:**
-Instead of a plain black background, the blocking overlay shows a heavily pixelated and darkened version of what was on screen before the ad appeared. This provides visual context while clearly indicating blocking is active. The system maintains a rolling 6-second buffer of snapshots (captured every 2 seconds) and uses the oldest frame when blocking starts.
+Rolling 6-second buffer (3 frames at 2s intervals). Uses oldest frame when blocking starts (ensures pre-ad content). OpenCV pixelation with INTER_NEAREST. Uploaded async via `/blocking/background` POST API.
 
-**Smooth Transitions:**
-- **Start blocking**: 1.5s animation - ad shrinks from full-screen to corner preview
-- **End blocking**: 1.5s animation - preview grows to full-screen, then switches to video
-- Preview updates during animation for responsive feel
-
-Example display:
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        BLOCKING (OCR)                           │
-│                                                                 │
-│                         aprovechar                              │
-│                    = to take advantage of                       │
-│                                                                 │
-│                 Hay que aprovechar el tiempo.                   │
-│                                                     ┌─────────┐ │
-│  Uptime: 2h 15m 30s                                 │   AD    │ │
-│  Ads blocked: 47                                    │ PREVIEW │ │
-│  Block time: 12m 45s                                └─────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
+**Transition Frame Detection:**
+Black/solid-color frames are held in blocking state to prevent premature unblocking and re-blocking flicker between ads.
 
 Both preview window and debug dashboard are toggleable via Web UI Settings.
 
@@ -205,12 +207,14 @@ Both preview window and debug dashboard are toggleable via Web UI Settings.
 
 ```
 minus/
-├── minus.py              # Main entry point
+├── minus.py              # Main entry point - orchestrates everything
 ├── minus.spec            # PyInstaller build spec
 ├── test_fire_tv.py       # Fire TV controller test script
+├── tests/
+│   └── test_modules.py   # Unit tests for all modules
 ├── src/
 │   ├── ocr.py            # PaddleOCR on RKNN NPU
-│   ├── vlm.py            # Qwen3-VL-2B on Axera NPU
+│   ├── vlm.py            # FastVLM-1.5B on Axera NPU
 │   ├── ad_blocker.py     # GStreamer video pipeline with input-selector
 │   ├── audio.py          # GStreamer audio passthrough with mute control
 │   ├── health.py         # Health monitor for all subsystems
@@ -218,6 +222,14 @@ minus/
 │   ├── overlay.py        # Text overlay via ustreamer API
 │   ├── fire_tv.py        # Fire TV ADB controller
 │   ├── fire_tv_setup.py  # Fire TV setup flow with overlay notifications
+│   ├── vocabulary.py     # Spanish vocabulary list (120+ words)
+│   ├── console.py        # Console blanking/restore functions
+│   ├── drm.py            # DRM output probing (HDMI, resolution, plane)
+│   ├── v4l2.py           # V4L2 device probing (format, resolution)
+│   ├── config.py         # MinusConfig dataclass
+│   ├── capture.py        # UstreamerCapture class for snapshots
+│   ├── screenshots.py    # ScreenshotManager with deduplication
+│   ├── skip_detection.py # Skip button detection (regex patterns)
 │   ├── templates/
 │   │   └── index.html    # Web UI single-page app
 │   └── static/
@@ -229,30 +241,70 @@ minus/
 ├── models/
 │   └── paddleocr/        # RKNN models (or symlink)
 ├── screenshots/
-│   ├── ocr/              # Ad detection screenshots (auto-truncated)
-│   └── non_ad/           # Non-ad screenshots for VLM training
+│   ├── ads/              # OCR-detected ads (for training)
+│   ├── non_ads/          # User paused = false positives (for training)
+│   ├── vlm_spastic/      # VLM uncertainty cases (for analysis)
+│   └── static/           # Static screen suppression (still frames)
 ├── README.md             # This file
 ├── CLAUDE.md             # Development notes
 └── AUDIO.md              # Audio implementation details
 ```
 
+## Testing
+
+Minus includes a comprehensive test suite covering all extracted modules.
+
+```bash
+# Run all tests (no dependencies required)
+python3 tests/test_modules.py
+
+# Or with pytest (if installed)
+python3 -m pytest tests/test_modules.py -v
+```
+
+**Test Output:**
+```
+============================================================
+RESULTS: 106/106 passed
+============================================================
+```
+
+**What's Tested:**
+- **Vocabulary** - Format validation, content structure, common words
+- **Config** - Dataclass defaults and custom values
+- **Skip Detection** - Button pattern matching, countdown parsing, edge cases
+- **Screenshots** - Deduplication, file saving, hash computation, truncation
+- **Console** - Blanking/restore command generation
+- **Capture** - Snapshot URL handling, cleanup
+- **DRM** - Output probing, fallback values
+- **V4L2** - Format detection, error handling
+- **Overlay** - NotificationOverlay, positions, show/hide
+- **Health** - HealthMonitor, HealthStatus, HDMI detection
+- **Fire TV** - Controller, key codes, device detection
+- **VLM** - VLMManager, response parsing
+- **OCR** - Keywords, exclusions, terminal detection
+- **WebUI** - Flask routes, API endpoints
+
 ## VLM Model
 
-The VLM uses **Qwen3-VL-2B-INT4** on the Axera LLM 8850 NPU:
+The VLM uses **FastVLM-1.5B** on the Axera LLM 8850 NPU:
 
 | Metric | Value |
 |--------|-------|
-| Accuracy | 96% on ad detection benchmark |
-| Inference | 1.3-1.7s per frame |
-| Model load | ~40s (once at startup) |
+| Accuracy | Better than 0.5B with fewer false positives (~36% vs ~88% on home screens) |
+| Inference | ~0.9s per frame |
+| Model load | ~13s (once at startup) |
 | Prompt | "Is this an advertisement? Answer Yes or No." |
 
 Model location:
 ```
-/home/radxa/axera_models/Qwen3-VL-2B/
-├── main_axcl_aarch64_rebuilt
-├── qwen3_tokenizer.txt
-└── Qwen3-VL-2B-Instruct-AX650-c128_p1152-int4/
+/home/radxa/axera_models/FastVLM-1.5B/
+├── fastvlm_ax650_context_1k_prefill_640_int4/
+│   ├── image_encoder_512x512.axmodel
+│   ├── llava_qwen2_p128_l*.axmodel
+│   └── model.embed_tokens.weight.npy
+├── fastvlm_tokenizer/
+└── utils/
 ```
 
 ## Fire TV Control (Optional)
@@ -311,8 +363,9 @@ pip3 install --break-system-packages pyclipper shapely numpy opencv-python pexpe
 ## Troubleshooting
 
 **No HDMI signal:**
-When started without HDMI input, Minus displays "NO HDMI INPUT" on screen
-and waits for user to connect a source. To check signal manually:
+When started without HDMI input, Minus displays a bouncing "NO SIGNAL" screensaver
+(DVD-style) and waits for user to connect a source. When the text hits a corner,
+it does a little spin animation! To check signal manually:
 ```bash
 v4l2-ctl -d /dev/video0 --query-dv-timings
 ```
@@ -326,7 +379,7 @@ pkill -9 ustreamer    # Kill orphaned ustreamer
 **VLM not loading:**
 ```bash
 axcl_smi              # Check Axera card status
-ls /home/radxa/axera_models/Qwen3-VL-2B/  # Verify model files
+ls /home/radxa/axera_models/FastVLM-1.5B/  # Verify model files
 ```
 
 **Display issues:**
@@ -426,9 +479,10 @@ Minus includes a unified health monitor that runs in the background:
 Minus includes a mobile-friendly web UI for remote monitoring and control:
 
 **Access:**
-- Local: `http://localhost:8080`
-- Tailscale: `http://<tailscale-hostname>:8080`
-- Direct video stream: `http://<hostname>:9090/stream`
+- Local: `http://localhost:80`
+- mDNS: `http://minus.local:80` (from any device on same network)
+- Tailscale: `http://<tailscale-hostname>:80`
+- Direct video stream: `http://minus.local:9090/stream`
 
 **Features:**
 - **Live video feed** - Real-time MJPEG stream from ustreamer
@@ -451,59 +505,34 @@ For development and testing, you can manually trigger ad blocking:
 # Trigger blocking for 20 seconds (source: ocr, vlm, both, or default)
 curl -X POST -H "Content-Type: application/json" \
   -d '{"duration": 20, "source": "ocr"}' \
-  http://localhost:8080/api/test/trigger-block
+  http://localhost:80/api/test/trigger-block
 
 # Stop blocking immediately
-curl -X POST http://localhost:8080/api/test/stop-block
+curl -X POST http://localhost:80/api/test/stop-block
 ```
 
 Test mode prevents the detection loop from canceling the blocking, allowing you to test the full blocking experience including pixelated background and animations.
 
-## Text Overlay API
+## ustreamer Overlay and Blocking API
 
-Minus includes a text overlay system that renders text directly on the video stream via ustreamer's MPP hardware encoder. This is used for Fire TV setup guidance and can be used for custom notifications.
+ustreamer provides two overlay systems rendered in the MPP encoder:
 
-**API Endpoints:**
-- `GET http://localhost:9090/overlay` - Get current overlay configuration
-- `GET http://localhost:9090/overlay/set?params` - Set overlay configuration
-
-**Parameters:**
-| Parameter | Description |
-|-----------|-------------|
-| `text` | Text to display (URL-encoded, supports newlines with `%0A`) |
-| `enabled` | `true` to enable, `false` to disable |
-| `position` | 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right, 4=center |
-| `scale` | Text scale factor (1-10, default: 3) |
-| `color_y`, `color_u`, `color_v` | Text color in YUV (default: white) |
-| `bg_enabled` | Enable background box (default: true) |
-| `bg_alpha` | Background transparency 0-255 (default: 180) |
-| `clear` | Set to `true` to clear overlay |
-
-**Example Usage:**
+**1. Notification Overlay** (`/overlay/*`) - For Fire TV setup, status messages:
 ```bash
-# Show "LIVE" in top-right corner
 curl "http://localhost:9090/overlay/set?text=LIVE&position=1&scale=4&enabled=true"
-
-# Show multi-line text
-curl "http://localhost:9090/overlay/set?text=Line%201%0ALine%202&position=0&enabled=true"
-
-# Clear overlay
 curl "http://localhost:9090/overlay/set?clear=true"
 ```
 
-**Python Usage:**
-```python
-from src.overlay import NotificationOverlay
+**2. Blocking Mode** (`/blocking/*`) - For ad blocking overlays at 60fps:
+- `GET /blocking` - Get current config
+- `GET /blocking/set?enabled=true&text_vocab=...` - Configure blocking
+- `POST /blocking/background` - Upload pixelated NV12 background
 
-overlay = NotificationOverlay(ustreamer_port=9090)
-overlay.show("Hello World", duration=5.0)  # Auto-hides after 5 seconds
-overlay.hide()  # Manual hide
-```
+**Multi-color text:** Lines auto-detected by prefix - `[` → white (header), `(` → gray (pronunciation), `=` → white (translation), `"` → gray (example), other → purple (Spanish word).
 
-**Performance:**
-- ~0.5ms overhead per frame
-- Rendered directly on NV12 frames before JPEG encoding
-- No GStreamer pipeline modifications needed
+**Thread Safety:** FreeType rendering is mutex-protected for 4 parallel MPP encoder workers.
+
+**Performance:** ~0.5ms overhead per frame, rendered directly on NV12 before JPEG encoding.
 
 ## Housekeeping
 
@@ -513,9 +542,13 @@ overlay.hide()  # Manual hide
 - Keeps 3 backup files (minus.log.1, .2, .3)
 
 **Screenshot Management:**
-- Ad screenshots: `screenshots/ocr/` (auto-truncated to last 50)
-- Non-ad screenshots: `screenshots/non_ad/` (saved when pausing via WebUI)
-- Configurable via `--max-screenshots` (0 = unlimited)
+Screenshots are organized by type for easy training data preparation:
+- `screenshots/ads/` - OCR-detected ads (unlimited by default for training)
+- `screenshots/non_ads/` - User paused = false positives (for training)
+- `screenshots/vlm_spastic/` - VLM uncertainty (detected ad then changed mind)
+- `screenshots/static/` - Static screen suppression (still frames with ad text)
+- Rate limited: Max 1 ad screenshot per 5 seconds (with deduplication)
+- Configurable via `--max-screenshots` (default: 0 = unlimited)
 
 **Audio Error Recovery:**
 - Watchdog checks every 3 seconds, restarts if stalled for 6+ seconds
@@ -548,7 +581,7 @@ pyinstaller minus.spec
 
 **Note:** The executable still requires external model files at runtime:
 - PaddleOCR models in standard location
-- VLM models in `/home/radxa/axera_models/Qwen3-VL-2B/`
+- VLM models in `/home/radxa/axera_models/FastVLM-1.5B/`
 
 ## License
 

@@ -172,10 +172,16 @@ class PaddleOCR:
         'shop now', 'buy now',
         'promoted',  # Twitter/social media promoted ads
         # Note: 'promo' removed - too broad, matches 'Promote' button
+        # Spanish keywords
+        'patrocinado', 'anuncio', 'publicidad',
+        'comprar ahora', 'visita al anunciante',
+        'contenido patrocinado',
     ]
     # Keywords that need word boundary matching (avoid matching inside words)
     AD_KEYWORDS_WORD = [
         'skip', 'sponsor',
+        # Spanish word-boundary keywords
+        'patroci',  # Catches patrocinado, patrocinador, etc.
     ]
 
     # Phrases that should NOT trigger ad detection (false positives)
@@ -183,6 +189,7 @@ class PaddleOCR:
     AD_EXCLUSIONS = [
         'skip recap', 'skiprecap',  # Netflix "Skip Recap" button
         'skip intro', 'skipintro',  # Streaming "Skip Intro" button
+        'saltar intro', 'saltarintro',  # Spanish "Skip Intro"
     ]
 
     def __init__(self, det_model_path, rec_model_path, dict_path,
@@ -323,7 +330,10 @@ class PaddleOCR:
         outputs = self.det_rknn.inference(inputs=[img_input])
         det_time = (time.time() - start) * 1000
 
-        pred = outputs[0]
+        # Copy output to release RKNN internal buffer reference
+        pred = outputs[0].copy()
+        del outputs  # Explicitly release RKNN output list
+
         if len(pred.shape) == 4:
             pred = pred[0, 0]
         elif len(pred.shape) == 3:
@@ -340,7 +350,10 @@ class PaddleOCR:
         outputs = self.rec_rknn.inference(inputs=[img_input])
         rec_time = (time.time() - start) * 1000
 
-        pred = outputs[0]
+        # Copy output to release RKNN internal buffer reference
+        pred = outputs[0].copy()
+        del outputs  # Explicitly release RKNN output list
+
         text, confidence = self.ctc_decode(pred)
         return text, confidence, rec_time
 

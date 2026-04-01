@@ -253,28 +253,31 @@ class HealthMonitor:
         )
 
     def _check_hdmi_signal(self) -> tuple[bool, str]:
-        """Check if HDMI signal is present."""
+        """Check if HDMI signal is present using ustreamer's HTTP API.
+
+        Uses ustreamer's /state endpoint instead of v4l2-ctl --query-dv-timings
+        because the V4L2 ioctl can disrupt the HDMI-RX stream causing brief skips.
+        """
         try:
-            result = subprocess.run(
-                ['v4l2-ctl', '-d', '/dev/video0', '--query-dv-timings'],
-                capture_output=True, text=True, timeout=2
-            )
+            import urllib.request
+            import json
 
-            if result.returncode != 0:
+            # Use config port if available, default to 9090
+            port = getattr(self.minus.config, 'ustreamer_port', 9090) if hasattr(self.minus, 'config') else 9090
+            url = f"http://localhost:{port}/state"
+            with urllib.request.urlopen(url, timeout=2.0) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                source = data.get('result', {}).get('source', {})
+
+                online = source.get('online', False)
+                resolution = source.get('resolution', {})
+                width = resolution.get('width', 0)
+                height = resolution.get('height', 0)
+
+                if online and width and height:
+                    return True, f"{width}x{height}"
+
                 return False, ""
-
-            # Parse resolution
-            width = height = 0
-            for line in result.stdout.split('\n'):
-                if 'Active width:' in line:
-                    width = int(line.split(':')[1].strip())
-                elif 'Active height:' in line:
-                    height = int(line.split(':')[1].strip())
-
-            if width and height:
-                return True, f"{width}x{height}"
-
-            return False, ""
 
         except Exception:
             return False, ""
