@@ -123,10 +123,10 @@ class AudioPassthrough:
         self._restart_in_progress = False
         self._restart_lock = threading.Lock()  # Separate lock for restart coordination
 
-        # A/V sync watchdog - periodic pipeline restart to prevent drift
+        # A/V sync watchdog - periodic queue flush to prevent drift
         # The sync queue adds fixed delay but clock drift over time could cause issues
-        # Restarting every 12 minutes resets the sync queue and prevents accumulated drift
-        self._sync_interval = 12 * 60  # 12 minutes between sync resets
+        # Flushing every 45 minutes resets the sync queue with minimal audio dropout (~300ms)
+        self._sync_interval = 45 * 60  # 45 minutes between sync resets
         self._last_sync_reset = 0
         self._sync_reset_enabled = True
 
@@ -228,6 +228,54 @@ class AudioPassthrough:
         if new == Gst.State.PLAYING:
             self._last_buffer_time = time.time()
             logger.debug("[AudioPassthrough] Pipeline now PLAYING")
+
+    def _flush_sync_queue(self):
+        """Flush the sync queue to reset A/V sync without full pipeline restart.
+
+        This causes a brief audio dropout (~300ms) while the queue refills,
+        but is much faster than a full pipeline restart (~1s).
+
+        Returns:
+            True if flush succeeded, False otherwise
+        """
+        if not self.pipeline:
+            return False
+
+        try:
+            syncqueue = self.pipeline.get_by_name('syncqueue')
+            if not syncqueue:
+                logger.warning("[AudioPassthrough] Could not find syncqueue element")
+                return False
+
+            # Get the sink pad to send flush events
+            sink_pad = syncqueue.get_static_pad('sink')
+            if not sink_pad:
+                logger.warning("[AudioPassthrough] Could not get syncqueue sink pad")
+                return False
+
+            # Send flush-start event (clears queue, puts downstream in flushing mode)
+            flush_start = Gst.Event.new_flush_start()
+            if not sink_pad.send_event(flush_start):
+                logger.warning("[AudioPassthrough] Failed to send flush-start event")
+                return False
+
+            # Brief pause to let flush propagate
+            time.sleep(0.05)
+
+            # Send flush-stop event (ends flushing, allows data flow to resume)
+            # reset_time=True resets the running time
+            flush_stop = Gst.Event.new_flush_stop(True)
+            if not sink_pad.send_event(flush_stop):
+                logger.warning("[AudioPassthrough] Failed to send flush-stop event")
+                return False
+
+            self._last_sync_reset = time.time()
+            logger.info("[AudioPassthrough] Sync queue flushed - A/V sync reset (~300ms dropout)")
+            return True
+
+        except Exception as e:
+            logger.error(f"[AudioPassthrough] Error flushing sync queue: {e}")
+            return False
 
     def _restart_pipeline(self):
         """Restart the audio pipeline after an error with exponential backoff.
@@ -405,14 +453,19 @@ class AudioPassthrough:
             needs_restart = False
             restart_reason = ""
 
-            # A/V Sync reset - periodically restart pipeline to prevent clock drift
-            # This is a low-power approach: just restart every 12 minutes
-            # The sync queue will refill with the correct delay automatically
+            # A/V Sync reset - periodically flush sync queue to prevent clock drift
+            # Uses queue flush instead of full restart for minimal dropout (~300ms vs ~1s)
             if self._sync_reset_enabled and self._last_sync_reset > 0:
                 time_since_sync = time.time() - self._last_sync_reset
                 if time_since_sync >= self._sync_interval:
-                    needs_restart = True
-                    restart_reason = f"A/V sync reset (every {self._sync_interval // 60}min)"
+                    # Try queue flush first (faster, less disruptive)
+                    if self._flush_sync_queue():
+                        # Flush succeeded, no restart needed
+                        pass
+                    else:
+                        # Flush failed, fall back to full restart
+                        needs_restart = True
+                        restart_reason = f"A/V sync reset failed flush (every {self._sync_interval // 60}min)"
 
             # Check if pipeline exists at all
             if not self.pipeline:
