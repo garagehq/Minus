@@ -781,6 +781,35 @@ class AudioPassthrough:
         finally:
             self._lock.release()
 
+    def reset_av_sync(self):
+        """Manually reset A/V sync by flushing the sync queue.
+
+        This can be called via the web UI when audio/video are out of sync.
+        Causes a brief audio dropout (~300ms) while the queue refills.
+
+        Returns:
+            dict with success status and message
+        """
+        if not self.is_running:
+            return {'success': False, 'error': 'Audio not running'}
+
+        if not self.pipeline:
+            return {'success': False, 'error': 'No audio pipeline'}
+
+        if self._flush_sync_queue():
+            return {
+                'success': True,
+                'message': 'A/V sync reset - audio will resume in ~300ms'
+            }
+        else:
+            # Fall back to full pipeline restart
+            logger.info("[AudioPassthrough] Flush failed, doing full restart for A/V sync")
+            threading.Thread(target=self._restart_pipeline, daemon=True).start()
+            return {
+                'success': True,
+                'message': 'A/V sync reset via pipeline restart - audio will resume in ~1s'
+            }
+
     def destroy(self):
         """Clean up resources."""
         self.stop()

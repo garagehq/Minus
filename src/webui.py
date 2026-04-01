@@ -922,6 +922,23 @@ class WebUI:
                 logger.error(f"Error getting audio status: {e}")
                 return jsonify({'error': str(e)}), 500
 
+        @self.app.route('/api/audio/sync-reset', methods=['POST'])
+        def api_audio_sync_reset():
+            """Reset A/V sync by flushing the audio sync queue.
+
+            Use this when audio and video are out of sync.
+            Causes a brief audio dropout (~300ms) while the queue refills.
+            """
+            try:
+                if hasattr(self.minus, 'audio') and self.minus.audio:
+                    result = self.minus.audio.reset_av_sync()
+                    logger.info(f"[WebUI] A/V sync reset: {result.get('message', 'unknown')}")
+                    return jsonify(result)
+                return jsonify({'success': False, 'error': 'Audio not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error resetting A/V sync: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
         # =========================================================================
         # Network Info
         # =========================================================================
