@@ -604,6 +604,12 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `GET/POST /api/preview/*`, `/api/debug-overlay/*`
 - `POST /api/test/trigger-block`, `/api/test/stop-block`
 - `GET /stream`, `/snapshot` - Proxy to ustreamer
+- `GET /api/health` - Health check for uptime monitors
+- `POST /api/video/restart` - Force restart video pipeline
+- `POST /api/ocr/test` - Run OCR on current frame (no screenshot save)
+- `POST /api/vlm/test` - Run VLM on current frame (no screenshot save)
+- `POST /api/blocking/skip` - Trigger Fire TV skip button
+- `POST /api/audio/sync-reset` - Reset A/V sync (~300ms dropout)
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
