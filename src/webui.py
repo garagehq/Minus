@@ -953,6 +953,80 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # Webhooks
+        # =========================================================================
+
+        @self.app.route('/api/webhooks')
+        def api_webhooks_get():
+            """Get webhook configuration."""
+            try:
+                from webhooks import get_webhook_manager
+                manager = get_webhook_manager()
+                return jsonify({
+                    'enabled': manager.enabled,
+                    'urls': manager.get_urls()
+                })
+            except Exception as e:
+                logger.error(f"Error getting webhooks: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/webhooks', methods=['POST'])
+        def api_webhooks_set():
+            """Configure webhooks.
+
+            JSON body:
+            - enabled: true/false to enable/disable webhooks
+            - urls: list of webhook URLs
+            - add_url: single URL to add
+            - remove_url: single URL to remove
+            """
+            try:
+                from webhooks import get_webhook_manager
+                manager = get_webhook_manager()
+                data = request.get_json() or {}
+
+                if 'enabled' in data:
+                    manager.set_enabled(bool(data['enabled']))
+
+                if 'urls' in data:
+                    with manager._lock:
+                        manager.urls = list(data['urls'])
+
+                if 'add_url' in data:
+                    manager.add_url(data['add_url'])
+
+                if 'remove_url' in data:
+                    manager.remove_url(data['remove_url'])
+
+                return jsonify({
+                    'success': True,
+                    'enabled': manager.enabled,
+                    'urls': manager.get_urls()
+                })
+            except Exception as e:
+                logger.error(f"Error setting webhooks: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/webhooks/test', methods=['POST'])
+        def api_webhooks_test():
+            """Send a test notification to all webhook URLs."""
+            try:
+                from webhooks import get_webhook_manager
+                manager = get_webhook_manager()
+
+                if not manager.urls:
+                    return jsonify({'success': False, 'error': 'No webhook URLs configured'}), 400
+
+                manager.notify('test', {'message': 'Test notification from Minus'})
+                return jsonify({
+                    'success': True,
+                    'message': f'Test notification sent to {len(manager.urls)} URL(s)'
+                })
+            except Exception as e:
+                logger.error(f"Error testing webhooks: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Health Check
         # =========================================================================
 

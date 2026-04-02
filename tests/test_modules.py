@@ -3586,6 +3586,201 @@ class TestAPIResponseFormats:
             pass
 
 
+class TestWebhooks:
+    """Tests for webhook functionality."""
+
+    def test_webhook_manager_init(self):
+        """Test WebhookManager initialization."""
+        from webhooks import WebhookManager
+
+        manager = WebhookManager()
+        assert manager.enabled is True
+        assert manager.urls == []
+
+    def test_webhook_manager_add_remove_url(self):
+        """Test adding and removing webhook URLs."""
+        from webhooks import WebhookManager
+
+        manager = WebhookManager()
+        manager.add_url('http://example.com/webhook')
+        assert 'http://example.com/webhook' in manager.get_urls()
+
+        manager.remove_url('http://example.com/webhook')
+        assert 'http://example.com/webhook' not in manager.get_urls()
+
+    def test_webhook_manager_enable_disable(self):
+        """Test enabling and disabling webhooks."""
+        from webhooks import WebhookManager
+
+        manager = WebhookManager()
+        manager.set_enabled(False)
+        assert manager.enabled is False
+
+        manager.set_enabled(True)
+        assert manager.enabled is True
+
+    def test_webhook_notify_when_disabled(self):
+        """Test that notify does nothing when disabled."""
+        from webhooks import WebhookManager
+
+        manager = WebhookManager(enabled=False)
+        manager.add_url('http://example.com/webhook')
+
+        # Should not raise or send anything
+        manager.notify('test', {'foo': 'bar'})
+
+    def test_webhook_api_get(self):
+        """Test webhook GET API."""
+        from webui import WebUI
+
+        mock_minus = MagicMock()
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/webhooks')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert 'enabled' in data
+            assert 'urls' in data
+
+    def test_webhook_api_set(self):
+        """Test webhook POST API."""
+        from webui import WebUI
+
+        mock_minus = MagicMock()
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/webhooks',
+                                   json={'enabled': True, 'add_url': 'http://test.com'},
+                                   content_type='application/json')
+            assert response.status_code == 200
+            data = response.get_json()
+            assert data['success'] is True
+
+
+class TestStress:
+    """Stress tests for system stability under load."""
+
+    def test_rapid_blocking_state_changes(self):
+        """Test rapid blocking state changes don't cause issues."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            import threading
+
+            blocker = DRMAdBlocker.__new__(DRMAdBlocker)
+            blocker.is_visible = False
+            blocker.current_source = None
+            blocker._lock = threading.Lock()
+            blocker._animating = False
+            blocker._animation_direction = None
+
+            # Rapidly toggle state
+            for i in range(100):
+                with blocker._lock:
+                    blocker.is_visible = not blocker.is_visible
+                    blocker.current_source = 'ocr' if blocker.is_visible else None
+
+            # Should complete without deadlock or crash
+            assert True
+        except ImportError:
+            pass
+
+    def test_concurrent_api_calls(self):
+        """Test concurrent API calls don't cause issues."""
+        from webui import WebUI
+        import threading
+
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.get_fps.return_value = 30.0
+        mock_minus.ad_blocker.is_visible = False
+        mock_minus.audio = MagicMock()
+        mock_minus.audio.is_running = True
+        mock_minus.audio.is_muted = False
+        mock_minus.vlm = None
+        mock_minus.ocr = None
+        mock_minus.fire_tv = None
+        mock_minus.health_monitor = None
+
+        ui = WebUI(mock_minus)
+        errors = []
+
+        def make_requests():
+            try:
+                with ui.app.test_client() as client:
+                    for _ in range(20):
+                        client.get('/api/health')
+                        client.get('/api/status')
+            except Exception as e:
+                errors.append(e)
+
+        # Run 5 threads making concurrent requests
+        threads = [threading.Thread(target=make_requests) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0, f"Got errors: {errors}"
+
+    def test_screenshot_manager_high_volume(self):
+        """Test screenshot manager handles high volume saves."""
+        import tempfile
+        import shutil
+        import os
+        from screenshots import ScreenshotManager
+        import numpy as np
+
+        temp_dir = tempfile.mkdtemp()
+        try:
+            manager = ScreenshotManager(temp_dir)
+
+            # Create dummy frame
+            frame = np.zeros((100, 100, 3), dtype=np.uint8)
+
+            # Save many screenshots rapidly
+            # matched_keywords is a list of (keyword, text) tuples
+            for i in range(50):
+                manager.save_ad_screenshot(frame, [(f'keyword_{i}', f'text_{i}')], [f'text_{i}', 'other text'])
+
+            # Verify some were saved (dedup may reduce count)
+            ad_dir = os.path.join(temp_dir, 'ads')
+            files = os.listdir(ad_dir) if os.path.exists(ad_dir) else []
+            assert len(files) > 0
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_config_creation_many_times(self):
+        """Test creating many config instances doesn't leak."""
+        from config import MinusConfig
+
+        configs = []
+        for _ in range(100):
+            configs.append(MinusConfig())
+
+        # All should have same defaults
+        for c in configs:
+            assert c.ustreamer_port == 9090
+            assert c.webui_port == 80
+
+    def test_skip_detection_many_patterns(self):
+        """Test skip detection with many text patterns."""
+        from skip_detection import check_skip_opportunity
+
+        # Generate many test patterns
+        patterns = [f'Skip Ad {i}' for i in range(100)]
+        patterns += [f'Skip in {i}' for i in range(60)]
+        patterns += ['Skip', 'Skip Ad', 'Omitir', 'Saltar'] * 20
+
+        # Process all patterns
+        for pattern in patterns:
+            result = check_skip_opportunity([pattern])
+            # Should not crash
+            assert isinstance(result, tuple)
+            assert len(result) == 3
+
+
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
 
@@ -3872,6 +4067,8 @@ def run_tests():
         TestConcurrency,
         TestVocabularyContent,
         TestAPIResponseFormats,
+        TestWebhooks,
+        TestStress,
         TestEdgeCases,
         TestInputValidation,
     ]

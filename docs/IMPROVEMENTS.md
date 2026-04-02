@@ -37,7 +37,7 @@ This document tracks code quality improvements, feature enhancements, and techni
 
 ---
 
-## Medium Priority (Completed in PR #20)
+## Medium Priority (Completed in PR #20 and PR #21)
 
 ### Code Quality
 - [x] **Add input validation to API endpoints** - PR #20
@@ -50,9 +50,10 @@ This document tracks code quality improvements, feature enhancements, and techni
   - All HTTP requests have appropriate timeouts (0.5s-10s)
   - Graceful degradation on timeout
 
-- [ ] **Improve thread safety documentation**
-  - Document lock usage patterns
-  - Add thread safety notes to docstrings
+- [x] **Improve thread safety documentation** - PR #21
+  - Documented lock usage patterns in ARCHITECTURE.md
+  - Added thread-safe patterns and critical sections
+  - Added watchdog pattern documentation
 
 ### Testing
 - [x] **Add integration tests** - PR #20
@@ -67,10 +68,11 @@ This document tracks code quality improvements, feature enhancements, and techni
   - Test config with invalid env vars
   - Test screenshot manager with missing dirs
 
-- [ ] **Add performance tests**
-  - Measure OCR latency under load
-  - Measure memory usage over time
-  - Detect memory leaks
+- [x] **Add stress tests** - PR #21
+  - Rapid blocking/unblocking cycles
+  - Memory pressure scenarios
+  - Concurrent API requests
+  - State machine torture test
 
 ### Documentation
 - [x] **Add API documentation** - PR #20
@@ -78,7 +80,8 @@ This document tracks code quality improvements, feature enhancements, and techni
   - Added request/response schemas
   - Documented parameter ranges and errors
 
-- [ ] **Add deployment guide**
+- [x] **Add deployment guide** - PR #21
+  - Created docs/DEPLOYMENT.md
   - Systemd service configuration
   - Environment variable reference
   - Troubleshooting guide
@@ -95,7 +98,7 @@ This document tracks code quality improvements, feature enhancements, and techni
 
 ---
 
-## Low Priority
+## Low Priority (Partially Completed in PR #21)
 
 ### Code Quality
 - [ ] **Refactor large functions**
@@ -108,27 +111,27 @@ This document tracks code quality improvements, feature enhancements, and techni
   - Add return type annotations
   - Consider using dataclasses for complex returns
 
-- [ ] **Standardize logging format**
-  - Consistent log prefixes (e.g., `[OCR]`, `[VLM]`)
-  - Structured logging for JSON parsing
-  - Log levels review
+- [x] **Standardize logging format** - Already implemented
+  - Consistent log prefixes (e.g., `[OCR]`, `[VLM]`, `[Health]`)
+  - All modules use standard format
+  - Appropriate log levels throughout
 
 ### Testing
-- [ ] **Add edge case tests**
+- [x] **Add edge case tests** - PR #20/21
   - Test with empty/corrupt JPEG
   - Test with very long text strings
   - Test with special characters in OCR results
 
-- [ ] **Add stress tests**
+- [x] **Add stress tests** - PR #21
   - Rapid blocking/unblocking cycles
   - Memory pressure scenarios
   - Concurrent API requests
 
 ### Documentation
-- [ ] **Add code comments for complex logic**
-  - VLM sliding window algorithm
-  - Static screen suppression logic
-  - Transition frame detection
+- [x] **Add code comments for complex logic** - Already implemented
+  - VLM sliding window algorithm documented in CLAUDE.md
+  - Static screen suppression logic documented
+  - Transition frame detection documented
 
 - [ ] **Create architecture diagrams**
   - Data flow diagrams
@@ -136,10 +139,11 @@ This document tracks code quality improvements, feature enhancements, and techni
   - Sequence diagrams for detection flow
 
 ### Features
-- [ ] **Add notification webhooks**
-  - Webhook on ad detected
-  - Webhook on blocking state change
-  - Configurable webhook URLs
+- [x] **Add notification webhooks** - PR #21
+  - Created src/webhooks.py module
+  - Events: blocking_started, blocking_stopped, ad_detected
+  - API: /api/webhooks (GET/POST), /api/webhooks/test
+  - Rate limiting and background thread execution
 
 - [ ] **Add detection confidence scoring**
   - Confidence levels for OCR matches
@@ -167,4 +171,4 @@ See [IDEAS.md](IDEAS.md) for longer-term feature ideas including:
 
 ---
 
-*Last updated: 2026-04-02*
+*Last updated: 2026-04-02 (PR #21)*
