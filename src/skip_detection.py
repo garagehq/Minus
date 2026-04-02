@@ -2,6 +2,7 @@
 Skip button detection for Minus.
 
 Detects "Skip Ad" buttons in OCR results for automatic ad skipping.
+Supports English and Spanish patterns.
 """
 
 import re
@@ -11,14 +12,20 @@ def check_skip_opportunity(all_texts: list) -> tuple:
     """
     Check OCR results for skippable "Skip" button.
 
-    For YouTube/Fire TV ads:
+    For YouTube/Fire TV ads (English):
     - "Skip" alone = skippable NOW
     - "Skip Ad" = skippable NOW
     - "Skip Ad >" or "Skip >" = skippable NOW (arrow indicates ready)
     - "Skip in X" = NOT skippable (countdown active, even if X is missing from OCR)
     - "Skip 5" or "Skip Ad in 5" = NOT skippable (countdown active)
 
-    CRITICAL: "Skip in" WITHOUT a number means OCR missed the countdown digit.
+    Spanish equivalents:
+    - "Omitir anuncio" = skippable NOW
+    - "Omitir" = skippable NOW
+    - "Saltar anuncio" = skippable NOW
+    - "Omitir en X" = NOT skippable (countdown active)
+
+    CRITICAL: "Skip in" or "Omitir en" WITHOUT a number means OCR missed the countdown digit.
     This is NOT skippable - treat it as countdown still active (return countdown=99).
 
     Args:
@@ -31,7 +38,11 @@ def check_skip_opportunity(all_texts: list) -> tuple:
         - countdown_seconds: Countdown remaining (0 if skippable, >0 if countdown, 99 if unknown)
     """
     for text in all_texts:
+        if text is None:
+            continue
         text_lower = text.lower().strip()
+
+        # === ENGLISH PATTERNS ===
 
         # Check for "Skip" with countdown number FIRST
         # Patterns: "Skip 5", "Skip Ad in 5", "Skip in 5s", "Skip 10", etc.
@@ -60,6 +71,33 @@ def check_skip_opportunity(all_texts: list) -> tuple:
 
         # Direct matches for READY skip button text (no "in" word)
         if text_lower in ['skip', 'skip ad', 'skip ads', 'skipad', 'skip>', 'skip >', 'skip ad>', 'skip ad >']:
+            return (True, text, 0)
+
+        # === SPANISH PATTERNS ===
+
+        # Check for "Omitir" with countdown number
+        # Patterns: "Omitir en 5", "Omitir anuncio en 5", "Omitir 5s", etc.
+        spanish_countdown = re.search(r'omitir\s*(?:anuncio\s*)?(?:en\s*)?(\d+)\s*s?', text_lower)
+        if spanish_countdown:
+            countdown = int(spanish_countdown.group(1))
+            if countdown > 0:
+                return (False, text, countdown)
+            return (True, text, 0)
+
+        # "Omitir en" without number = countdown active but digit missed
+        if re.search(r'omitir\s*(?:anuncio\s*)?en\b', text_lower) and not re.search(r'\d', text_lower):
+            return (False, text, 99)
+
+        # Standalone "Omitir" or "Omitir anuncio" = skippable NOW
+        if re.search(r'^omitir\s*(?:anuncio)?$', text_lower) and len(text_lower) <= 20:
+            return (True, text, 0)
+
+        # "Saltar anuncio" = skippable NOW (alternative Spanish phrasing)
+        if re.search(r'^saltar\s*(?:anuncio)?$', text_lower) and len(text_lower) <= 20:
+            return (True, text, 0)
+
+        # Direct matches for Spanish skip button text
+        if text_lower in ['omitir', 'omitir anuncio', 'saltar', 'saltar anuncio']:
             return (True, text, 0)
 
     return (False, None, None)

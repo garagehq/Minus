@@ -27,10 +27,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from config import VLM_MODEL_DIR
+
 logger = logging.getLogger('Minus.VLM')
 
 # Model paths - FastVLM-1.5B (smarter, fewer false positives than 0.5B)
-FASTVLM_MODEL_DIR = Path("/home/radxa/axera_models/FastVLM-1.5B")
+# Base directory can be overridden via MINUS_VLM_MODEL_DIR environment variable
+FASTVLM_MODEL_DIR = Path(VLM_MODEL_DIR)
 LLM_MODEL_PATH = FASTVLM_MODEL_DIR / "fastvlm_ax650_context_1k_prefill_640_int4"
 TOKENIZER_PATH = FASTVLM_MODEL_DIR / "fastvlm_tokenizer"
 VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512.axmodel"

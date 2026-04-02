@@ -82,7 +82,7 @@ class WebUI:
                 return jsonify(status)
             except Exception as e:
                 logger.error(f"Error getting status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/pause/<int:minutes>', methods=['POST'])
         def api_pause(minutes):
@@ -99,7 +99,7 @@ class WebUI:
                 })
             except Exception as e:
                 logger.error(f"Error pausing: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/resume', methods=['POST'])
         def api_resume():
@@ -109,7 +109,7 @@ class WebUI:
                 return jsonify({'success': True})
             except Exception as e:
                 logger.error(f"Error resuming: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/detections')
         def api_detections():
@@ -120,7 +120,7 @@ class WebUI:
                 return jsonify({'detections': detections[::-1]})
             except Exception as e:
                 logger.error(f"Error getting detections: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/logs')
         def api_logs():
@@ -135,7 +135,7 @@ class WebUI:
                 return jsonify({'lines': []})
             except Exception as e:
                 logger.error(f"Error reading logs: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/preview')
         def api_preview_status():
@@ -147,7 +147,7 @@ class WebUI:
                 return jsonify({'preview_enabled': enabled})
             except Exception as e:
                 logger.error(f"Error getting preview status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/preview/enable', methods=['POST'])
         def api_preview_enable():
@@ -158,7 +158,7 @@ class WebUI:
                 return jsonify({'success': True, 'preview_enabled': True})
             except Exception as e:
                 logger.error(f"Error enabling preview: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/preview/disable', methods=['POST'])
         def api_preview_disable():
@@ -169,7 +169,7 @@ class WebUI:
                 return jsonify({'success': True, 'preview_enabled': False})
             except Exception as e:
                 logger.error(f"Error disabling preview: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/debug-overlay')
         def api_debug_overlay_status():
@@ -181,7 +181,7 @@ class WebUI:
                 return jsonify({'debug_overlay_enabled': enabled})
             except Exception as e:
                 logger.error(f"Error getting debug overlay status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/debug-overlay/enable', methods=['POST'])
         def api_debug_overlay_enable():
@@ -192,7 +192,7 @@ class WebUI:
                 return jsonify({'success': True, 'debug_overlay_enabled': True})
             except Exception as e:
                 logger.error(f"Error enabling debug overlay: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/debug-overlay/disable', methods=['POST'])
         def api_debug_overlay_disable():
@@ -203,7 +203,7 @@ class WebUI:
                 return jsonify({'success': True, 'debug_overlay_enabled': False})
             except Exception as e:
                 logger.error(f"Error disabling debug overlay: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/pixelated-background')
         def api_pixelated_background_status():
@@ -215,7 +215,7 @@ class WebUI:
                 return jsonify({'pixelated_background_enabled': enabled})
             except Exception as e:
                 logger.error(f"Error getting pixelated background status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/pixelated-background/enable', methods=['POST'])
         def api_pixelated_background_enable():
@@ -226,7 +226,7 @@ class WebUI:
                 return jsonify({'success': True, 'pixelated_background_enabled': True})
             except Exception as e:
                 logger.error(f"Error enabling pixelated background: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/pixelated-background/disable', methods=['POST'])
         def api_pixelated_background_disable():
@@ -237,7 +237,7 @@ class WebUI:
                 return jsonify({'success': True, 'pixelated_background_enabled': False})
             except Exception as e:
                 logger.error(f"Error disabling pixelated background: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/firetv-keepalive')
         def api_firetv_keepalive_status():
@@ -249,7 +249,7 @@ class WebUI:
                 return jsonify({'keepalive_enabled': enabled})
             except Exception as e:
                 logger.error(f"Error getting Fire TV keep-alive status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/firetv-keepalive/enable', methods=['POST'])
         def api_firetv_keepalive_enable():
@@ -260,7 +260,7 @@ class WebUI:
                 return jsonify({'success': True, 'keepalive_enabled': True})
             except Exception as e:
                 logger.error(f"Error enabling Fire TV keep-alive: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/firetv-keepalive/disable', methods=['POST'])
         def api_firetv_keepalive_disable():
@@ -271,7 +271,7 @@ class WebUI:
                 return jsonify({'success': True, 'keepalive_enabled': False})
             except Exception as e:
                 logger.error(f"Error disabling Fire TV keep-alive: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/test/trigger-block', methods=['POST'])
         def api_test_trigger_block():
@@ -317,7 +317,7 @@ class WebUI:
                     return jsonify({'error': 'Ad blocker not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error triggering test block: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/test/stop-block', methods=['POST'])
         def api_test_stop_block():
@@ -332,7 +332,7 @@ class WebUI:
                     return jsonify({'error': 'Ad blocker not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error stopping test block: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/stream')
         def stream_proxy():
@@ -398,7 +398,7 @@ class WebUI:
                 return jsonify({'connected': False, 'state': 'not_initialized'})
             except Exception as e:
                 logger.error(f"Error getting Fire TV status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/firetv/command', methods=['POST'])
         def api_firetv_command():
@@ -426,7 +426,7 @@ class WebUI:
                 return jsonify({'error': 'Fire TV not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error sending Fire TV command: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Current Vocabulary Word
@@ -442,7 +442,7 @@ class WebUI:
                 return jsonify({'word': None, 'translation': None, 'example': None})
             except Exception as e:
                 logger.error(f"Error getting vocabulary: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Screenshot Gallery
@@ -498,7 +498,7 @@ class WebUI:
                 })
             except Exception as e:
                 logger.error(f"Error listing screenshots: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/screenshots/<subdir>/<filename>')
         def api_screenshot_file(subdir, filename):
@@ -571,8 +571,8 @@ class WebUI:
                 status = {}
                 try:
                     status = self.minus.get_status_dict()
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[WebUI] Failed to get status for debug snapshot: {e}")
 
                 # Save status to companion JSON file
                 import json
@@ -592,7 +592,7 @@ class WebUI:
                 })
             except Exception as e:
                 logger.error(f"Error taking debug snapshot: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/debug/snapshots')
         def api_debug_snapshots():
@@ -632,7 +632,7 @@ class WebUI:
                 return jsonify({'snapshots': snapshots[:50]})  # Limit to 50 most recent
             except Exception as e:
                 logger.error(f"Error listing debug snapshots: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/debug/snapshot/<timestamp>', methods=['DELETE'])
         def api_debug_snapshot_delete(timestamp):
@@ -659,7 +659,7 @@ class WebUI:
                     return jsonify({'error': 'No files found for this timestamp'}), 404
             except Exception as e:
                 logger.error(f"Error deleting debug snapshot: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # WiFi Management (nmcli)
@@ -690,7 +690,7 @@ class WebUI:
                 return jsonify({'connections': connections})
             except Exception as e:
                 logger.error(f"Error getting WiFi connections: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/wifi/scan')
         def api_wifi_scan():
@@ -721,7 +721,7 @@ class WebUI:
                 return jsonify({'networks': networks})
             except Exception as e:
                 logger.error(f"Error scanning WiFi: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/wifi/connect', methods=['POST'])
         def api_wifi_connect():
@@ -767,7 +767,7 @@ class WebUI:
                     return jsonify({'error': result.stderr or 'Connection failed'}), 500
             except Exception as e:
                 logger.error(f"Error connecting to WiFi: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/wifi/delete', methods=['POST'])
         def api_wifi_delete():
@@ -790,7 +790,7 @@ class WebUI:
                     return jsonify({'error': result.stderr or 'Delete failed'}), 500
             except Exception as e:
                 logger.error(f"Error deleting WiFi connection: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/wifi/priority', methods=['POST'])
         def api_wifi_priority():
@@ -814,7 +814,7 @@ class WebUI:
                     return jsonify({'error': result.stderr or 'Update failed'}), 500
             except Exception as e:
                 logger.error(f"Error updating WiFi priority: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # ADB RSA Key Management
@@ -842,7 +842,7 @@ class WebUI:
                 return jsonify(result)
             except Exception as e:
                 logger.error(f"Error getting ADB keys: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/adb/keys/revoke', methods=['POST'])
         def api_adb_keys_revoke():
@@ -872,7 +872,7 @@ class WebUI:
                     return jsonify({'success': True, 'deleted': [], 'message': 'No keys found to revoke.'})
             except Exception as e:
                 logger.error(f"Error revoking ADB keys: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Stats (Ads Blocked, Time Saved)
@@ -904,7 +904,7 @@ class WebUI:
                 return jsonify(stats)
             except Exception as e:
                 logger.error(f"Error getting stats: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Audio Mute Status
@@ -920,7 +920,7 @@ class WebUI:
                 return jsonify({'muted': muted})
             except Exception as e:
                 logger.error(f"Error getting audio status: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/audio/sync-reset', methods=['POST'])
         def api_audio_sync_reset():
@@ -945,36 +945,97 @@ class WebUI:
 
         @self.app.route('/api/health')
         def api_health():
-            """Simple health check endpoint for uptime monitors.
+            """Detailed health check endpoint for monitoring.
 
-            Returns 200 OK if service is running, with basic status info.
+            Returns 200 OK if service is running, with detailed subsystem status.
+            Use ?simple=1 for basic ok/error response suitable for uptime monitors.
             """
             try:
+                simple_mode = request.args.get('simple', '0') == '1'
+
                 health = {
                     'status': 'ok',
                     'service': 'minus',
                     'timestamp': time.time(),
+                    'subsystems': {}
                 }
 
-                # Check key subsystems
+                issues = []
+
+                # Video subsystem
+                video_status = {'status': 'not_initialized'}
                 if hasattr(self.minus, 'ad_blocker') and self.minus.ad_blocker:
-                    health['video'] = 'ok' if self.minus.ad_blocker.pipeline else 'error'
-                else:
-                    health['video'] = 'not_initialized'
+                    if self.minus.ad_blocker.pipeline:
+                        fps = self.minus.ad_blocker.get_fps()
+                        restart_count = getattr(self.minus.ad_blocker, '_restart_count', 0)
+                        video_status = {
+                            'status': 'ok',
+                            'fps': float(fps) if fps is not None else 0.0,
+                            'blocking': bool(self.minus.ad_blocker.is_visible),
+                            'restart_count': int(restart_count) if isinstance(restart_count, (int, float)) else 0
+                        }
+                    else:
+                        video_status = {'status': 'error', 'reason': 'no_pipeline'}
+                        issues.append('video_pipeline_down')
+                health['subsystems']['video'] = video_status
 
+                # Audio subsystem
+                audio_status = {'status': 'not_initialized'}
                 if hasattr(self.minus, 'audio') and self.minus.audio:
-                    health['audio'] = 'ok' if self.minus.audio.is_running else 'stopped'
-                else:
-                    health['audio'] = 'not_initialized'
+                    if self.minus.audio.is_running:
+                        restart_count = getattr(self.minus.audio, '_restart_count', 0)
+                        audio_status = {
+                            'status': 'ok',
+                            'muted': bool(self.minus.audio.is_muted),
+                            'restart_count': int(restart_count) if isinstance(restart_count, (int, float)) else 0
+                        }
+                    else:
+                        audio_status = {'status': 'stopped'}
+                        issues.append('audio_stopped')
+                health['subsystems']['audio'] = audio_status
 
-                if hasattr(self.minus, 'vlm_manager') and self.minus.vlm_manager:
-                    health['vlm'] = 'ok' if self.minus.vlm_manager.is_ready() else 'loading'
-                else:
-                    health['vlm'] = 'disabled'
+                # VLM subsystem
+                vlm_status = {'status': 'disabled'}
+                if hasattr(self.minus, 'vlm') and self.minus.vlm:
+                    if self.minus.vlm.is_ready():
+                        vlm_status = {'status': 'ok'}
+                    else:
+                        vlm_status = {'status': 'loading'}
+                health['subsystems']['vlm'] = vlm_status
+
+                # OCR subsystem
+                ocr_status = {'status': 'disabled'}
+                if hasattr(self.minus, 'ocr') and self.minus.ocr:
+                    ocr_status = {'status': 'ok'}
+                health['subsystems']['ocr'] = ocr_status
+
+                # Fire TV subsystem
+                firetv_status = {'status': 'disabled'}
+                if hasattr(self.minus, 'fire_tv') and self.minus.fire_tv:
+                    if self.minus.fire_tv.is_connected():
+                        firetv_status = {'status': 'connected'}
+                    else:
+                        firetv_status = {'status': 'disconnected'}
+                health['subsystems']['fire_tv'] = firetv_status
+
+                # Health monitor status
+                if hasattr(self.minus, 'health_monitor') and self.minus.health_monitor:
+                    hm_status = self.minus.health_monitor.get_status()
+                    health['hdmi_signal'] = hm_status.hdmi_signal
+                    health['hdmi_resolution'] = hm_status.hdmi_resolution
+                    health['uptime_seconds'] = hm_status.uptime_seconds
 
                 # Overall status
-                if health.get('video') == 'error' or health.get('audio') == 'stopped':
+                if issues:
                     health['status'] = 'degraded'
+                    health['issues'] = issues
+
+                # Simple mode returns just status for uptime monitors
+                if simple_mode:
+                    return jsonify({
+                        'status': health['status'],
+                        'timestamp': health['timestamp']
+                    })
 
                 return jsonify(health)
             except Exception as e:
@@ -1019,7 +1080,7 @@ class WebUI:
                 return jsonify({'error': 'Ad blocker not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error getting color settings: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/video/color', methods=['POST'])
         def api_video_color_set():
@@ -1220,7 +1281,7 @@ class WebUI:
                 })
             except Exception as e:
                 logger.error(f"Error getting network info: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Clear Detections
@@ -1237,7 +1298,7 @@ class WebUI:
                 return jsonify({'error': 'Detection history not available'}), 500
             except Exception as e:
                 logger.error(f"Error clearing detections: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Service Control
@@ -1256,7 +1317,7 @@ class WebUI:
                 return jsonify({'success': True, 'message': 'Service restart scheduled'})
             except Exception as e:
                 logger.error(f"Error restarting service: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
         # Fire TV App Launch
@@ -1299,7 +1360,7 @@ class WebUI:
                 return jsonify({'error': 'Fire TV not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error launching app: {e}")
-                return jsonify({'error': str(e)}), 500
+                return jsonify({'success': False, 'error': str(e)}), 500
 
     def start(self):
         """Start the web server in a background thread."""
