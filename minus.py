@@ -1649,6 +1649,18 @@ class Minus:
                         logger.info(f"[Static] Cooldown complete - blocking re-enabled")
                         self.static_blocking_suppressed = False
                         self.screen_became_dynamic_time = 0
+
+                        # Clear detection state from static period to prevent false positives
+                        # The ad detected during pause was a "still ad" that shouldn't trigger
+                        # blocking when video resumes
+                        if self.ocr_ad_detected or self.vlm_ad_detected:
+                            logger.info(f"[Static] Clearing stale detection state (OCR={self.ocr_ad_detected}, VLM={self.vlm_ad_detected})")
+                            self.ocr_ad_detected = False
+                            self.ocr_no_ad_count = 0
+                            self.vlm_ad_detected = False
+                            self.vlm_no_ad_count = 0
+                            self.vlm_decision_history.clear()  # Clear VLM sliding window
+                            self._update_blocking_state()  # Update combined state
                 elif not self.static_blocking_suppressed:
                     # Normal state - not suppressed and not in cooldown
                     pass

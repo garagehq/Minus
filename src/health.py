@@ -70,6 +70,8 @@ class HealthMonitor:
         self._start_time = time.time()
         self._last_hdmi_signal = True
         self._hdmi_lost_time = 0
+        self._hdmi_fps_zero_since = 0  # When captured_fps first dropped to 0
+        self._hdmi_signal_loss_threshold = 5.0  # Seconds of 0 FPS before signal is considered lost
 
         # Recovery callbacks
         self._on_hdmi_lost: Optional[Callable] = None
@@ -261,6 +263,10 @@ class HealthMonitor:
 
         Uses ustreamer's /state endpoint instead of v4l2-ctl --query-dv-timings
         because the V4L2 ioctl can disrupt the HDMI-RX stream causing brief skips.
+
+        Also checks captured_fps to detect when source goes to sleep (still
+        connected but not sending frames). If FPS is 0 for more than 5 seconds,
+        signal is considered lost.
         """
         try:
             import urllib.request
@@ -277,11 +283,33 @@ class HealthMonitor:
                 resolution = source.get('resolution', {})
                 width = resolution.get('width', 0)
                 height = resolution.get('height', 0)
+                captured_fps = source.get('captured_fps', 0)
 
-                if online and width and height:
+                # Device must be online with valid resolution
+                if not (online and width and height):
+                    self._hdmi_fps_zero_since = 0  # Reset FPS tracking
+                    return False, ""
+
+                # Check if we're receiving frames (FPS > 0)
+                if captured_fps > 0:
+                    # Signal is good - reset FPS zero tracking
+                    self._hdmi_fps_zero_since = 0
                     return True, f"{width}x{height}"
-
-                return False, ""
+                else:
+                    # FPS is 0 - source might be sleeping
+                    now = time.time()
+                    if self._hdmi_fps_zero_since == 0:
+                        # Just started being 0
+                        self._hdmi_fps_zero_since = now
+                        # Give it a grace period - still report signal OK
+                        return True, f"{width}x{height}"
+                    elif (now - self._hdmi_fps_zero_since) < self._hdmi_signal_loss_threshold:
+                        # Within grace period - still report signal OK
+                        return True, f"{width}x{height}"
+                    else:
+                        # FPS has been 0 for too long - signal lost
+                        logger.debug(f"[HealthMonitor] FPS 0 for {now - self._hdmi_fps_zero_since:.1f}s - signal lost")
+                        return False, ""
 
         except Exception:
             return False, ""

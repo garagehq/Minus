@@ -336,6 +336,13 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - VLM history cleared on stop prevents false re-triggers
 - Transition frame detection holds blocking through black screens between ads
 
+**Static Screen Suppression:**
+- Prevents blocking on paused video screens (Netflix/YouTube show ads when paused)
+- After 2.5s of static screen (`STATIC_TIME_THRESHOLD`), blocking is suppressed
+- When video resumes, 0.5s cooldown (`DYNAMIC_COOLDOWN`) before re-enabling blocking
+- Detection state (OCR/VLM) cleared on cooldown complete to prevent false positives
+- Static ad screenshots saved to `screenshots/static/` for analysis
+
 ## Blocking Overlay
 
 When ads are detected, the screen shows a full blocking overlay **rendered at 60fps via ustreamer's native MPP blocking mode**:
@@ -583,7 +590,8 @@ The health monitor (`src/health.py`) runs in a background thread and checks:
 | Disk | Free > 500MB | Log warning |
 
 **HDMI Disconnect/Reconnect Recovery:**
-- Detects HDMI signal loss via v4l2-ctl
+- Detects HDMI signal loss via ustreamer's `/state` API (`captured_fps` field)
+- Signal considered lost if FPS is 0 for more than 5 seconds (handles source going to sleep)
 - Shows "NO SIGNAL" overlay and mutes audio immediately
 - On signal restoration: restarts ustreamer → restarts video pipeline → restores display
 - Full recovery typically completes in ~7 seconds

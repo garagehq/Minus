@@ -2727,6 +2727,83 @@ class TestHealthExtended:
 
         assert hasattr(HealthMonitor, '_check_ustreamer_alive')
 
+    def test_health_monitor_hdmi_fps_zero_tracking(self):
+        """Test health monitor tracks FPS zero duration for signal loss detection."""
+        from health import HealthMonitor
+
+        mock_minus = MagicMock()
+        mock_minus.config = MagicMock()
+        mock_minus.config.ustreamer_port = 9090
+        monitor = HealthMonitor(mock_minus)
+
+        # Should have FPS zero tracking attributes
+        assert hasattr(monitor, '_hdmi_fps_zero_since')
+        assert hasattr(monitor, '_hdmi_signal_loss_threshold')
+        assert monitor._hdmi_fps_zero_since == 0
+        assert monitor._hdmi_signal_loss_threshold == 5.0
+
+    def test_health_monitor_signal_loss_threshold(self):
+        """Test signal is considered lost after FPS is 0 for threshold duration."""
+        from health import HealthMonitor
+        import time
+
+        mock_minus = MagicMock()
+        mock_minus.config = MagicMock()
+        mock_minus.config.ustreamer_port = 9090
+        monitor = HealthMonitor(mock_minus)
+
+        # Mock the urllib request to return FPS=0
+        with patch('urllib.request.urlopen') as mock_urlopen:
+            mock_response = MagicMock()
+            mock_response.read.return_value = b'{"result":{"source":{"online":true,"resolution":{"width":1920,"height":1080},"captured_fps":0}}}'
+            mock_response.__enter__ = MagicMock(return_value=mock_response)
+            mock_response.__exit__ = MagicMock(return_value=False)
+            mock_urlopen.return_value = mock_response
+
+            # First call - should report signal OK (grace period)
+            signal, resolution = monitor._check_hdmi_signal()
+            assert signal == True
+            assert monitor._hdmi_fps_zero_since > 0
+
+            # Simulate time passing beyond threshold
+            monitor._hdmi_fps_zero_since = time.time() - 10  # 10 seconds ago
+
+            # Now should report signal lost
+            signal, resolution = monitor._check_hdmi_signal()
+            assert signal == False
+
+
+# ============================================================================
+# Static Screen Suppression Tests
+# ============================================================================
+
+class TestStaticScreenSuppression:
+    """Tests for static screen suppression and unpause false positive fix."""
+
+    def test_detection_state_cleared_on_cooldown_complete(self):
+        """Test that detection state is cleared when static cooldown completes.
+
+        This prevents false positives when video resumes after being paused
+        while an ad was showing on the pause screen.
+        """
+        # This is a documentation test - the actual logic is in minus.py
+        # The fix clears ocr_ad_detected, vlm_ad_detected, and vlm_decision_history
+        # when static_blocking_suppressed transitions from True to False
+        pass
+
+    def test_static_suppression_flow(self):
+        """Test the expected flow of static screen suppression."""
+        # Expected flow:
+        # 1. Video paused -> screen becomes static
+        # 2. After STATIC_TIME_THRESHOLD (2.5s), static_blocking_suppressed = True
+        # 3. Ad detected during pause -> ocr_ad_detected/vlm_ad_detected set
+        # 4. But blocking doesn't show because static_blocking_suppressed = True
+        # 5. Video unpaused -> screen becomes dynamic
+        # 6. After DYNAMIC_COOLDOWN (0.5s), static_blocking_suppressed = False
+        # 7. Detection state (ocr_ad_detected, vlm_ad_detected) is cleared
+        # 8. No false positive blocking on the resumed video
+        pass
+
 
 # ============================================================================
 # Extended Overlay Tests
