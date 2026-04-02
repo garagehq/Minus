@@ -588,6 +588,14 @@ The health monitor (`src/health.py`) runs in a background thread and checks:
 - On signal restoration: restarts ustreamer → restarts video pipeline → restores display
 - Full recovery typically completes in ~7 seconds
 
+**Display Output Resilience (HDMI-TX Disconnected):**
+- Service continues running even if HDMI-TX display output is disconnected
+- ustreamer runs independently for web preview and ML detection
+- Web UI shows "DISPLAY DISCONNECTED" overlay with grayscale video feed underneath
+- Display retry loop attempts reconnection every 7 seconds (only display pipeline, not ustreamer)
+- OCR/VLM ad detection continues working without display output
+- API exposes `display_connected` and `display_error` fields in `/api/status`
+
 **Video Pipeline Watchdog:**
 - Buffer watchdog detects stalls (10 seconds without buffer)
 - Monitors GStreamer pipeline state (must be PLAYING)
@@ -637,6 +645,9 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `GET/POST /api/video/color` - Get/set color settings (saturation, brightness, contrast, hue)
 - `POST /api/ocr/test` - Run OCR on current frame (no screenshot save)
 - `POST /api/vlm/test` - Run VLM on current frame (no screenshot save)
+- `GET /api/vlm/status` - Get VLM status (disabled, model_loaded, etc.)
+- `POST /api/vlm/disable` - Disable VLM and unload model from NPU
+- `POST /api/vlm/enable` - Re-enable VLM and load model
 - `POST /api/blocking/skip` - Trigger Fire TV skip button
 - `POST /api/audio/sync-reset` - Reset A/V sync (~300ms dropout)
 
