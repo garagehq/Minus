@@ -306,6 +306,22 @@
                 <p class="help-text">If audio is out of sync with video, click to reset. Causes ~300ms audio dropout.</p>
             </section>
 
+            <!-- Detection Settings -->
+            <section class="settings-section">
+                <h2>Detection Settings</h2>
+                <div class="setting-item">
+                    <span class="setting-label">VLM (FastVLM-1.5B)</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="vlm-toggle" onchange="toggleVLM(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="vlm-status" id="vlm-status-info">
+                    <span class="status-text">Status: <span id="vlm-status-text">Loading...</span></span>
+                </div>
+                <p class="help-text">Disabling VLM unloads the model from the Axera NPU to free memory. Re-enabling takes ~13 seconds to load.</p>
+            </section>
+
             <!-- Fire TV Settings -->
             <section class="settings-section">
                 <h2>Fire TV Settings</h2>
@@ -901,6 +917,71 @@
             } catch (error) {
                 console.error('Keep-alive toggle failed:', error);
                 document.getElementById('keepalive-toggle').checked = !enabled;
+            }
+        }
+
+        // VLM Control
+        let vlmOperationInProgress = false;
+
+        async function toggleVLM(enabled) {
+            if (vlmOperationInProgress) {
+                // Revert the toggle
+                document.getElementById('vlm-toggle').checked = !enabled;
+                return;
+            }
+
+            const statusText = document.getElementById('vlm-status-text');
+            vlmOperationInProgress = true;
+
+            try {
+                const endpoint = enabled ? '/api/vlm/enable' : '/api/vlm/disable';
+                statusText.textContent = enabled ? 'Loading model...' : 'Unloading model...';
+
+                const response = await fetch(endpoint, { method: 'POST' });
+                const data = await response.json();
+
+                if (data.success) {
+                    statusText.textContent = enabled ? 'Enabled' : 'Disabled';
+                    console.log('VLM toggle:', data.message);
+                } else {
+                    statusText.textContent = 'Error: ' + (data.error || 'Unknown');
+                    document.getElementById('vlm-toggle').checked = !enabled;
+                    console.error('VLM toggle failed:', data.error);
+                }
+            } catch (error) {
+                statusText.textContent = 'Error';
+                document.getElementById('vlm-toggle').checked = !enabled;
+                console.error('VLM toggle error:', error);
+            }
+
+            vlmOperationInProgress = false;
+        }
+
+        async function updateVLMStatus() {
+            try {
+                const response = await fetch('/api/vlm/status');
+                const data = await response.json();
+
+                const toggle = document.getElementById('vlm-toggle');
+                const statusText = document.getElementById('vlm-status-text');
+
+                if (!vlmOperationInProgress) {
+                    // Update toggle state based on actual VLM state
+                    const isEnabled = data.initialized && !data.disabled && data.model_loaded;
+                    toggle.checked = isEnabled;
+
+                    if (!data.initialized) {
+                        statusText.textContent = 'Not initialized';
+                    } else if (data.disabled) {
+                        statusText.textContent = 'Disabled';
+                    } else if (data.model_loaded) {
+                        statusText.textContent = 'Enabled';
+                    } else {
+                        statusText.textContent = 'Loading...';
+                    }
+                }
+            } catch (error) {
+                console.error('Failed to get VLM status:', error);
             }
         }
 
@@ -1636,6 +1717,7 @@
         fetchKeepaliveState();
         fetchColorSettings();
         updateFireTVStatus();
+        updateVLMStatus();
 
         setInterval(updateStatus, 1000);
         setInterval(updateStats, 2000);
@@ -1643,6 +1725,7 @@
         setInterval(updateVocabulary, 3000);
         setInterval(updateAudioStatus, 2000);
         setInterval(updateFireTVStatus, 5000);
+        setInterval(updateVLMStatus, 3000);
     </script>
 </body>
 </html>

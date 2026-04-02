@@ -386,15 +386,53 @@ class VLMManager:
         return False, 0.3
 
     def release(self):
-        """Release resources - clean up model components."""
-        self.config = None
-        self.tokenizer = None
-        self.imer = None
-        self.vision_session = None
-        self.embeds = None
-        self.image_processor = None
-        self.is_ready = False
-        logger.info("VLM manager released")
+        """Release resources - clean up model components and free NPU memory."""
+        import gc
+
+        with self._lock:
+            # Release InferManager first (holds NPU sessions)
+            if self.imer is not None:
+                try:
+                    # Clear KV caches
+                    if hasattr(self.imer, 'k_caches'):
+                        for cache in self.imer.k_caches:
+                            if cache is not None:
+                                cache.fill(0)
+                    if hasattr(self.imer, 'v_caches'):
+                        for cache in self.imer.v_caches:
+                            if cache is not None:
+                                cache.fill(0)
+                    # Release any axengine sessions
+                    if hasattr(self.imer, 'sessions'):
+                        for session in self.imer.sessions:
+                            if session is not None and hasattr(session, 'release'):
+                                try:
+                                    session.release()
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    logger.debug(f"Error cleaning up InferManager: {e}")
+                self.imer = None
+
+            # Release vision encoder session
+            if self.vision_session is not None:
+                try:
+                    if hasattr(self.vision_session, 'release'):
+                        self.vision_session.release()
+                except Exception as e:
+                    logger.debug(f"Error releasing vision session: {e}")
+                self.vision_session = None
+
+            # Clear other components
+            self.config = None
+            self.tokenizer = None
+            self.embeds = None
+            self.image_processor = None
+            self.is_ready = False
+
+        # Force garbage collection to free memory
+        gc.collect()
+        logger.info("[VLM] Model unloaded and resources released")
 
     def start_tokenizer_service(self):
         """Compatibility method - FastVLM uses transformers tokenizer."""

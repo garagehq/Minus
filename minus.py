@@ -644,6 +644,95 @@ class Minus:
         # NOTE: Screenshot cleanup removed - we want to keep ALL screenshots for training data
         # The memory issue should be addressed by fixing actual memory leaks, not deleting training data
 
+    # ===== VLM Control Methods =====
+
+    def disable_vlm(self) -> dict:
+        """
+        Disable VLM and unload the model from the Axera NPU.
+
+        Returns:
+            dict with success status and message
+        """
+        if not self.vlm:
+            return {'success': False, 'error': 'VLM not initialized'}
+
+        if self.vlm_disabled and not self.vlm.is_ready:
+            return {'success': True, 'message': 'VLM already disabled'}
+
+        try:
+            # Show unloading notification
+            if hasattr(self, 'system_notification') and self.system_notification:
+                self.system_notification.show_vlm_unloading()
+
+            logger.info("[VLM] Disabling VLM and unloading model...")
+            self.vlm_disabled = True
+
+            # Release the model and free NPU resources
+            self.vlm.release()
+
+            # Show disabled notification
+            if hasattr(self, 'system_notification') and self.system_notification:
+                self.system_notification.show_vlm_disabled()
+
+            logger.info("[VLM] VLM disabled and model unloaded")
+            return {'success': True, 'message': 'VLM disabled and model unloaded from NPU'}
+        except Exception as e:
+            logger.error(f"[VLM] Error disabling VLM: {e}")
+            return {'success': False, 'error': str(e)}
+
+    def enable_vlm(self) -> dict:
+        """
+        Enable VLM and reload the model to the Axera NPU.
+
+        Returns:
+            dict with success status and message
+        """
+        if not self.vlm:
+            return {'success': False, 'error': 'VLM not initialized'}
+
+        if not self.vlm_disabled and self.vlm.is_ready:
+            return {'success': True, 'message': 'VLM already enabled'}
+
+        try:
+            # Show loading notification
+            if hasattr(self, 'system_notification') and self.system_notification:
+                self.system_notification.show_vlm_loading()
+
+            logger.info("[VLM] Enabling VLM and loading model...")
+
+            # Load the model
+            if self.vlm.load_model():
+                self.vlm_disabled = False
+                self.vlm_consecutive_timeouts = 0
+
+                # Show ready notification
+                if hasattr(self, 'system_notification') and self.system_notification:
+                    self.system_notification.show_vlm_ready()
+
+                logger.info("[VLM] VLM enabled and model loaded")
+                return {'success': True, 'message': 'VLM enabled and model loaded to NPU'}
+            else:
+                # Show failed notification
+                if hasattr(self, 'system_notification') and self.system_notification:
+                    self.system_notification.show_vlm_failed()
+
+                return {'success': False, 'error': 'Failed to load VLM model'}
+        except Exception as e:
+            logger.error(f"[VLM] Error enabling VLM: {e}")
+            if hasattr(self, 'system_notification') and self.system_notification:
+                self.system_notification.show_vlm_failed()
+            return {'success': False, 'error': str(e)}
+
+    def get_vlm_status(self) -> dict:
+        """Get detailed VLM status."""
+        return {
+            'initialized': self.vlm is not None,
+            'disabled': self.vlm_disabled,
+            'model_loaded': self.vlm.is_ready if self.vlm else False,
+            'consecutive_timeouts': self.vlm_consecutive_timeouts,
+            'frame_count': self.vlm_frame_count,
+        }
+
     # ===== Fire TV Setup Methods =====
 
     def _start_fire_tv_setup_delayed(self, delay_seconds: float = 15.0):

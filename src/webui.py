@@ -1404,6 +1404,62 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # VLM Control (Enable/Disable)
+        # =========================================================================
+
+        @self.app.route('/api/vlm/status')
+        def api_vlm_status():
+            """Get detailed VLM status including model load state."""
+            try:
+                if hasattr(self.minus, 'get_vlm_status'):
+                    status = self.minus.get_vlm_status()
+                    return jsonify(status)
+                return jsonify({
+                    'initialized': False,
+                    'disabled': True,
+                    'model_loaded': False
+                })
+            except Exception as e:
+                logger.error(f"Error getting VLM status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/vlm/disable', methods=['POST'])
+        def api_vlm_disable():
+            """Disable VLM and unload the model from the Axera NPU.
+
+            This completely frees the NPU resources used by the VLM model.
+            Detection will continue in OCR-only mode.
+            """
+            try:
+                if hasattr(self.minus, 'disable_vlm'):
+                    result = self.minus.disable_vlm()
+                    if result.get('success'):
+                        return jsonify(result)
+                    return jsonify(result), 500
+                return jsonify({'success': False, 'error': 'VLM control not available'}), 500
+            except Exception as e:
+                logger.error(f"Error disabling VLM: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/vlm/enable', methods=['POST'])
+        def api_vlm_enable():
+            """Enable VLM and load the model to the Axera NPU.
+
+            This loads the FastVLM-1.5B model which takes ~13 seconds.
+            An overlay notification will show loading progress.
+            """
+            try:
+                if hasattr(self.minus, 'enable_vlm'):
+                    result = self.minus.enable_vlm()
+                    if result.get('success'):
+                        return jsonify(result)
+                    return jsonify(result), 500
+                return jsonify({'success': False, 'error': 'VLM control not available'}), 500
+            except Exception as e:
+                logger.error(f"Error enabling VLM: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Blocking Control
         # =========================================================================
 

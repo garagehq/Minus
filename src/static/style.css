@@ -1508,6 +1508,24 @@ input:checked + .toggle-slider:before {
     text-align: center;
 }
 
+/* VLM Status */
+.vlm-status {
+    margin-top: 0.5rem;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    font-size: 0.8rem;
+}
+
+.vlm-status .status-text {
+    color: var(--text-secondary);
+}
+
+.vlm-status #vlm-status-text {
+    color: var(--accent);
+    font-weight: 500;
+}
+
 /* ==================== SYSTEM SECTION ==================== */
 .system-section {
     padding: 0.5rem 0;

@@ -341,6 +341,16 @@ class SystemNotification(NotificationOverlay):
         text = "[ VLM FAILED ]\n\nOCR-ONLY MODE"
         self.show(text, duration=8.0)
 
+    def show_vlm_unloading(self):
+        """Show VLM unloading notification."""
+        text = "[ UNLOADING VLM ]\n\nReleasing NPU..."
+        self.show(text, duration=None)
+
+    def show_vlm_disabled(self):
+        """Show VLM disabled notification (auto-hides)."""
+        text = "[ VLM DISABLED ]\n\nOCR-ONLY MODE"
+        self.show(text, duration=5.0)
+
     def show_system_ready(self):
         """Show system ready notification (auto-hides)."""
         text = "[ MINUS READY ]\n\nAD BLOCKING ACTIVE"
