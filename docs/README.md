@@ -25,6 +25,8 @@ This directory contains detailed documentation for the Minus project.
 
 | Document | Description |
 |----------|-------------|
+| [API.md](API.md) | HTTP API reference |
+| [IMPROVEMENTS.md](IMPROVEMENTS.md) | Improvement tracker |
 | [IDEAS.md](IDEAS.md) | Future ideas and improvements |
 | [BENCHMARK-STREAMING.md](BENCHMARK-STREAMING.md) | Streaming performance benchmarks |
 
