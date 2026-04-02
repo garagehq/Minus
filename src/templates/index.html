@@ -34,7 +34,8 @@
                 <div class="video-container" id="video-container">
                     <img id="video-feed" src="/stream" alt="Live Feed">
                     <div id="video-overlay" class="video-overlay hidden">
-                        <span>NO SIGNAL</span>
+                        <span id="video-overlay-title">NO SIGNAL</span>
+                        <span id="video-overlay-message" class="overlay-message"></span>
                     </div>
                     <div id="audio-mute-indicator" class="audio-indicator hidden">
                         <span>&#128263;</span>
@@ -533,12 +534,27 @@
                 document.getElementById('fps-value').textContent = Math.round(status.fps) || '--';
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
 
-                // Video overlay
+                // Video overlay - handle display and HDMI issues
                 const overlay = document.getElementById('video-overlay');
-                if (!status.hdmi_signal) {
+                const overlayTitle = document.getElementById('video-overlay-title');
+                const overlayMessage = document.getElementById('video-overlay-message');
+
+                if (status.display_connected === false) {
+                    // Display not connected - show error message
                     overlay.classList.remove('hidden');
+                    overlayTitle.textContent = 'DISPLAY DISCONNECTED';
+                    overlayMessage.textContent = status.display_error || 'Check HDMI-TX connection to TV/monitor. Retrying...';
+                    overlayMessage.classList.remove('hidden');
+                } else if (!status.hdmi_signal) {
+                    // No HDMI input signal
+                    overlay.classList.remove('hidden');
+                    overlayTitle.textContent = 'NO SIGNAL';
+                    overlayMessage.textContent = 'Check HDMI input source';
+                    overlayMessage.classList.remove('hidden');
                 } else {
+                    // All good - hide overlay
                     overlay.classList.add('hidden');
+                    overlayMessage.classList.add('hidden');
                 }
 
                 // System info

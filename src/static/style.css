@@ -294,15 +294,34 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     right: 0;
     bottom: 0;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    background: rgba(0, 0, 0, 0.9);
+    gap: 1rem;
+    background: rgba(0, 0, 0, 0.7);
     color: var(--danger);
     font-family: var(--font-display);
     font-size: 2rem;
     text-transform: uppercase;
     letter-spacing: 0.2em;
     animation: flicker 0.5s infinite;
+    backdrop-filter: grayscale(70%) blur(2px);
+    -webkit-backdrop-filter: grayscale(70%) blur(2px);
+}
+
+.video-overlay .overlay-message {
+    font-family: var(--font-mono);
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    text-transform: none;
+    letter-spacing: normal;
+    text-align: center;
+    max-width: 90%;
+    line-height: 1.4;
+}
+
+.video-overlay .overlay-message.hidden {
+    display: none;
 }
 
 @keyframes flicker {

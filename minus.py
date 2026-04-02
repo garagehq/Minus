@@ -206,6 +206,12 @@ class Minus:
         self.ml_thread = None
         self.vlm_thread = None
 
+        # Display state
+        self.display_connected = False
+        self.display_error = None
+        self._display_retry_thread = None
+        self._display_retry_interval = 7  # seconds between retry attempts
+
         # VLM degradation state
         self.vlm_disabled = False
         self.vlm_consecutive_timeouts = 0
@@ -533,6 +539,11 @@ class Minus:
 
     def _on_video_pipeline_stall(self):
         """Handle video pipeline stall detected by health monitor."""
+        # Skip if display is disconnected (retry loop handles reconnection)
+        if not self.display_connected:
+            logger.debug("[Recovery] Skipping pipeline stall recovery - display disconnected")
+            return
+
         logger.warning("[Recovery] Video pipeline stall detected - showing loading and restarting")
         if self.ad_blocker:
             # Show loading while we restart the pipeline
@@ -542,6 +553,11 @@ class Minus:
 
     def _restart_ustreamer(self):
         """Restart ustreamer process."""
+        # Skip if display is disconnected (retry loop handles reconnection)
+        if not self.display_connected:
+            logger.debug("[Recovery] Skipping ustreamer restart - display disconnected")
+            return
+
         logger.warning("[Recovery] Restarting ustreamer...")
         try:
             # Kill existing ustreamer
@@ -811,6 +827,75 @@ class Minus:
 
         return self.fire_tv_setup.check_for_auth_dialog(ocr_results)
 
+    # ===== Display Recovery Methods =====
+
+    def _start_display_retry_loop(self):
+        """Start a background thread that retries display connection.
+
+        This only retries the display pipeline (kmssink), not ustreamer.
+        ustreamer is kept running for web preview and ML detection.
+        """
+        if self._display_retry_thread and self._display_retry_thread.is_alive():
+            logger.debug("Display retry loop already running")
+            return
+
+        def retry_loop():
+            logger.info(f"[Display] Starting retry loop (interval: {self._display_retry_interval}s)")
+
+            while self.running and not self.display_connected:
+                time.sleep(self._display_retry_interval)
+
+                if not self.running:
+                    break
+
+                if self.display_connected:
+                    logger.info("[Display] Display connected by another thread, stopping retry loop")
+                    break
+
+                logger.info("[Display] Attempting to reconnect display pipeline...")
+
+                try:
+                    # Check if ustreamer needs to be restarted
+                    if not self._is_ustreamer_running():
+                        logger.warning("[Display] ustreamer not running, restarting...")
+                        if not self.start_ustreamer():
+                            logger.error("[Display] Failed to restart ustreamer")
+                            continue
+
+                    # Only retry the display pipeline (not ustreamer)
+                    if self.start_display_pipeline():
+                        self.display_connected = True
+                        self.display_error = None
+                        logger.info("[Display] Display pipeline reconnected successfully!")
+
+                        # Show system ready notification if overlay available
+                        if self.system_notification:
+                            self.system_notification.show_system_ready()
+                        break
+                    else:
+                        logger.warning("[Display] Display pipeline reconnect failed, will retry...")
+                        self.display_error = "Display output not available. Check HDMI-TX connection to TV/monitor."
+                except Exception as e:
+                    logger.error(f"[Display] Reconnect attempt failed with exception: {e}")
+                    self.display_error = f"Display error: {e}"
+
+            logger.info("[Display] Retry loop ended")
+
+        self._display_retry_thread = threading.Thread(
+            target=retry_loop,
+            daemon=True,
+            name="DisplayRetryLoop"
+        )
+        self._display_retry_thread.start()
+
+    def _stop_display_retry_loop(self):
+        """Stop the display retry loop if running."""
+        # The loop checks self.running and self.display_connected,
+        # so setting display_connected = True will stop it
+        if self._display_retry_thread and self._display_retry_thread.is_alive():
+            logger.info("[Display] Stopping retry loop...")
+            # Thread will exit on next iteration
+
     def try_skip_ad(self):
         """Attempt to skip ad on Fire TV if connected."""
         if self.fire_tv_controller and self.fire_tv_controller.is_connected():
@@ -920,6 +1005,8 @@ class Minus:
             'hdmi_signal': health_status.hdmi_signal if health_status else True,
             'vlm_ready': not self.vlm_disabled and (self.vlm is not None and self.vlm.is_ready if self.vlm else False),
             'vlm_disabled': self.vlm_disabled,
+            'display_connected': self.display_connected,
+            'display_error': self.display_error,
 
             # Memory/health
             'memory_percent': health_status.memory_percent if health_status else 0,
@@ -1218,11 +1305,14 @@ class Minus:
             logger.warning(f"V4L2 device initialization error: {e}")
             return False
 
-    def start_display(self):
-        """Start ustreamer and display pipeline."""
-        # Kill any existing processes
+    def start_ustreamer(self):
+        """Start ustreamer process for video capture/streaming.
+
+        This keeps the web preview and ML detection working even if
+        the display output (HDMI-TX) is disconnected.
+        """
+        # Kill any existing ustreamer
         subprocess.run(['pkill', '-9', 'ustreamer'], capture_output=True)
-        subprocess.run(['pkill', '-9', 'gst-launch'], capture_output=True)
         time.sleep(0.5)
 
         port = self.config.ustreamer_port
@@ -1289,37 +1379,60 @@ class Minus:
         # Initialize frame capture
         self.frame_capture = UstreamerCapture(port=port)
 
-        # Start the display pipeline (managed by ad_blocker)
-        if self.ad_blocker:
-            # Wait if pipeline is currently being restarted (avoid race condition)
-            if hasattr(self.ad_blocker, '_pipeline_restarting') and self.ad_blocker._pipeline_restarting:
-                logger.info("Pipeline restart in progress, waiting...")
-                for _ in range(10):  # Wait up to 10 seconds
-                    time.sleep(1)
-                    if not self.ad_blocker._pipeline_restarting:
-                        break
-                if self.ad_blocker._pipeline_restarting:
-                    logger.warning("Pipeline still restarting after 10s")
-                    return False
+        return True
 
-            logger.info("Starting display pipeline...")
-            if self.ad_blocker.start():
-                logger.info("Display pipeline started - 30 FPS with instant ad blocking")
+    def _is_ustreamer_running(self):
+        """Check if ustreamer process is running."""
+        return self.ustreamer_process is not None and self.ustreamer_process.poll() is None
 
-                # Start audio passthrough
-                if self.audio:
-                    if self.audio.start():
-                        logger.info("Audio passthrough started")
-                    else:
-                        logger.warning("Audio passthrough failed to start")
+    def start_display_pipeline(self):
+        """Start the display pipeline (GStreamer kmssink).
 
-                return True
-            else:
-                logger.error("Display pipeline failed to start")
+        Requires ustreamer to already be running. Returns True on success,
+        False if the display output (HDMI-TX) is not available.
+        """
+        if not self.ad_blocker:
+            logger.error("No ad_blocker available")
+            return False
+
+        # Wait if pipeline is currently being restarted (avoid race condition)
+        if hasattr(self.ad_blocker, '_pipeline_restarting') and self.ad_blocker._pipeline_restarting:
+            logger.info("Pipeline restart in progress, waiting...")
+            for _ in range(10):  # Wait up to 10 seconds
+                time.sleep(1)
+                if not self.ad_blocker._pipeline_restarting:
+                    break
+            if self.ad_blocker._pipeline_restarting:
+                logger.warning("Pipeline still restarting after 10s")
                 return False
 
-        logger.error("No ad_blocker available")
-        return False
+        logger.info("Starting display pipeline...")
+        if self.ad_blocker.start():
+            logger.info("Display pipeline started - 30 FPS with instant ad blocking")
+
+            # Start audio passthrough
+            if self.audio:
+                if self.audio.start():
+                    logger.info("Audio passthrough started")
+                else:
+                    logger.warning("Audio passthrough failed to start")
+
+            return True
+        else:
+            logger.error("Display pipeline failed to start")
+            return False
+
+    def start_display(self):
+        """Start ustreamer and display pipeline."""
+        # Kill any existing GStreamer processes (ustreamer handled in start_ustreamer)
+        subprocess.run(['pkill', '-9', 'gst-launch'], capture_output=True)
+
+        # Start ustreamer first (for web preview and ML detection)
+        if not self.start_ustreamer():
+            return False
+
+        # Then start display pipeline (may fail if HDMI-TX disconnected)
+        return self.start_display_pipeline()
 
     def _update_blocking_state(self):
         """Update combined blocking state using weighted OCR/VLM model."""
@@ -1974,15 +2087,20 @@ class Minus:
             logger.info("Starting loading display while initializing...")
             self.ad_blocker.start_loading_mode()
 
+        # Start ML threads flag - set early so threads can start
+        self.running = True
+
         # Start display (will transition from loading to live when ready)
         if not self.start_display():
-            logger.error("Failed to start display")
-            return False
-
-        logger.info("Display running at 30 FPS with instant ad blocking")
-
-        # Start ML threads
-        self.running = True
+            logger.warning("Failed to start display - will retry in background")
+            self.display_connected = False
+            self.display_error = "Display output not available. Check HDMI-TX connection to TV/monitor."
+            # Start retry loop in background
+            self._start_display_retry_loop()
+        else:
+            self.display_connected = True
+            self.display_error = None
+            logger.info("Display running at 30 FPS with instant ad blocking")
 
         if self.ocr:
             self.ml_thread = threading.Thread(target=self.ml_worker, daemon=True)
@@ -2049,6 +2167,11 @@ class Minus:
                     time.sleep(1)
                     continue
 
+                # Skip restart if display is already disconnected (retry loop handles it)
+                if not self.display_connected:
+                    time.sleep(1)
+                    continue
+
                 if self.ustreamer_process and self.ustreamer_process.poll() is not None:
                     logger.warning("ustreamer process died, restarting...")
                     if not self.start_display():
@@ -2061,6 +2184,8 @@ class Minus:
                         time.sleep(5)  # Wait before retry
                     else:
                         restart_failures = 0  # Reset on success
+                        self.display_connected = True  # Update status
+                        self.display_error = None
                 time.sleep(1)
         except KeyboardInterrupt:
             pass
