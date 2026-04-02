@@ -855,6 +855,35 @@ class Minus:
                 logger.info("[Display] Attempting to reconnect display pipeline...")
 
                 try:
+                    # Re-probe DRM to detect if display was connected since startup
+                    drm_info = probe_drm_output()
+                    if drm_info['connector_id'] is not None:
+                        # Check if DRM settings changed (display connected after startup)
+                        if (drm_info['connector_id'] != self.config.drm_connector_id or
+                            drm_info['plane_id'] != self.config.drm_plane_id):
+                            logger.info(f"[Display] DRM output changed: connector {self.config.drm_connector_id} -> {drm_info['connector_id']}, "
+                                       f"plane {self.config.drm_plane_id} -> {drm_info['plane_id']}")
+                            # Update config
+                            self.config.drm_connector_id = drm_info['connector_id']
+                            self.config.drm_plane_id = drm_info['plane_id']
+                            self.config.output_width = drm_info['width']
+                            self.config.output_height = drm_info['height']
+                            self.config.audio_playback_device = drm_info['audio_device']
+
+                            # Update ad_blocker with new DRM settings
+                            if self.ad_blocker:
+                                self.ad_blocker.connector_id = drm_info['connector_id']
+                                self.ad_blocker.plane_id = drm_info['plane_id']
+                                self.ad_blocker.output_width = drm_info['width']
+                                self.ad_blocker.output_height = drm_info['height']
+                                # Reinitialize pipeline with new settings
+                                self.ad_blocker._init_pipeline()
+                                logger.info("[Display] Pipeline reinitialized with new DRM settings")
+                    else:
+                        logger.debug("[Display] No HDMI output detected yet")
+                        self.display_error = "Display output not available. Check HDMI-TX connection to TV/monitor."
+                        continue
+
                     # Check if ustreamer needs to be restarted
                     if not self._is_ustreamer_running():
                         logger.warning("[Display] ustreamer not running, restarting...")
