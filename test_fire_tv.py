@@ -59,7 +59,7 @@ def scan_devices():
     return devices
 
 
-def test_connection(ip_address: str):
+def run_connection_test(ip_address: str):
     """Test connecting to a Fire TV."""
     print(f"\n=== Testing connection to {ip_address} ===\n")
 
@@ -90,7 +90,7 @@ def test_connection(ip_address: str):
     return controller
 
 
-def test_commands(controller: FireTVController):
+def run_commands_test(controller: FireTVController):
     """Test sending basic commands."""
     print("\n=== Testing commands ===\n")
 
@@ -248,7 +248,7 @@ Examples:
         controller = quick_connect()
         if controller:
             # Test basic commands
-            test_commands(controller)
+            run_commands_test(controller)
 
             # Demo or interactive mode
             if args.demo:
@@ -265,12 +265,12 @@ Examples:
         return 1
 
     # Connect
-    controller = test_connection(ip_address)
+    controller = run_connection_test(ip_address)
     if not controller:
         return 1
 
     # Test basic commands
-    test_commands(controller)
+    run_commands_test(controller)
 
     # Demo or interactive mode
     if args.demo:

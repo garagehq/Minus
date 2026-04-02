@@ -7,9 +7,21 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 - **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame)
 - **Spanish vocabulary practice** during ad blocks!
 
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [docs/FEATURES.md](docs/FEATURES.md) | Complete feature list and capabilities |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture and data flow |
+| [docs/AESTHETICS.md](docs/AESTHETICS.md) | Visual design guide for UI/overlays |
+| [MARISOL.md](MARISOL.md) | AI agent context guide |
+| [docs/DEBUG_GLITCHES.md](docs/DEBUG_GLITCHES.md) | Video glitch debugging notes |
+| [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
+| [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
+
 ## Visual Design
 
-See **[AESTHETICS.md](AESTHETICS.md)** for the complete visual design guide including:
+See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design guide including:
 - Color palette (black background, matrix green, danger red, purple accents)
 - Typography (VT323 for display, IBM Plex Mono for body, DejaVu for TV overlays)
 - Component styling and animations
@@ -79,7 +91,7 @@ See **[AESTHETICS.md](AESTHETICS.md)** for the complete visual design guide incl
 | `src/screenshots.py` | ScreenshotManager class with deduplication |
 | `src/skip_detection.py` | Skip button detection (regex patterns) |
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
-| `tests/test_modules.py` | Unit tests for all extracted modules (106 tests) |
+| `tests/test_modules.py` | Comprehensive test suite (242+ tests) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
 | `install.sh` | Install as systemd service |
@@ -784,7 +796,7 @@ The project includes a comprehensive test suite for all extracted modules.
 
 **Running Tests:**
 ```bash
-python3 tests/test_modules.py  # 106 tests
+python3 tests/test_modules.py  # 242+ tests
 
 # Or with pytest (if installed)
 python3 -m pytest tests/test_modules.py -v
@@ -807,14 +819,34 @@ python3 -m pytest tests/test_modules.py -v
 | `src/fire_tv.py` | TestFireTV | Controller, key codes, device detection |
 | `src/vlm.py` | TestVLM | VLMManager, response parsing, 4-tuple returns |
 | `src/ocr.py` | TestOCR | Keywords, exclusions, terminal detection |
-| `src/webui.py` | TestWebUI | Flask routes, API endpoints |
+| `src/webui.py` | TestWebUI, TestWebUIExtended | Flask routes, all API endpoints |
+| `src/ad_blocker.py` | TestAdBlocker, TestAdBlockerExtended | Blocking modes, color controls, animations |
+| `src/audio.py` | TestAudio, TestAudioExtended | A/V sync, pipeline controls, mute/unmute |
+| `src/fire_tv.py` | TestFireTV, TestFireTVExtended | Connection, commands, device discovery |
+| `src/vlm.py` | TestVLM, TestVLMExtended | Response parsing, confidence detection |
+| `src/ocr.py` | TestOCR, TestOCRExtended | Keywords, exclusions, terminal detection |
+| `src/skip_detection.py` | TestSkipDetection, TestSkipDetectionExtended | Pattern matching, countdown parsing |
+| `src/screenshots.py` | TestScreenshots, TestScreenshotsExtended | Deduplication, categories, truncation |
+| `src/config.py` | TestConfig, TestConfigValidation | Defaults, custom values |
+| `src/health.py` | TestHealth, TestHealthExtended | Monitoring, callbacks, status |
+| `src/overlay.py` | TestOverlay, TestOverlayExtended | Positions, show/hide, text formatting |
+| `src/drm.py` | TestDRM, TestDRMExtended | DRM probing, fallback values |
+| `src/v4l2.py` | TestV4L2, TestV4L2Extended | Format detection, error handling |
+| `src/console.py` | TestConsole, TestConsoleExtended | Console blanking/restore |
+| `src/capture.py` | TestCapture, TestCaptureExtended | Snapshot capture, cleanup |
 | Integration | TestIntegration | Cross-module tests |
+| Memory | TestMemoryLeaks | Resource cleanup, executor reuse |
+| Blocking | TestBlockingModeIntegration | State transitions, API format |
+| Error Handling | TestErrorHandling | Missing subsystems, graceful failures |
+| Concurrency | TestConcurrency | Thread safety, locks |
+| Vocabulary | TestVocabulary, TestVocabularyContent | Format, content, duplicates |
+| API Responses | TestAPIResponseFormats | Consistent response structure |
 
 **Test Design:**
 - Tests are self-contained with temporary directories
 - Mock subprocess calls to avoid system dependencies
 - Fallback to manual test runner if pytest not installed
-- All 106 tests should pass on a clean system
+- All 242+ tests should pass on a clean system
 
 ## Module Structure
 
