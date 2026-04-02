@@ -2043,6 +2043,25 @@ class Minus:
         """Start the stream processing."""
         logger.info("Starting Minus...")
 
+        # Start web UI early so it's accessible even when waiting for HDMI signal
+        if HAS_WEBUI:
+            try:
+                self.webui = WebUI(
+                    minus_instance=self,
+                    port=self.config.webui_port,
+                    ustreamer_port=self.config.ustreamer_port
+                )
+                self.webui.start()
+                logger.info(f"Web UI available at http://0.0.0.0:{self.config.webui_port}")
+            except Exception as e:
+                logger.warning(f"Failed to start Web UI: {e}")
+                self.webui = None
+
+        # Start health monitor early so status is available
+        if self.health_monitor:
+            self.health_monitor.start()
+            logger.info("Health monitor started")
+
         # Check signal
         signal_info = self.check_hdmi_signal()
         if not signal_info:
@@ -2121,24 +2140,7 @@ class Minus:
             all_keywords = PaddleOCR.AD_KEYWORDS_EXACT + PaddleOCR.AD_KEYWORDS_WORD
             logger.info(f"OCR watching for ad keywords: {all_keywords}")
 
-        # Start health monitor (before VLM loading)
-        if self.health_monitor:
-            self.health_monitor.start()
-            logger.info("Health monitor started")
-
-        # Start web UI (before VLM loading so it's immediately accessible)
-        if HAS_WEBUI:
-            try:
-                self.webui = WebUI(
-                    minus_instance=self,
-                    port=self.config.webui_port,
-                    ustreamer_port=self.config.ustreamer_port
-                )
-                self.webui.start()
-                logger.info(f"Web UI available at http://0.0.0.0:{self.config.webui_port}")
-            except Exception as e:
-                logger.warning(f"Failed to start Web UI: {e}")
-                self.webui = None
+        # Note: Health monitor and Web UI already started at beginning of run()
 
         # Start Fire TV setup early (runs in parallel with VLM loading)
         # 5 second delay ensures display is stable before scanning

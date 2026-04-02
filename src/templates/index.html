@@ -535,21 +535,22 @@
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
 
                 // Video overlay - handle display and HDMI issues
+                // Priority: NO SIGNAL (input) > DISPLAY DISCONNECTED (output)
                 const overlay = document.getElementById('video-overlay');
                 const overlayTitle = document.getElementById('video-overlay-title');
                 const overlayMessage = document.getElementById('video-overlay-message');
 
-                if (status.display_connected === false) {
-                    // Display not connected - show error message
+                if (!status.hdmi_signal) {
+                    // No HDMI input signal - highest priority
+                    overlay.classList.remove('hidden');
+                    overlayTitle.textContent = 'NO SIGNAL';
+                    overlayMessage.textContent = 'HDMI input not detected. Check source device.';
+                    overlayMessage.classList.remove('hidden');
+                } else if (status.display_connected === false) {
+                    // Display output not connected
                     overlay.classList.remove('hidden');
                     overlayTitle.textContent = 'DISPLAY DISCONNECTED';
                     overlayMessage.textContent = status.display_error || 'Check HDMI-TX connection to TV/monitor. Retrying...';
-                    overlayMessage.classList.remove('hidden');
-                } else if (!status.hdmi_signal) {
-                    // No HDMI input signal
-                    overlay.classList.remove('hidden');
-                    overlayTitle.textContent = 'NO SIGNAL';
-                    overlayMessage.textContent = 'Check HDMI input source';
                     overlayMessage.classList.remove('hidden');
                 } else {
                     // All good - hide overlay
