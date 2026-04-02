@@ -313,6 +313,14 @@ class AudioPassthrough:
                     logger.warning(f"[AudioPassthrough] Trying alternate capture device: {old_device} -> {self.capture_device}")
                     self._consecutive_failures = 0  # Reset for new device
 
+                # After 10 consecutive failures, pause watchdog to stop restart spam
+                # This prevents frame jumps from constant GStreamer pipeline recreation
+                if self._consecutive_failures >= 10:
+                    logger.error(f"[AudioPassthrough] Too many failures ({self._consecutive_failures}), pausing audio watchdog")
+                    self._watchdog_paused = True
+                    self.is_running = False
+                    return
+
                 # Calculate backoff delay
                 delay = min(
                     self._base_restart_delay * (2 ** (self._consecutive_failures - 1)),
