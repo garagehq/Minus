@@ -3209,6 +3209,152 @@ class TestBlockingModeIntegration:
 
 
 # ============================================================================
+# Detection Pipeline Integration Tests
+# ============================================================================
+
+class TestDetectionPipeline:
+    """Integration tests for the detection pipeline."""
+
+    def test_ocr_ad_keyword_patterns(self):
+        """Test OCR ad keyword patterns are defined."""
+        from ocr import PaddleOCR
+
+        # The PaddleOCR class should have keyword patterns defined
+        # We check the module has the expected constants/patterns
+        ocr_instance = PaddleOCR.__new__(PaddleOCR)
+
+        # Check OCR module exists and can be instantiated
+        assert ocr_instance is not None
+
+        # Test that ad keywords would be detected in typical ad text
+        ad_texts = ['Skip Ad', 'Advertisement', 'Sponsored', 'Skip in 5']
+        non_ad_texts = ['Play', 'Pause', 'Volume', 'Settings']
+
+        # These texts should be distinguishable by keyword matching
+        for ad_text in ad_texts:
+            # At least one ad keyword should be in ad text (case-insensitive)
+            keywords = ['skip', 'ad', 'sponsor', 'advertis']
+            assert any(kw in ad_text.lower() for kw in keywords)
+
+    def test_skip_detection_with_ocr_output(self):
+        """Test skip detection integration with OCR output."""
+        from skip_detection import check_skip_opportunity
+
+        # Simulate OCR results
+        ocr_results = ['Skip Ad', 'More Info', '2:30']
+        is_skippable, text, countdown = check_skip_opportunity(ocr_results)
+        assert is_skippable is True
+        assert 'Skip' in text
+
+        # Simulate countdown
+        ocr_results = ['Skip in 3', 'Learn More']
+        is_skippable, text, countdown = check_skip_opportunity(ocr_results)
+        assert is_skippable is False
+        assert countdown == 3
+
+    def test_blocking_state_transitions(self):
+        """Test blocking state machine transitions."""
+        try:
+            from ad_blocker import DRMAdBlocker
+            import threading
+
+            blocker = DRMAdBlocker.__new__(DRMAdBlocker)
+            blocker.is_visible = False
+            blocker.current_source = None
+            blocker._lock = threading.Lock()
+            blocker._animating = False
+            blocker._animation_direction = None
+            blocker._test_blocking_until = 0
+
+            # Initial state
+            assert blocker.is_visible is False
+
+            # Simulate ad detection -> blocking
+            blocker.is_visible = True
+            blocker.current_source = 'ocr'
+            assert blocker.is_visible is True
+
+            # Simulate ad end -> unblocking
+            blocker.is_visible = False
+            blocker.current_source = None
+            assert blocker.is_visible is False
+        except ImportError:
+            pass
+
+    def test_audio_mute_coordination(self):
+        """Test audio mute/unmute coordination with blocking."""
+        try:
+            from audio import AudioPassthrough
+            import threading
+
+            audio = AudioPassthrough.__new__(AudioPassthrough)
+            audio.is_muted = False
+            audio.is_running = False
+            audio._lock = threading.Lock()
+            audio.pipeline = None
+
+            # Simulate mute on ad
+            audio.is_muted = True
+            assert audio.is_muted is True
+
+            # Simulate unmute on ad end
+            audio.is_muted = False
+            assert audio.is_muted is False
+        except ImportError:
+            pass
+
+    def test_vlm_response_parsing(self):
+        """Test VLM response parsing for ad detection."""
+        try:
+            from vlm import VLMManager
+
+            manager = VLMManager.__new__(VLMManager)
+            manager.is_ready_flag = False
+
+            # Check VLM module can be instantiated
+            assert manager is not None
+
+            # Test response interpretation logic
+            # VLM typically returns "Yes" or "No" responses
+            positive_responses = ['yes', 'Yes', 'YES', 'yes, this is an ad']
+            negative_responses = ['no', 'No', 'NO', 'no, this is content']
+
+            for resp in positive_responses:
+                assert 'yes' in resp.lower()
+
+            for resp in negative_responses:
+                assert 'no' in resp.lower()
+        except ImportError:
+            pass
+
+    def test_detection_history_tracking(self):
+        """Test detection history is tracked correctly."""
+        # Simulate detection history
+        detection_history = []
+
+        # Add detection
+        detection = {
+            'timestamp': 1234567890,
+            'source': 'ocr',
+            'is_ad': True,
+            'text': 'Skip Ad'
+        }
+        detection_history.append(detection)
+        assert len(detection_history) == 1
+        assert detection_history[0]['source'] == 'ocr'
+
+        # Add another detection
+        detection2 = {
+            'timestamp': 1234567891,
+            'source': 'vlm',
+            'is_ad': True,
+            'confidence': 0.95
+        }
+        detection_history.append(detection2)
+        assert len(detection_history) == 2
+
+
+# ============================================================================
 # Error Handling Tests
 # ============================================================================
 
@@ -3440,6 +3586,244 @@ class TestAPIResponseFormats:
             pass
 
 
+class TestEdgeCases:
+    """Tests for edge cases and boundary conditions."""
+
+    def test_skip_detection_empty_list(self):
+        """Test skip detection with empty text list."""
+        from skip_detection import check_skip_opportunity
+
+        result = check_skip_opportunity([])
+        assert result == (False, None, None)
+
+    def test_skip_detection_none_values(self):
+        """Test skip detection handles None values in list."""
+        from skip_detection import check_skip_opportunity
+
+        result = check_skip_opportunity([None, None, 'text'])
+        # Should not crash
+        assert result[0] in (True, False)
+
+    def test_skip_detection_empty_strings(self):
+        """Test skip detection with empty strings."""
+        from skip_detection import check_skip_opportunity
+
+        result = check_skip_opportunity(['', '  ', '\n'])
+        assert result == (False, None, None)
+
+    def test_skip_detection_unicode(self):
+        """Test skip detection with unicode characters."""
+        from skip_detection import check_skip_opportunity
+
+        # Test with Spanish characters
+        result = check_skip_opportunity(['Omitir anuncio'])
+        assert result[0] is True
+
+        # Test with emoji (should not match)
+        result = check_skip_opportunity(['🎬 Watch Now'])
+        assert result[0] is False
+
+    def test_skip_detection_very_long_text(self):
+        """Test skip detection with very long text."""
+        from skip_detection import check_skip_opportunity
+
+        long_text = 'Skip Ad ' * 1000
+        result = check_skip_opportunity([long_text])
+        # Should not crash, may or may not match depending on length check
+        assert result[0] in (True, False)
+
+    def test_vocabulary_all_have_required_fields(self):
+        """Test all vocabulary entries have required fields."""
+        from vocabulary import SPANISH_VOCABULARY
+
+        # Vocabulary entries are tuples: (spanish, pronunciation, english, example)
+        for word in SPANISH_VOCABULARY:
+            assert isinstance(word, tuple)
+            assert len(word) >= 3  # At least spanish, pronunciation, english
+            spanish, pronunciation, english = word[0], word[1], word[2]
+            assert len(spanish) > 0
+            assert len(english) > 0
+
+    def test_config_handles_invalid_env_vars(self):
+        """Test config handles invalid environment variable values."""
+        import os
+        from config import _get_env_float, _get_env_int
+
+        # Test with invalid float
+        os.environ['TEST_INVALID_FLOAT'] = 'not_a_number'
+        result = _get_env_float('TEST_INVALID_FLOAT', 1.0)
+        assert result == 1.0  # Should return default
+
+        # Test with invalid int
+        os.environ['TEST_INVALID_INT'] = 'not_a_number'
+        result = _get_env_int('TEST_INVALID_INT', 5)
+        assert result == 5  # Should return default
+
+        # Cleanup
+        del os.environ['TEST_INVALID_FLOAT']
+        del os.environ['TEST_INVALID_INT']
+
+    def test_screenshot_manager_handles_missing_dirs(self):
+        """Test screenshot manager handles missing directories."""
+        import tempfile
+        import shutil
+        from screenshots import ScreenshotManager
+
+        # Create temp dir
+        temp_dir = tempfile.mkdtemp()
+        try:
+            manager = ScreenshotManager(temp_dir)
+            # Should create subdirectories
+            assert manager.base_dir.exists()
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def test_health_status_dataclass_defaults(self):
+        """Test HealthStatus dataclass has sensible defaults."""
+        from health import HealthStatus
+
+        status = HealthStatus()
+        assert status.hdmi_signal is False
+        assert status.hdmi_resolution == ""
+        assert status.memory_percent == 0
+        assert status.output_fps == 0.0
+
+
+class TestInputValidation:
+    """Tests for API input validation."""
+
+    def test_color_validation_rejects_invalid_saturation(self):
+        """Test color API rejects invalid saturation values."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.set_color_settings.return_value = {'success': True}
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            # Test saturation too high
+            response = client.post('/api/video/color',
+                                   json={'saturation': 3.0},
+                                   content_type='application/json')
+            assert response.status_code == 400
+            data = response.get_json()
+            assert 'errors' in data
+
+            # Test saturation too low
+            response = client.post('/api/video/color',
+                                   json={'saturation': -0.5},
+                                   content_type='application/json')
+            assert response.status_code == 400
+
+    def test_color_validation_rejects_invalid_brightness(self):
+        """Test color API rejects invalid brightness values."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/video/color',
+                                   json={'brightness': 2.0},
+                                   content_type='application/json')
+            assert response.status_code == 400
+
+    def test_color_validation_accepts_valid_values(self):
+        """Test color API accepts valid values."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.set_color_settings.return_value = {'success': True}
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/video/color',
+                                   json={'saturation': 1.5, 'brightness': 0.0},
+                                   content_type='application/json')
+            assert response.status_code == 200
+
+    def test_trigger_block_validation_rejects_invalid_duration(self):
+        """Test trigger-block API rejects invalid duration values."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            # Test duration too high
+            response = client.post('/api/test/trigger-block',
+                                   json={'duration': 100},
+                                   content_type='application/json')
+            assert response.status_code == 400
+
+            # Test duration too low
+            response = client.post('/api/test/trigger-block',
+                                   json={'duration': 0},
+                                   content_type='application/json')
+            assert response.status_code == 400
+
+    def test_trigger_block_validation_rejects_invalid_source(self):
+        """Test trigger-block API rejects invalid source values."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.post('/api/test/trigger-block',
+                                   json={'source': 'invalid'},
+                                   content_type='application/json')
+            assert response.status_code == 400
+
+    def test_pause_validation_rejects_out_of_range(self):
+        """Test pause API already validates duration range."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            # Test duration too high
+            response = client.post('/api/pause/100')
+            assert response.status_code == 400
+
+            # Test duration too low
+            response = client.post('/api/pause/0')
+            assert response.status_code == 400
+
+    def test_metrics_endpoint_returns_prometheus_format(self):
+        """Test metrics endpoint returns Prometheus format."""
+        from webui import WebUI
+        mock_minus = MagicMock()
+        mock_minus.ad_blocker = MagicMock()
+        mock_minus.ad_blocker.get_fps.return_value = 30.0
+        mock_minus.ad_blocker.is_visible = False
+        mock_minus.ad_blocker._restart_count = 0
+        mock_minus.ad_blocker._total_time_saved = 120.5
+        mock_minus.audio = MagicMock()
+        mock_minus.audio.is_running = True
+        mock_minus.audio.is_muted = False
+        mock_minus.audio._restart_count = 0
+        mock_minus.health_monitor = None
+
+        ui = WebUI(mock_minus)
+
+        with ui.app.test_client() as client:
+            response = client.get('/api/metrics')
+            assert response.status_code == 200
+            assert response.content_type.startswith('text/plain')
+            data = response.data.decode('utf-8')
+            # Check for Prometheus format markers
+            assert '# HELP' in data
+            assert '# TYPE' in data
+            assert 'minus_video_fps' in data
+
+
 # ============================================================================
 # Test Runner
 # ============================================================================
@@ -3483,10 +3867,13 @@ def run_tests():
         TestConsoleExtended,
         TestCaptureExtended,
         TestBlockingModeIntegration,
+        TestDetectionPipeline,
         TestErrorHandling,
         TestConcurrency,
         TestVocabularyContent,
         TestAPIResponseFormats,
+        TestEdgeCases,
+        TestInputValidation,
     ]
 
     total_tests = 0

@@ -283,11 +283,24 @@ class WebUI:
             """
             try:
                 data = request.get_json() or {}
-                duration = min(60, max(1, data.get('duration', 10)))
-                source = data.get('source', 'ocr')
 
-                if source not in ('ocr', 'vlm', 'both', 'default'):
-                    source = 'ocr'
+                # Validate duration
+                duration = data.get('duration', 10)
+                if not isinstance(duration, (int, float)) or duration < 1 or duration > 60:
+                    return jsonify({
+                        'success': False,
+                        'error': 'duration must be a number between 1 and 60 seconds'
+                    }), 400
+                duration = int(duration)
+
+                # Validate source
+                source = data.get('source', 'ocr')
+                valid_sources = ('ocr', 'vlm', 'both', 'default')
+                if source not in valid_sources:
+                    return jsonify({
+                        'success': False,
+                        'error': f'source must be one of: {", ".join(valid_sources)}'
+                    }), 400
 
                 if self.minus.ad_blocker:
                     # Enable test mode to prevent detection loop from hiding
@@ -1042,6 +1055,80 @@ class WebUI:
                 logger.error(f"Health check error: {e}")
                 return jsonify({'status': 'error', 'error': str(e)}), 500
 
+        @self.app.route('/api/metrics')
+        def api_metrics():
+            """Prometheus-compatible metrics endpoint.
+
+            Returns metrics in Prometheus text format for monitoring systems.
+            """
+            try:
+                lines = []
+
+                # Helper to add metric
+                def add_metric(name, value, help_text, metric_type='gauge', labels=None):
+                    lines.append(f'# HELP {name} {help_text}')
+                    lines.append(f'# TYPE {name} {metric_type}')
+                    if labels:
+                        label_str = ','.join(f'{k}="{v}"' for k, v in labels.items())
+                        lines.append(f'{name}{{{label_str}}} {value}')
+                    else:
+                        lines.append(f'{name} {value}')
+
+                # Uptime
+                uptime = 0
+                if hasattr(self.minus, 'health_monitor') and self.minus.health_monitor:
+                    status = self.minus.health_monitor.get_status()
+                    uptime = status.uptime_seconds
+                add_metric('minus_uptime_seconds', uptime, 'Time since service start')
+
+                # Video stats
+                if hasattr(self.minus, 'ad_blocker') and self.minus.ad_blocker:
+                    fps = self.minus.ad_blocker.get_fps() or 0
+                    add_metric('minus_video_fps', fps, 'Current video FPS')
+
+                    blocking = 1 if self.minus.ad_blocker.is_visible else 0
+                    add_metric('minus_blocking_active', blocking, 'Whether blocking is active')
+
+                    restart_count = getattr(self.minus.ad_blocker, '_restart_count', 0)
+                    if isinstance(restart_count, (int, float)):
+                        add_metric('minus_video_restarts_total', restart_count, 'Total video pipeline restarts', 'counter')
+
+                # Audio stats
+                if hasattr(self.minus, 'audio') and self.minus.audio:
+                    running = 1 if self.minus.audio.is_running else 0
+                    add_metric('minus_audio_running', running, 'Whether audio is running')
+
+                    muted = 1 if self.minus.audio.is_muted else 0
+                    add_metric('minus_audio_muted', muted, 'Whether audio is muted')
+
+                    restart_count = getattr(self.minus.audio, '_restart_count', 0)
+                    if isinstance(restart_count, (int, float)):
+                        add_metric('minus_audio_restarts_total', restart_count, 'Total audio pipeline restarts', 'counter')
+
+                # Detection stats
+                if hasattr(self.minus, 'detection_counts'):
+                    counts = self.minus.detection_counts
+                    add_metric('minus_ocr_detections_total', counts.get('ocr', 0), 'Total OCR ad detections', 'counter')
+                    add_metric('minus_vlm_detections_total', counts.get('vlm', 0), 'Total VLM ad detections', 'counter')
+
+                # HDMI signal
+                if hasattr(self.minus, 'health_monitor') and self.minus.health_monitor:
+                    status = self.minus.health_monitor.get_status()
+                    signal = 1 if status.hdmi_signal else 0
+                    add_metric('minus_hdmi_signal', signal, 'Whether HDMI signal is present')
+
+                # Time saved
+                if hasattr(self.minus, 'ad_blocker') and self.minus.ad_blocker:
+                    time_saved = getattr(self.minus.ad_blocker, '_total_time_saved', 0)
+                    if isinstance(time_saved, (int, float)):
+                        add_metric('minus_time_saved_seconds', time_saved, 'Total time saved by blocking ads', 'counter')
+
+                response = '\n'.join(lines) + '\n'
+                return response, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+            except Exception as e:
+                logger.error(f"Metrics error: {e}")
+                return f'# Error generating metrics: {e}\n', 500, {'Content-Type': 'text/plain; charset=utf-8'}
+
         # =========================================================================
         # Video Pipeline Control
         # =========================================================================
@@ -1097,6 +1184,24 @@ class WebUI:
                     return jsonify({'success': False, 'error': 'Ad blocker not initialized'}), 500
 
                 data = request.get_json() or {}
+
+                # Validate input ranges
+                errors = []
+                if 'saturation' in data:
+                    if not isinstance(data['saturation'], (int, float)) or not (0.0 <= data['saturation'] <= 2.0):
+                        errors.append('saturation must be a number between 0.0 and 2.0')
+                if 'brightness' in data:
+                    if not isinstance(data['brightness'], (int, float)) or not (-1.0 <= data['brightness'] <= 1.0):
+                        errors.append('brightness must be a number between -1.0 and 1.0')
+                if 'contrast' in data:
+                    if not isinstance(data['contrast'], (int, float)) or not (0.0 <= data['contrast'] <= 2.0):
+                        errors.append('contrast must be a number between 0.0 and 2.0')
+                if 'hue' in data:
+                    if not isinstance(data['hue'], (int, float)) or not (-1.0 <= data['hue'] <= 1.0):
+                        errors.append('hue must be a number between -1.0 and 1.0')
+
+                if errors:
+                    return jsonify({'success': False, 'errors': errors}), 400
 
                 result = self.minus.ad_blocker.set_color_settings(
                     saturation=data.get('saturation'),
