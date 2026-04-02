@@ -37,6 +37,9 @@
                         <span id="video-overlay-title">NO SIGNAL</span>
                         <span id="video-overlay-message" class="overlay-message"></span>
                     </div>
+                    <div id="display-badge" class="display-badge hidden">
+                        <span>DISPLAY DISCONNECTED</span>
+                    </div>
                     <div id="audio-mute-indicator" class="audio-indicator hidden">
                         <span>&#128263;</span>
                     </div>
@@ -534,28 +537,31 @@
                 document.getElementById('fps-value').textContent = Math.round(status.fps) || '--';
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
 
-                // Video overlay - handle display and HDMI issues
-                // Priority: NO SIGNAL (input) > DISPLAY DISCONNECTED (output)
+                // Video overlay - handle HDMI input issues (full overlay)
+                // Display badge - handle HDMI output issues (small corner badge)
                 const overlay = document.getElementById('video-overlay');
                 const overlayTitle = document.getElementById('video-overlay-title');
                 const overlayMessage = document.getElementById('video-overlay-message');
+                const displayBadge = document.getElementById('display-badge');
 
                 if (!status.hdmi_signal) {
-                    // No HDMI input signal - highest priority
+                    // No HDMI input signal - show full overlay
                     overlay.classList.remove('hidden');
                     overlayTitle.textContent = 'NO SIGNAL';
                     overlayMessage.textContent = 'HDMI input not detected. Check source device.';
                     overlayMessage.classList.remove('hidden');
-                } else if (status.display_connected === false) {
-                    // Display output not connected
-                    overlay.classList.remove('hidden');
-                    overlayTitle.textContent = 'DISPLAY DISCONNECTED';
-                    overlayMessage.textContent = status.display_error || 'Check HDMI-TX connection to TV/monitor. Retrying...';
-                    overlayMessage.classList.remove('hidden');
+                    displayBadge.classList.add('hidden');
                 } else {
-                    // All good - hide overlay
+                    // HDMI input is working - hide full overlay, live feed visible
                     overlay.classList.add('hidden');
                     overlayMessage.classList.add('hidden');
+
+                    // Show small badge if display output is disconnected
+                    if (status.display_connected === false) {
+                        displayBadge.classList.remove('hidden');
+                    } else {
+                        displayBadge.classList.add('hidden');
+                    }
                 }
 
                 // System info
