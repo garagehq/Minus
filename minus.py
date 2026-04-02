@@ -1834,38 +1834,47 @@ class Minus:
         if not signal_info:
             logger.warning("No HDMI signal detected - starting in no-signal mode")
             # Start display in no-signal mode to show "NO HDMI INPUT"
+            no_signal_display_ok = False
             if self.ad_blocker:
-                if self.ad_blocker.start_no_signal_mode():
+                no_signal_display_ok = self.ad_blocker.start_no_signal_mode()
+                if no_signal_display_ok:
                     logger.info("Display showing NO SIGNAL message - waiting for HDMI...")
-                    # Poll for HDMI signal every 2 seconds
-                    self.running = True
-                    try:
-                        poll_count = 0
-                        while self.running:
-                            time.sleep(2)
-                            poll_count += 1
-                            if poll_count % 15 == 0:  # Log every 30 seconds
-                                logger.info("Still waiting for HDMI input...")
-                            signal_info = self.check_hdmi_signal()
-                            if signal_info:
-                                width, height, fps = signal_info
-                                logger.info(f"HDMI signal detected: {width}x{height} @ {fps}fps - switching to loading mode")
-                                # Switch to loading mode while we start the display
-                                self.ad_blocker.start_loading_mode()
-                                break
-                    except KeyboardInterrupt:
-                        self.stop()
-                        return True
-
-                    if not self.running:
-                        self.stop()
-                        return True
                 else:
-                    logger.error("Failed to start no-signal display")
-                    return False
+                    logger.warning("Could not start no-signal display (DRM unavailable?) - waiting for HDMI without display")
             else:
-                logger.error("No ad_blocker available for no-signal display")
-                return False
+                logger.warning("No ad_blocker available - waiting for HDMI without display")
+
+            # Poll for HDMI signal every 2 seconds (even if no-signal display failed)
+            self.running = True
+            try:
+                poll_count = 0
+                while self.running:
+                    time.sleep(2)
+                    poll_count += 1
+                    if poll_count % 15 == 0:  # Log every 30 seconds
+                        logger.info("Still waiting for HDMI input...")
+
+                    # Retry no-signal display periodically if it failed initially
+                    if not no_signal_display_ok and self.ad_blocker and poll_count % 5 == 0:
+                        no_signal_display_ok = self.ad_blocker.start_no_signal_mode()
+                        if no_signal_display_ok:
+                            logger.info("No-signal display now working")
+
+                    signal_info = self.check_hdmi_signal()
+                    if signal_info:
+                        width, height, fps = signal_info
+                        logger.info(f"HDMI signal detected: {width}x{height} @ {fps}fps - switching to loading mode")
+                        # Switch to loading mode while we start the display
+                        if self.ad_blocker:
+                            self.ad_blocker.start_loading_mode()
+                        break
+            except KeyboardInterrupt:
+                self.stop()
+                return True
+
+            if not self.running:
+                self.stop()
+                return True
 
         width, height, fps = signal_info
         logger.info(f"HDMI signal: {width}x{height} @ {fps}fps")

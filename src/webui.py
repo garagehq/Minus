@@ -1084,7 +1084,8 @@ class WebUI:
                 # VLM subsystem
                 vlm_status = {'status': 'disabled'}
                 if hasattr(self.minus, 'vlm') and self.minus.vlm:
-                    if self.minus.vlm.is_ready():
+                    # Note: is_ready is a property, not a method
+                    if self.minus.vlm.is_ready:
                         vlm_status = {'status': 'ok'}
                     else:
                         vlm_status = {'status': 'loading'}
@@ -1098,8 +1099,8 @@ class WebUI:
 
                 # Fire TV subsystem
                 firetv_status = {'status': 'disabled'}
-                if hasattr(self.minus, 'fire_tv') and self.minus.fire_tv:
-                    if self.minus.fire_tv.is_connected():
+                if hasattr(self.minus, 'fire_tv_controller') and self.minus.fire_tv_controller:
+                    if self.minus.fire_tv_controller.is_connected():
                         firetv_status = {'status': 'connected'}
                     else:
                         firetv_status = {'status': 'disconnected'}
