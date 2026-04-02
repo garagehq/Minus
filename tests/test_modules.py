@@ -1445,10 +1445,26 @@ class TestWebUI:
         """Test the /api/health endpoint."""
         from webui import WebUI
         mock_minus = MagicMock()
+
+        # Properly mock ad_blocker with serializable values
         mock_minus.ad_blocker = MagicMock()
         mock_minus.ad_blocker.pipeline = MagicMock()
+        mock_minus.ad_blocker.get_fps.return_value = 30.0
+        mock_minus.ad_blocker.is_visible = False
+        mock_minus.ad_blocker._restart_count = 0
+
+        # Properly mock audio with serializable values
         mock_minus.audio = MagicMock()
         mock_minus.audio.is_running = True
+        mock_minus.audio.is_muted = False
+        mock_minus.audio._restart_count = 0
+
+        # Set optional subsystems to None to prevent MagicMock serialization issues
+        mock_minus.vlm = None
+        mock_minus.ocr = None
+        mock_minus.fire_tv = None
+        mock_minus.health_monitor = None
+
         ui = WebUI(mock_minus)
 
         with ui.app.test_client() as client:
@@ -1458,8 +1474,10 @@ class TestWebUI:
             assert 'status' in data
             assert 'service' in data
             assert data['service'] == 'minus'
-            assert 'video' in data
-            assert 'audio' in data
+            # Video and audio are now in subsystems
+            assert 'subsystems' in data
+            assert 'video' in data['subsystems']
+            assert 'audio' in data['subsystems']
 
     def test_webui_api_video_restart(self):
         """Test the /api/video/restart endpoint."""
@@ -2770,7 +2788,7 @@ class TestWebUIExtended:
 
     def test_webui_stream_route(self):
         """Test /stream route exists."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
@@ -2794,7 +2812,7 @@ class TestWebUIExtended:
 
     def test_webui_snapshot_route(self):
         """Test /snapshot route exists."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
@@ -2817,7 +2835,7 @@ class TestWebUIExtended:
 
     def test_webui_api_detections_route(self):
         """Test /api/detections route exists."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
@@ -2840,7 +2858,7 @@ class TestWebUIExtended:
 
     def test_webui_api_logs_route(self):
         """Test /api/logs route exists."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
@@ -2863,7 +2881,7 @@ class TestWebUIExtended:
 
     def test_webui_api_firetv_routes(self):
         """Test Fire TV API routes exist."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
@@ -2887,7 +2905,7 @@ class TestWebUIExtended:
 
     def test_webui_preview_toggle_routes(self):
         """Test preview toggle routes exist."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None
@@ -3227,7 +3245,7 @@ class TestErrorHandling:
 
     def test_webui_handles_missing_components(self):
         """Test WebUI handles missing components gracefully."""
-        from webui import MinusWebUI
+        from webui import WebUI as MinusWebUI
 
         mock_minus = MagicMock()
         mock_minus.ad_blocker = None

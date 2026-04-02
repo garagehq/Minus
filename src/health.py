@@ -20,6 +20,8 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from config import MinusConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -50,16 +52,18 @@ class HealthMonitor:
     and triggers recovery actions when issues are detected.
     """
 
-    def __init__(self, minus, check_interval: float = 5.0):
+    def __init__(self, minus, check_interval: float = 5.0, config: MinusConfig = None):
         """
         Initialize health monitor.
 
         Args:
             minus: Reference to main Minus instance
             check_interval: How often to check health (seconds)
+            config: MinusConfig instance for threshold values
         """
         self.minus = minus
         self.check_interval = check_interval
+        self._config = config or MinusConfig()
 
         self._monitor_thread = None
         self._stop_event = threading.Event()
@@ -75,8 +79,8 @@ class HealthMonitor:
         self._on_vlm_failure: Optional[Callable] = None
         self._on_memory_critical: Optional[Callable] = None
 
-        # Thresholds
-        self.frame_stale_threshold = 5.0  # seconds
+        # Thresholds (from config)
+        self.frame_stale_threshold = self._config.frame_stale_threshold
         self.memory_warning_percent = 80
         self.memory_critical_percent = 90
         self.disk_warning_mb = 500

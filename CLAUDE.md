@@ -128,6 +128,22 @@ python3 minus.py
 
 This allows Minus to work with different displays without manual configuration.
 
+**Environment variables:**
+```bash
+# Paths (override defaults for different installations)
+MINUS_USTREAMER_PATH=/path/to/ustreamer     # Default: /home/radxa/ustreamer-patched
+MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-1.5B
+MINUS_OCR_MODEL_DIR=/path/to/ocr/models     # Default: /home/radxa/rknn-llm/.../paddleocr
+
+# Timing thresholds
+MINUS_ANIMATION_START=0.3        # Blocking animation duration (seconds)
+MINUS_ANIMATION_END=0.25         # Unblocking animation duration (seconds)
+MINUS_FRAME_STALE_THRESHOLD=5.0  # Health check frame freshness (seconds)
+MINUS_DYNAMIC_COOLDOWN=0.5       # Wait after screen becomes dynamic (seconds)
+MINUS_SCENE_CHANGE_THRESHOLD=0.01  # Frame difference threshold for scene change
+MINUS_VLM_ALONE_THRESHOLD=5      # Consecutive VLM detections needed to trigger alone
+```
+
 ## Performance
 
 | Metric | Value |

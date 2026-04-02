@@ -107,7 +107,7 @@ os.environ['OPENCV_LOG_LEVEL'] = 'ERROR'
 # Import extracted modules
 from drm import probe_drm_output
 from v4l2 import probe_v4l2_device
-from config import MinusConfig
+from config import MinusConfig, USTREAMER_PATH, OCR_MODEL_DIR
 from capture import UstreamerCapture
 from screenshots import ScreenshotManager
 from skip_detection import check_skip_opportunity
@@ -286,7 +286,7 @@ class Minus:
 
         # Weighted detection parameters
         self.OCR_TRUST_WINDOW = 5.0
-        self.VLM_ALONE_THRESHOLD = 5  # Require 5 consecutive VLM detections to trigger alone
+        self.VLM_ALONE_THRESHOLD = self.config.vlm_alone_threshold
         self.MIN_BLOCKING_DURATION = 3.0
         self.OCR_STOP_THRESHOLD = 3
         self.VLM_STOP_THRESHOLD = 2
@@ -298,14 +298,14 @@ class Minus:
         self.prev_frame = None
         self.prev_frame_had_ad = False
         self.scene_skip_count = 0
-        self.scene_change_threshold = 0.01
+        self.scene_change_threshold = self.config.scene_change_threshold
         self.max_scene_skip = 30  # Force OCR after this many consecutive skips
 
         # Static screen suppression - disable blocking for still ads
         # (e.g., paused video with ad, YouTube landing page with sponsored content)
         self.STATIC_TIME_THRESHOLD = 2.5  # Seconds of static screen to trigger suppression
         self.STATIC_OCR_THRESHOLD = 4     # OCR iterations without scene change
-        self.DYNAMIC_COOLDOWN = 0.5       # Keep suppression for this long after screen becomes dynamic (reduced from 1.5s)
+        self.DYNAMIC_COOLDOWN = self.config.dynamic_cooldown
         self.static_since_time = 0        # When screen became static (0 = not static)
         self.static_ocr_count = 0         # OCR iterations without scene change
         self.static_blocking_suppressed = False  # Currently suppressing due to static
@@ -462,10 +462,12 @@ class Minus:
                 self.system_notification = None
 
     def _find_model_paths(self):
-        """Find PaddleOCR model paths."""
+        """Find PaddleOCR model paths.
+        Search order: local models dir, then configurable OCR_MODEL_DIR (env MINUS_OCR_MODEL_DIR).
+        """
         search_paths = [
             Path(__file__).parent / 'models' / 'paddleocr',
-            Path('/home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/install/demo_Linux_aarch64/models/paddleocr'),
+            Path(OCR_MODEL_DIR),
         ]
 
         for base_path in search_paths:
@@ -565,7 +567,7 @@ class Minus:
             # Restart with patched ustreamer using detected format and MPP encoder
             port = self.config.ustreamer_port
             ustreamer_cmd = [
-                '/home/radxa/ustreamer-patched',
+                USTREAMER_PATH,
                 f'--device={self.device}',
                 f'--format={video_format}',
                 f'--resolution={resolution}',
@@ -1150,7 +1152,7 @@ class Minus:
 
         # Start ustreamer with detected format and MPP hardware encoder
         ustreamer_cmd = [
-            '/home/radxa/ustreamer-patched',
+            USTREAMER_PATH,
             f'--device={self.device}',
             f'--format={video_format}',
             f'--resolution={width}x{height}',

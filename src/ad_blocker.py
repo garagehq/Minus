@@ -23,6 +23,7 @@ import random
 import logging
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 from collections import deque
 
@@ -32,6 +33,7 @@ from gi.repository import Gst
 
 # Import vocabulary from extracted module
 from vocabulary import SPANISH_VOCABULARY
+from config import MinusConfig
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -47,7 +49,7 @@ class DRMAdBlocker:
     """
 
     def __init__(self, connector_id=215, plane_id=72, minus_instance=None, ustreamer_port=9090,
-                 output_width=1920, output_height=1080):
+                 output_width=1920, output_height=1080, config=None):
         self.is_visible = False
         self.current_source = None
         self.connector_id = connector_id
@@ -120,11 +122,12 @@ class DRMAdBlocker:
         # Time saved tracking
         self._total_time_saved = 0.0
 
-        # Animation settings
+        # Animation settings (use config values if provided)
+        self._config = config or MinusConfig()
         self._animation_thread = None
         self._stop_animation = threading.Event()
-        self._animation_duration_start = 0.3  # Reduced from 1.25s for faster response
-        self._animation_duration_end = 0.25   # Reduced from 0.5s for faster unblock
+        self._animation_duration_start = self._config.animation_start_duration
+        self._animation_duration_end = self._config.animation_end_duration
         self._animating = False
         self._animation_direction = None
         self._animation_source = None
@@ -187,7 +190,12 @@ class DRMAdBlocker:
 
             with urllib.request.urlopen(req, timeout=timeout) as response:
                 return json.loads(response.read().decode('utf-8'))
+        except urllib.error.URLError as e:
+            # Network errors - log at INFO since these indicate connectivity issues
+            logger.info(f"[DRMAdBlocker] API connection error ({endpoint}): {e}")
+            return None
         except Exception as e:
+            # Other errors (JSON parse, etc.) - log at DEBUG
             logger.debug(f"[DRMAdBlocker] API call error ({endpoint}): {e}")
             return None
 
@@ -342,8 +350,8 @@ class DRMAdBlocker:
                         self.bus.remove_signal_watch()
                         self.bus = None
                     self.pipeline.set_state(Gst.State.NULL)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error during pipeline cleanup: {e}")
                 self.pipeline = None
             # Reinitialize the normal pipeline
             self._init_pipeline()
@@ -414,8 +422,8 @@ class DRMAdBlocker:
                     state_ret, state, pending = self.pipeline.get_state(0)
                     if state not in (Gst.State.PLAYING, Gst.State.PAUSED):
                         self._restart_pipeline()
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error checking pipeline state: {e}")
 
     def _restart_pipeline(self):
         with self._restart_lock:
@@ -435,8 +443,8 @@ class DRMAdBlocker:
                         self.bus.remove_signal_watch()
                         self.bus = None
                     self.pipeline.set_state(Gst.State.NULL)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error during pipeline cleanup: {e}")
                 self.pipeline = None
 
             time.sleep(delay)
@@ -515,8 +523,8 @@ class DRMAdBlocker:
                 # Clean up failed pipeline
                 try:
                     self.pipeline.set_state(Gst.State.NULL)
-                except:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error during no-signal pipeline cleanup: {e}")
                 self.pipeline = None
                 return False
 
@@ -610,7 +618,8 @@ class DRMAdBlocker:
                         self._no_signal_textoverlay.set_property('text', '[ NO SIGNAL ]')
 
                 time.sleep(0.033)  # ~30fps animation
-            except Exception:
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] No-signal animation error, stopping: {e}")
                 break
 
     def start_loading_mode(self):
@@ -631,8 +640,8 @@ class DRMAdBlocker:
                         self.bus.remove_signal_watch()
                         self.bus = None
                     self.pipeline.set_state(Gst.State.NULL)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error during pipeline cleanup: {e}")
                 self.pipeline = None
 
             # Create a standalone pipeline for loading display
@@ -706,8 +715,9 @@ class DRMAdBlocker:
                 text = f"[ INITIALIZING{dots}{padding}]"
                 try:
                     self._loading_textoverlay.set_property('text', text)
-                except Exception:
-                    pass  # Pipeline may have been destroyed
+                except Exception as e:
+                    # Pipeline may have been destroyed during shutdown
+                    logger.debug(f"[DRMAdBlocker] Loading text update failed (pipeline destroyed?): {e}")
 
             idx = (idx + 1) % len(dot_counts)
             self._stop_loading_anim.wait(interval)
@@ -848,13 +858,18 @@ class DRMAdBlocker:
             self._snapshot_buffer_thread = None
 
     def _snapshot_buffer_loop(self):
+        consecutive_failures = 0
         while not self._stop_snapshot_buffer.is_set():
             try:
                 url = f"http://localhost:{self.ustreamer_port}/snapshot"
                 with urllib.request.urlopen(url, timeout=1.0) as response:
                     self._snapshot_buffer.append({'data': response.read(), 'time': time.time()})
-            except Exception:
-                pass
+                consecutive_failures = 0  # Reset on success
+            except Exception as e:
+                consecutive_failures += 1
+                # Log only first failure and every 10th to avoid spam
+                if consecutive_failures == 1 or consecutive_failures % 10 == 0:
+                    logger.debug(f"[DRMAdBlocker] Snapshot buffer fetch failed ({consecutive_failures}x): {e}")
             self._stop_snapshot_buffer.wait(self._snapshot_interval)
 
     def _upload_background(self):
@@ -994,8 +1009,8 @@ class DRMAdBlocker:
         try:
             with open('/dev/shm/minus_blocking_state', 'w') as f:
                 f.write('0')
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[DRMAdBlocker] Failed to write blocking state file: {e}")
 
         if self.audio:
             self.audio.unmute()
@@ -1121,8 +1136,8 @@ class DRMAdBlocker:
             try:
                 with open('/dev/shm/minus_blocking_state', 'w') as f:
                     f.write('1')
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] Failed to write blocking state file: {e}")
 
             if self.minus:
                 self.minus.blocking_active = True
