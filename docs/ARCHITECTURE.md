@@ -125,10 +125,56 @@ audiotestsrc ───────┘
 
 ### Thread Safety
 
-- All shared state protected by `threading.Lock()`
-- GStreamer pipeline accessed only from main thread
-- HTTP API calls are thread-safe
-- Watchdogs use atomic flags for signaling
+**Lock Usage:**
+
+| Module | Lock | Protects |
+|--------|------|----------|
+| `ad_blocker.py` | `_lock` | `is_visible`, `current_source`, animation state |
+| `audio.py` | `_lock` | `is_muted`, pipeline state, restart flag |
+| `fire_tv.py` | `_lock` | `_connected`, `_device`, connection state |
+| `health.py` | `_status_lock` | Health status updates |
+| `capture.py` | `_capture_lock` | Rate limiting between workers |
+| `capture.py` | `_session_lock` | HTTP session creation |
+
+**Thread-Safe Patterns:**
+
+1. **State Reads**: Use `with self._lock:` for compound reads
+2. **State Updates**: Always lock before modifying shared state
+3. **API Calls**: HTTP calls are inherently thread-safe
+4. **GStreamer**: Pipeline accessed from single thread only
+5. **Atomic Flags**: `threading.Event()` for stop signals
+
+**Critical Sections:**
+
+```python
+# Example: ad_blocker.py show/hide
+def show(self, source='default'):
+    with self._lock:
+        if self.is_visible:
+            return
+        self.is_visible = True
+        self.current_source = source
+    # API calls outside lock to prevent blocking
+    self._send_blocking_request(...)
+```
+
+**Watchdog Pattern:**
+
+```python
+# Watchdogs use Event for clean shutdown
+self._stop_event = threading.Event()
+
+def _watchdog_loop(self):
+    while not self._stop_event.is_set():
+        self._check_health()
+        self._stop_event.wait(timeout=5.0)  # Interruptible sleep
+```
+
+**Rate Limiting:**
+
+The capture module uses a global lock to prevent HTTP contention:
+- Minimum 500ms between captures during normal operation
+- Minimum 1s between captures during blocking (MPP encoder busy)
 
 ## API Endpoints
 

@@ -10,6 +10,7 @@ This directory contains detailed documentation for the Minus project.
 |----------|-------------|
 | [FEATURES.md](FEATURES.md) | Complete feature list and capabilities |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture and data flow |
+| [DEPLOYMENT.md](DEPLOYMENT.md) | Installation and deployment guide |
 | [AESTHETICS.md](AESTHETICS.md) | Visual design guide for UI/overlays |
 
 ### Debugging & Development

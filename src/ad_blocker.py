@@ -519,7 +519,15 @@ class DRMAdBlocker:
             logger.debug("[DRMAdBlocker] Setting no-signal pipeline to PLAYING...")
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
-                logger.error(f"[DRMAdBlocker] Failed to start no-signal pipeline (state change returned FAILURE)")
+                # Try to get the actual error from the bus
+                error_msg = "unknown"
+                if self.bus:
+                    msg = self.bus.timed_pop_filtered(100 * Gst.MSECOND, Gst.MessageType.ERROR)
+                    if msg:
+                        err, debug = msg.parse_error()
+                        error_msg = f"{err.message} (debug: {debug})"
+                logger.error(f"[DRMAdBlocker] Failed to start no-signal pipeline: {error_msg}")
+                logger.error(f"[DRMAdBlocker] Pipeline was: plane={self.plane_id}, connector={self.connector_id}")
                 # Clean up failed pipeline
                 try:
                     self.pipeline.set_state(Gst.State.NULL)
