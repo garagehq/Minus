@@ -416,6 +416,9 @@ class DRMAdBlocker:
                 break
             if self._pipeline_restarting:
                 continue
+            # Don't restart if we're intentionally in a special mode
+            if self.current_source in ('no_hdmi_device', 'loading'):
+                continue
             if self._last_buffer_time > 0:
                 time_since_buffer = time.time() - self._last_buffer_time
                 if time_since_buffer > self._stall_threshold:
@@ -478,6 +481,9 @@ class DRMAdBlocker:
         """
         try:
             logger.debug("[DRMAdBlocker] Starting no-signal mode...")
+
+            # Stop the watchdog - we don't want it restarting the normal pipeline
+            self._stop_watchdog_thread()
 
             # Stop any existing animations
             self._stop_loading_animation()
@@ -644,6 +650,9 @@ class DRMAdBlocker:
         animated dots (0-4 dots, increasing then decreasing).
         """
         try:
+            # Stop the watchdog - we don't want it restarting the normal pipeline
+            self._stop_watchdog_thread()
+
             # Stop any existing animations
             self._stop_loading_animation()
             self._stop_no_signal_animation()
