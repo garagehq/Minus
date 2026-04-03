@@ -458,6 +458,7 @@ class DRMAdBlocker:
                     logger.info("[DRMAdBlocker] Pipeline restarted successfully")
                     self._last_buffer_time = time.time()
                     self._last_restart_time = time.time()
+                    self._consecutive_failures = 0  # Reset on success
         finally:
             self._pipeline_restarting = False
 
