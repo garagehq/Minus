@@ -369,6 +369,10 @@ class DRMAdBlocker:
             logger.info("[DRMAdBlocker] Pipeline started")
             self._start_watchdog()
 
+            # Reset failure counters on fresh start (important after long HDMI outages)
+            self._consecutive_failures = 0
+            self._last_buffer_time = time.time()
+
             # Re-detect frame resolution now that ustreamer should be running
             self._update_frame_resolution()
 
