@@ -375,9 +375,10 @@ class AudioPassthrough:
                     logger.warning(f"[AudioPassthrough] Trying alternate capture device: {old_device} -> {self.capture_device}")
                     self._consecutive_failures = 0  # Reset for new device
 
-                # Calculate backoff delay
+                # Calculate backoff delay (cap exponent at 10 to prevent overflow)
+                exponent = min(self._consecutive_failures - 1, 10)
                 delay = min(
-                    self._base_restart_delay * (2 ** (self._consecutive_failures - 1)),
+                    self._base_restart_delay * (2 ** exponent),
                     self._max_restart_delay
                 )
                 self._current_restart_delay = delay

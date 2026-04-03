@@ -434,7 +434,9 @@ class DRMAdBlocker:
         try:
             self._restart_count += 1
             self._consecutive_failures += 1
-            delay = min(self._base_restart_delay * (2 ** (self._consecutive_failures - 1)), self._max_restart_delay)
+            # Cap exponent at 10 to prevent overflow (2^10 = 1024, way past max_restart_delay anyway)
+            exponent = min(self._consecutive_failures - 1, 10)
+            delay = min(self._base_restart_delay * (2 ** exponent), self._max_restart_delay)
             logger.warning(f"[DRMAdBlocker] Restarting pipeline (attempt {self._restart_count}, delay {delay:.1f}s)")
 
             if self.pipeline:
