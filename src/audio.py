@@ -17,6 +17,7 @@ Architecture:
 
 import gc
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -119,6 +120,9 @@ class AudioPassthrough:
         self._last_restart_time = 0
         self._consecutive_failures = 0
 
+        # Track our PID for ALSA device ownership check
+        self._our_pid = os.getpid()
+
         # Restart coordination - prevent multiple concurrent restarts
         self._restart_in_progress = False
         self._restart_lock = threading.Lock()  # Separate lock for restart coordination
@@ -132,6 +136,64 @@ class AudioPassthrough:
 
         # Initialize GStreamer (may already be initialized by video pipeline)
         Gst.init(None)
+
+    def _is_alsa_device_running(self) -> bool:
+        """Check if our ALSA playback device is actually running with our PID.
+
+        This checks /proc/asound/cardX/pcmYp/sub0/status to see if the device
+        is in RUNNING state and owned by our process. This is more reliable
+        than GStreamer state queries when PipeWire/WirePlumber is involved.
+
+        Returns:
+            True if device is RUNNING and owned by us, False otherwise
+        """
+        try:
+            # Parse playback device from self.playback_device (e.g., "hw:1,0")
+            # Format: hw:card,device
+            if not self.playback_device.startswith("hw:"):
+                return False
+
+            parts = self.playback_device[3:].split(",")
+            if len(parts) != 2:
+                return False
+
+            card = parts[0]
+            device = parts[1]
+
+            # Check status file: /proc/asound/cardX/pcmYp/sub0/status
+            # 'p' suffix means playback (vs 'c' for capture)
+            status_path = f"/proc/asound/card{card}/pcm{device}p/sub0/status"
+
+            if not os.path.exists(status_path):
+                return False
+
+            with open(status_path, 'r') as f:
+                status_content = f.read()
+
+            # Parse status - looking for:
+            # state: RUNNING
+            # owner_pid: <our_pid>
+            state_running = False
+            owner_is_us = False
+
+            for line in status_content.split('\n'):
+                line = line.strip()
+                if line.startswith('state:'):
+                    state_running = 'RUNNING' in line
+                elif line.startswith('owner_pid'):
+                    # Format: "owner_pid   : 12345"
+                    try:
+                        pid_str = line.split(':')[1].strip()
+                        owner_pid = int(pid_str)
+                        owner_is_us = (owner_pid == self._our_pid)
+                    except (IndexError, ValueError):
+                        pass
+
+            return state_running and owner_is_us
+
+        except Exception as e:
+            logger.debug(f"[AudioPassthrough] Error checking ALSA status: {e}")
+            return False
 
     def _init_pipeline(self):
         """Initialize GStreamer audio pipeline."""
@@ -313,14 +375,6 @@ class AudioPassthrough:
                     logger.warning(f"[AudioPassthrough] Trying alternate capture device: {old_device} -> {self.capture_device}")
                     self._consecutive_failures = 0  # Reset for new device
 
-                # After 10 consecutive failures, pause watchdog to stop restart spam
-                # This prevents frame jumps from constant GStreamer pipeline recreation
-                if self._consecutive_failures >= 10:
-                    logger.error(f"[AudioPassthrough] Too many failures ({self._consecutive_failures}), pausing audio watchdog")
-                    self._watchdog_paused = True
-                    self.is_running = False
-                    return
-
                 # Calculate backoff delay
                 delay = min(
                     self._base_restart_delay * (2 ** (self._consecutive_failures - 1)),
@@ -483,16 +537,36 @@ class AudioPassthrough:
             elif self._last_buffer_time > 0:
                 time_since_buffer = time.time() - self._last_buffer_time
                 if time_since_buffer > self._stall_threshold:
-                    needs_restart = True
-                    restart_reason = f"stalled ({time_since_buffer:.1f}s since last buffer)"
+                    # GStreamer says stalled, but check ALSA status first
+                    # PipeWire can interfere with GStreamer buffer probes
+                    if self._is_alsa_device_running():
+                        logger.debug(
+                            f"[AudioPassthrough] Buffer probe stale ({time_since_buffer:.1f}s) "
+                            f"but ALSA device is RUNNING - updating buffer time"
+                        )
+                        self._last_buffer_time = time.time()
+                    else:
+                        needs_restart = True
+                        restart_reason = f"stalled ({time_since_buffer:.1f}s since last buffer)"
 
             # Check pipeline state (only if we have a pipeline and haven't already decided to restart)
             if not needs_restart and self.pipeline:
                 try:
                     state_ret, state, pending = self.pipeline.get_state(0)
                     if state != Gst.State.PLAYING and self.is_running:
-                        needs_restart = True
-                        restart_reason = f"not in PLAYING state ({state.value_nick if state else 'None'})"
+                        # GStreamer says not PLAYING, but check if audio is ACTUALLY flowing
+                        # via ALSA /proc status. This handles PipeWire/WirePlumber interference
+                        # where GStreamer state may be incorrect but audio works fine.
+                        if self._is_alsa_device_running():
+                            logger.debug(
+                                f"[AudioPassthrough] GStreamer reports {state.value_nick if state else 'None'} "
+                                f"but ALSA device is RUNNING with our PID - skipping restart"
+                            )
+                            # Update last buffer time since audio is actually flowing
+                            self._last_buffer_time = time.time()
+                        else:
+                            needs_restart = True
+                            restart_reason = f"not in PLAYING state ({state.value_nick if state else 'None'})"
                 except Exception as e:
                     needs_restart = True
                     restart_reason = f"error checking state: {e}"
@@ -697,14 +771,47 @@ class AudioPassthrough:
 
         try:
             self._watchdog_paused = False
-            logger.info("[AudioPassthrough] Watchdog resumed - restarting pipeline")
 
             # Reset failure counters
             self._consecutive_failures = 0
             self._current_restart_delay = self._base_restart_delay
 
+            # Check if pipeline is already working - don't restart unnecessarily
+            if self.pipeline:
+                try:
+                    state_ret, state, pending = self.pipeline.get_state(0)
+                    if state == Gst.State.PLAYING:
+                        logger.info("[AudioPassthrough] Watchdog resumed - pipeline already PLAYING, no restart needed")
+                        return
+                    # Also check ALSA status - if device is running with our PID, audio is working
+                    if self._is_alsa_device_running():
+                        logger.info("[AudioPassthrough] Watchdog resumed - ALSA device already running, no restart needed")
+                        self._last_buffer_time = time.time()
+                        return
+                except Exception as e:
+                    logger.debug(f"[AudioPassthrough] Error checking pipeline state during resume: {e}")
+
+            logger.info("[AudioPassthrough] Watchdog resumed - restarting pipeline")
+
             # Force GC before restart
             gc.collect()
+
+            # Clean up existing pipeline before creating new one
+            if self.pipeline:
+                try:
+                    if hasattr(self, 'bus') and self.bus:
+                        try:
+                            self.bus.remove_signal_watch()
+                        except:
+                            pass
+                        self.bus = None
+                    self.pipeline.set_state(Gst.State.NULL)
+                    self.pipeline.get_state(GST_STATE_CHANGE_TIMEOUT)
+                except Exception as e:
+                    logger.debug(f"[AudioPassthrough] Error cleaning up old pipeline: {e}")
+                self.pipeline = None
+                self.volume = None
+                time.sleep(0.5)  # Give ALSA time to release device
 
             # Restart pipeline
             if self.is_running:
