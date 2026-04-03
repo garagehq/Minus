@@ -788,12 +788,43 @@ The service:
 
 ## Development Notes
 
-**CRITICAL: Always verify fixes work before claiming completion:**
-- After implementing a fix, TEST it by observing actual behavior
-- Do not claim "fixed" until you have verified the fix works
-- Create innovative ways to test when direct observation isn't possible (e.g., check logs, API responses, file changes, process state)
-- Continue iterating on solutions until they demonstrably work
-- If you cannot verify a fix, clearly state that it needs user verification
+### CRITICAL: Testing and Debugging Methodology
+
+**Finding the Root Cause is ESSENTIAL:**
+- Do NOT implement band-aid fixes that mask symptoms without understanding the cause
+- Investigate WHY something is failing, not just WHAT is failing
+- Example: If audio restarts constantly, don't just limit restart attempts - find out WHY it's restarting
+- Use logs, `/proc` filesystem, API responses, and system state to trace the actual problem
+- A fix that doesn't address root cause will likely cause other issues or recur
+
+**Test Fixes BEFORE Pushing:**
+- After implementing a fix, TEST it immediately by observing actual behavior
+- Focus testing specifically on the ORIGINAL PROBLEM - verify the symptom is gone
+- Do NOT push fixes without verification - iterate until the fix demonstrably works
+- Run prolonged tests (30-60 seconds minimum) to catch intermittent issues
+- Watch for the specific symptom that was reported (e.g., "frame jumps every 2-3 seconds")
+
+**Testing Methodology:**
+1. Understand the symptom clearly (what exactly is failing and how often)
+2. Identify potential causes through log analysis and code review
+3. Implement a fix targeting the root cause
+4. Restart the service and observe behavior
+5. Check logs for the specific error patterns that were occurring
+6. Run a prolonged test (60 seconds) watching for the original symptom
+7. Only commit/push after confirming the symptom is resolved
+
+**Verification Techniques:**
+- Check logs: `sudo journalctl -u minus --since "60 seconds ago" | grep -E "error|restart|fail"`
+- Check FPS: `curl -s http://localhost/api/status | jq .fps`
+- Check ALSA status: `cat /proc/asound/card*/pcm*/sub*/status`
+- Check pipeline state: API responses, GStreamer state queries
+- Record video samples for visual issues: `ffmpeg -i http://localhost:9090/stream -t 10 test.mp4`
+
+**Common Pitfalls to Avoid:**
+- Limiting retry attempts instead of fixing why retries are needed
+- Assuming a fix works without observing the system under the original conditions
+- Pushing multiple untested changes at once (makes debugging harder)
+- Not checking if the "fix" introduced new problems
 
 **Git commits:**
 - Do NOT add "Co-Authored-By" lines to commits
@@ -947,3 +978,24 @@ The codebase has been refactored from monolithic files into smaller, focused mod
 - Total time from start to connection: ~13 seconds (5s delay + ~8s scan/connect)
 
 **Bug fixed:** Auth retry interval was 3 seconds, causing multiple auth dialogs on the TV before user could respond. Fixed to 35 seconds (longer than AUTH_TIMEOUT of 30s) in `fire_tv_setup.py`.
+
+### Audio Watchdog Restart Loop (Fixed - Apr 2026)
+
+**Symptom:** Frame jumps every 2-3 seconds due to constant GStreamer audio pipeline restarts.
+
+**Root Cause:** When HDMI signal was restored, `resume_watchdog()` tried to create a new audio pipeline without:
+1. Checking if the existing pipeline was already working
+2. Cleaning up the old pipeline first
+
+This caused the new pipeline to fail with "device in use" because the old pipeline still held the ALSA device. The watchdog then repeatedly tried to restart every 3 seconds.
+
+**Why band-aid fixes don't work:** Initially tried limiting restart attempts, but this just disabled audio after 5 restarts instead of fixing the underlying issue. The correct approach was to find WHY restarts were happening.
+
+**Solution implemented:**
+- Added `_is_alsa_device_running()` helper that checks `/proc/asound/cardX/pcmYp/sub0/status` to verify if ALSA device is actually running with our PID
+- This is more reliable than GStreamer state queries when PipeWire/WirePlumber is involved
+- Modified watchdog loop to skip restarts when ALSA confirms audio is flowing
+- Modified `resume_watchdog()` to check if pipeline is already PLAYING before restart
+- Added proper cleanup of old pipeline before creating new one
+
+**Key insight:** The `/proc/asound` status showed the device was RUNNING with minus as owner, proving audio WAS working. GStreamer state queries were unreliable due to PipeWire interference, but the kernel-level ALSA status was authoritative.
