@@ -1480,6 +1480,22 @@ class WebUI:
                 # Send select command (usually skips ads)
                 controller.send_command('select')
                 logger.info("[WebUI] Skip ad command sent to Fire TV")
+
+                # Force unblock after brief delay (don't wait for OCR to detect)
+                def _unblock_after_skip():
+                    import time as _time
+                    _time.sleep(1.5)
+                    logger.info("[WebUI] Forcing unblock after manual skip")
+                    if self.minus.ad_blocker:
+                        self.minus.ad_blocker.hide()
+                    if self.minus.audio:
+                        self.minus.audio.unmute()
+                    self.minus.ocr_ad_detected = False
+                    self.minus.vlm_ad_detected = False
+                    self.minus.blocking_source = None
+                import threading
+                threading.Thread(target=_unblock_after_skip, daemon=True).start()
+
                 return jsonify({'success': True, 'message': 'Skip command sent'})
             except Exception as e:
                 logger.error(f"Error sending skip command: {e}")

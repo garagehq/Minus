@@ -1830,10 +1830,25 @@ class Minus:
                             self.ad_blocker.set_skip_status(True, "Skipping...")
 
                         if self.try_skip_ad():
-                            logger.info(f"[SKIP] Skip command sent! Waiting to see if it worked...")
+                            logger.info(f"[SKIP] Skip command sent! Unblocking after brief delay...")
                             self.last_skip_success_time = time.time()
                             if self.ad_blocker:
                                 self.ad_blocker.add_time_saved(30.0)
+
+                            # After successful skip, immediately stop blocking
+                            # Wait briefly for skip animation, then force unblock
+                            def _unblock_after_skip():
+                                time.sleep(1.5)  # Brief delay for skip animation
+                                logger.info("[SKIP] Forcing unblock after skip")
+                                self.ocr_ad_detected = False
+                                self.vlm_ad_detected = False
+                                self.ocr_no_ad_count = self.OCR_STOP_THRESHOLD
+                                self.blocking_source = None
+                                if self.ad_blocker:
+                                    self.ad_blocker.hide()
+                                if self.audio:
+                                    self.audio.unmute()
+                            threading.Thread(target=_unblock_after_skip, daemon=True).start()
                         else:
                             logger.warning(f"[SKIP] Skip command failed (Fire TV not connected?)")
 
