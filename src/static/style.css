@@ -782,6 +782,10 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     grid-template-columns: repeat(2, 1fr);
 }
 
+.remote-row.volume {
+    grid-template-columns: repeat(3, 1fr);
+}
+
 .remote-btn {
     padding: 0.75rem 0.5rem;
     border: 1px solid var(--border);

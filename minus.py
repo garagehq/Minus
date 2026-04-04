@@ -879,6 +879,12 @@ class Minus:
                                 # Reinitialize pipeline with new settings
                                 self.ad_blocker._init_pipeline()
                                 logger.info("[Display] Pipeline reinitialized with new DRM settings")
+
+                            # Update audio playback device to match new HDMI output
+                            if self.audio and drm_info['audio_device'] != self.audio.playback_device:
+                                logger.info(f"[Display] Audio device changed: {self.audio.playback_device} -> {drm_info['audio_device']}")
+                                self.audio.stop()
+                                self.audio.playback_device = drm_info['audio_device']
                     else:
                         logger.debug("[Display] No HDMI output detected yet")
                         self.display_error = "Display output not available. Check HDMI-TX connection to TV/monitor."
