@@ -825,6 +825,87 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     box-shadow: 0 0 15px rgba(0, 255, 65, 0.4);
 }
 
+/* ==================== INLINE REMOTE (under video feed) ==================== */
+.inline-remote-toggle {
+    display: flex;
+    justify-content: center;
+    margin-top: 0.5rem;
+}
+
+.inline-remote-btn {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    font-family: var(--font-body);
+    font-size: 0.85rem;
+    padding: 0.4rem 1rem;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.inline-remote-btn:hover {
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+
+.connection-badge-sm {
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+}
+
+.connection-badge-sm.connected {
+    background: rgba(0, 255, 65, 0.15);
+    color: var(--accent);
+}
+
+.connection-badge-sm.disconnected {
+    background: rgba(255, 0, 64, 0.15);
+    color: var(--danger);
+}
+
+.inline-remote {
+    margin-top: 0.5rem;
+    transition: all 0.2s;
+}
+
+.inline-remote .remote-grid.compact {
+    max-width: 260px;
+    padding: 0.75rem;
+}
+
+.inline-remote .remote-grid.compact .remote-btn {
+    padding: 0.6rem 0.4rem;
+    font-size: 0.8rem;
+}
+
+.inline-apps {
+    display: flex;
+    justify-content: center;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.app-btn-sm {
+    padding: 0.3rem 0.6rem;
+    border: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-family: var(--font-body);
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.app-btn-sm:hover {
+    border-color: var(--accent);
+    color: var(--text-primary);
+}
+
 /* ==================== DETECTIONS SECTION ==================== */
 .detections-section {
     background: var(--bg-card);

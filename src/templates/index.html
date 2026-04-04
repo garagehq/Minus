@@ -32,7 +32,7 @@
             <!-- Live Video -->
             <section class="video-section">
                 <div class="video-container" id="video-container">
-                    <img id="video-feed" src="/stream" alt="Live Feed">
+                    <img id="video-feed" src="/stream" alt="Live Feed" onerror="scheduleStreamReconnect()">
                     <div id="video-overlay" class="video-overlay hidden">
                         <span id="video-overlay-title">NO SIGNAL</span>
                         <span id="video-overlay-message" class="overlay-message"></span>
@@ -44,6 +44,42 @@
                         <span>&#128263;</span>
                     </div>
                     <button id="fullscreen-btn" class="fullscreen-btn" onclick="toggleFullscreen()" title="Fullscreen">&#x26F6;</button>
+                </div>
+                <!-- Toggleable Remote under feed -->
+                <div class="inline-remote-toggle">
+                    <button class="inline-remote-btn" onclick="toggleInlineRemote()">
+                        <span id="inline-remote-icon">&#9654;</span> Remote
+                        <span id="firetv-inline-status" class="connection-badge-sm disconnected">--</span>
+                    </button>
+                </div>
+                <div id="inline-remote" class="inline-remote hidden">
+                    <div class="remote-grid compact">
+                        <div class="remote-row">
+                            <button class="remote-btn" onclick="sendFireTVCommand('back')">&#8592; Back</button>
+                            <button class="remote-btn nav" onclick="sendFireTVCommand('up')">&#9650;</button>
+                            <button class="remote-btn" onclick="sendFireTVCommand('home')">&#8962; Home</button>
+                        </div>
+                        <div class="remote-row">
+                            <button class="remote-btn nav" onclick="sendFireTVCommand('left')">&#9664;</button>
+                            <button class="remote-btn select" onclick="sendFireTVCommand('select')">OK</button>
+                            <button class="remote-btn nav" onclick="sendFireTVCommand('right')">&#9654;</button>
+                        </div>
+                        <div class="remote-row">
+                            <button class="remote-btn" onclick="sendFireTVCommand('rewind')">&#9194;</button>
+                            <button class="remote-btn nav" onclick="sendFireTVCommand('down')">&#9660;</button>
+                            <button class="remote-btn" onclick="sendFireTVCommand('fast_forward')">&#9193;</button>
+                        </div>
+                        <div class="remote-row media">
+                            <button class="remote-btn" onclick="sendFireTVCommand('play_pause')">&#9199; Play/Pause</button>
+                            <button class="remote-btn" onclick="sendFireTVCommand('menu')">&#9776; Menu</button>
+                        </div>
+                    </div>
+                    <div class="inline-apps">
+                        <button class="app-btn-sm" onclick="launchApp('youtube')">YouTube</button>
+                        <button class="app-btn-sm" onclick="launchApp('netflix')">Netflix</button>
+                        <button class="app-btn-sm" onclick="launchApp('prime')">Prime</button>
+                        <button class="app-btn-sm" onclick="launchApp('disney')">Disney+</button>
+                    </div>
                 </div>
             </section>
 
@@ -459,6 +495,12 @@
                 content.classList.toggle('active', content.id === 'tab-' + tabName);
             });
 
+            // Reconnect MJPEG stream when returning to home tab
+            // Browsers disconnect the stream when the img is hidden (display:none)
+            if (tabName === 'home') {
+                reconnectStream();
+            }
+
             // Load data for specific tabs
             if (tabName === 'screenshots') {
                 loadScreenshots();
@@ -468,6 +510,37 @@
                 loadNetworkInfo();
                 refreshLogs();
             } else if (tabName === 'remote') {
+                updateFireTVStatus();
+            }
+        }
+
+        let streamReconnectTimer = null;
+
+        function reconnectStream() {
+            const feed = document.getElementById('video-feed');
+            if (feed) {
+                // Force reconnect by resetting src with cache buster
+                feed.src = '/stream?t=' + Date.now();
+            }
+        }
+
+        function scheduleStreamReconnect() {
+            // Avoid stacking multiple reconnect timers
+            if (streamReconnectTimer) return;
+            streamReconnectTimer = setTimeout(() => {
+                streamReconnectTimer = null;
+                if (currentTab === 'home') {
+                    reconnectStream();
+                }
+            }, 3000);
+        }
+
+        function toggleInlineRemote() {
+            const remote = document.getElementById('inline-remote');
+            const icon = document.getElementById('inline-remote-icon');
+            remote.classList.toggle('hidden');
+            icon.textContent = remote.classList.contains('hidden') ? '\u25B6' : '\u25BC';
+            if (!remote.classList.contains('hidden')) {
                 updateFireTVStatus();
             }
         }
@@ -690,13 +763,18 @@
                 const badge = document.getElementById('firetv-status');
                 const appsSection = document.getElementById('apps-section');
 
+                // Also update inline remote badge
+                const inlineBadge = document.getElementById('firetv-inline-status');
+
                 if (data.connected) {
                     badge.textContent = 'Connected';
                     badge.className = 'connection-badge connected';
+                    if (inlineBadge) { inlineBadge.textContent = 'Connected'; inlineBadge.className = 'connection-badge-sm connected'; }
                     if (appsSection) appsSection.classList.remove('hidden');
                 } else {
                     badge.textContent = data.state === 'not_initialized' ? 'Not Setup' : 'Disconnected';
                     badge.className = 'connection-badge disconnected';
+                    if (inlineBadge) { inlineBadge.textContent = 'Disconnected'; inlineBadge.className = 'connection-badge-sm disconnected'; }
                     if (appsSection) appsSection.classList.add('hidden');
                 }
             } catch (error) {
