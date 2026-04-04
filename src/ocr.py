@@ -552,6 +552,11 @@ class PaddleOCR:
             if re.search(r'ad\s*\d+\s*of\s*\d+', text_lower) or re.search(r'ad\d+of\d+', text_clean):
                 matched.append(('ad X of Y', text))
 
+            # "Ad 10", "Ad 5", "Ad 30" - Netflix/streaming ad countdown timer
+            # Matches "Ad" followed by a number (seconds remaining)
+            if re.search(r'^ad\s*\d+$', text_lower.strip()):
+                matched.append(('ad countdown', text))
+
         # Check if this appears to be terminal content
         is_terminal = self.is_terminal_content(all_texts)
 
