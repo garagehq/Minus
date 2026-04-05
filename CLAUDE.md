@@ -999,3 +999,39 @@ This caused the new pipeline to fail with "device in use" because the old pipeli
 - Added proper cleanup of old pipeline before creating new one
 
 **Key insight:** The `/proc/asound` status showed the device was RUNNING with minus as owner, proving audio WAS working. GStreamer state queries were unreliable due to PipeWire interference, but the kernel-level ALSA status was authoritative.
+
+### MPP Decoder Stuck After HDMI Signal Drop (Fixed - Apr 2026)
+
+**Symptom:** After a brief HDMI signal loss (even 8 seconds), the video pipeline stalls every ~12 seconds with `mpp_buffer: check buffer found NULL pointer from mpp_dec_advanced_thread`. Restarting the GStreamer pipeline alone doesn't help - MPP stays stuck.
+
+**Root Cause:** The RK3588 MPP JPEG decoder holds resources that don't get properly freed when the GStreamer pipeline is destroyed. After the HDMI source briefly drops and recovers, the decoder enters a corrupt state that persists across pipeline restarts.
+
+**Solution implemented:**
+- After 3+ consecutive pipeline failures, the system now kills ustreamer (`pkill -9 ustreamer`) to force-release MPP resources
+- The health monitor detects ustreamer is down and restarts it + the video pipeline with clean MPP state
+- This auto-recovers from stuck MPP decoder without manual service restart
+
+### Audio Device Mismatch on Display Reconnect (Fixed - Apr 2026)
+
+**Symptom:** No audio after TV wakes up from standby. Audio pipeline starts on wrong HDMI output (e.g., `hw:0,0` instead of `hw:1,0`).
+
+**Root Cause:** When the display retry loop detects a DRM output change (TV connected to different HDMI port than at boot), it updated the config but not the audio object's playback device. Audio would start on the old device.
+
+**Solution implemented:**
+- Display retry loop now checks if `drm_info['audio_device'] != self.audio.playback_device`
+- If changed, stops the audio pipeline and updates the playback device before restarting
+- Ensures audio always matches the active HDMI output
+
+### Netflix Ad Countdown Detection (Fixed - Apr 2026)
+
+**Symptom:** Netflix ads showing "Ad 10", "Ad 5" (countdown timer format) were not detected by OCR.
+
+**Root Cause:** Existing OCR patterns only matched "Ad X of Y" format. Netflix uses standalone "Ad NN" where NN is seconds remaining.
+
+**Solution:** Added regex pattern `^ad\s*\d+$` to match the countdown format.
+
+### Skip-to-Unblock Delay (Fixed - Apr 2026)
+
+**Symptom:** After successfully skipping an ad via Fire TV, the blocking overlay stayed for 2-3+ seconds waiting for OCR to detect the ad was gone.
+
+**Solution:** After a successful skip command (auto or manual via web UI), blocking is now removed after a 1.5s delay instead of waiting for 3 OCR cycles. The delay allows the skip animation to complete, then force-unblocks by resetting all detection state.
