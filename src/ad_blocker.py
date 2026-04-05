@@ -456,6 +456,17 @@ class DRMAdBlocker:
                     logger.debug(f"[DRMAdBlocker] Error during pipeline cleanup: {e}")
                 self.pipeline = None
 
+            # After 3+ consecutive failures, the MPP decoder may be stuck.
+            # Force-restart ustreamer to reset MPP state.
+            if self._consecutive_failures >= 3:
+                logger.warning(f"[DRMAdBlocker] {self._consecutive_failures} consecutive failures - restarting ustreamer to reset MPP")
+                try:
+                    import subprocess
+                    subprocess.run(['pkill', '-9', 'ustreamer'], capture_output=True, timeout=5)
+                    time.sleep(2)
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error killing ustreamer: {e}")
+
             time.sleep(delay)
             self._init_pipeline()
 
