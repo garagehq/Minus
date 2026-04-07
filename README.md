@@ -1,595 +1,165 @@
-# Minus
+# Minus — HDCP 1.4 Setup for Radxa Rock 5B Plus
 
-HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
-- **PaddleOCR** on RK3588 NPU (~300ms per frame)
-- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame)
-- **Audio passthrough** with auto-mute during ads
-- **Spanish vocabulary practice** during ad blocks!
-- **Web UI** for remote monitoring and control via Tailscale
+Automated HDCP 1.4 enablement for the HDMI RX (input) port on the Rock 5B Plus.
 
-## Overview
+Once configured, the device can capture HDCP-protected video from sources like FireTV, Roku, PS5, Xbox, Apple TV, and other consumer HDMI devices at up to 4K@60Hz.
 
-Minus captures video from HDMI-RX, displays it via GStreamer kmssink at 30fps, while running two ML workers concurrently to detect ads. When ads are detected, enables a **60fps blocking overlay** with Spanish vocabulary practice.
+## Requirements
 
-**Key features:**
-- **60fps blocking overlay** - Native MPP compositing in ustreamer encoder (not GStreamer)
-- **Fast animations** - 0.3s blocking start, 0.25s unblocking
-- **Audio passthrough** - HDMI audio with instant mute during ads, silent keepalive prevents stalls
-- **Dual NPU inference** - OCR and VLM run concurrently on separate NPUs
-- **Web UI** - Remote monitoring/control via Tailscale (mobile-friendly)
-- **MPP hardware encoding** - 60fps 4K streaming via RK3588 VPU
-- **No X11 required** - Pure DRM/KMS display via kmssink
-- **Spanish learning** - Practice vocabulary while ads are blocked
-- **30fps display** - Smooth passthrough without stutter
-- **Set and forget** - systemd service, health monitoring, automatic recovery
-- **Fire TV control** - Auto-skip ads via ADB remote control (optional)
-- **Transition detection** - Holds blocking through black screens between ads
-
-```
-┌──────────────┐     ┌────────────────────┐     ┌─────────────────────┐
-│   HDMI-RX    │────▶│     ustreamer      │────▶│  GStreamer Pipeline │
-│ /dev/video0  │     │ (MJPEG + Blocking) │     │  (queue + kmssink)  │
-│  4K@30fps    │     │                    │     │                     │
-│              │     │  :9090/stream      │     │                     │
-│  Audio ──────┼─────┼────────────────────┼────▶│    kmssink + audio  │
-│  hw:4,0      │     │  :9090/snapshot    │     │   (auto-mute on ad) │
-└──────────────┘     │  /blocking/* API   │     └─────────────────────┘
-                     └────────┬───────────┘
-                              │
-                              ▼ HTTP snapshot (~150ms)
-              ┌───────────────┴───────────────┐
-              │                               │
-     ┌────────┴────────┐           ┌──────────┴──────────┐
-     │   OCR Worker    │           │    VLM Worker       │
-     │   PaddleOCR     │           │   FastVLM-1.5B      │
-     │   RK3588 NPU    │           │   Axera LLM 8850    │
-     │   ~400ms        │           │   ~0.9s             │
-     └─────────────────┘           └─────────────────────┘
-```
-
-## Hardware
-
-- **Board:** Radxa with RK3588
-- **HDMI-RX:** `/dev/video0` (rk_hdmirx driver)
-- **HDMI-RX Audio:** `hw:4,0` (rockchip,hdmiin @ 48kHz)
-- **HDMI-TX Audio:** `hw:0,0` (rockchip-hdmi0)
-- **OCR NPU:** RK3588 6 TOPS NPU
-- **VLM NPU:** Axera M5 LLM 8850 (AX650N) via M.2
-- **Supported resolutions:** Up to 4K@30fps
+- Radxa Rock 5B Plus running Debian Bookworm
+- A valid HDCP 1.4 sink key file (`.bin`, exactly 308 bytes)
+- Root access on the device
 
 ## Quick Start
 
 ```bash
-cd /home/radxa/Minus
-
-# Install dependencies (first time only)
-sudo apt install -y imagemagick ffmpeg curl
-
-# Build ustreamer (first time only)
-git clone https://github.com/pikvm/ustreamer.git
-cd ustreamer && make -j$(nproc) && sudo cp ustreamer /usr/local/bin/
-
-# Python packages
-pip3 install pyclipper shapely numpy opencv-python pexpect PyGObject
-
-# Run everything
-python3 minus.py
-
-# Check HDMI signal only
-python3 minus.py --check-signal
+cd /home/radxa/Minus/hdcp
+sudo ./setup_hdcp_device.sh /path/to/your_hdcp_key.bin
 ```
 
-## Command Line Options
+The script handles the entire setup automatically:
 
-| Option | Description |
-|--------|-------------|
-| `--device PATH` | Video device (default: /dev/video0) |
-| `--screenshot-dir DIR` | Screenshot directory (default: screenshots) |
-| `--ocr-timeout SEC` | Skip OCR frames taking longer than this (default: 1.5s) |
-| `--max-screenshots N` | Keep only N recent screenshots per folder (default: 0=unlimited) |
-| `--check-signal` | Check HDMI signal and exit |
-| `--connector-id N` | DRM connector ID (default: 215) |
-| `--plane-id N` | DRM plane ID (default: 72) |
-| `--webui-port N` | Web UI port (default: 80) |
+1. **Validates** the key file (correct size, type ID, KSV bit parity)
+2. **Converts** the key to the byte order the hardware expects (little-endian byte-swap)
+3. **Installs U-Boot with OP-TEE** (BL32 firmware required for HDCP key loading)
+4. **Patches the device tree** to enable HDCP hardware, add the vendor storage partition, and set the `hdcp1x-enable` flag
+5. **Compiles the kernel module** on-device if kernel headers are available (or uses a pre-compiled fallback)
+6. **Deploys** the key and kernel module for automatic loading on boot
+7. **Creates a systemd service** so HDCP starts automatically after every reboot
 
-## Performance
+After the reboot, HDCP is active. No further configuration needed.
 
-| Metric | Value |
-|--------|-------|
-| Display framerate | **30fps** (video), **60fps** (blocking overlay) |
-| ustreamer stream | **~60fps** (MPP hardware encoding at 4K) |
-| Ad blocking transition | **0.3s start**, **0.25s end** (fast response) |
-| Preview window | **60fps** (hardware-scaled in MPP encoder) |
-| Blocking composite | **~0.5ms** per frame overhead |
-| Snapshot capture | ~150ms (4K JPEG download) |
-| OCR latency | 100-200ms capture + 250-400ms inference |
-| VLM latency | ~0.9s per frame |
-| VLM model load | ~13s (once at startup) |
-| JPEG quality | 80% (MPP hardware encoder) |
-
-**FPS Monitoring:** Output FPS is logged every 60 seconds via health monitor.
-
-## Ad Detection Logic (Weighted Model)
-
-**OCR (Primary - Authoritative):**
-- Triggers blocking immediately on 1 detection
-- Stops blocking after 3 consecutive no-ads
-- **Authoritative for stopping** when OCR triggered the block
-
-**VLM (Secondary - Anti-Waffle Protected):**
-- Uses sliding window of last 45 seconds of decisions
-- Needs 80%+ ad agreement to trigger blocking alone (prevents waffling)
-- If OCR detected within 5s: VLM is trusted more quickly
-- Stops after 2 consecutive no-ads (when VLM triggered alone)
-
-**Transition Frame Detection:**
-When blocking is active, black/solid-color frames are detected as transitions between ads and held in blocking state to prevent premature unblocking.
-
-**Starting Blocking:**
-| Trigger | Time to block |
-|---------|---------------|
-| OCR detects ad | ~0.5s (immediate + 0.3s animation) |
-| VLM alone (no OCR) | ~8s (needs 80% agreement) |
-| VLM with recent OCR | ~2s (trusted) |
-
-**Stopping Blocking:**
-| Trigger Source | Time after ad ends |
-|----------------|-------------------|
-| OCR triggered | ~2-3s (3 no-ads) |
-| VLM triggered alone | ~4s (2 no-ads) |
-
-**Anti-flicker:**
-- Minimum 3 seconds blocking duration
-- VLM history cleared on stop (prevents re-trigger)
-
-## Blocking Overlay
-
-When ads are detected, ustreamer's **native MPP blocking mode** renders at 60fps:
-- **Pixelated Background**: 20x downscaled, 60% darkened pre-ad frame
-- **Header**: `BLOCKING (OCR)`, `BLOCKING (VLM)`, or `BLOCKING (OCR+VLM)`
-- **Spanish word**: Random intermediate-level vocabulary (IBM Plex Mono Bold, purple)
-- **Translation**: English meaning (DejaVu Sans Bold, white)
-- **Example**: Sentence using the word (DejaVu Sans Bold, gray)
-- **Rotation**: New vocabulary every 11-15 seconds
-- **Ad Preview**: Live 60fps preview in bottom-right corner
-- **Debug Dashboard**: Stats in bottom-left (IBM Plex Mono Regular)
-
-**Multi-color text per line:** Purple for Spanish word, white for header/translation, gray for pronunciation/example - matching the web UI aesthetic.
-
-**Pixelated Background:**
-Rolling 6-second buffer (3 frames at 2s intervals). Uses oldest frame when blocking starts (ensures pre-ad content). OpenCV pixelation with INTER_NEAREST. Uploaded async via `/blocking/background` POST API.
-
-**Transition Frame Detection:**
-Black/solid-color frames are held in blocking state to prevent premature unblocking and re-blocking flicker between ads.
-
-Both preview window and debug dashboard are toggleable via Web UI Settings.
-
-## Spanish Vocabulary
-
-120+ intermediate-level words and phrases including:
-- **Common verbs**: aprovechar, lograr, desarrollar, destacar, enfrentar...
-- **Reflexive verbs**: comprometerse, enterarse, arrepentirse, darse cuenta...
-- **Adjectives**: disponible, imprescindible, agotado, capaz, dispuesto...
-- **Nouns**: desarrollo, comportamiento, conocimiento, ambiente, herramienta...
-- **Expressions**: sin embargo, a pesar de, de repente, hoy en dia, cada vez mas...
-- **False friends**: embarazada, exito, sensible, libreria, asistir...
-- **Subjunctive triggers**: es importante que, espero que, dudo que, ojala...
-- **Time expressions**: hace poco, dentro de poco, a la larga, de antemano...
-
-## Ad Keywords Detected
-
-**Exact phrases** (match anywhere):
-- skip ad, skip ads, skipad, skipads
-- sponsored, advertisement, ad break
-- shop now, buy now, promoted
-
-**Whole words:**
-- skip, sponsor
-
-## Log Output
-
-```
-2025-12-24 02:32:47 [I] Starting Minus...
-2025-12-24 02:32:47 [I] HDMI signal: 3840x2160 @ 30.0fps
-2025-12-24 02:32:50 [I] ustreamer started on port 9090
-2025-12-24 02:32:52 [I] Display pipeline started - 30 FPS with instant ad blocking
-2025-12-24 02:32:52 [I] [AudioPassthrough] Audio passthrough started
-2025-12-24 02:33:33 [I] VLM model loaded successfully
-2025-12-24 02:33:45 [W] AD BLOCKING STARTED (OCR)
-2025-12-24 02:33:45 [I] [DRMAdBlocker] Switching to blocking overlay (ocr)
-2025-12-24 02:33:45 [I] [AudioPassthrough] Audio MUTED
-2025-12-24 02:34:04 [W] AD BLOCKING ENDED after 19.3s
-2025-12-24 02:34:04 [I] [DRMAdBlocker] Switching to video stream
-2025-12-24 02:34:04 [I] [AudioPassthrough] Audio UNMUTED
-```
-
-## Project Structure
-
-```
-minus/
-├── minus.py              # Main entry point - orchestrates everything
-├── minus.spec            # PyInstaller build spec
-├── test_fire_tv.py       # Fire TV controller test script
-├── tests/
-│   └── test_modules.py   # Unit tests for all modules
-├── src/
-│   ├── ocr.py            # PaddleOCR on RKNN NPU
-│   ├── vlm.py            # FastVLM-1.5B on Axera NPU
-│   ├── ad_blocker.py     # GStreamer video pipeline with input-selector
-│   ├── audio.py          # GStreamer audio passthrough with mute control
-│   ├── health.py         # Health monitor for all subsystems
-│   ├── webui.py          # Flask web UI server
-│   ├── overlay.py        # Text overlay via ustreamer API
-│   ├── fire_tv.py        # Fire TV ADB controller
-│   ├── fire_tv_setup.py  # Fire TV setup flow with overlay notifications
-│   ├── vocabulary.py     # Spanish vocabulary list (120+ words)
-│   ├── console.py        # Console blanking/restore functions
-│   ├── drm.py            # DRM output probing (HDMI, resolution, plane)
-│   ├── v4l2.py           # V4L2 device probing (format, resolution)
-│   ├── config.py         # MinusConfig dataclass
-│   ├── capture.py        # UstreamerCapture class for snapshots
-│   ├── screenshots.py    # ScreenshotManager with deduplication
-│   ├── skip_detection.py # Skip button detection (regex patterns)
-│   ├── templates/
-│   │   └── index.html    # Web UI single-page app
-│   └── static/
-│       └── style.css     # Web UI dark theme styles
-├── install.sh            # Install as systemd service
-├── uninstall.sh          # Remove systemd service
-├── stop.sh               # Graceful shutdown script
-├── minus.service         # systemd service file
-├── models/
-│   └── paddleocr/        # RKNN models (or symlink)
-├── screenshots/
-│   ├── ads/              # OCR-detected ads (for training)
-│   ├── non_ads/          # User paused = false positives (for training)
-│   ├── vlm_spastic/      # VLM uncertainty cases (for analysis)
-│   └── static/           # Static screen suppression (still frames)
-├── README.md             # This file
-├── CLAUDE.md             # Development notes
-└── AUDIO.md              # Audio implementation details
-```
-
-## Testing
-
-Minus includes a comprehensive test suite covering all extracted modules.
+## Verifying HDCP
 
 ```bash
-# Run all tests (no dependencies required)
-python3 tests/test_modules.py
+# Check HDCP status
+cat /sys/class/misc/hdmirx_hdcp/support   # Should be: 1
+cat /sys/class/misc/hdmirx_hdcp/enable    # Should be: 1
+cat /sys/class/misc/hdmirx_hdcp/status    # Should be: HDCP1.4: Authenticated success
 
-# Or with pytest (if installed)
-python3 -m pytest tests/test_modules.py -v
+# Check service
+systemctl status hdcp-enable.service      # Should be: active (exited)
+
+# Check module
+lsmod | grep vendor_fix                   # Should show vendor_fix
 ```
 
-**Test Output:**
-```
-============================================================
-RESULTS: 106/106 passed
-============================================================
-```
+## Capturing Video
 
-**What's Tested:**
-- **Vocabulary** - Format validation, content structure, common words
-- **Config** - Dataclass defaults and custom values
-- **Skip Detection** - Button pattern matching, countdown parsing, edge cases
-- **Screenshots** - Deduplication, file saving, hash computation, truncation
-- **Console** - Blanking/restore command generation
-- **Capture** - Snapshot URL handling, cleanup
-- **DRM** - Output probing, fallback values
-- **V4L2** - Format detection, error handling
-- **Overlay** - NotificationOverlay, positions, show/hide
-- **Health** - HealthMonitor, HealthStatus, HDMI detection
-- **Fire TV** - Controller, key codes, device detection
-- **VLM** - VLMManager, response parsing
-- **OCR** - Keywords, exclusions, terminal detection
-- **WebUI** - Flask routes, API endpoints
-
-## VLM Model
-
-The VLM uses **FastVLM-1.5B** on the Axera LLM 8850 NPU:
-
-| Metric | Value |
-|--------|-------|
-| Accuracy | Better than 0.5B with fewer false positives (~36% vs ~88% on home screens) |
-| Inference | ~0.9s per frame |
-| Model load | ~13s (once at startup) |
-| Prompt | "Is this an advertisement? Answer Yes or No." |
-
-Model location:
-```
-/home/radxa/axera_models/FastVLM-1.5B/
-├── fastvlm_ax650_context_1k_prefill_640_int4/
-│   ├── image_encoder_512x512.axmodel
-│   ├── llava_qwen2_p128_l*.axmodel
-│   └── model.embed_tokens.weight.npy
-├── fastvlm_tokenizer/
-└── utils/
-```
-
-## Fire TV Control (Optional)
-
-Minus can control Fire TV devices via ADB over WiFi to automatically skip ads.
-
-**Auto-Setup:** When Minus starts, it automatically scans for Fire TV devices and guides you through setup with on-screen overlay notifications. First-time connection requires approving the ADB authorization dialog on your TV.
-
-**Requirements:**
-- Fire TV on the same WiFi network
-- ADB debugging enabled on Fire TV
-
-**Enable ADB Debugging on Fire TV:**
-1. Go to **Settings** (gear icon)
-2. Select **My Fire TV**
-3. Select **Developer Options** (if not visible: go to About → click device name 7 times)
-4. Turn ON **ADB Debugging**
-
-**Test Fire TV Connection:**
-```bash
-# Auto-discover and connect
-python3 test_fire_tv.py
-
-# Guided setup with instructions
-python3 test_fire_tv.py --setup
-
-# Interactive remote control
-python3 test_fire_tv.py --interactive
-```
-
-**First Connection:**
-When connecting for the first time, your Fire TV will show an "Allow USB Debugging?" dialog.
-Look at your TV and press **Allow** (check "Always allow" for permanent authorization).
-
-**Available Commands:**
-- Navigation: up, down, left, right, select, back, home
-- Media: play, pause, play_pause, fast_forward, rewind
-- Volume: volume_up, volume_down, mute
-- Power: power, sleep, wakeup
-
-## Dependencies
+Connect an HDCP source to the HDMI RX port, then:
 
 ```bash
-# System packages
-sudo apt install -y imagemagick ffmpeg curl libevent-dev libjpeg-dev libbsd-dev
+# Capture a single frame
+gst-launch-1.0 v4l2src device=/dev/video0 num-buffers=1 \
+  ! videoconvert ! jpegenc ! filesink location=/tmp/capture.jpg
 
-# Build ustreamer with MPP hardware encoding
-git clone https://github.com/garagehq/ustreamer.git /home/radxa/ustreamer-garagehq
-cd /home/radxa/ustreamer-garagehq && make WITH_MPP=1
-cp ustreamer /home/radxa/ustreamer-patched
+# Continuous stream to display
+gst-launch-1.0 v4l2src device=/dev/video0 \
+  ! videoconvert ! autovideosink
 
-# Python packages
-pip3 install --break-system-packages pyclipper shapely numpy opencv-python pexpect PyGObject flask requests androidtv
+# Record to file
+gst-launch-1.0 v4l2src device=/dev/video0 \
+  ! video/x-raw,format=NV16 ! videoconvert \
+  ! x264enc ! mp4mux ! filesink location=/tmp/recording.mp4
+```
+
+> **Note:** The HDMI RX uses the multiplanar V4L2 API. Use GStreamer — `ffmpeg` does not support multiplanar capture on this device.
+
+## HDCP Key Requirements
+
+The key file must be:
+- Exactly **308 bytes**
+- Raw DCP LLC format: `type_id(4 bytes) + KSV(5 bytes) + device_keys(280 bytes) + padding(19 bytes)`
+- Type ID must be `0x02000000` (Sink/Receiver)
+- KSV must have exactly 20 ones and 20 zeros in binary (HDCP 1.4 spec requirement)
+- Each device should use a **unique key** — do not reuse keys across devices
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `setup_hdcp_device.sh` | Setup script — run with `sudo` and pass your key file |
+| `u-boot-rk2410_2017.09-1_arm64.deb` | U-Boot package with OP-TEE/BL32 for Rock 5B Plus |
+| `vendor_fix.c` | Kernel module source — compiled on-device automatically by the setup script |
+| `vendor_fix.ko` | Pre-compiled kernel module (fallback if on-device compilation isn't available) |
+
+## Kernel Module Compilation
+
+The `vendor_fix.ko` kernel module must match the running kernel version. The setup script handles this automatically:
+
+1. **If kernel headers are installed** (`linux-headers-$(uname -r)`): the script compiles `vendor_fix.c` on-device for the exact running kernel. No cross-compilation needed.
+
+2. **If kernel headers are NOT available**: the script falls back to the pre-compiled `vendor_fix.ko`. This may fail if the kernel version doesn't match.
+
+3. **If the module already exists and matches the running kernel**: the script skips compilation entirely.
+
+To install kernel headers manually:
+```bash
+sudo apt install linux-headers-$(uname -r)
+```
+
+To force recompilation on the next run, delete the existing module:
+```bash
+rm /home/radxa/vendor_fix.ko
+sudo ./setup_hdcp_device.sh /path/to/your_key.bin
 ```
 
 ## Troubleshooting
 
-**No HDMI signal:**
-When started without HDMI input, Minus displays a bouncing "NO SIGNAL" screensaver
-(DVD-style) and waits for user to connect a source. When the text hits a corner,
-it does a little spin animation! To check signal manually:
-```bash
-v4l2-ctl -d /dev/video0 --query-dv-timings
-```
+### `support` returns 0
 
-**ustreamer fails to start:**
-```bash
-fuser -k /dev/video0  # Kill processes using device
-pkill -9 ustreamer    # Kill orphaned ustreamer
-```
+| Check | Command | Meaning |
+|-------|---------|---------|
+| OP-TEE loaded? | `ls /dev/tee0` | If missing, U-Boot install failed — re-run setup |
+| vnvm partition? | `cat /proc/mtd \| grep vnvm` | If missing, DTB patch failed |
+| hdcp1x-enable? | `ls /proc/device-tree/hdmirx-controller@fdee0000/hdcp1x-enable` | If missing, DTB patch failed |
+| Service running? | `systemctl status hdcp-enable.service` | Should be `active (exited)` |
+| Module loaded? | `lsmod \| grep vendor_fix` | If missing, module failed to load (kernel mismatch?) |
 
-**VLM not loading:**
-```bash
-axcl_smi              # Check Axera card status
-ls /home/radxa/axera_models/FastVLM-1.5B/  # Verify model files
-```
+### Status shows "Authenticated failed"
 
-**Display issues:**
-```bash
-modetest -M rockchip -p | grep -A5 "plane\[72\]"  # Check DRM plane
-modetest -M rockchip -c | grep HDMI               # Check connector
-```
+The HDCP handshake was attempted but the key was rejected. Possible causes:
+- Invalid or corrupted key file
+- Key not in the correct 308-byte DCP format
+- Key reused from a revoked device
 
-**OCR not detecting:**
-```bash
-curl http://localhost:9090/snapshot -o test.jpg  # Test snapshot
-```
+### Status shows "Unknown status"
 
-**Audio issues:**
-```bash
-# Check audio devices
-arecord -l                                        # List capture devices
-aplay -l                                          # List playback devices
-v4l2-ctl -d /dev/video0 --get-ctrl audio_present # Check if HDMI has audio
+No HDCP source is connected, or the source hasn't initiated the handshake yet. This is normal when nothing is plugged into the HDMI RX port. Plug in an HDCP source (FireTV, Roku, etc.) and check again after a few seconds.
 
-# Test audio passthrough with silent keepalive (prevents stalls)
-gst-launch-1.0 \
-  alsasrc device=hw:4,0 ! "audio/x-raw,rate=48000,channels=2,format=S16LE" ! \
-  queue ! audioconvert ! "audio/x-raw,rate=48000,channels=2,format=F32LE" ! mix. \
-  audiotestsrc wave=silence is-live=true ! "audio/x-raw,rate=48000,channels=2,format=F32LE" ! mix. \
-  audiomixer name=mix ! alsasink device=hw:0,0 sync=false
-```
+### Black frame captured
 
-The `audiomixer` with `audiotestsrc wave=silence` keeps the pipeline alive even when
-the HDMI source has no audio (between songs, during silence, etc.).
+If `status` shows `Authenticated success` but captures are black, the source may be using HDCP 2.x instead of 1.4. This setup only supports HDCP 1.4. Most consumer devices fall back to 1.4 automatically.
 
-**Color correction:**
-Adjust video colors in real-time via the Web UI Settings tab, or via API:
-```bash
-# Get current color settings
-curl http://localhost/api/video/color
-
-# Set color settings (saturation, brightness, contrast, hue)
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"saturation": 1.25, "brightness": 0.0}' \
-  http://localhost/api/video/color
-```
-Default: saturation=1.25, brightness=0.0, contrast=1.0, hue=0.0
-
-## Running as a Service
-
-Minus can run as a systemd service for 24/7 unattended operation:
+### No HDMI signal detected
 
 ```bash
-# Install as systemd service
-sudo ./install.sh
-
-# View logs
-journalctl -u minus -f
-
-# Stop service
-sudo systemctl stop minus
-
-# Uninstall
-sudo ./uninstall.sh
+v4l2-ctl -d /dev/video0 --get-dv-timings
+# If "Link has been severed": unplug and replug the HDMI cable
+# If "No locks available": the signal is unstable, replug and wait a few seconds
 ```
 
-The service automatically:
-- Starts on boot
-- Restarts on crashes (5 attempts per 5 minutes)
-- Disables X11/display managers to avoid conflicts
+### Module fails to load (kernel mismatch)
 
-## Health Monitoring
-
-Minus includes a unified health monitor that runs in the background:
-
-**What it monitors:**
-- HDMI signal (detects unplug/replug, shows "NO SIGNAL" message)
-- ustreamer health (HTTP health check, not just PID)
-- Video pipeline health (buffer flow, pipeline state)
-- Output FPS (logged every 60s, warning if < 25 fps)
-- VLM/OCR health (consecutive timeout detection)
-- Memory usage (warning at 80%, critical at 90%)
-- Disk space (warning below 500MB)
-
-**Automatic recovery:**
-- HDMI signal lost → Shows "NO SIGNAL" overlay, mutes audio
-- HDMI signal restored → Restarts ustreamer + video pipeline, unmutes audio (~7s recovery)
-- ustreamer stall → Restarts ustreamer + video pipeline
-- Video pipeline stall → Restarts pipeline with exponential backoff (1s-30s)
-- VLM failure → Degrades to OCR-only mode, attempts VLM restart
-- Critical memory → Triggers garbage collection, cleans old screenshots
-
-**HDMI Cable Robustness:**
-- Jiggling or unplugging HDMI cables triggers automatic recovery
-- No manual restart required - system recovers automatically
-- Video pipeline watchdog detects stalls (10s threshold)
-- Exponential backoff prevents restart storms
-
-**Graceful degradation:**
-- If VLM fails repeatedly (5+ consecutive timeouts), switches to OCR-only mode
-- VLM restart is attempted after 30 seconds
-- OCR continues working even if VLM is disabled
-- 30-second startup grace period before health checks begin
-
-## Web UI
-
-Minus includes a mobile-friendly web UI for remote monitoring and control:
-
-**Access:**
-- Local: `http://localhost:80`
-- mDNS: `http://minus.local:80` (from any device on same network)
-- Tailscale: `http://<tailscale-hostname>:80`
-- Direct video stream: `http://minus.local:9090/stream`
-
-**Features:**
-- **Live video feed** - Real-time MJPEG stream from ustreamer
-- **Status display** - Blocking state, FPS, HDMI resolution, uptime
-- **Pause controls** - 1/2/5/10 minute presets to pause ad blocking
-- **Video color controls** - Real-time saturation, brightness, contrast, hue sliders
-- **Settings** - Toggle ad preview window, debug dashboard, A/V sync reset
-- **Detection history** - Recent OCR/VLM detections with timestamps
-- **Log viewer** - Collapsible log output for debugging
-
-**Pause & Training Data:**
-When you pause blocking via the WebUI, Minus automatically saves a screenshot
-to `screenshots/non_ad/`. This creates training data for improving the VLM:
-- **Pausing = "this is NOT an ad"** (false positive correction)
-- Screenshots saved with `non_ad_` prefix for easy labeling
-- Use these to fine-tune the VLM and reduce false positives
-
-**Test API Endpoints:**
-For development and testing, you can manually trigger ad blocking:
+If `dmesg | grep vendor_fix` shows version errors:
 ```bash
-# Trigger blocking for 20 seconds (source: ocr, vlm, both, or default)
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"duration": 20, "source": "ocr"}' \
-  http://localhost:80/api/test/trigger-block
-
-# Stop blocking immediately
-curl -X POST http://localhost:80/api/test/stop-block
+# Install kernel headers and re-run the setup
+sudo apt install linux-headers-$(uname -r)
+rm /home/radxa/vendor_fix.ko
+sudo ./setup_hdcp_device.sh /path/to/your_key.bin
 ```
 
-Test mode prevents the detection loop from canceling the blocking, allowing you to test the full blocking experience including pixelated background and animations.
+### SD card interference
 
-## ustreamer Overlay and Blocking API
+If an SD card with a Radxa image is plugged in, U-Boot may load the unmodified device tree from the SD card instead of eMMC. The setup script handles this automatically, but for best results remove the SD card.
 
-ustreamer provides two overlay systems rendered in the MPP encoder:
+### Boot device detection
 
-**1. Notification Overlay** (`/overlay/*`) - For Fire TV setup, status messages:
-```bash
-curl "http://localhost:9090/overlay/set?text=LIVE&position=1&scale=4&enabled=true"
-curl "http://localhost:9090/overlay/set?clear=true"
-```
+The script auto-detects whether the device boots from eMMC or SD card and flashes U-Boot to the correct device. If you move the SD card to a different slot or change boot media, re-run the setup script.
 
-**2. Blocking Mode** (`/blocking/*`) - For ad blocking overlays at 60fps:
-- `GET /blocking` - Get current config
-- `GET /blocking/set?enabled=true&text_vocab=...` - Configure blocking
-- `POST /blocking/background` - Upload pixelated NV12 background
+## Re-running the Script
 
-**Multi-color text:** Lines auto-detected by prefix - `[` → white (header), `(` → gray (pronunciation), `=` → white (translation), `"` → gray (example), other → purple (Spanish word).
-
-**Thread Safety:** FreeType rendering is mutex-protected for 4 parallel MPP encoder workers.
-
-**Performance:** ~0.5ms overhead per frame, rendered directly on NV12 before JPEG encoding.
-
-## Housekeeping
-
-**Log File:**
-- Location: `/tmp/minus.log`
-- Max 5MB per log file
-- Keeps 3 backup files (minus.log.1, .2, .3)
-
-**Screenshot Management:**
-Screenshots are organized by type for easy training data preparation:
-- `screenshots/ads/` - OCR-detected ads (unlimited by default for training)
-- `screenshots/non_ads/` - User paused = false positives (for training)
-- `screenshots/vlm_spastic/` - VLM uncertainty (detected ad then changed mind)
-- `screenshots/static/` - Static screen suppression (still frames with ad text)
-- Rate limited: Max 1 ad screenshot per 5 seconds (with deduplication)
-- Configurable via `--max-screenshots` (default: 0 = unlimited)
-
-**Audio Error Recovery:**
-- Watchdog checks every 3 seconds, restarts if stalled for 6+ seconds
-- Exponential backoff for restart attempts (1s → 2s → 4s → ... → 60s max)
-- No maximum restart limit - always tries to recover
-- Backoff resets after 5 seconds of sustained audio flow
-
-**Video Pipeline Recovery:**
-- Watchdog checks every 3 seconds, restarts if stalled for 10+ seconds
-- Monitors GStreamer pipeline state and buffer flow
-- Handles HTTP connection errors (ustreamer restart)
-- Handles unexpected EOS events
-- Exponential backoff for restart attempts (1s → 2s → 4s → ... → 30s max)
-- Backoff resets after 10 seconds of sustained buffer flow
-- Preserves blocking overlay state across restarts
-
-## Building Executable
-
-Minus can be compiled into a standalone executable using PyInstaller:
-
-```bash
-# Install PyInstaller
-pip3 install pyinstaller
-
-# Build executable
-pyinstaller minus.spec
-
-# Output will be in dist/minus
-```
-
-**Note:** The executable still requires external model files at runtime:
-- PaddleOCR models in standard location
-- VLM models in `/home/radxa/axera_models/FastVLM-1.5B/`
-
-## License
-
-MIT
+The script is idempotent — it detects components that are already installed and skips them. Safe to re-run at any time, for example:
+- To update the HDCP key
+- After a kernel update (recompiles the module automatically)
+- After moving to different boot media

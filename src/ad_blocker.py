@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.error
 import json
 from collections import deque
+from pathlib import Path
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -144,6 +145,10 @@ class DRMAdBlocker:
         self._text_u = 128
         self._text_v = 128
 
+        # Color settings persistence
+        self._color_settings_file = Path.home() / '.minus_color_settings.json'
+        self._saved_color_settings = self._load_color_settings()
+
         # Current vocabulary word tracking
         self._current_vocab = None  # (spanish, pronunciation, english, example)
 
@@ -174,6 +179,47 @@ class DRMAdBlocker:
         except Exception as e:
             logger.warning(f"[DRMAdBlocker] Could not detect frame resolution: {e}, using 1920x1080")
             return 1920, 1080
+
+    def _load_color_settings(self):
+        """Load saved color settings from disk."""
+        defaults = {
+            'saturation': 1.0,
+            'brightness': 0.0,
+            'contrast': 1.0,
+            'hue': 0.0
+        }
+        try:
+            if self._color_settings_file.exists():
+                with open(self._color_settings_file, 'r') as f:
+                    saved = json.load(f)
+                    # Merge with defaults to handle missing keys
+                    for key in defaults:
+                        if key in saved:
+                            defaults[key] = saved[key]
+                    logger.info(f"[DRMAdBlocker] Loaded color settings: sat={defaults['saturation']:.2f}")
+                    return defaults
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] Could not load color settings: {e}")
+        return defaults
+
+    def _save_color_settings(self, settings):
+        """Save color settings to disk."""
+        try:
+            with open(self._color_settings_file, 'w') as f:
+                json.dump(settings, f)
+            logger.debug(f"[DRMAdBlocker] Saved color settings to {self._color_settings_file}")
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] Could not save color settings: {e}")
+
+    def _apply_saved_color_settings(self):
+        """Apply saved color settings to the pipeline."""
+        if self._saved_color_settings and self.pipeline:
+            self.set_color_settings(
+                saturation=self._saved_color_settings.get('saturation'),
+                brightness=self._saved_color_settings.get('brightness'),
+                contrast=self._saved_color_settings.get('contrast'),
+                hue=self._saved_color_settings.get('hue')
+            )
 
     def _blocking_api_call(self, endpoint, params=None, data=None, method='GET', timeout=0.1):
         """Make an API call to ustreamer blocking endpoint."""
@@ -209,7 +255,7 @@ class DRMAdBlocker:
                 f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream "
                 f"is-live=true blocksize=262144 timeout=10 retries=-1 keep-alive=true ! "
                 f"multipartdemux ! jpegparse ! mppjpegdec ! video/x-raw,format=NV12 ! "
-                f"videobalance saturation=1.25 brightness=0.0 contrast=1.0 hue=0.0 name=colorbalance ! "
+                f"videobalance saturation=1.0 brightness=0.0 contrast=1.0 hue=0.0 name=colorbalance ! "
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "
                 f"identity name=fpsprobe ! "
                 f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
@@ -268,7 +314,7 @@ class DRMAdBlocker:
             dict with saturation, brightness, contrast, hue values
         """
         defaults = {
-            'saturation': 1.25,
+            'saturation': 1.0,
             'brightness': 0.0,
             'contrast': 1.0,
             'hue': 0.0
@@ -329,6 +375,10 @@ class DRMAdBlocker:
                        f"bright={current['brightness']:.2f} contrast={current['contrast']:.2f} "
                        f"hue={current['hue']:.2f}")
 
+            # Persist settings for next restart
+            self._saved_color_settings = current.copy()
+            self._save_color_settings(current)
+
             return {'success': True, **current}
 
         except Exception as e:
@@ -375,6 +425,9 @@ class DRMAdBlocker:
 
             # Re-detect frame resolution now that ustreamer should be running
             self._update_frame_resolution()
+
+            # Apply saved color settings (user's preferences persist across restarts)
+            self._apply_saved_color_settings()
 
             # Clear loading state
             self.current_source = None
@@ -476,7 +529,9 @@ class DRMAdBlocker:
                     logger.info("[DRMAdBlocker] Pipeline restarted successfully")
                     self._last_buffer_time = time.time()
                     self._last_restart_time = time.time()
-                    self._consecutive_failures = 0  # Reset on success
+                    # Don't reset consecutive_failures here - let the buffer probe
+                    # reset it after sustained flow. This ensures the ustreamer
+                    # force-restart triggers if the pipeline keeps stalling.
         finally:
             self._pipeline_restarting = False
 

@@ -68,7 +68,7 @@ class HealthMonitor:
         self._monitor_thread = None
         self._stop_event = threading.Event()
         self._start_time = time.time()
-        self._last_hdmi_signal = True
+        self._last_hdmi_signal = None  # None = first check not done yet (avoids false "signal lost" on startup)
         self._hdmi_lost_time = 0
         self._hdmi_fps_zero_since = 0  # When captured_fps first dropped to 0
         self._hdmi_signal_loss_threshold = 5.0  # Seconds of 0 FPS before signal is considered lost
@@ -162,19 +162,30 @@ class HealthMonitor:
         status = self.get_status()
 
         # HDMI signal monitoring
-        if not status.hdmi_signal and self._last_hdmi_signal:
-            # Signal just lost
-            self._hdmi_lost_time = time.time()
-            logger.warning("[HealthMonitor] HDMI signal LOST")
-            if self._on_hdmi_lost:
-                self._on_hdmi_lost()
+        # Skip transition callbacks until we've completed startup grace period
+        # This prevents false "signal lost/restored" during startup before ustreamer is ready
+        uptime = time.time() - self._start_time
+        if self._last_hdmi_signal is not None and uptime > self.startup_grace_period:
+            if not status.hdmi_signal and self._last_hdmi_signal:
+                # Signal just lost
+                self._hdmi_lost_time = time.time()
+                logger.warning("[HealthMonitor] HDMI signal LOST")
+                if self._on_hdmi_lost:
+                    self._on_hdmi_lost()
 
-        elif status.hdmi_signal and not self._last_hdmi_signal:
-            # Signal just restored
-            lost_duration = time.time() - self._hdmi_lost_time
-            logger.info(f"[HealthMonitor] HDMI signal RESTORED (was lost {lost_duration:.1f}s)")
-            if self._on_hdmi_restored:
-                self._on_hdmi_restored()
+            elif status.hdmi_signal and not self._last_hdmi_signal:
+                # Signal just restored (only if it was actually lost, not just starting up)
+                if self._hdmi_lost_time > 0:
+                    lost_duration = time.time() - self._hdmi_lost_time
+                    logger.info(f"[HealthMonitor] HDMI signal RESTORED (was lost {lost_duration:.1f}s)")
+                    if self._on_hdmi_restored:
+                        self._on_hdmi_restored()
+                else:
+                    logger.debug(f"[HealthMonitor] HDMI signal present (initial detection)")
+        else:
+            # Still in startup grace period - just track state changes without callbacks
+            if self._last_hdmi_signal is None:
+                logger.debug(f"[HealthMonitor] Initial HDMI signal state: {status.hdmi_signal}")
 
         self._last_hdmi_signal = status.hdmi_signal
 
