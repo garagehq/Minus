@@ -1004,9 +1004,14 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
 
 .screenshot-tabs, .wifi-tabs {
     display: flex;
-    gap: 0.5rem;
+    gap: 0.3rem;
     margin-bottom: 0.75rem;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+    flex-wrap: nowrap;
 }
+.screenshot-tabs::-webkit-scrollbar { display: none; }
 
 .tab-btn {
     padding: 0.5rem 1rem;
@@ -2023,6 +2028,18 @@ input:checked + .toggle-slider:before {
         font-size: 0.9rem;
         padding: 0.5rem 0.25rem;
     }
+
+    .screenshot-tabs {
+        gap: 0.2rem;
+    }
+    .screenshot-tabs .tab-btn {
+        padding: 0.4rem 0.5rem;
+        font-size: 0.7rem;
+    }
+    .screenshot-tabs .review-btn {
+        padding: 0.2rem 0.25rem;
+        font-size: 0.65rem;
+    }
 }
 
 @media (min-width: 768px) {
@@ -2329,11 +2346,13 @@ input:checked + .toggle-slider:before {
     background: none;
     border: 1px solid var(--border);
     border-radius: 4px;
-    padding: 0.2rem 0.4rem;
-    font-size: 0.9rem;
+    padding: 0.25rem 0.35rem;
+    font-size: 0.75rem;
     cursor: pointer;
-    opacity: 0.6;
+    opacity: 0.5;
     transition: opacity 0.2s;
+    flex-shrink: 0;
+    line-height: 1;
 }
 .review-btn:hover {
     opacity: 1;
@@ -2417,17 +2436,17 @@ input:checked + .toggle-slider:before {
 
 .review-stack {
     position: relative;
-    width: 90vw;
-    max-width: 460px;
-    height: 70vh;
-    max-height: 600px;
+    width: 92vw;
+    max-width: 550px;
+    height: 65vh;
+    max-height: 550px;
     margin: 0 auto;
 }
 
 .review-card {
     position: absolute;
     inset: 0;
-    background: var(--bg-card);
+    background: #000;
     border: 1px solid var(--border-highlight);
     border-radius: 12px;
     overflow: hidden;
@@ -2439,21 +2458,24 @@ input:checked + .toggle-slider:before {
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
     display: flex;
     flex-direction: column;
+    z-index: 3;
 }
 .review-card.stack-1 {
     transform: scale(0.95) translateY(10px);
-    opacity: 0.5;
+    opacity: 1;
     pointer-events: none;
+    z-index: 2;
 }
 .review-card.stack-2 {
     transform: scale(0.90) translateY(20px);
-    opacity: 0.3;
+    opacity: 1;
     pointer-events: none;
+    z-index: 1;
 }
 
 .review-card-header {
-    padding: 0.6rem 0.8rem;
-    font-size: 0.7rem;
+    padding: 0.35rem 0.6rem;
+    font-size: 0.65rem;
     color: var(--text-muted);
     font-family: var(--font-body);
     background: var(--bg-secondary);
@@ -2470,12 +2492,14 @@ input:checked + .toggle-slider:before {
     justify-content: center;
     overflow: hidden;
     background: #000;
+    min-height: 0;
 }
 .review-card-image img {
     width: 100%;
     height: 100%;
     object-fit: contain;
     pointer-events: none;
+    background: #000;
 }
 
 /* Stamp overlays */
@@ -2520,13 +2544,15 @@ input:checked + .toggle-slider:before {
 /* Fly-out animations */
 .review-card.fly-right {
     transform: translateX(150vw) rotate(30deg) !important;
-    opacity: 0;
+    opacity: 0 !important;
     transition: transform 0.4s ease-out, opacity 0.3s ease-out;
+    z-index: 4;
 }
 .review-card.fly-left {
     transform: translateX(-150vw) rotate(-30deg) !important;
-    opacity: 0;
+    opacity: 0 !important;
     transition: transform 0.4s ease-out, opacity 0.3s ease-out;
+    z-index: 4;
 }
 
 /* Done state */
