@@ -183,6 +183,7 @@
             <!-- System Info -->
             <section class="system-section">
                 <div class="system-info">
+                    <span id="ocr-status" class="system-badge">OCR: --</span>
                     <span id="vlm-status" class="system-badge">VLM: --</span>
                     <span id="memory-status" class="system-badge">Mem: --</span>
                     <span id="hdmi-status" class="system-badge">HDMI: --</span>
@@ -706,6 +707,18 @@
                 }
 
                 // System info
+                const ocrStatus = document.getElementById('ocr-status');
+                if (status.ocr_disabled) {
+                    ocrStatus.textContent = 'OCR: Disabled';
+                    ocrStatus.className = 'system-badge warning';
+                } else if (status.ocr_ready) {
+                    ocrStatus.textContent = 'OCR: Ready';
+                    ocrStatus.className = 'system-badge ok';
+                } else {
+                    ocrStatus.textContent = 'OCR: Failed';
+                    ocrStatus.className = 'system-badge error';
+                }
+
                 const vlmStatus = document.getElementById('vlm-status');
                 if (status.vlm_disabled) {
                     vlmStatus.textContent = 'VLM: Disabled';

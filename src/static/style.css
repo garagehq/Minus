@@ -1691,6 +1691,11 @@ input:checked + .toggle-slider:before {
     color: var(--purple);
 }
 
+.system-badge.error {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
 /* ==================== KEYBOARD SHORTCUTS ==================== */
 .shortcuts-help {
     position: fixed;

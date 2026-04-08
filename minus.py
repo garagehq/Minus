@@ -388,22 +388,39 @@ class Minus:
                 config.output_height = config.output_height or 1080
                 config.audio_playback_device = config.audio_playback_device or 'hw:0,0'
 
-        # Initialize OCR
+        # Initialize OCR (with retry)
+        self.ocr_disabled = False
         if config.no_ocr:
             logger.info("OCR disabled via --no-ocr flag")
+            self.ocr_disabled = True
         elif HAS_OCR:
             det_model, rec_model, dict_path = self._find_model_paths()
             if det_model:
-                self.ocr = PaddleOCR(
-                    det_model_path=det_model,
-                    rec_model_path=rec_model,
-                    dict_path=dict_path
-                )
-                if self.ocr.load_models():
-                    logger.info("OCR models loaded successfully")
-                else:
-                    self.ocr = None
-                    logger.warning("Failed to load OCR models")
+                for attempt in range(1, 4):
+                    try:
+                        self.ocr = PaddleOCR(
+                            det_model_path=det_model,
+                            rec_model_path=rec_model,
+                            dict_path=dict_path
+                        )
+                        if self.ocr.load_models():
+                            logger.info("OCR models loaded successfully")
+                            break
+                        else:
+                            self.ocr = None
+                            logger.warning(f"OCR load_models failed (attempt {attempt}/3)")
+                    except Exception as e:
+                        self.ocr = None
+                        logger.warning(f"OCR init failed (attempt {attempt}/3): {e}")
+                    if attempt < 3:
+                        time.sleep(2)
+                if not self.ocr:
+                    logger.error("OCR failed after 3 attempts - continuing without OCR")
+            else:
+                logger.warning("OCR model files not found - continuing without OCR")
+        else:
+            logger.warning("OCR module not available")
+            self.ocr_disabled = True
 
         # Initialize ad blocker (manages display pipeline with input-selector)
         if HAS_ADBLOCKER:
@@ -1049,6 +1066,8 @@ class Minus:
             'hdmi_signal': health_status.hdmi_signal if health_status else True,
             'vlm_ready': not self.vlm_disabled and (self.vlm is not None and self.vlm.is_ready if self.vlm else False),
             'vlm_disabled': self.vlm_disabled,
+            'ocr_ready': self.ocr is not None and self.ocr.initialized,
+            'ocr_disabled': getattr(self, 'ocr_disabled', False),
             'display_connected': self.display_connected,
             'display_error': self.display_error,
 
@@ -2205,15 +2224,29 @@ class Minus:
         # 5 second delay ensures display is stable before scanning
         self._start_fire_tv_setup_delayed(delay_seconds=5.0)
 
-        # Load VLM model and start worker thread
+        # Load VLM model and start worker thread (with retry)
         if self.vlm:
             # Show loading notification
             if self.system_notification:
                 self.system_notification.show_vlm_loading()
 
-            logger.info("Loading VLM model (FastVLM-1.5B)...")
-            if self.vlm.load_model():
-                logger.info("VLM model loaded successfully")
+            vlm_loaded = False
+            for attempt in range(1, 4):
+                logger.info(f"Loading VLM model (FastVLM-1.5B)... attempt {attempt}/3")
+                try:
+                    if self.vlm.load_model():
+                        logger.info("VLM model loaded successfully")
+                        vlm_loaded = True
+                        break
+                    else:
+                        logger.warning(f"VLM load_model returned False (attempt {attempt}/3)")
+                except Exception as e:
+                    logger.warning(f"VLM load_model error (attempt {attempt}/3): {e}")
+                if attempt < 3:
+                    logger.info("Retrying VLM load in 5 seconds...")
+                    time.sleep(5)
+
+            if vlm_loaded:
                 self.vlm_thread = threading.Thread(target=self.vlm_worker, daemon=True)
                 self.vlm_thread.start()
                 logger.info(f"VLM worker started with prompt: \"{self.vlm.AD_PROMPT}\"")
@@ -2222,7 +2255,7 @@ class Minus:
                 if self.system_notification:
                     self.system_notification.show_vlm_ready()
             else:
-                logger.warning("VLM model failed to load - VLM detection disabled")
+                logger.error("VLM failed after 3 attempts - continuing without VLM")
                 self.vlm = None
 
                 # Show failure notification (auto-hides after 8s)

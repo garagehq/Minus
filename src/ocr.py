@@ -213,48 +213,55 @@ class PaddleOCR:
         self.initialized = False
 
     def load_models(self):
-        """Load all RKNN models."""
+        """Load all RKNN models. Returns True on success, False on failure."""
         if not HAS_POSTPROCESS:
             print("[OCR] Cannot load models without pyclipper/shapely")
             return False
 
-        print("[OCR] Loading PaddleOCR models...")
+        try:
+            print("[OCR] Loading PaddleOCR models...")
 
-        # Load detection model
-        print(f"[OCR]   Loading detection model...")
-        self.det_rknn = RKNNLite()
-        ret = self.det_rknn.load_rknn(self.det_model_path)
-        if ret != 0:
-            print(f"[OCR]   Failed to load detection model: {ret}")
-            return False
-        ret = self.det_rknn.init_runtime()
-        if ret != 0:
-            print(f"[OCR]   Failed to init detection runtime: {ret}")
-            return False
+            # Load detection model
+            print(f"[OCR]   Loading detection model...")
+            self.det_rknn = RKNNLite()
+            ret = self.det_rknn.load_rknn(self.det_model_path)
+            if ret != 0:
+                print(f"[OCR]   Failed to load detection model: {ret}")
+                return False
+            ret = self.det_rknn.init_runtime()
+            if ret != 0:
+                print(f"[OCR]   Failed to init detection runtime: {ret}")
+                return False
 
-        # Load recognition model
-        print(f"[OCR]   Loading recognition model...")
-        self.rec_rknn = RKNNLite()
-        ret = self.rec_rknn.load_rknn(self.rec_model_path)
-        if ret != 0:
-            print(f"[OCR]   Failed to load recognition model: {ret}")
-            return False
-        ret = self.rec_rknn.init_runtime()
-        if ret != 0:
-            print(f"[OCR]   Failed to init recognition runtime: {ret}")
-            return False
+            # Load recognition model
+            print(f"[OCR]   Loading recognition model...")
+            self.rec_rknn = RKNNLite()
+            ret = self.rec_rknn.load_rknn(self.rec_model_path)
+            if ret != 0:
+                print(f"[OCR]   Failed to load recognition model: {ret}")
+                return False
+            ret = self.rec_rknn.init_runtime()
+            if ret != 0:
+                print(f"[OCR]   Failed to init recognition runtime: {ret}")
+                return False
 
-        # Initialize CTC decoder
-        if os.path.exists(self.dict_path):
-            self.ctc_decode = CTCLabelDecode(self.dict_path)
-            print(f"[OCR]   Dictionary loaded: {len(self.ctc_decode.character)} characters")
-        else:
-            print(f"[OCR]   Dictionary not found: {self.dict_path}")
-            return False
+            # Initialize CTC decoder
+            if os.path.exists(self.dict_path):
+                self.ctc_decode = CTCLabelDecode(self.dict_path)
+                print(f"[OCR]   Dictionary loaded: {len(self.ctc_decode.character)} characters")
+            else:
+                print(f"[OCR]   Dictionary not found: {self.dict_path}")
+                return False
 
-        self.initialized = True
-        print("[OCR] Models loaded successfully")
-        return True
+            self.initialized = True
+            print("[OCR] Models loaded successfully")
+            return True
+
+        except Exception as e:
+            print(f"[OCR] Failed to load models: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def preprocess_det(self, img):
         """Preprocess image for detection."""
