@@ -215,6 +215,66 @@ class VLMManager:
         vit_output = self.vision_session.run(None, {"images": input_image})[0]
         return vit_output
 
+    def query_image(self, image_path, prompt):
+        """
+        Run a custom prompt on an image.
+
+        Args:
+            image_path: Path to image file (JPEG/PNG)
+            prompt: Custom question to ask about the image
+
+        Returns:
+            tuple: (response_text, elapsed_time)
+        """
+        if not self.is_ready:
+            return "VLM not ready", 0
+
+        if not os.path.exists(image_path):
+            return f"Image not found: {image_path}", 0
+
+        from ml_dtypes import bfloat16
+
+        with self._lock:
+            try:
+                start_time = time.time()
+                self._reset_kv_cache()
+                image_features = self._encode_image(image_path)
+
+                full_prompt = "<|im_start|>system\nYou are a helpful assistant that answers questions accurately and concisely.<|im_end|>\n"
+                full_prompt += "<|im_start|>user\n" + "<image>" * self.TOKEN_LENGTH + "\n"
+                full_prompt += prompt + "<|im_end|>\n<|im_start|>assistant\n"
+
+                token_ids = self.tokenizer.encode(full_prompt)
+                prefill_data = np.take(self.embeds, token_ids, axis=0)
+                prefill_data = prefill_data.astype(bfloat16)
+
+                image_token_indices = np.where(np.array(token_ids) == 151646)[0]
+                if len(image_token_indices) > 0:
+                    image_start_index = image_token_indices[0]
+                    image_insert_index = image_start_index + 1
+                    prefill_data[image_insert_index:image_insert_index + self.TOKEN_LENGTH] = \
+                        image_features[0, :, :].astype(bfloat16)
+
+                eos_token_id = None
+                if isinstance(self.config.eos_token_id, list) and len(self.config.eos_token_id) > 1:
+                    eos_token_id = self.config.eos_token_id
+
+                slice_len = 128
+                token_ids = self.imer.prefill(
+                    self.tokenizer, token_ids, prefill_data, slice_len=slice_len
+                )
+                response = self.imer.decode(
+                    self.tokenizer, token_ids, self.embeds,
+                    slice_len=slice_len, eos_token_id=eos_token_id, stream=False
+                )
+
+                elapsed = time.time() - start_time
+                return response, elapsed
+
+            except Exception as e:
+                logger.error(f"VLM query error: {e}")
+                return str(e), time.time() - start_time
+
     def detect_ad(self, image_path):
         """
         Run ad detection on an image.

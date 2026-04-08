@@ -163,7 +163,7 @@ except ImportError as e:
 # Import Fire TV Setup Manager
 try:
     from fire_tv_setup import FireTVSetupManager
-    from night_mode import NightMode
+    from autonomous_mode import AutonomousMode
     HAS_FIRE_TV = True
 except ImportError as e:
     logger.warning(f"Fire TV module not available: {e}")
@@ -342,7 +342,7 @@ class Minus:
         self._fire_tv_setup_thread = None
 
         # Night mode - automatic overnight YouTube playback for training data
-        self.night_mode = NightMode()
+        self.autonomous_mode = AutonomousMode()
 
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
@@ -814,9 +814,9 @@ class Minus:
         self.add_detection('FireTV', [f"Connected to {manufacturer} {model}"])
 
         # Connect night mode to Fire TV controller
-        if self.night_mode:
-            self.night_mode.set_fire_tv(self.fire_tv_controller)
-            logger.info("[NightMode] Fire TV controller connected")
+        if self.autonomous_mode:
+            self.autonomous_mode.set_fire_tv(self.fire_tv_controller)
+            logger.info("[AutonomousMode] Fire TV controller connected")
 
     def _check_ocr_for_fire_tv_dialog(self, ocr_results: list) -> bool:
         """
@@ -2230,9 +2230,13 @@ class Minus:
                     self.system_notification.show_vlm_failed()
 
         # Start night mode if it was enabled (persisted setting)
-        if self.night_mode:
-            self.night_mode.set_ad_blocker(self.ad_blocker)
-            self.night_mode.start_if_enabled()
+        if self.autonomous_mode:
+            self.autonomous_mode.set_ad_blocker(self.ad_blocker)
+            if hasattr(self, 'vlm') and self.vlm:
+                self.autonomous_mode.set_vlm(self.vlm)
+            if hasattr(self, 'frame_capture') and self.frame_capture:
+                self.autonomous_mode.set_frame_capture(self.frame_capture)
+            self.autonomous_mode.start_if_enabled()
 
         logger.info("Minus running - press Ctrl+C to stop")
 
@@ -2277,9 +2281,9 @@ class Minus:
         self.running = False
 
         # Stop night mode
-        if self.night_mode:
-            self.night_mode.destroy()
-            self.night_mode = None
+        if self.autonomous_mode:
+            self.autonomous_mode.destroy()
+            self.autonomous_mode = None
 
         # Stop Fire TV setup first
         if self.fire_tv_setup:

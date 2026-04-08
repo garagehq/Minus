@@ -2,11 +2,14 @@
 Autonomous Mode for Minus - Automated YouTube playback for training data collection.
 
 Configurable schedule with support for 24/7 operation. Keeps YouTube playing
-on Fire TV to collect ad detection training data.
+on Fire TV to collect ad detection training data. Uses VLM to understand
+screen state and take intelligent actions.
 """
 
 import json
 import logging
+import os
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta
@@ -22,12 +25,17 @@ SETTINGS_FILE = Path("/home/radxa/.minus_autonomous_mode.json")
 # Eastern timezone (default, but schedule hours are timezone-agnostic for simplicity)
 ET = ZoneInfo("America/New_York")
 
-# YouTube package name
-YOUTUBE_PACKAGE = "com.amazon.firetv.youtube"
+# YouTube package names (Fire TV can use different packages)
+YOUTUBE_PACKAGES = [
+    "com.amazon.firetv.youtube",
+    "com.google.android.youtube.tv",
+    "com.google.android.youtube",
+    "youtube",
+]
 
 # Timing constants
 CHECK_INTERVAL = 60.0          # Check every minute
-KEEPALIVE_INTERVAL = 300.0     # Keep YouTube active every 5 minutes
+KEEPALIVE_INTERVAL = 120.0     # Check screen state every 2 minutes (VLM-guided, only acts if needed)
 
 
 class AutonomousModeStats:
@@ -65,7 +73,7 @@ class AutonomousModeStats:
         self.__init__()
 
 
-class NightMode:
+class AutonomousMode:
     """
     Autonomous Mode controller for automated operation.
 
@@ -81,16 +89,20 @@ class NightMode:
     DEFAULT_START_HOUR = 0   # Midnight
     DEFAULT_END_HOUR = 8     # 8 AM
 
-    def __init__(self, fire_tv_controller=None, ad_blocker=None):
+    def __init__(self, fire_tv_controller=None, ad_blocker=None, vlm=None, frame_capture=None):
         """
         Initialize autonomous mode.
 
         Args:
             fire_tv_controller: FireTVController instance for device control
             ad_blocker: DRMAdBlocker instance for ad detection stats
+            vlm: VLMManager instance for screen understanding
+            frame_capture: UstreamerCapture instance for grabbing frames
         """
         self._fire_tv = fire_tv_controller
         self._ad_blocker = ad_blocker
+        self._vlm = vlm
+        self._frame_capture = frame_capture
 
         # State
         self._enabled = False          # User toggle
@@ -158,6 +170,14 @@ class NightMode:
     def set_ad_blocker(self, blocker):
         """Set ad blocker reference."""
         self._ad_blocker = blocker
+
+    def set_vlm(self, vlm):
+        """Set VLM reference for screen understanding."""
+        self._vlm = vlm
+
+    def set_frame_capture(self, capture):
+        """Set frame capture reference."""
+        self._frame_capture = capture
 
     def set_status_callback(self, callback: Callable[[dict], None]):
         """Set callback for status changes."""
@@ -443,6 +463,104 @@ class NightMode:
             if self._on_status_change:
                 self._on_status_change(self.get_status())
 
+    def _is_youtube_app(self, app_name: str) -> bool:
+        """Check if the app name matches any known YouTube package."""
+        if not app_name:
+            return False
+        app_lower = app_name.lower()
+        return any(pkg in app_lower for pkg in YOUTUBE_PACKAGES)
+
+    # VLM prompt that returns a structured, single-word answer for reliable parsing
+    SCREEN_QUERY_PROMPT = (
+        "Look at this TV screen and classify it into exactly one category. "
+        "Answer with ONLY one of these words:\n"
+        "PLAYING - a video is actively playing\n"
+        "PAUSED - a video is paused (play bar visible, frozen frame)\n"
+        "DIALOG - a popup or dialog is showing (like 'Are you still watching?')\n"
+        "MENU - a home screen, browse screen, or video selection menu\n"
+        "SCREENSAVER - a screensaver or blank/black screen\n"
+        "Answer with one word only."
+    )
+
+    def _query_screen(self) -> Optional[str]:
+        """Use VLM to understand what's currently on screen.
+
+        Returns:
+            VLM response (should be one of: PLAYING, PAUSED, DIALOG, MENU, SCREENSAVER),
+            or None if unavailable.
+        """
+        if not self._vlm or not self._vlm.is_ready or not self._frame_capture:
+            return None
+
+        try:
+            import cv2
+            frame = self._frame_capture.capture()
+            if frame is None:
+                return None
+
+            with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+                tmp_path = tmp.name
+                cv2.imwrite(tmp_path, frame)
+
+            try:
+                response, elapsed = self._vlm.query_image(tmp_path, self.SCREEN_QUERY_PROMPT)
+                logger.info(f"[AutonomousMode] VLM screen query ({elapsed:.1f}s): {response}")
+                return response
+            finally:
+                os.unlink(tmp_path)
+
+        except Exception as e:
+            logger.error(f"[AutonomousMode] VLM screen query failed: {e}")
+            return None
+
+    def _determine_action(self, screen_desc: str) -> str:
+        """Determine what action to take based on VLM screen classification.
+
+        Expects structured response (PLAYING/PAUSED/DIALOG/MENU/SCREENSAVER).
+        Falls back to keyword matching if VLM gives a longer response.
+
+        Returns one of: 'none', 'play', 'dismiss', 'select', 'launch'
+        """
+        if not screen_desc:
+            return "none"
+
+        desc = screen_desc.strip().upper()
+
+        # Check for structured single-word responses first
+        if desc.startswith("PLAYING"):
+            return "none"
+        if desc.startswith("DIALOG"):
+            return "dismiss"
+        if desc.startswith("SCREENSAVER"):
+            return "launch"
+        if desc.startswith("MENU"):
+            return "select"
+        if desc.startswith("PAUSED"):
+            return "play"
+
+        # Fallback: keyword matching on longer responses
+        desc_lower = screen_desc.lower()
+
+        # "still watching" is a strong signal for dialog regardless of context
+        if "still watching" in desc_lower or "still there" in desc_lower:
+            return "dismiss"
+
+        if "screensaver" in desc_lower or "black screen" in desc_lower:
+            return "launch"
+
+        if "home screen" in desc_lower or "browse" in desc_lower or "thumbnail" in desc_lower:
+            return "select"
+
+        # Only match "paused" as a positive statement, not "not paused"
+        if "paused" in desc_lower and "not paused" not in desc_lower:
+            return "play"
+
+        if "playing" in desc_lower:
+            return "none"
+
+        # Unknown state - do nothing to avoid disruption
+        return "none"
+
     def _launch_youtube(self) -> bool:
         """Launch YouTube app on Fire TV."""
         if not self._fire_tv or not self._fire_tv.is_connected():
@@ -452,22 +570,27 @@ class NightMode:
         try:
             # Check current app
             current = self._fire_tv.get_current_app()
-            if current and YOUTUBE_PACKAGE in current:
+            logger.debug(f"[AutonomousMode] Current app: {current}")
+
+            if self._is_youtube_app(current):
                 logger.debug("[AutonomousMode] YouTube already running")
                 return True
 
-            # Launch YouTube
+            # Launch YouTube via intent
             logger.info("[AutonomousMode] Launching YouTube...")
-
-            # Use adb_shell to launch YouTube
             with self._fire_tv._lock:
                 if self._fire_tv._device:
-                    self._fire_tv._device.adb_shell(
-                        f"am start -n {YOUTUBE_PACKAGE}/.MainActivity"
-                    )
+                    # Try multiple package names
+                    for pkg in YOUTUBE_PACKAGES:
+                        try:
+                            self._fire_tv._device.adb_shell(
+                                f"am start -a android.intent.action.MAIN -c android.intent.category.LEANBACK_LAUNCHER {pkg}"
+                            )
+                            break
+                        except Exception:
+                            continue
 
-            time.sleep(3)  # Wait for app to launch
-
+            time.sleep(3)
             logger.info("[AutonomousMode] YouTube launched")
             self._log_event("YouTube launched")
             return True
@@ -478,49 +601,64 @@ class NightMode:
             return False
 
     def _ensure_youtube_playing(self):
-        """Ensure YouTube is running and playing content."""
+        """Use VLM to understand screen state and take appropriate action."""
         if not self._fire_tv or not self._fire_tv.is_connected():
             return
 
         try:
-            # Check if YouTube is active
-            current = self._fire_tv.get_current_app()
+            # Use VLM to understand what's on screen
+            screen_desc = self._query_screen()
+            action = self._determine_action(screen_desc)
 
-            if not current or YOUTUBE_PACKAGE not in current:
-                # YouTube not active, relaunch
-                logger.info("[AutonomousMode] YouTube not active, relaunching...")
-                self._launch_youtube()
-                time.sleep(2)
-
-                # Navigate to start playing
-                self._navigate_to_video()
+            if action == "none":
+                logger.debug("[AutonomousMode] Screen looks good, no action needed")
                 return
 
-            # YouTube is active - send occasional keep-alive
-            logger.debug("[AutonomousMode] YouTube active, sending keepalive")
+            logger.info(f"[AutonomousMode] Action needed: {action} (screen: {screen_desc})")
+            self._log_event(f"VLM action: {action}")
+
+            if action == "play":
+                # Video is paused - use play_pause (more reliable on Fire TV YouTube)
+                self._fire_tv.send_command("play_pause")
+                logger.info("[AutonomousMode] Sent play_pause command (video was paused)")
+
+            elif action == "dismiss":
+                # Dialog like "Are you still watching?" - press select to dismiss
+                self._fire_tv.send_command("select")
+                time.sleep(1.5)
+                # After dismissing, send play_pause to ensure playback resumes
+                self._fire_tv.send_command("play_pause")
+                logger.info("[AutonomousMode] Dismissed dialog and sent play_pause")
+
+            elif action == "select":
+                # On home/menu screen - navigate to a video
+                self._fire_tv.send_command("down")
+                time.sleep(0.5)
+                self._fire_tv.send_command("select")
+                self.stats.videos_played += 1
+                logger.info("[AutonomousMode] Selected video from menu")
+                self._log_event("Selected video from menu")
+
+            elif action == "launch":
+                # Screensaver/sleep - wake up and launch YouTube
+                self._fire_tv.send_command("wakeup")
+                time.sleep(2)
+                self._launch_youtube()
+                time.sleep(2)
+                self._fire_tv.send_command("down")
+                time.sleep(0.5)
+                self._fire_tv.send_command("select")
+                self.stats.videos_played += 1
+                logger.info("[AutonomousMode] Woke up and launched YouTube")
+                self._log_event("Woke up device and launched YouTube")
+
+            elif action == "back":
+                self._fire_tv.send_command("back")
+                time.sleep(1)
+                self._fire_tv.send_command("play")
 
         except Exception as e:
             logger.error(f"[AutonomousMode] Error in ensure_youtube_playing: {e}")
-            self.stats.errors += 1
-
-    def _navigate_to_video(self):
-        """Navigate YouTube to play a video."""
-        if not self._fire_tv:
-            return
-
-        try:
-            # Simple navigation: go to home, then select first video
-            time.sleep(1)
-            self._fire_tv.send_command("down")  # Move to video row
-            time.sleep(0.5)
-            self._fire_tv.send_command("select")  # Select first video
-
-            self.stats.videos_played += 1
-            logger.info("[AutonomousMode] Started playing video")
-            self._log_event("Started playing video")
-
-        except Exception as e:
-            logger.error(f"[AutonomousMode] Failed to navigate: {e}")
             self.stats.errors += 1
 
     def play_next_video(self):

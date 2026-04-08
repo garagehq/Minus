@@ -1618,12 +1618,12 @@ class WebUI:
         # Night Mode
         # =========================================================================
 
-        @self.app.route('/api/nightmode')
-        def api_nightmode_status():
+        @self.app.route('/api/autonomous')
+        def api_autonomous_status():
             """Get night mode status."""
             try:
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    return jsonify(self.minus.night_mode.get_status())
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    return jsonify(self.minus.autonomous_mode.get_status())
                 return jsonify({
                     'enabled': False,
                     'active': False,
@@ -1633,12 +1633,12 @@ class WebUI:
                 logger.error(f"Error getting night mode status: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @self.app.route('/api/nightmode/enable', methods=['POST'])
-        def api_nightmode_enable():
+        @self.app.route('/api/autonomous/enable', methods=['POST'])
+        def api_autonomous_enable():
             """Enable night mode (scheduled 12am-8am ET)."""
             try:
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    result = self.minus.night_mode.enable()
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    result = self.minus.autonomous_mode.enable()
                     logger.info("[WebUI] Night mode enabled")
                     return jsonify(result)
                 return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
@@ -1646,12 +1646,12 @@ class WebUI:
                 logger.error(f"Error enabling night mode: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @self.app.route('/api/nightmode/disable', methods=['POST'])
-        def api_nightmode_disable():
+        @self.app.route('/api/autonomous/disable', methods=['POST'])
+        def api_autonomous_disable():
             """Disable night mode."""
             try:
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    result = self.minus.night_mode.disable()
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    result = self.minus.autonomous_mode.disable()
                     logger.info("[WebUI] Night mode disabled")
                     return jsonify(result)
                 return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
@@ -1659,12 +1659,12 @@ class WebUI:
                 logger.error(f"Error disabling night mode: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @self.app.route('/api/nightmode/toggle', methods=['POST'])
-        def api_nightmode_toggle():
+        @self.app.route('/api/autonomous/toggle', methods=['POST'])
+        def api_autonomous_toggle():
             """Toggle night mode on/off."""
             try:
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    result = self.minus.night_mode.toggle()
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    result = self.minus.autonomous_mode.toggle()
                     logger.info(f"[WebUI] Night mode toggled: enabled={result.get('enabled')}")
                     return jsonify(result)
                 return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
@@ -1672,12 +1672,12 @@ class WebUI:
                 logger.error(f"Error toggling night mode: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @self.app.route('/api/nightmode/start', methods=['POST'])
-        def api_nightmode_start():
+        @self.app.route('/api/autonomous/start', methods=['POST'])
+        def api_autonomous_start():
             """Start night mode immediately (manual override)."""
             try:
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    result = self.minus.night_mode.start_now()
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    result = self.minus.autonomous_mode.start_now()
                     logger.info("[WebUI] Night mode started immediately (manual)")
                     return jsonify(result)
                 return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
@@ -1685,21 +1685,21 @@ class WebUI:
                 logger.error(f"Error starting night mode: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @self.app.route('/api/nightmode/logs')
-        def api_nightmode_logs():
+        @self.app.route('/api/autonomous/logs')
+        def api_autonomous_logs():
             """Get autonomous mode logs."""
             try:
                 lines = int(request.args.get('lines', 50))
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    log_content = self.minus.night_mode.get_log_tail(lines)
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    log_content = self.minus.autonomous_mode.get_log_tail(lines)
                     return jsonify({'logs': log_content})
                 return jsonify({'logs': 'Autonomous mode not initialized'})
             except Exception as e:
                 logger.error(f"Error getting autonomous mode logs: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
-        @self.app.route('/api/nightmode/schedule', methods=['POST'])
-        def api_nightmode_schedule():
+        @self.app.route('/api/autonomous/schedule', methods=['POST'])
+        def api_autonomous_schedule():
             """Set autonomous mode schedule."""
             try:
                 data = request.get_json() or {}
@@ -1707,8 +1707,8 @@ class WebUI:
                 end_hour = int(data.get('end_hour', 8))
                 always_on = bool(data.get('always_on', False))
 
-                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
-                    result = self.minus.night_mode.set_schedule(start_hour, end_hour, always_on)
+                if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                    result = self.minus.autonomous_mode.set_schedule(start_hour, end_hour, always_on)
                     logger.info(f"[WebUI] Autonomous mode schedule set: {start_hour}:00-{end_hour}:00, always_on={always_on}")
                     return jsonify(result)
                 return jsonify({'success': False, 'error': 'Autonomous mode not initialized'}), 500

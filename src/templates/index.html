@@ -378,7 +378,7 @@
                 <div class="setting-item">
                     <span class="setting-label">Enable</span>
                     <label class="toggle-switch">
-                        <input type="checkbox" id="nightmode-toggle" onchange="toggleNightMode(this.checked)">
+                        <input type="checkbox" id="autonomous-toggle" onchange="toggleAutonomousMode(this.checked)">
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
@@ -416,17 +416,17 @@
                         </label>
                     </div>
                 </div>
-                <div class="nightmode-status" id="nightmode-status-info">
-                    <span class="status-text">Status: <span id="nightmode-status-text">Loading...</span></span>
-                    <span class="status-detail" id="nightmode-time-et"></span>
+                <div class="autonomous-status" id="autonomous-status-info">
+                    <span class="status-text">Status: <span id="autonomous-status-text">Loading...</span></span>
+                    <span class="status-detail" id="autonomous-time-et"></span>
                 </div>
-                <div class="nightmode-stats" id="nightmode-stats">
-                    <span id="nightmode-videos">Videos: --</span>
-                    <span id="nightmode-ads">Ads: --</span>
+                <div class="autonomous-stats" id="autonomous-stats">
+                    <span id="autonomous-videos">Videos: --</span>
+                    <span id="autonomous-ads">Ads: --</span>
                 </div>
                 <p class="help-text">Plays YouTube during scheduled hours to collect ad training data. Requires Fire TV.</p>
-                <div class="nightmode-actions">
-                    <button onclick="startNightModeNow()" class="action-btn" id="nightmode-start-btn">Start Now</button>
+                <div class="autonomous-actions">
+                    <button onclick="startAutonomousModeNow()" class="action-btn" id="autonomous-start-btn">Start Now</button>
                 </div>
             </section>
 
@@ -1158,41 +1158,41 @@
         // Night Mode Control
         // =========================================================================
 
-        async function toggleNightMode(enabled) {
-            const statusText = document.getElementById('nightmode-status-text');
+        async function toggleAutonomousMode(enabled) {
+            const statusText = document.getElementById('autonomous-status-text');
 
             try {
-                const endpoint = enabled ? '/api/nightmode/enable' : '/api/nightmode/disable';
+                const endpoint = enabled ? '/api/autonomous/enable' : '/api/autonomous/disable';
                 statusText.textContent = enabled ? 'Enabling...' : 'Disabling...';
 
                 const response = await fetch(endpoint, { method: 'POST' });
                 const data = await response.json();
 
                 if (data.enabled !== undefined) {
-                    updateNightModeUI(data);
+                    updateAutonomousModeUI(data);
                 } else {
                     statusText.textContent = 'Error: ' + (data.error || 'Unknown');
-                    document.getElementById('nightmode-toggle').checked = !enabled;
+                    document.getElementById('autonomous-toggle').checked = !enabled;
                 }
             } catch (error) {
                 statusText.textContent = 'Error';
-                document.getElementById('nightmode-toggle').checked = !enabled;
+                document.getElementById('autonomous-toggle').checked = !enabled;
                 console.error('Night mode toggle error:', error);
             }
         }
 
-        async function startNightModeNow() {
-            const btn = document.getElementById('nightmode-start-btn');
+        async function startAutonomousModeNow() {
+            const btn = document.getElementById('autonomous-start-btn');
             btn.disabled = true;
             btn.textContent = 'Starting...';
 
             try {
-                const response = await fetch('/api/nightmode/start', { method: 'POST' });
+                const response = await fetch('/api/autonomous/start', { method: 'POST' });
                 const data = await response.json();
 
                 if (data.active) {
                     btn.textContent = 'Running';
-                    updateNightModeUI(data);
+                    updateAutonomousModeUI(data);
                 } else {
                     btn.textContent = 'Start Now';
                 }
@@ -1207,25 +1207,25 @@
             }, 2000);
         }
 
-        async function updateNightModeStatus() {
+        async function updateAutonomousModeStatus() {
             try {
-                const response = await fetch('/api/nightmode');
+                const response = await fetch('/api/autonomous');
                 if (!response.ok) return;
 
                 const data = await response.json();
-                updateNightModeUI(data);
+                updateAutonomousModeUI(data);
             } catch (error) {
                 console.error('Night mode status fetch failed:', error);
             }
         }
 
-        function updateNightModeUI(data) {
-            const toggle = document.getElementById('nightmode-toggle');
-            const statusText = document.getElementById('nightmode-status-text');
-            const timeEt = document.getElementById('nightmode-time-et');
-            const videosEl = document.getElementById('nightmode-videos');
-            const adsEl = document.getElementById('nightmode-ads');
-            const startBtn = document.getElementById('nightmode-start-btn');
+        function updateAutonomousModeUI(data) {
+            const toggle = document.getElementById('autonomous-toggle');
+            const statusText = document.getElementById('autonomous-status-text');
+            const timeEt = document.getElementById('autonomous-time-et');
+            const videosEl = document.getElementById('autonomous-videos');
+            const adsEl = document.getElementById('autonomous-ads');
+            const startBtn = document.getElementById('autonomous-start-btn');
             const startHour = document.getElementById('auto-start-hour');
             const endHour = document.getElementById('auto-end-hour');
             const alwaysOn = document.getElementById('auto-always-on');
@@ -1279,7 +1279,7 @@
             const alwaysOn = document.getElementById('auto-always-on').checked;
 
             try {
-                const response = await fetch('/api/nightmode/schedule', {
+                const response = await fetch('/api/autonomous/schedule', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ start_hour: startHour, end_hour: endHour, always_on: alwaysOn })
@@ -2026,7 +2026,7 @@
         fetchColorSettings();
         updateFireTVStatus();
         updateVLMStatus();
-        updateNightModeStatus();
+        updateAutonomousModeStatus();
 
         setInterval(updateStatus, 1000);
         setInterval(updateStats, 2000);
@@ -2035,7 +2035,7 @@
         setInterval(updateAudioStatus, 2000);
         setInterval(updateFireTVStatus, 5000);
         setInterval(updateVLMStatus, 3000);
-        setInterval(updateNightModeStatus, 5000);
+        setInterval(updateAutonomousModeStatus, 5000);
     </script>
 </body>
 </html>

@@ -3,3 +3,7 @@ __pycache__/
 __pycache__
 *.log
 minus.log
+autonomous-mode-logs.md
+night-mode-logs.md
+night-shift-logs.md
+night-shift-monitor.sh
