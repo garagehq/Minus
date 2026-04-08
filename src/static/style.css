@@ -2216,3 +2216,48 @@ input:checked + .toggle-slider:before {
 .modal-content, .shortcuts-help, .system-footer, header, .tab-nav {
     transition: background-color 0.3s ease, border-color 0.3s ease, box-shadow 0.3s ease;
 }
+
+/* ==================== NIGHT MODE SECTION ==================== */
+.nightmode-status {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin: 0.5rem 0;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+}
+
+.nightmode-status .status-text {
+    font-size: 0.9rem;
+}
+
+.nightmode-status .status-detail {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.nightmode-status .status-active {
+    color: var(--accent);
+    font-weight: 600;
+}
+
+.nightmode-status .status-enabled {
+    color: var(--purple);
+}
+
+.nightmode-stats {
+    display: flex;
+    gap: 1rem;
+    margin: 0.5rem 0;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.nightmode-actions {
+    margin-top: 0.75rem;
+}
+
+.nightmode-actions .action-btn {
+    width: 100%;
+}

@@ -1614,6 +1614,90 @@ class WebUI:
                 logger.error(f"Error launching app: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
+        # =========================================================================
+        # Night Mode
+        # =========================================================================
+
+        @self.app.route('/api/nightmode')
+        def api_nightmode_status():
+            """Get night mode status."""
+            try:
+                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
+                    return jsonify(self.minus.night_mode.get_status())
+                return jsonify({
+                    'enabled': False,
+                    'active': False,
+                    'error': 'Night mode not initialized'
+                })
+            except Exception as e:
+                logger.error(f"Error getting night mode status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/nightmode/enable', methods=['POST'])
+        def api_nightmode_enable():
+            """Enable night mode (scheduled 12am-8am ET)."""
+            try:
+                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
+                    result = self.minus.night_mode.enable()
+                    logger.info("[WebUI] Night mode enabled")
+                    return jsonify(result)
+                return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error enabling night mode: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/nightmode/disable', methods=['POST'])
+        def api_nightmode_disable():
+            """Disable night mode."""
+            try:
+                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
+                    result = self.minus.night_mode.disable()
+                    logger.info("[WebUI] Night mode disabled")
+                    return jsonify(result)
+                return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error disabling night mode: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/nightmode/toggle', methods=['POST'])
+        def api_nightmode_toggle():
+            """Toggle night mode on/off."""
+            try:
+                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
+                    result = self.minus.night_mode.toggle()
+                    logger.info(f"[WebUI] Night mode toggled: enabled={result.get('enabled')}")
+                    return jsonify(result)
+                return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error toggling night mode: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/nightmode/start', methods=['POST'])
+        def api_nightmode_start():
+            """Start night mode immediately (manual override)."""
+            try:
+                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
+                    result = self.minus.night_mode.start_now()
+                    logger.info("[WebUI] Night mode started immediately (manual)")
+                    return jsonify(result)
+                return jsonify({'success': False, 'error': 'Night mode not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error starting night mode: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/nightmode/logs')
+        def api_nightmode_logs():
+            """Get night mode logs."""
+            try:
+                lines = int(request.args.get('lines', 50))
+                if hasattr(self.minus, 'night_mode') and self.minus.night_mode:
+                    log_content = self.minus.night_mode.get_log_tail(lines)
+                    return jsonify({'logs': log_content})
+                return jsonify({'logs': 'Night mode not initialized'})
+            except Exception as e:
+                logger.error(f"Error getting night mode logs: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
     def start(self):
         """Start the web server in a background thread."""
         if self.running:

@@ -163,6 +163,7 @@ except ImportError as e:
 # Import Fire TV Setup Manager
 try:
     from fire_tv_setup import FireTVSetupManager
+    from night_mode import NightMode
     HAS_FIRE_TV = True
 except ImportError as e:
     logger.warning(f"Fire TV module not available: {e}")
@@ -339,6 +340,9 @@ class Minus:
         self.fire_tv_setup = None
         self.fire_tv_controller = None
         self._fire_tv_setup_thread = None
+
+        # Night mode - automatic overnight YouTube playback for training data
+        self.night_mode = NightMode()
 
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
@@ -808,6 +812,11 @@ class Minus:
 
         # Add to detection history
         self.add_detection('FireTV', [f"Connected to {manufacturer} {model}"])
+
+        # Connect night mode to Fire TV controller
+        if self.night_mode:
+            self.night_mode.set_fire_tv(self.fire_tv_controller)
+            logger.info("[NightMode] Fire TV controller connected")
 
     def _check_ocr_for_fire_tv_dialog(self, ocr_results: list) -> bool:
         """
@@ -2220,6 +2229,11 @@ class Minus:
                 if self.system_notification:
                     self.system_notification.show_vlm_failed()
 
+        # Start night mode if it was enabled (persisted setting)
+        if self.night_mode:
+            self.night_mode.set_ad_blocker(self.ad_blocker)
+            self.night_mode.start_if_enabled()
+
         logger.info("Minus running - press Ctrl+C to stop")
 
         # Monitor ustreamer
@@ -2261,6 +2275,11 @@ class Minus:
         """Stop everything."""
         logger.info("Stopping...")
         self.running = False
+
+        # Stop night mode
+        if self.night_mode:
+            self.night_mode.destroy()
+            self.night_mode = None
 
         # Stop Fire TV setup first
         if self.fire_tv_setup:

@@ -372,6 +372,30 @@
                 <p class="help-text">Disabling VLM unloads the model from the Axera NPU to free memory. Re-enabling takes ~13 seconds to load.</p>
             </section>
 
+            <!-- Night Mode Settings -->
+            <section class="settings-section">
+                <h2>Night Mode</h2>
+                <div class="setting-item">
+                    <span class="setting-label">Enable Night Mode</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="nightmode-toggle" onchange="toggleNightMode(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="nightmode-status" id="nightmode-status-info">
+                    <span class="status-text">Status: <span id="nightmode-status-text">Loading...</span></span>
+                    <span class="status-detail" id="nightmode-time-et"></span>
+                </div>
+                <div class="nightmode-stats" id="nightmode-stats">
+                    <span id="nightmode-videos">Videos: --</span>
+                    <span id="nightmode-ads">Ads: --</span>
+                </div>
+                <p class="help-text">Automatically plays YouTube from 12am-8am ET to collect ad training data. Requires Fire TV connected.</p>
+                <div class="nightmode-actions">
+                    <button onclick="startNightModeNow()" class="action-btn" id="nightmode-start-btn">Start Now</button>
+                </div>
+            </section>
+
             <!-- Fire TV Settings -->
             <section class="settings-section">
                 <h2>Fire TV Settings</h2>
@@ -1093,6 +1117,116 @@
                 }
             } catch (error) {
                 console.error('Failed to get VLM status:', error);
+            }
+        }
+
+        // =========================================================================
+        // Night Mode Control
+        // =========================================================================
+
+        async function toggleNightMode(enabled) {
+            const statusText = document.getElementById('nightmode-status-text');
+
+            try {
+                const endpoint = enabled ? '/api/nightmode/enable' : '/api/nightmode/disable';
+                statusText.textContent = enabled ? 'Enabling...' : 'Disabling...';
+
+                const response = await fetch(endpoint, { method: 'POST' });
+                const data = await response.json();
+
+                if (data.enabled !== undefined) {
+                    updateNightModeUI(data);
+                } else {
+                    statusText.textContent = 'Error: ' + (data.error || 'Unknown');
+                    document.getElementById('nightmode-toggle').checked = !enabled;
+                }
+            } catch (error) {
+                statusText.textContent = 'Error';
+                document.getElementById('nightmode-toggle').checked = !enabled;
+                console.error('Night mode toggle error:', error);
+            }
+        }
+
+        async function startNightModeNow() {
+            const btn = document.getElementById('nightmode-start-btn');
+            btn.disabled = true;
+            btn.textContent = 'Starting...';
+
+            try {
+                const response = await fetch('/api/nightmode/start', { method: 'POST' });
+                const data = await response.json();
+
+                if (data.active) {
+                    btn.textContent = 'Running';
+                    updateNightModeUI(data);
+                } else {
+                    btn.textContent = 'Start Now';
+                }
+            } catch (error) {
+                console.error('Night mode start error:', error);
+                btn.textContent = 'Start Now';
+            }
+
+            setTimeout(() => {
+                btn.disabled = false;
+                btn.textContent = 'Start Now';
+            }, 2000);
+        }
+
+        async function updateNightModeStatus() {
+            try {
+                const response = await fetch('/api/nightmode');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                updateNightModeUI(data);
+            } catch (error) {
+                console.error('Night mode status fetch failed:', error);
+            }
+        }
+
+        function updateNightModeUI(data) {
+            const toggle = document.getElementById('nightmode-toggle');
+            const statusText = document.getElementById('nightmode-status-text');
+            const timeEt = document.getElementById('nightmode-time-et');
+            const videosEl = document.getElementById('nightmode-videos');
+            const adsEl = document.getElementById('nightmode-ads');
+            const startBtn = document.getElementById('nightmode-start-btn');
+
+            // Update toggle
+            toggle.checked = data.enabled;
+
+            // Update status text
+            if (data.active) {
+                statusText.textContent = 'Active (Running)';
+                statusText.className = 'status-active';
+                startBtn.textContent = 'Running...';
+                startBtn.disabled = true;
+            } else if (data.enabled) {
+                if (data.is_night_time) {
+                    statusText.textContent = 'Enabled (Waiting)';
+                } else {
+                    statusText.textContent = 'Enabled (Scheduled)';
+                }
+                statusText.className = 'status-enabled';
+                startBtn.textContent = 'Start Now';
+                startBtn.disabled = false;
+            } else {
+                statusText.textContent = 'Disabled';
+                statusText.className = '';
+                startBtn.textContent = 'Start Now';
+                startBtn.disabled = false;
+            }
+
+            // Update time display
+            if (data.current_time_et) {
+                timeEt.textContent = `Current: ${data.current_time_et} ET`;
+            }
+
+            // Update stats
+            if (data.stats) {
+                videosEl.textContent = `Videos: ${data.stats.videos_played || 0}`;
+                adsEl.textContent = `Ads: ${data.stats.ads_detected || 0}`;
             }
         }
 
@@ -1829,6 +1963,7 @@
         fetchColorSettings();
         updateFireTVStatus();
         updateVLMStatus();
+        updateNightModeStatus();
 
         setInterval(updateStatus, 1000);
         setInterval(updateStats, 2000);
@@ -1837,6 +1972,7 @@
         setInterval(updateAudioStatus, 2000);
         setInterval(updateFireTVStatus, 5000);
         setInterval(updateVLMStatus, 3000);
+        setInterval(updateNightModeStatus, 5000);
     </script>
 </body>
 </html>
