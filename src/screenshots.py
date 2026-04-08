@@ -3,6 +3,11 @@ Screenshot management for Minus.
 
 Handles saving screenshots for ad detection and VLM training data collection.
 Organizes screenshots into separate folders by type for easy training data preparation.
+
+Deduplication uses perceptual difference hashing (dHash):
+- Resize to 9x8 grayscale, compare adjacent pixels → 64-bit hash
+- Hamming distance < 10 bits = ~85% similar → skip as duplicate
+- Also rejects blank/black frames (mean brightness < 15)
 """
 
 import logging
@@ -11,8 +16,19 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
+
+# Dedup: max hamming distance to consider frames as duplicates (out of 64 bits)
+# 10 bits = ~84% similar, catches near-identical frames
+DHASH_THRESHOLD = 10
+
+# Reject frames with mean brightness below this (0-255)
+BLACK_FRAME_THRESHOLD = 15
+
+# Reject frames with std deviation below this (solid color)
+SOLID_FRAME_THRESHOLD = 10
 
 
 class ScreenshotManager:
@@ -48,12 +64,24 @@ class ScreenshotManager:
         self.vlm_spastic_count = 0
         self.static_count = 0
 
-        # Deduplication for ads (prevents saving same frame multiple times)
-        self.screenshot_hashes = set()
+        # Deduplication for ALL categories (prevents saving same/similar frames)
+        # Stores recent dHash values per category for near-duplicate detection
+        self._recent_hashes = {
+            'ads': [],
+            'non_ads': [],
+            'vlm_spastic': [],
+            'static': [],
+        }
+        self._max_hashes = 200  # Keep last N hashes per category
 
-        # Rate limiting - max 1 ad screenshot per 5 seconds to prevent flooding
-        self._last_ad_screenshot_time = 0
-        self._min_screenshot_interval = 5.0  # seconds
+        # Rate limiting per category
+        self._last_screenshot_time = {
+            'ads': 0,
+            'non_ads': 0,
+            'vlm_spastic': 0,
+            'static': 0,
+        }
+        self._min_screenshot_interval = 5.0  # seconds between saves
 
         # Ensure directories exist
         self.ads_dir.mkdir(parents=True, exist_ok=True)
@@ -61,42 +89,104 @@ class ScreenshotManager:
         self.vlm_spastic_dir.mkdir(parents=True, exist_ok=True)
         self.static_dir.mkdir(parents=True, exist_ok=True)
 
-    def compute_image_hash(self, frame):
-        """Compute a fast perceptual hash for deduplication.
+    def compute_dhash(self, frame):
+        """Compute a perceptual difference hash (dHash) for near-duplicate detection.
 
-        Resizes to 8x8 grayscale and hashes the bytes.
-        O(1) lookup in hash set, robust to minor variations.
+        Resizes to 9x8, compares adjacent pixels horizontally → 64-bit hash.
+        Similar images have low hamming distance even with minor variations
+        (compression artifacts, slight timing differences, UI changes).
         """
         try:
-            small = cv2.resize(frame, (8, 8), interpolation=cv2.INTER_AREA)
+            small = cv2.resize(frame, (9, 8), interpolation=cv2.INTER_AREA)
             if len(small.shape) == 3:
                 small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-            return hash(small.tobytes())
+            # Compare adjacent pixels: 1 if left > right, else 0
+            diff = small[:, 1:] > small[:, :-1]
+            # Pack into integer
+            return int(np.packbits(diff.flatten()).tobytes().hex(), 16)
         except Exception:
             return None
 
-    def save_ad_screenshot(self, frame, matched_keywords, all_texts):
-        """Save screenshot when ad detected (with deduplication and rate limiting)."""
+    @staticmethod
+    def _hamming_distance(h1, h2):
+        """Count differing bits between two hashes."""
+        return bin(h1 ^ h2).count('1')
+
+    def _is_near_duplicate(self, frame_hash, category):
+        """Check if a frame hash is a near-duplicate of any recent hash in this category."""
+        if frame_hash is None:
+            return False
+        for existing_hash in self._recent_hashes[category]:
+            if self._hamming_distance(frame_hash, existing_hash) < DHASH_THRESHOLD:
+                return True
+        return False
+
+    def _record_hash(self, frame_hash, category):
+        """Record a hash for future duplicate detection."""
+        if frame_hash is None:
+            return
+        hashes = self._recent_hashes[category]
+        hashes.append(frame_hash)
+        if len(hashes) > self._max_hashes:
+            del hashes[:len(hashes) - self._max_hashes]
+
+    @staticmethod
+    def _is_blank_frame(frame):
+        """Reject black, near-black, or solid-color frames.
+
+        Returns True if frame should be rejected.
+        """
+        try:
+            gray = frame
+            if len(frame.shape) == 3:
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            mean_val = np.mean(gray)
+            std_val = np.std(gray)
+            if mean_val < BLACK_FRAME_THRESHOLD:
+                return True  # Near-black
+            if std_val < SOLID_FRAME_THRESHOLD:
+                return True  # Solid color (including white/gray)
+            return False
+        except Exception:
+            return False
+
+    def _should_save(self, frame, category):
+        """Common gate for all screenshot saves: rate limit, blank reject, dedup.
+
+        Returns True if the frame should be saved.
+        """
         if frame is None:
-            return
+            logger.warning(f"[Screenshot] Cannot save {category} screenshot: no frame")
+            return False
 
-        # Rate limiting - prevent flooding during long ads
+        # Rate limiting
         now = time.time()
-        if now - self._last_ad_screenshot_time < self._min_screenshot_interval:
+        elapsed = now - self._last_screenshot_time[category]
+        if elapsed < self._min_screenshot_interval:
+            logger.debug(f"[Screenshot] Rate limited {category} (only {elapsed:.1f}s since last)")
+            return False
+
+        # Reject blank/black frames
+        if self._is_blank_frame(frame):
+            logger.info(f"[Screenshot] Rejected blank/black frame for {category}")
+            return False
+
+        # Near-duplicate check
+        frame_hash = self.compute_dhash(frame)
+        if self._is_near_duplicate(frame_hash, category):
+            logger.info(f"[Screenshot] Rejected near-duplicate for {category} (dHash match)")
+            return False
+
+        # All checks passed — record state
+        self._last_screenshot_time[category] = now
+        self._record_hash(frame_hash, category)
+        return True
+
+    def save_ad_screenshot(self, frame, matched_keywords, all_texts):
+        """Save screenshot when ad detected (with dedup, rate limiting, blank rejection)."""
+        if not self._should_save(frame, 'ads'):
             return
 
-        # Check for duplicate using perceptual hash
-        img_hash = self.compute_image_hash(frame)
-        if img_hash is not None and img_hash in self.screenshot_hashes:
-            return  # Skip duplicate
-
-        # Add hash to set (cap at 1000 entries to prevent unbounded memory growth)
-        if img_hash is not None:
-            if len(self.screenshot_hashes) >= 1000:
-                self.screenshot_hashes.clear()
-            self.screenshot_hashes.add(img_hash)
-
-        self._last_ad_screenshot_time = now
         self.ads_count += 1
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         filename = f"ad_{timestamp}_{self.ads_count:04d}.png"
@@ -118,8 +208,7 @@ class ScreenshotManager:
 
         Called when user pauses blocking, indicating a false positive.
         """
-        if frame is None:
-            logger.warning("[Screenshot] Cannot save non-ad screenshot: no frame")
+        if not self._should_save(frame, 'non_ads'):
             return
 
         try:
@@ -144,7 +233,7 @@ class ScreenshotManager:
         These screenshots represent still/static ads that should NOT trigger blocking
         (e.g., paused video with ad overlay, YouTube landing page with sponsored content).
         """
-        if frame is None:
+        if not self._should_save(frame, 'static'):
             return
 
         try:
@@ -168,7 +257,7 @@ class ScreenshotManager:
 
         This captures potential false positive cases where VLM was uncertain.
         """
-        if frame is None:
+        if not self._should_save(frame, 'vlm_spastic'):
             return
 
         try:

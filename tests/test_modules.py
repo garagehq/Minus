@@ -236,27 +236,48 @@ class TestScreenshots:
         assert manager.ads_dir.exists()
         assert manager.non_ads_dir.exists()
 
-    def test_compute_image_hash(self):
-        """Test image hash computation."""
+    def test_compute_dhash(self):
+        """Test perceptual difference hash computation."""
         if not HAS_NUMPY:
             return  # Skip if numpy not available
 
         from screenshots import ScreenshotManager
         manager = ScreenshotManager(base_dir=self.base_dir)
 
-        # Create a test image
-        test_image = np.zeros((100, 100, 3), dtype=np.uint8)
-        hash1 = manager.compute_image_hash(test_image)
+        # Realistic scenes
+        scene1 = np.random.RandomState(42).randint(30, 220, (480, 640, 3), dtype=np.uint8)
+        scene2 = np.random.RandomState(99).randint(30, 220, (480, 640, 3), dtype=np.uint8)
+
+        hash1 = manager.compute_dhash(scene1)
         assert hash1 is not None
 
         # Same image should have same hash
-        hash2 = manager.compute_image_hash(test_image)
+        hash2 = manager.compute_dhash(scene1)
         assert hash1 == hash2
 
-        # Different image should have different hash
-        different_image = np.ones((100, 100, 3), dtype=np.uint8) * 255
-        hash3 = manager.compute_image_hash(different_image)
-        assert hash1 != hash3
+        # Minor variant should be near-duplicate
+        variant = scene1.copy()
+        variant[10:30, 10:100] = 150
+        hash_v = manager.compute_dhash(variant)
+        assert manager._hamming_distance(hash1, hash_v) < 10
+
+        # Different scene should NOT be duplicate
+        hash3 = manager.compute_dhash(scene2)
+        assert manager._hamming_distance(hash1, hash3) > 10
+
+    def test_blank_frame_rejection(self):
+        """Test that black and solid-color frames are rejected."""
+        if not HAS_NUMPY:
+            return
+
+        from screenshots import ScreenshotManager
+        # Black frame
+        assert ScreenshotManager._is_blank_frame(np.zeros((100, 100, 3), dtype=np.uint8))
+        # Solid gray
+        assert ScreenshotManager._is_blank_frame(np.full((100, 100, 3), 128, dtype=np.uint8))
+        # Normal content should pass
+        normal = np.random.RandomState(1).randint(50, 200, (100, 100, 3), dtype=np.uint8)
+        assert not ScreenshotManager._is_blank_frame(normal)
 
     def test_save_ad_screenshot(self):
         """Test saving ad screenshot."""
