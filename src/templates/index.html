@@ -372,15 +372,49 @@
                 <p class="help-text">Disabling VLM unloads the model from the Axera NPU to free memory. Re-enabling takes ~13 seconds to load.</p>
             </section>
 
-            <!-- Night Mode Settings -->
+            <!-- Autonomous Mode Settings -->
             <section class="settings-section">
-                <h2>Night Mode</h2>
+                <h2>Autonomous Mode</h2>
                 <div class="setting-item">
-                    <span class="setting-label">Enable Night Mode</span>
+                    <span class="setting-label">Enable</span>
                     <label class="toggle-switch">
                         <input type="checkbox" id="nightmode-toggle" onchange="toggleNightMode(this.checked)">
                         <span class="toggle-slider"></span>
                     </label>
+                </div>
+                <div class="autonomous-schedule">
+                    <div class="schedule-row">
+                        <label class="schedule-label">Schedule:</label>
+                        <select id="auto-start-hour" onchange="updateAutonomousSchedule()">
+                            <option value="0">12 AM</option><option value="1">1 AM</option><option value="2">2 AM</option>
+                            <option value="3">3 AM</option><option value="4">4 AM</option><option value="5">5 AM</option>
+                            <option value="6">6 AM</option><option value="7">7 AM</option><option value="8">8 AM</option>
+                            <option value="9">9 AM</option><option value="10">10 AM</option><option value="11">11 AM</option>
+                            <option value="12">12 PM</option><option value="13">1 PM</option><option value="14">2 PM</option>
+                            <option value="15">3 PM</option><option value="16">4 PM</option><option value="17">5 PM</option>
+                            <option value="18">6 PM</option><option value="19">7 PM</option><option value="20">8 PM</option>
+                            <option value="21">9 PM</option><option value="22">10 PM</option><option value="23">11 PM</option>
+                        </select>
+                        <span class="schedule-to">to</span>
+                        <select id="auto-end-hour" onchange="updateAutonomousSchedule()">
+                            <option value="0">12 AM</option><option value="1">1 AM</option><option value="2">2 AM</option>
+                            <option value="3">3 AM</option><option value="4">4 AM</option><option value="5">5 AM</option>
+                            <option value="6">6 AM</option><option value="7">7 AM</option><option value="8" selected>8 AM</option>
+                            <option value="9">9 AM</option><option value="10">10 AM</option><option value="11">11 AM</option>
+                            <option value="12">12 PM</option><option value="13">1 PM</option><option value="14">2 PM</option>
+                            <option value="15">3 PM</option><option value="16">4 PM</option><option value="17">5 PM</option>
+                            <option value="18">6 PM</option><option value="19">7 PM</option><option value="20">8 PM</option>
+                            <option value="21">9 PM</option><option value="22">10 PM</option><option value="23">11 PM</option>
+                        </select>
+                        <span class="schedule-tz">ET</span>
+                    </div>
+                    <div class="setting-item">
+                        <span class="setting-label">24/7 Mode</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="auto-always-on" onchange="updateAutonomousSchedule()">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
                 </div>
                 <div class="nightmode-status" id="nightmode-status-info">
                     <span class="status-text">Status: <span id="nightmode-status-text">Loading...</span></span>
@@ -390,7 +424,7 @@
                     <span id="nightmode-videos">Videos: --</span>
                     <span id="nightmode-ads">Ads: --</span>
                 </div>
-                <p class="help-text">Automatically plays YouTube from 12am-8am ET to collect ad training data. Requires Fire TV connected.</p>
+                <p class="help-text">Plays YouTube during scheduled hours to collect ad training data. Requires Fire TV.</p>
                 <div class="nightmode-actions">
                     <button onclick="startNightModeNow()" class="action-btn" id="nightmode-start-btn">Start Now</button>
                 </div>
@@ -1192,9 +1226,17 @@
             const videosEl = document.getElementById('nightmode-videos');
             const adsEl = document.getElementById('nightmode-ads');
             const startBtn = document.getElementById('nightmode-start-btn');
+            const startHour = document.getElementById('auto-start-hour');
+            const endHour = document.getElementById('auto-end-hour');
+            const alwaysOn = document.getElementById('auto-always-on');
 
             // Update toggle
             toggle.checked = data.enabled;
+
+            // Update schedule dropdowns
+            if (data.start_hour !== undefined) startHour.value = data.start_hour;
+            if (data.end_hour !== undefined) endHour.value = data.end_hour;
+            if (data.always_on !== undefined) alwaysOn.checked = data.always_on;
 
             // Update status text
             if (data.active) {
@@ -1203,10 +1245,11 @@
                 startBtn.textContent = 'Running...';
                 startBtn.disabled = true;
             } else if (data.enabled) {
-                if (data.is_night_time) {
-                    statusText.textContent = 'Enabled (Waiting)';
+                if (data.is_scheduled_time) {
+                    statusText.textContent = 'Enabled (In Window)';
                 } else {
-                    statusText.textContent = 'Enabled (Scheduled)';
+                    const schedule = data.always_on ? '24/7' : data.schedule;
+                    statusText.textContent = `Enabled (${schedule})`;
                 }
                 statusText.className = 'status-enabled';
                 startBtn.textContent = 'Start Now';
@@ -1227,6 +1270,26 @@
             if (data.stats) {
                 videosEl.textContent = `Videos: ${data.stats.videos_played || 0}`;
                 adsEl.textContent = `Ads: ${data.stats.ads_detected || 0}`;
+            }
+        }
+
+        async function updateAutonomousSchedule() {
+            const startHour = parseInt(document.getElementById('auto-start-hour').value);
+            const endHour = parseInt(document.getElementById('auto-end-hour').value);
+            const alwaysOn = document.getElementById('auto-always-on').checked;
+
+            try {
+                const response = await fetch('/api/nightmode/schedule', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ start_hour: startHour, end_hour: endHour, always_on: alwaysOn })
+                });
+                const data = await response.json();
+                if (data.schedule) {
+                    console.log('Schedule updated:', data.schedule);
+                }
+            } catch (error) {
+                console.error('Failed to update schedule:', error);
             }
         }
 
