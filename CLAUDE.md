@@ -76,7 +76,8 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/ad_blocker.py` | GStreamer video pipeline, blocking API client |
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
-| `src/vlm.py` | FastVLM-1.5B on Axera NPU |
+| `src/vlm.py` | FastVLM-1.5B on Axera NPU (ad detection + custom queries) |
+| `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
 | `src/health.py` | Unified health monitor for all subsystems |
 | `src/webui.py` | Flask web UI for remote monitoring/control |
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
@@ -88,10 +89,12 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/v4l2.py` | V4L2 device probing (format, resolution) |
 | `src/config.py` | MinusConfig dataclass |
 | `src/capture.py` | UstreamerCapture class for snapshot capture |
-| `src/screenshots.py` | ScreenshotManager class with deduplication |
+| `src/screenshots.py` | ScreenshotManager with dHash dedup + blank rejection |
 | `src/skip_detection.py` | Skip button detection (regex patterns) |
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
-| `tests/test_modules.py` | Comprehensive test suite (242+ tests) |
+| `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
+| `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
+| `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
 | `install.sh` | Install as systemd service |
@@ -417,10 +420,17 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 **FastVLM-1.5B** on Axera LLM 8850 NPU:
 - Smarter than 0.5B with fewer false positives on streaming interfaces
-- **~0.9s** inference time
-- **~13s** model load time (once at startup)
+- **~0.9s** inference time for ad detection
+- **~1.0s** for custom queries (structured prompt)
+- **~13s** model load time (once at startup, with 3 retries)
 - Uses Python axengine + transformers tokenizer
 - Home screen detection provides additional safety net
+
+**Two inference modes:**
+- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification
+- `query_image(image_path, prompt)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification)
+
+Both modes share the same model and are serialized via `threading.Lock`.
 
 ```
 /home/radxa/axera_models/FastVLM-1.5B/
@@ -616,7 +626,14 @@ The health monitor (`src/health.py`) runs in a background thread and checks:
 - 30-second grace period before ustreamer health checks begin
 - Prevents false positives during VLM model loading
 
-**Graceful degradation:**
+**Graceful degradation (startup):**
+- OCR initialization: 3 retries with 2s delay, continues without OCR if all fail
+- VLM model loading: 3 retries with 5s delay, continues without VLM if all fail
+- Both failures are non-fatal — the system runs with whatever subsystems loaded
+- `ocr_ready` and `ocr_disabled` fields in `/api/status` (matching existing `vlm_ready`/`vlm_disabled`)
+- OCR status badge in web UI header: `OCR: Ready / Disabled / Failed`
+
+**Graceful degradation (runtime):**
 - If VLM fails 5+ times consecutively, switches to OCR-only mode
 - VLM restart is attempted after 30 seconds in background
 - OCR continues working independently
@@ -658,6 +675,14 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `POST /api/vlm/enable` - Re-enable VLM and load model
 - `POST /api/blocking/skip` - Trigger Fire TV skip button
 - `POST /api/audio/sync-reset` - Reset A/V sync (~300ms dropout)
+- `GET /api/autonomous` - Autonomous mode status
+- `POST /api/autonomous/enable` / `disable` / `toggle` / `start` - Control autonomous mode
+- `POST /api/autonomous/schedule` - Set schedule (start_hour, end_hour, always_on)
+- `GET /api/autonomous/logs` - Autonomous mode log entries
+- `GET /api/screenshots/review/<category>` - Unreviewed screenshots for swipe classification
+- `POST /api/screenshots/approve` - Mark screenshot as correctly labeled
+- `POST /api/screenshots/classify` - Move screenshot between categories
+- `POST /api/screenshots/undo` - Undo last review action
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
@@ -692,10 +717,88 @@ Test mode prevents the detection loop from canceling the blocking, allowing full
 Minus automatically collects training data for future VLM improvements, organized by type:
 
 **Screenshot directories:**
-- `screenshots/ads/` - OCR-detected ads (rate limited, hash dedup)
+- `screenshots/ads/` - OCR-detected ads
 - `screenshots/non_ads/` - User paused = false positives
 - `screenshots/vlm_spastic/` - VLM uncertainty cases (detected 2-5x then changed)
 - `screenshots/static/` - Static screen suppression
+
+**Screenshot Quality Filtering (all categories):**
+
+Every save goes through `_should_save()` which applies three layers of filtering:
+
+| Layer | What it catches | Threshold |
+|-------|----------------|-----------|
+| Rate limiting | Rapid-fire saves | 5s minimum between saves per category |
+| Blank rejection | Black/solid-color frames | Mean brightness < 15 or std dev < 10 |
+| dHash dedup | Near-duplicate frames | Hamming distance < 10 bits (~85% similar) |
+
+**dHash (Difference Hash):**
+- Resize frame to 9x8 grayscale, compare adjacent pixels → 64-bit hash
+- Two frames of the same ad with slightly different timestamps: hamming distance ~1-5
+- A genuinely different scene: hamming distance ~20-30
+- Keeps last 200 hashes per category for rolling dedup window
+
+**Screenshot Review System (Tinder-style):**
+
+The web UI includes a swipe-based review system for classifying screenshots:
+- Each screenshot tab (Ads, Non-Ads, VLM Spastic, Static) has a 👀 review button
+- Opens a full-screen modal with a 3-card visual stack
+- **Swipe right** (or arrow key) = approve / classify as ad
+- **Swipe left** (or arrow key) = reclassify / classify as not ad
+- **Undo** (Ctrl+Z or button) reverses the last action
+- Progress tracked in `/home/radxa/.minus_reviewed_screenshots.json` — shows oldest unreviewed first
+
+| Category | Swipe Right | Swipe Left |
+|----------|-------------|------------|
+| Ads | Approved (correct) | Move to Non-Ads |
+| Non-Ads | Approved (correct) | Move to Ads |
+| VLM Spastic | Move to Ads | Move to Non-Ads |
+| Static | Move to Ads | Move to Non-Ads |
+
+**Review API:**
+- `GET /api/screenshots/review/<category>` - Unreviewed items, oldest first
+- `POST /api/screenshots/approve` - Mark as correctly labeled
+- `POST /api/screenshots/classify` - Move between categories
+- `POST /api/screenshots/undo` - Undo last action
+
+## Autonomous Mode
+
+Autonomous Mode keeps YouTube playing on Fire TV during scheduled hours so Minus can collect ad detection training data unattended. Uses VLM to understand screen state and take intelligent actions.
+
+**How it works:**
+1. **Schedule** — Configurable start/end hours (e.g., 22:00–06:00), or 24/7 mode
+2. **VLM-guided keepalive** — Every 2 minutes, captures a frame and asks VLM to classify the screen state
+3. **Smart actions** — Based on VLM response, takes the minimum necessary action:
+
+| VLM Response | Action | Command |
+|-------------|--------|---------|
+| PLAYING | None | Video is fine |
+| PAUSED | Play | `play_pause` key |
+| DIALOG | Dismiss | `select` + `play_pause` |
+| MENU | Select video | `down` + `select` |
+| SCREENSAVER | Wake + launch | `wakeup` + launch YouTube |
+
+**VLM Screen Query Prompt:**
+```
+Look at this TV screen and classify it into exactly one category.
+Answer with ONLY one of these words:
+PLAYING, PAUSED, DIALOG, MENU, SCREENSAVER
+```
+This structured prompt returns in ~1.0s (vs 5-22s with descriptive prompts).
+
+**Settings persistence:** `/home/radxa/.minus_autonomous_mode.json`
+```json
+{"enabled": true, "start_hour": 22, "end_hour": 6, "always_on": false}
+```
+
+**API endpoints:**
+- `GET /api/autonomous` - Current status (active, schedule, stats)
+- `POST /api/autonomous/enable` / `disable` / `toggle`
+- `POST /api/autonomous/start` - Start immediately (manual override)
+- `POST /api/autonomous/schedule` - Set hours and always_on flag
+- `GET /api/autonomous/logs` - Recent log entries
+
+**Web UI:** Toggle button, schedule time selectors, 24/7 checkbox, stats display in Settings tab.
 
 ## Fire TV Remote Control
 
@@ -862,10 +965,9 @@ The project includes a comprehensive test suite for all extracted modules.
 
 **Running Tests:**
 ```bash
-python3 tests/test_modules.py  # 242+ tests
-
-# Or with pytest (if installed)
-python3 -m pytest tests/test_modules.py -v
+python3 tests/test_modules.py            # 300+ unit tests
+python3 tests/test_autonomous_mode.py    # Autonomous mode tests
+python3 tests/test_review_ui.py          # Playwright UI tests (requires chromium)
 ```
 
 **Test Coverage:**
@@ -907,12 +1009,20 @@ python3 -m pytest tests/test_modules.py -v
 | Concurrency | TestConcurrency | Thread safety, locks |
 | Vocabulary | TestVocabulary, TestVocabularyContent | Format, content, duplicates |
 | API Responses | TestAPIResponseFormats | Consistent response structure |
+| `src/vlm.py` | TestVLMQueryImage | Custom prompt queries, error paths |
+| `src/ocr.py` | TestOCRResilience | NPU failure handling, graceful degradation |
+| `src/screenshots.py` | TestScreenshotDedup | dHash, blank rejection, rate limiting, per-category |
+| Memory | TestMemoryManagement | Hash buffer caps, resource cleanup |
+| HDCP | TestHDCPHandling | Encrypted frame handling, blank frame rejection |
+| `src/autonomous_mode.py` | TestAutonomousMode | Schedule, VLM actions, state, persistence (separate file) |
+| Review UI | TestReviewModal* | Playwright: desktop/mobile swipe, modal, API (separate file) |
 
 **Test Design:**
 - Tests are self-contained with temporary directories
 - Mock subprocess calls to avoid system dependencies
 - Fallback to manual test runner if pytest not installed
-- All 242+ tests should pass on a clean system
+- All 300+ tests should pass on a clean system
+- Playwright tests require chromium: `python3 -m playwright install chromium`
 
 ## Module Structure
 

@@ -52,6 +52,16 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 - Skip button detection via OCR
 - Guided setup flow with overlay notifications
 
+### Autonomous Mode
+
+**VLM-Guided YouTube Playback:**
+- Configurable schedule (start/end hours, or 24/7 mode)
+- VLM screen state classification every 2 minutes (PLAYING/PAUSED/DIALOG/MENU/SCREENSAVER)
+- Smart actions: only intervenes when needed (play, dismiss dialog, select video, wake device)
+- Stats tracking: videos played, ads detected, ads skipped, session duration
+- Settings persist across restarts (`/home/radxa/.minus_autonomous_mode.json`)
+- Web UI controls: toggle, schedule time selectors, 24/7 checkbox
+
 **Commands:**
 - Navigation: up, down, left, right, select, back, home
 - Media: play, pause, fast_forward, rewind
@@ -89,6 +99,12 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 - Memory monitoring with cleanup
 - VLM degradation to OCR-only mode
 
+**Graceful Degradation:**
+- OCR init: 3 retries with 2s delay, continues without OCR if all fail
+- VLM model load: 3 retries with 5s delay, continues without VLM if all fail
+- OCR + VLM status badges in web UI (Ready/Disabled/Failed)
+- System continues running with whatever subsystems loaded
+
 **Status Tracking:**
 - FPS monitoring (logged every 60s)
 - Full status logged every 5 minutes
@@ -117,11 +133,22 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 - `screenshots/vlm_spastic/` - VLM uncertainty cases
 - `screenshots/static/` - Static screen suppression
 
-**Features:**
-- Hash-based deduplication
-- Rate limiting
-- Configurable max screenshots per folder
-- Automatic truncation
+**Quality Filtering (all categories):**
+- dHash perceptual deduplication (hamming distance < 10 bits = ~85% similar)
+- Black/blank frame rejection (mean brightness < 15)
+- Solid-color frame rejection (std deviation < 10)
+- Rate limiting (5s minimum between saves per category)
+- Rolling dedup window (last 200 hashes per category)
+- Configurable max screenshots per folder with automatic truncation
+
+**Review System (Tinder-style):**
+- Swipe-based screenshot classification in web UI
+- Per-category review buttons (Ads, Non-Ads, VLM Spastic, Static)
+- Swipe right = approve/classify as ad, swipe left = reclassify/not ad
+- 3-card visual stack with fly-out animations
+- Progress tracking (oldest unreviewed first)
+- Undo support (Ctrl+Z)
+- Keyboard shortcuts (arrow keys, Escape)
 
 ## Configuration
 

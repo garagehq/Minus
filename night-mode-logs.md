@@ -1,7 +1,0 @@
-- [2026-04-07 23:31:27 ET] Night mode ENABLED (scheduled)
-- [2026-04-07 23:32:30 ET] Night mode DISABLED
-- [2026-04-07 23:32:51 ET] Night mode ENABLED (scheduled)
-- [2026-04-07 23:32:57 ET] Night mode DISABLED
-- [2026-04-07 23:33:28 ET] Night mode ENABLED (scheduled)
-- [2026-04-07 23:33:35 ET] Night mode DISABLED
-- [2026-04-07 23:34:05 ET] Night mode ENABLED (scheduled)

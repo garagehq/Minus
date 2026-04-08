@@ -68,7 +68,8 @@
 | Fire TV Setup | `src/fire_tv_setup.py` | Auto-setup flow |
 | Overlay | `src/overlay.py` | Notification overlays |
 | Vocabulary | `src/vocabulary.py` | Spanish vocabulary list |
-| Screenshots | `src/screenshots.py` | Training data collection |
+| Screenshots | `src/screenshots.py` | Training data with dHash dedup |
+| Autonomous Mode | `src/autonomous_mode.py` | VLM-guided YouTube playback |
 | Skip Detection | `src/skip_detection.py` | Skip button detection |
 | Config | `src/config.py` | Configuration dataclass |
 | Capture | `src/capture.py` | Snapshot capture |
@@ -122,6 +123,7 @@ audiotestsrc ───────┘
 | Video Watchdog | Detect pipeline stalls | 3s |
 | Audio Watchdog | Detect audio stalls | 3s |
 | Fire TV Keepalive | Maintain ADB connection | 5min |
+| Autonomous Mode | VLM screen check + keepalive | 60s check, 2min VLM |
 
 ### Thread Safety
 
@@ -135,6 +137,7 @@ audiotestsrc ───────┘
 | `health.py` | `_status_lock` | Health status updates |
 | `capture.py` | `_capture_lock` | Rate limiting between workers |
 | `capture.py` | `_session_lock` | HTTP session creation |
+| `autonomous_mode.py` | `_lock` | Active state, schedule, settings |
 
 **Thread-Safe Patterns:**
 
@@ -207,6 +210,13 @@ The capture module uses a global lock to prevent HTTP contention:
 | `/api/firetv/status` | GET | Fire TV status |
 | `/api/firetv/command` | POST | Send Fire TV command |
 | `/api/blocking/skip` | POST | Trigger Fire TV skip |
+| `/api/autonomous` | GET | Autonomous mode status |
+| `/api/autonomous/enable` | POST | Enable autonomous mode |
+| `/api/autonomous/schedule` | POST | Set schedule |
+| `/api/screenshots/review/<cat>` | GET | Unreviewed screenshots |
+| `/api/screenshots/classify` | POST | Move between categories |
+| `/api/screenshots/approve` | POST | Mark as reviewed |
+| `/api/screenshots/undo` | POST | Undo last action |
 
 ## Configuration
 
