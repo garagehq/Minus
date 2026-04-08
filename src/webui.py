@@ -17,9 +17,11 @@ Features:
 - Configuration management
 """
 
+import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -27,6 +29,9 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request, Response, send_from_directory
 import requests
+
+# Reviewed screenshots tracking
+REVIEWED_FILE = Path("/home/radxa/.minus_reviewed_screenshots.json")
 
 logger = logging.getLogger('Minus.WebUI')
 
@@ -48,6 +53,11 @@ class WebUI:
         self.ustreamer_port = ustreamer_port
         self.server_thread = None
         self.running = False
+
+        # Screenshot review state
+        self._reviewed = set()
+        self._undo_stack = []  # [{action, filename, source, target}]
+        self._load_reviewed()
 
         # Create Flask app
         self.app = Flask(
@@ -528,6 +538,146 @@ class WebUI:
             except Exception as e:
                 logger.error(f"Error serving screenshot: {e}")
                 return Response(status=404)
+
+        # =========================================================================
+        # Screenshot Review (Tinder-style classification)
+        # =========================================================================
+
+        @self.app.route('/api/screenshots/review/<category>')
+        def api_screenshots_review(category):
+            """Get unreviewed screenshots for swipe classification.
+
+            Returns oldest-first, skipping already-reviewed items.
+            """
+            try:
+                valid = {'ads', 'non_ads', 'vlm_spastic', 'static'}
+                if category not in valid:
+                    return jsonify({'error': 'Invalid category'}), 400
+
+                screenshots_dir = Path(__file__).parent.parent / 'screenshots' / category
+                if not screenshots_dir.exists():
+                    return jsonify({'items': [], 'total': 0, 'unreviewed': 0, 'reviewed_count': 0})
+
+                all_files = sorted(screenshots_dir.glob('*.png'), key=lambda x: x.stat().st_mtime)
+                total = len(all_files)
+                unreviewed = [f for f in all_files if f.name not in self._reviewed]
+
+                # Return up to 200 items (lazy-load images on frontend)
+                items = [{
+                    'name': f.name,
+                    'path': f'/api/screenshots/{category}/{f.name}',
+                } for f in unreviewed[:200]]
+
+                return jsonify({
+                    'items': items,
+                    'total': total,
+                    'unreviewed': len(unreviewed),
+                    'reviewed_count': total - len(unreviewed),
+                })
+            except Exception as e:
+                logger.error(f"Error listing review screenshots: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/screenshots/classify', methods=['POST'])
+        def api_screenshots_classify():
+            """Reclassify a screenshot (move between categories)."""
+            try:
+                data = request.get_json() or {}
+                filename = data.get('filename')
+                source = data.get('source')
+                target = data.get('target')
+
+                valid_sources = {'ads', 'non_ads', 'vlm_spastic', 'static'}
+                valid_targets = {'ads', 'non_ads'}
+                if source not in valid_sources or target not in valid_targets:
+                    return jsonify({'error': 'Invalid source or target'}), 400
+                if not filename or '..' in filename or '/' in filename:
+                    return jsonify({'error': 'Invalid filename'}), 400
+
+                base = Path(__file__).parent.parent / 'screenshots'
+                source_path = base / source / filename
+                if not source_path.exists():
+                    return jsonify({'error': 'File not found'}), 404
+
+                target_path = base / target / filename
+                # Handle filename collision
+                if target_path.exists():
+                    stem = target_path.stem
+                    target_path = base / target / f"{stem}_reclassified.png"
+
+                shutil.move(str(source_path), str(target_path))
+
+                self._reviewed.add(target_path.name)
+                self._save_reviewed()
+
+                self._undo_stack.append({
+                    'action': 'classify',
+                    'original_name': filename,
+                    'new_name': target_path.name,
+                    'source': source,
+                    'target': target,
+                })
+
+                return jsonify({'success': True, 'moved_to': target, 'new_name': target_path.name})
+            except Exception as e:
+                logger.error(f"Error classifying screenshot: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/screenshots/approve', methods=['POST'])
+        def api_screenshots_approve():
+            """Mark a screenshot as correctly classified (reviewed)."""
+            try:
+                data = request.get_json() or {}
+                filename = data.get('filename')
+                category = data.get('category')
+
+                if not filename or not category:
+                    return jsonify({'error': 'Missing filename or category'}), 400
+
+                base = Path(__file__).parent.parent / 'screenshots'
+                path = base / category / filename
+                if not path.exists():
+                    return jsonify({'error': 'File not found'}), 404
+
+                self._reviewed.add(filename)
+                self._save_reviewed()
+
+                self._undo_stack.append({
+                    'action': 'approve',
+                    'original_name': filename,
+                    'category': category,
+                })
+
+                return jsonify({'success': True})
+            except Exception as e:
+                logger.error(f"Error approving screenshot: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/screenshots/undo', methods=['POST'])
+        def api_screenshots_undo():
+            """Undo the last review action."""
+            try:
+                if not self._undo_stack:
+                    return jsonify({'error': 'Nothing to undo'}), 400
+
+                last = self._undo_stack.pop()
+                base = Path(__file__).parent.parent / 'screenshots'
+
+                if last['action'] == 'classify':
+                    current = base / last['target'] / last['new_name']
+                    original = base / last['source'] / last['original_name']
+                    if current.exists():
+                        shutil.move(str(current), str(original))
+                    self._reviewed.discard(last['new_name'])
+                    self._save_reviewed()
+                elif last['action'] == 'approve':
+                    self._reviewed.discard(last['original_name'])
+                    self._save_reviewed()
+
+                return jsonify({'success': True, 'undone': last})
+            except Exception as e:
+                logger.error(f"Error undoing action: {e}")
+                return jsonify({'error': str(e)}), 500
 
         # =========================================================================
         # Debug Snapshot (Screenshot + Logs)
@@ -1715,6 +1865,25 @@ class WebUI:
             except Exception as e:
                 logger.error(f"Error setting autonomous mode schedule: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
+
+    def _load_reviewed(self):
+        """Load reviewed screenshots set from disk."""
+        try:
+            if REVIEWED_FILE.exists():
+                with open(REVIEWED_FILE) as f:
+                    self._reviewed = set(json.load(f))
+                logger.info(f"[WebUI] Loaded {len(self._reviewed)} reviewed screenshots")
+        except Exception as e:
+            logger.warning(f"[WebUI] Could not load reviewed screenshots: {e}")
+            self._reviewed = set()
+
+    def _save_reviewed(self):
+        """Save reviewed screenshots set to disk."""
+        try:
+            with open(REVIEWED_FILE, 'w') as f:
+                json.dump(sorted(self._reviewed), f)
+        except Exception as e:
+            logger.warning(f"[WebUI] Could not save reviewed screenshots: {e}")
 
     def start(self):
         """Start the web server in a background thread."""

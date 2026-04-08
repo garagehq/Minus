@@ -245,9 +245,13 @@
                 <h2>Screenshots</h2>
                 <div class="screenshot-tabs">
                     <button class="tab-btn active" onclick="showScreenshotTab('ads')">Ads</button>
+                    <button class="review-btn" onclick="openReviewModal('ads')" title="Review Ads">👀</button>
                     <button class="tab-btn" onclick="showScreenshotTab('non_ads')">Non-Ads</button>
+                    <button class="review-btn" onclick="openReviewModal('non_ads')" title="Review Non-Ads">👀</button>
                     <button class="tab-btn" onclick="showScreenshotTab('vlm_spastic')">VLM Spastic</button>
+                    <button class="review-btn" onclick="openReviewModal('vlm_spastic')" title="Review VLM Spastic">👀</button>
                     <button class="tab-btn" onclick="showScreenshotTab('static')">Static</button>
+                    <button class="review-btn" onclick="openReviewModal('static')" title="Review Static">👀</button>
                     <button class="tab-btn debug-tab" onclick="showScreenshotTab('debug')">📷 Debug</button>
                 </div>
                 <div id="screenshots-grid" class="screenshots-grid">
@@ -2049,6 +2053,248 @@
         setInterval(updateFireTVStatus, 5000);
         setInterval(updateVLMStatus, 3000);
         setInterval(updateAutonomousModeStatus, 5000);
+    // =========================================================================
+    // Screenshot Review Modal (Tinder-style swipe classification)
+    // =========================================================================
+
+    const REVIEW_CONFIGS = {
+        ads:          { rightLabel: 'CORRECT',    leftLabel: 'NOT AD',     rightAction: 'approve', leftTarget: 'non_ads' },
+        non_ads:      { rightLabel: 'CORRECT',    leftLabel: 'IS AN AD',   rightAction: 'approve', leftTarget: 'ads' },
+        vlm_spastic:  { rightLabel: 'AD',         leftLabel: 'NOT AD',     rightAction: 'classify_ads', leftTarget: 'non_ads' },
+        static:       { rightLabel: 'AD',         leftLabel: 'NOT AD',     rightAction: 'classify_ads', leftTarget: 'non_ads' },
+    };
+
+    let reviewItems = [];
+    let reviewIndex = 0;
+    let reviewCategory = '';
+    let reviewConfig = {};
+    let reviewStats = { right: 0, left: 0 };
+
+    async function openReviewModal(category) {
+        reviewCategory = category;
+        reviewConfig = REVIEW_CONFIGS[category];
+        reviewIndex = 0;
+        reviewStats = { right: 0, left: 0 };
+
+        const resp = await fetch(`/api/screenshots/review/${category}`);
+        const data = await resp.json();
+        reviewItems = data.items || [];
+
+        const modal = document.getElementById('review-modal');
+        const counter = document.getElementById('review-counter');
+        const info = document.getElementById('review-info');
+
+        if (reviewItems.length === 0) {
+            info.textContent = `All ${data.total} screenshots reviewed!`;
+            info.style.display = 'block';
+        } else {
+            info.textContent = `${data.reviewed_count} already reviewed`;
+            info.style.display = data.reviewed_count > 0 ? 'block' : 'none';
+        }
+
+        // Update hint labels
+        document.getElementById('hint-left-label').textContent = reviewConfig.leftLabel;
+        document.getElementById('hint-right-label').textContent = reviewConfig.rightLabel;
+
+        modal.classList.add('open');
+        renderReviewStack();
+        updateReviewCounter();
+    }
+
+    function closeReviewModal() {
+        document.getElementById('review-modal').classList.remove('open');
+        // Refresh screenshot grid
+        loadScreenshots();
+    }
+
+    function updateReviewCounter() {
+        const counter = document.getElementById('review-counter');
+        if (reviewItems.length === 0) {
+            counter.textContent = 'No items to review';
+        } else {
+            counter.textContent = `${reviewIndex + 1} of ${reviewItems.length}`;
+        }
+        document.getElementById('review-category-label').textContent =
+            reviewCategory.replace('_', ' ').replace('vlm spastic', 'VLM Spastic');
+    }
+
+    function renderReviewStack() {
+        const container = document.getElementById('review-stack');
+        container.innerHTML = '';
+
+        if (reviewIndex >= reviewItems.length) {
+            // Done!
+            container.innerHTML = `
+                <div class="review-done">
+                    <div class="review-done-icon">&#10003;</div>
+                    <h3>Review Complete!</h3>
+                    <p>${reviewStats.right} approved, ${reviewStats.left} reclassified</p>
+                </div>`;
+            return;
+        }
+
+        // Render up to 3 cards (active + 2 behind)
+        for (let i = 0; i < 3 && (reviewIndex + i) < reviewItems.length; i++) {
+            const item = reviewItems[reviewIndex + i];
+            const card = document.createElement('div');
+            card.className = 'review-card' + (i > 0 ? ` stack-${i}` : '');
+            card.innerHTML = `
+                <div class="review-card-header">
+                    <span class="review-card-name">${item.name}</span>
+                </div>
+                <div class="review-card-image">
+                    <img src="${item.path}" alt="${item.name}" draggable="false">
+                </div>
+                <div class="review-stamp review-stamp-right" id="${i === 0 ? 'stamp-right' : ''}">${reviewConfig.rightLabel}</div>
+                <div class="review-stamp review-stamp-left" id="${i === 0 ? 'stamp-left' : ''}">${reviewConfig.leftLabel}</div>
+            `;
+            container.appendChild(card);
+
+            if (i === 0) {
+                attachSwipeHandlers(card);
+            }
+        }
+    }
+
+    function attachSwipeHandlers(card) {
+        let startX = 0, currentX = 0;
+        let isDragging = false;
+        const THRESHOLD = Math.min(window.innerWidth * 0.2, 80);
+
+        function onStart(e) {
+            const touch = e.touches ? e.touches[0] : e;
+            startX = currentX = touch.clientX;
+            isDragging = true;
+            card.style.transition = 'none';
+        }
+
+        function onMove(e) {
+            if (!isDragging) return;
+            const touch = e.touches ? e.touches[0] : e;
+            currentX = touch.clientX;
+            const dx = currentX - startX;
+            e.preventDefault();
+
+            const rotation = Math.min(Math.max(dx / 20, -15), 15);
+            card.style.transform = `translateX(${dx}px) rotate(${rotation}deg)`;
+
+            // Stamp feedback
+            const progress = Math.min(Math.abs(dx) / THRESHOLD, 1);
+            const rightStamp = card.querySelector('.review-stamp-right');
+            const leftStamp = card.querySelector('.review-stamp-left');
+            rightStamp.style.opacity = dx > 20 ? progress : 0;
+            leftStamp.style.opacity = dx < -20 ? progress : 0;
+
+            // Glow
+            card.classList.toggle('glow-right', dx > THRESHOLD);
+            card.classList.toggle('glow-left', dx < -THRESHOLD);
+        }
+
+        function onEnd() {
+            if (!isDragging) return;
+            isDragging = false;
+            const dx = currentX - startX;
+
+            if (dx > THRESHOLD) {
+                completeSwipe('right');
+            } else if (dx < -THRESHOLD) {
+                completeSwipe('left');
+            } else {
+                // Snap back
+                card.style.transition = 'transform 0.3s ease';
+                card.style.transform = '';
+                card.querySelector('.review-stamp-right').style.opacity = 0;
+                card.querySelector('.review-stamp-left').style.opacity = 0;
+                card.classList.remove('glow-right', 'glow-left');
+            }
+        }
+
+        card.addEventListener('touchstart', onStart, { passive: true });
+        card.addEventListener('touchmove', onMove, { passive: false });
+        card.addEventListener('touchend', onEnd);
+        card.addEventListener('mousedown', onStart);
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onEnd);
+    }
+
+    async function completeSwipe(direction) {
+        const card = document.querySelector('.review-card:not(.stack-1):not(.stack-2)');
+        if (!card) return;
+
+        const item = reviewItems[reviewIndex];
+        card.classList.add(`fly-${direction}`);
+
+        if (direction === 'right') {
+            reviewStats.right++;
+            if (reviewConfig.rightAction === 'approve') {
+                await fetch('/api/screenshots/approve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: item.name, category: reviewCategory })
+                });
+            } else {
+                // classify_ads - move to ads
+                await fetch('/api/screenshots/classify', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ filename: item.name, source: reviewCategory, target: 'ads' })
+                });
+            }
+        } else {
+            reviewStats.left++;
+            await fetch('/api/screenshots/classify', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filename: item.name, source: reviewCategory, target: reviewConfig.leftTarget })
+            });
+        }
+
+        reviewIndex++;
+        setTimeout(() => {
+            renderReviewStack();
+            updateReviewCounter();
+        }, 350);
+    }
+
+    async function undoReview() {
+        const resp = await fetch('/api/screenshots/undo', { method: 'POST' });
+        const data = await resp.json();
+        if (data.success && reviewIndex > 0) {
+            reviewIndex--;
+            if (data.undone.action === 'classify') reviewStats.left--;
+            else reviewStats.right--;
+            renderReviewStack();
+            updateReviewCounter();
+        }
+    }
+
+    // Keyboard shortcuts for review modal
+    document.addEventListener('keydown', (e) => {
+        const modal = document.getElementById('review-modal');
+        if (!modal || !modal.classList.contains('open')) return;
+        if (e.key === 'Escape') closeReviewModal();
+        if (e.key === 'ArrowRight') completeSwipe('right');
+        if (e.key === 'ArrowLeft') completeSwipe('left');
+        if (e.key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undoReview(); }
+    });
     </script>
+
+    <!-- Review Modal -->
+    <div id="review-modal" class="review-modal">
+        <div class="review-modal-header">
+            <span id="review-category-label" class="review-category-label"></span>
+            <span id="review-counter" class="review-counter"></span>
+            <div class="review-modal-actions">
+                <button onclick="undoReview()" class="review-undo-btn" title="Undo (Ctrl+Z)">&#8630; Undo</button>
+                <button onclick="closeReviewModal()" class="review-close-btn">&times;</button>
+            </div>
+        </div>
+        <div id="review-info" class="review-info" style="display:none"></div>
+        <div id="review-stack" class="review-stack"></div>
+        <div class="review-hints">
+            <span class="hint-left">&larr; <span id="hint-left-label">Reclassify</span></span>
+            <span class="hint-right"><span id="hint-right-label">Approve</span> &rarr;</span>
+        </div>
+    </div>
 </body>
 </html>
