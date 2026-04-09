@@ -191,10 +191,13 @@ achieves ~60fps on 4K input with minimal CPU usage.
 
 **Dynamic Format Detection:**
 Minus automatically probes the V4L2 device to detect its current format and resolution. Supported formats:
-- **NV12** - RK3588 HDMI-RX native (uses MPP hardware encoder)
-- **BGR24/BGR3** - Some HDMI devices (uses standard ustreamer BGR24 support)
+- **NV12** - RK3588 HDMI-RX native (uses MPP hardware encoder directly)
+- **NV24** - Some devices like Roku (converted to NV12 for MPP, ~60fps)
+- **BGR24/BGR3** - Google TV and similar devices (converted to NV12 for MPP, ~42fps at 4K)
 - **YUYV/UYVY** - Webcam-style devices
 - **MJPEG** - Pre-compressed JPEG sources
+
+Format conversions (NV24→NV12, BGR24→NV12) are done in software in the MPP encoder before hardware JPEG encoding.
 
 **Performance comparison (4K HDMI input):**
 
@@ -231,8 +234,8 @@ cp ustreamer /home/radxa/ustreamer-patched
 ```
 
 **Key changes in garagehq/ustreamer:**
-- `src/ustreamer/encoders/mpp/encoder.c` - MPP hardware JPEG encoder with cache sync, blocking composite
-- `src/libs/capture.c` - NV12/NV16/NV24 format support, extended timeouts
+- `src/ustreamer/encoders/mpp/encoder.c` - MPP hardware JPEG encoder with cache sync, blocking composite, NV24→NV12 and BGR24→NV12 format conversion
+- `src/libs/capture.c` - NV12/NV16/NV24/BGR24 format support, extended timeouts
 - `src/libs/blocking.c` - FreeType text rendering, NV12 compositing, thread-safe mutex
 - `src/ustreamer/http/server.c` - Blocking API endpoints (`/blocking`, `/blocking/set`, `/blocking/background`)
 - `src/ustreamer/encoder.c` - MPP encoder integration, multi-worker support
