@@ -883,6 +883,19 @@ The Remote tab provides a device selector where users can:
 - `POST /api/firetv/connect` - Connect to Fire TV by IP
 - `POST /api/firetv/command` - Send remote command
 
+**Google TV / Android TV API Endpoints:**
+- `GET /api/googletv/status` - Connection status
+- `GET /api/googletv/scan` - Scan network for devices (port 5555)
+- `POST /api/googletv/connect` - Connect by IP:PORT (Wireless debugging uses dynamic port)
+- `POST /api/googletv/command` - Send remote command (includes `assistant` for Google Assistant)
+
+**Google TV Setup Notes:**
+- Uses "Wireless debugging" (not USB debugging) for network ADB
+- Settings > System > Developer options > Wireless debugging
+- Shows IP:PORT on TV screen when enabled (e.g., 192.168.1.100:37421)
+- Enter the full IP:PORT in web UI Remote tab
+- First connection requires approving the ADB dialog on TV
+
 ## Fire TV Remote Control
 
 Minus can control Fire TV devices over WiFi via ADB for ad skipping and playback control.
@@ -911,6 +924,31 @@ Minus can control Fire TV devices over WiFi via ADB for ad skipping and playback
 **Usage:** `quick_connect()` → `skip_ad()` / `go_back()` → `disconnect()`
 
 **Setup States:** `idle` → `scanning` → `waiting_adb_enable` → `waiting_auth` → `connected`
+
+## Google TV / Android TV Remote Control
+
+Minus can control Google TV and Android TV devices over WiFi via ADB's Wireless debugging feature.
+
+**Setup Flow:**
+1. Select "Google TV / Android TV" in the Remote tab
+2. On-screen overlay guides you through enabling Wireless debugging
+3. Enter the IP:PORT shown on your TV's Wireless debugging screen
+4. Approve the connection dialog on your TV
+
+**Key Differences from Fire TV:**
+- Uses "Wireless debugging" instead of "ADB debugging" (USB debugging)
+- Dynamic port (not fixed 5555) - must enter IP:PORT format
+- Found in Developer options after enabling developer mode
+
+**Enabling Wireless Debugging:**
+1. Settings > System > About > click Build number 7 times
+2. Go back to System > Developer options
+3. Turn ON "Wireless debugging"
+4. Note the IP address and port shown on screen
+
+**Commands:** Same as Fire TV plus `assistant` for Google Assistant button
+
+**Setup States:** Same as Fire TV: `idle` → `scanning` → `waiting_adb_enable` → `waiting_auth` → `connected`
 
 ## Color Correction
 

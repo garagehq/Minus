@@ -478,21 +478,22 @@ class GoogleTVNotification(NotificationOverlay):
         self.show(text, duration=None)
 
     def show_adb_enable_instructions(self, timeout_remaining: int = None):
-        """Show instructions for enabling ADB debugging."""
+        """Show instructions for enabling Wireless debugging."""
         lines = [
             "Google TV Setup",
             "",
-            "Enable ADB Debugging:",
+            "Enable Wireless Debugging:",
             "1. Settings > System > About",
-            "2. Click Build number 7 times",
-            "3. Go back to System",
-            "4. Developer options",
-            "5. Turn ON USB debugging",
+            "2. Click Build 7x for Dev Mode",
+            "3. System > Developer options",
+            "4. Turn ON Wireless debugging",
+            "5. Enter IP:Port shown on TV",
+            "   in the web UI Remote tab",
         ]
 
         if timeout_remaining is not None:
             lines.append("")
-            lines.append(f"Scanning... ({timeout_remaining}s)")
+            lines.append(f"Waiting... ({timeout_remaining}s)")
 
         text = "\n".join(lines)
         self.show(text, duration=None)
@@ -500,16 +501,16 @@ class GoogleTVNotification(NotificationOverlay):
     def show_auth_instructions(self, ip_address: str = None, attempt: int = None, timeout_remaining: int = None):
         """Show instructions for authorizing ADB connection."""
         lines = [
-            "Google TV Found!",
+            "Connecting to Google TV...",
             "",
             "On your TV, press Allow",
-            "on the USB Debugging dialog.",
+            "on the debugging dialog.",
             "",
             "Check: Always allow",
         ]
 
         if ip_address:
-            lines.insert(1, f"IP: {ip_address}")
+            lines.insert(1, f"Address: {ip_address}")
 
         if attempt is not None and timeout_remaining is not None:
             lines.append("")

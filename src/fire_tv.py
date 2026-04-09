@@ -114,6 +114,7 @@ class FireTVController:
         self.adbkey_path = adbkey_path or DEFAULT_ADBKEY_PATH
         self._device = None
         self._ip_address: Optional[str] = None
+        self._port: int = ADB_PORT
         self._connected = False
         self._lock = threading.Lock()
 
@@ -437,7 +438,7 @@ class FireTVController:
         Connect to a Fire TV device.
 
         Args:
-            ip_address: IP address of the Fire TV
+            ip_address: IP address of the Fire TV (can include port as IP:PORT)
             timeout: Connection timeout in seconds
             wait_for_auth: If True, uses longer timeout and shows auth instructions
 
@@ -447,6 +448,7 @@ class FireTVController:
         Note:
             First connection requires approving the RSA key on the TV screen.
             The TV will show a dialog asking to allow USB debugging.
+            For Google TV Wireless debugging, use IP:PORT format (e.g., 192.168.1.100:37421).
         """
         with self._lock:
             if self._connected and self._ip_address == ip_address:
@@ -457,18 +459,33 @@ class FireTVController:
             if self._connected:
                 self._disconnect_internal()
 
-            self._ip_address = ip_address
+            # Parse IP:PORT format (for Google TV Wireless debugging)
+            if ':' in ip_address:
+                host, port_str = ip_address.rsplit(':', 1)
+                try:
+                    port = int(port_str)
+                    self._ip_address = host
+                    self._port = port
+                    logger.info(f"[FireTV] Using custom port {port} (Wireless debugging)")
+                except ValueError:
+                    # Not a valid port, treat as IP
+                    self._ip_address = ip_address
+                    self._port = ADB_PORT
+            else:
+                self._ip_address = ip_address
+                self._port = ADB_PORT
 
             # Use longer timeout for first-time auth
             actual_timeout = AUTH_TIMEOUT if wait_for_auth else timeout
 
             if wait_for_auth:
-                print(f"\n[FireTV] Connecting to {ip_address}...")
+                addr_display = f"{self._ip_address}:{self._port}"
+                print(f"\n[FireTV] Connecting to {addr_display}...")
                 print("[FireTV] If this is your first connection, please look at your TV screen")
                 print("[FireTV] and press 'Allow' when the authorization dialog appears.")
                 print(f"[FireTV] Waiting up to {int(actual_timeout)} seconds for authorization...\n")
 
-            logger.info(f"[FireTV] Connecting to Fire TV at {ip_address}...")
+            logger.info(f"[FireTV] Connecting to device at {self._ip_address}:{self._port}...")
 
             try:
                 from androidtv import FireTVSync
@@ -488,7 +505,7 @@ class FireTVController:
                 signer = PythonRSASigner(pub_key, priv_key)
 
                 # Create FireTVSync instance with signer
-                self._device = FireTVSync(ip_address, port=ADB_PORT, adbkey=self.adbkey_path, signer=signer)
+                self._device = FireTVSync(self._ip_address, port=self._port, adbkey=self.adbkey_path, signer=signer)
 
                 # Connect with authentication
                 success = self._device.adb_connect(auth_timeout_s=actual_timeout)
