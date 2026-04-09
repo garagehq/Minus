@@ -2591,3 +2591,227 @@ input:checked + .toggle-slider:before {
 }
 .hint-left { color: var(--danger); }
 .hint-right { color: var(--green); }
+
+/* ==================== DEVICE SELECTOR ==================== */
+.device-selector-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+
+.device-selector-section h2 {
+    margin: 0 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.device-selector {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.device-btn {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 0.75rem 0.5rem;
+    background: var(--bg-secondary);
+    border: 2px solid var(--border);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    font-family: var(--font-body);
+}
+
+.device-btn:hover {
+    border-color: var(--primary);
+    background: rgba(187, 134, 252, 0.1);
+}
+
+.device-btn.selected {
+    border-color: var(--green);
+    background: rgba(0, 255, 65, 0.1);
+    box-shadow: 0 0 10px rgba(0, 255, 65, 0.2);
+}
+
+.device-icon {
+    font-size: 1.5rem;
+    margin-bottom: 0.25rem;
+}
+
+.device-name {
+    font-size: 0.75rem;
+    color: var(--text-primary);
+    text-align: center;
+}
+
+.device-config-status {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+}
+
+/* Device Setup Section */
+.device-setup-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+
+.device-setup-section h2 {
+    margin: 0 0 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border);
+}
+
+.setup-steps {
+    margin-bottom: 1rem;
+}
+
+.setup-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.5rem 0;
+    color: var(--text-secondary);
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+
+.step-number {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 1.5rem;
+    height: 1.5rem;
+    background: var(--primary);
+    color: var(--bg-primary);
+    border-radius: 50%;
+    font-size: 0.75rem;
+    font-weight: bold;
+    flex-shrink: 0;
+}
+
+.device-scan-section {
+    margin-top: 1rem;
+}
+
+.scan-results {
+    margin-top: 0.75rem;
+}
+
+.scan-result {
+    display: flex;
+    flex-direction: column;
+    padding: 0.75rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.scan-result:hover {
+    border-color: var(--green);
+    background: rgba(0, 255, 65, 0.1);
+}
+
+.device-found-name {
+    color: var(--text-primary);
+    font-weight: 500;
+}
+
+.device-found-info {
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+}
+
+.scanning {
+    text-align: center;
+    padding: 1rem;
+    color: var(--text-secondary);
+}
+
+.manual-ip-section {
+    margin-top: 1rem;
+}
+
+.input-label {
+    display: block;
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    margin-bottom: 0.5rem;
+}
+
+.ip-input-row {
+    display: flex;
+    gap: 0.5rem;
+}
+
+.ip-input {
+    flex: 1;
+    padding: 0.5rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+}
+
+.ip-input:focus {
+    outline: none;
+    border-color: var(--primary);
+}
+
+/* Remote Sections */
+.remote-section {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 1rem;
+    margin-bottom: 1rem;
+}
+
+.remote-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 1rem;
+}
+
+.remote-header h2 {
+    margin: 0;
+    border-bottom: none;
+    padding-bottom: 0;
+}
+
+.generic-info {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: var(--text-secondary);
+}
+
+.generic-info p {
+    margin: 0.5rem 0;
+}
+
+/* Device Reset Section */
+.device-reset-section {
+    text-align: center;
+    padding: 1rem;
+}
+
+/* Connection Badge Variants */
+.connection-badge.warning {
+    background: transparent;
+    border: 1px solid var(--warning);
+    color: var(--warning);
+}

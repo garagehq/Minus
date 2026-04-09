@@ -336,9 +336,10 @@ class Minus:
         from collections import deque
         self.detection_history = deque(maxlen=50)  # Recent detections for web UI
 
-        # Fire TV state
+        # Remote control state
         self.fire_tv_setup = None
         self.fire_tv_controller = None
+        self.roku_controller = None
         self._fire_tv_setup_thread = None
 
         # Night mode - automatic overnight YouTube playback for training data
@@ -473,6 +474,7 @@ class Minus:
                 self.health_monitor.on_video_pipeline_stall(self._on_video_pipeline_stall)
                 self.health_monitor.on_vlm_failure(self._handle_vlm_failure)
                 self.health_monitor.on_memory_critical(self._handle_memory_critical)
+                self.health_monitor.on_format_change(self._on_format_change)
                 logger.info("Health monitor initialized")
             except Exception as e:
                 logger.warning(f"Health monitor init failed: {e}")
@@ -572,6 +574,47 @@ class Minus:
             # Start will transition from loading to live
             self.ad_blocker.start()
 
+    def _on_format_change(self, new_format: str):
+        """Handle HDMI format/resolution change detected by health monitor.
+
+        This enables seamless switching between different streaming devices
+        (FireTV, Roku, AppleTV, etc.) without manual intervention.
+
+        Args:
+            new_format: New format string like 'NV24@1280x720'
+        """
+        logger.warning(f"[Recovery] HDMI format changed to {new_format} - restarting ustreamer")
+
+        # Skip if display is disconnected (retry loop handles reconnection)
+        if not self.display_connected:
+            logger.debug("[Recovery] Skipping format change recovery - display disconnected")
+            return
+
+        # Show loading screen while we adapt to new format
+        if self.ad_blocker:
+            self.ad_blocker.start_loading_mode()
+
+        # Mute audio during transition
+        if self.audio:
+            self.audio.mute()
+
+        # Restart ustreamer with the new format
+        self._restart_ustreamer()
+
+        # Wait for ustreamer to be ready
+        time.sleep(2)
+
+        # Restart video pipeline to reconnect
+        if self.ad_blocker:
+            logger.info("[Recovery] Restarting video pipeline for new format...")
+            self.ad_blocker.start()
+
+        # Restore audio
+        if self.audio:
+            self.audio.unmute()
+
+        logger.info(f"[Recovery] Format change complete - now running at {new_format}")
+
     def _restart_ustreamer(self):
         """Restart ustreamer process."""
         # Skip if display is disconnected (retry loop handles reconnection)
@@ -596,12 +639,27 @@ class Minus:
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(1)
 
+            # Initialize V4L2 device with proper DV timings for the new source
+            # This ensures proper format negotiation when switching between devices
+            self._init_v4l2_device()
+
             # Re-probe the device in case format changed
             device_info = probe_v4l2_device(self.device)
-            video_format = device_info.get('ustreamer_format') or getattr(self, '_detected_format', 'NV12')
-            resolution = f"{device_info.get('width') or 3840}x{device_info.get('height') or 2160}"
+            detected_format = device_info.get('ustreamer_format') or getattr(self, '_detected_format', 'NV12')
+            width = device_info.get('width') or 3840
+            height = device_info.get('height') or 2160
+            resolution = f"{width}x{height}"
 
-            # Restart with patched ustreamer using detected format and MPP encoder
+            video_format = detected_format
+
+            # Update stored format info
+            self._detected_format = video_format
+            self._detected_resolution = resolution
+
+            logger.info(f"[Recovery] Source outputs {detected_format} at {resolution}")
+
+            # Restart with patched ustreamer using MPP hardware encoder
+            # The patched ustreamer handles NV24→NV12 conversion internally
             port = self.config.ustreamer_port
             ustreamer_cmd = [
                 USTREAMER_PATH,
@@ -611,10 +669,10 @@ class Minus:
                 '--persistent',
                 f'--port={port}',
                 '--host=0.0.0.0',          # Bind to all interfaces for remote access
-                '--encoder=mpp-jpeg',      # Use RK3588 VPU hardware encoding
-                '--encode-scale=4k',       # Native 4K output (no downscaling)
+                '--encoder=mpp-jpeg',
+                '--encode-scale=native',
                 '--quality=80',
-                '--workers=4',             # 4 parallel MPP encoders (optimal)
+                '--workers=4',
                 '--buffers=5',
                 '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
             ]
@@ -770,43 +828,142 @@ class Minus:
             'frame_count': self.vlm_frame_count,
         }
 
-    # ===== Fire TV Setup Methods =====
+    # ===== Device Setup Methods =====
 
-    def _start_fire_tv_setup_delayed(self, delay_seconds: float = 15.0):
-        """Start Fire TV setup after a delay (to let display stabilize first)."""
-        if not HAS_FIRE_TV:
-            logger.info("[FireTV] Fire TV module not available")
-            return
+    def _start_device_setup_delayed(self, delay_seconds: float = 15.0):
+        """Start device setup after a delay (to let display stabilize first).
 
+        This is device-aware - checks the configured device type and starts
+        the appropriate setup flow:
+        - Fire TV / Google TV: Start FireTVSetupManager with ADB flow
+        - Roku: Auto-connect using saved IP (no setup overlay needed)
+        - Other: Skip setup entirely
+        """
         def delayed_start():
-            logger.info(f"[FireTV] Waiting {delay_seconds}s before starting Fire TV setup...")
+            logger.info(f"[DeviceSetup] Waiting {delay_seconds}s before starting device setup...")
             time.sleep(delay_seconds)
 
             if not self.running:
                 return
 
-            logger.info("[FireTV] Initializing Fire TV setup manager...")
-            self.fire_tv_setup = FireTVSetupManager(
-                ad_blocker=self.ad_blocker,
-                ocr_worker=self.ocr,
-                ustreamer_port=self.config.ustreamer_port
-            )
+            # Check configured device type
+            try:
+                from src.device_config import get_device_config_manager
+                device_manager = get_device_config_manager()
+                config = device_manager.get_config()
+                device_type = config.get('device_type', 'none')
+                device_ip = config.get('device_ip', '')
+                setup_complete = config.get('setup_complete', False)
 
-            # Set callbacks
-            self.fire_tv_setup.set_callbacks(
-                on_state_change=self._on_fire_tv_state_change,
-                on_connected=self._on_fire_tv_connected
-            )
+                logger.info(f"[DeviceSetup] Configured device: {device_type}, IP: {device_ip}, setup_complete: {setup_complete}")
+            except Exception as e:
+                logger.warning(f"[DeviceSetup] Could not load device config: {e}")
+                device_type = 'none'
+                device_ip = ''
+                setup_complete = False
 
-            # Start the setup flow
-            self.fire_tv_setup.start_setup()
+            # Handle based on device type
+            if device_type in ('fire_tv', 'google_tv'):
+                self._start_fire_tv_setup(device_ip if setup_complete else None)
+            elif device_type == 'roku':
+                self._start_roku_connection(device_ip if setup_complete else None)
+            else:
+                logger.info(f"[DeviceSetup] No remote setup needed for device type: {device_type}")
 
         self._fire_tv_setup_thread = threading.Thread(
             target=delayed_start,
             daemon=True,
-            name="FireTVSetupDelay"
+            name="DeviceSetupDelay"
         )
         self._fire_tv_setup_thread.start()
+
+    def _start_fire_tv_setup(self, saved_ip: str = None):
+        """Start Fire TV / Google TV setup flow."""
+        if not HAS_FIRE_TV:
+            logger.info("[FireTV] Fire TV module not available")
+            return
+
+        logger.info("[FireTV] Initializing Fire TV setup manager...")
+        self.fire_tv_setup = FireTVSetupManager(
+            ad_blocker=self.ad_blocker,
+            ocr_worker=self.ocr,
+            ustreamer_port=self.config.ustreamer_port
+        )
+
+        # Set callbacks
+        self.fire_tv_setup.set_callbacks(
+            on_state_change=self._on_fire_tv_state_change,
+            on_connected=self._on_fire_tv_connected
+        )
+
+        # If we have a saved IP, try to connect directly first
+        if saved_ip:
+            logger.info(f"[FireTV] Attempting direct connection to saved IP: {saved_ip}")
+            # The setup manager will try this IP first before scanning
+            self.fire_tv_setup.set_preferred_ip(saved_ip)
+
+        # Start the setup flow
+        self.fire_tv_setup.start_setup()
+
+    def _start_roku_connection(self, saved_ip: str = None):
+        """Start Roku connection with appropriate overlay notifications."""
+        try:
+            from src.roku import RokuController
+            from src.overlay import RokuNotification
+
+            # Initialize notification overlay
+            roku_notification = RokuNotification(ustreamer_port=self.config.ustreamer_port)
+
+            if saved_ip:
+                roku_notification.show_connecting(saved_ip)
+                logger.info(f"[Roku] Connecting to saved Roku at {saved_ip}...")
+
+                self.roku_controller = RokuController()
+                if self.roku_controller.connect(saved_ip):
+                    device_info = self.roku_controller.get_device_info()
+                    device_name = device_info.get('name', 'Roku') if device_info else 'Roku'
+                    model = device_info.get('model', '') if device_info else ''
+                    full_name = f"{device_name} {model}".strip()
+
+                    logger.info(f"[Roku] Connected to {full_name} at {saved_ip}")
+
+                    # Check if Roku is in limited mode
+                    control_mode = self.roku_controller.check_control_mode()
+                    if control_mode == 'limited':
+                        logger.warning("[Roku] Roku is in Limited mode - commands won't work!")
+                        # Show brief connected message, then setup instructions
+                        roku_notification.show_connected(full_name)
+                        time.sleep(3)
+                        roku_notification.show_limited_mode()
+
+                        # Start background thread to auto-hide when mode changes
+                        def monitor_control_mode():
+                            """Poll for control mode change and hide overlay."""
+                            check_interval = 10  # Check every 10 seconds
+                            max_checks = 30  # Max 5 minutes (30 x 10s)
+                            for _ in range(max_checks):
+                                time.sleep(check_interval)
+                                if not self.roku_controller or not self.roku_controller.is_connected():
+                                    break
+                                mode = self.roku_controller.check_control_mode()
+                                if mode == 'full':
+                                    logger.info("[Roku] Control mode changed to FULL - hiding setup overlay")
+                                    roku_notification.hide()
+                                    roku_notification.show_connected(f"{full_name} - Ready!")
+                                    break
+
+                        threading.Thread(target=monitor_control_mode, daemon=True, name="Roku-ModeMonitor").start()
+                    else:
+                        roku_notification.show_connected(full_name)
+                else:
+                    logger.warning(f"[Roku] Failed to connect to Roku at {saved_ip}")
+                    roku_notification.show_failed("Could not connect")
+            else:
+                logger.info("[Roku] No saved Roku IP - showing setup instructions")
+                roku_notification.show_not_configured()
+
+        except Exception as e:
+            logger.error(f"[Roku] Error starting Roku connection: {e}")
 
     def _on_fire_tv_state_change(self, new_state: str):
         """Handle Fire TV setup state changes."""
@@ -1085,7 +1242,32 @@ class Minus:
             # Fire TV status
             'fire_tv_connected': self.fire_tv_controller is not None and self.fire_tv_controller.is_connected() if self.fire_tv_controller else False,
             'fire_tv_setup_state': self.fire_tv_setup.state if self.fire_tv_setup else None,
+
+            # Roku status
+            'roku_connected': self.roku_controller is not None and self.roku_controller.is_connected() if self.roku_controller else False,
+
+            # Device-aware remote status
+            'remote_connected': self._is_remote_connected(),
+            'remote_device_type': self._get_configured_device_type(),
         }
+
+    def _is_remote_connected(self) -> bool:
+        """Check if the configured remote device is connected."""
+        device_type = self._get_configured_device_type()
+        if device_type in ('fire_tv', 'google_tv'):
+            return self.fire_tv_controller is not None and self.fire_tv_controller.is_connected() if self.fire_tv_controller else False
+        elif device_type == 'roku':
+            return self.roku_controller is not None and self.roku_controller.is_connected() if self.roku_controller else False
+        return False
+
+    def _get_configured_device_type(self) -> str:
+        """Get the configured device type."""
+        try:
+            from src.device_config import get_device_config_manager
+            manager = get_device_config_manager()
+            return manager.config.device_type
+        except:
+            return 'none'
 
     def _compare_frames(self, frame, prev_frame):
         """Compare two frames and return normalized mean difference (0-1)."""
@@ -1343,18 +1525,21 @@ class Minus:
             # Give the driver time to stabilize after timing change
             time.sleep(0.3)
 
-            # Step 3: Explicitly set pixel format to BGR3
-            # This ensures the device is not stuck in a different format (e.g., NV12)
-            # which would cause ustreamer's format negotiation to fail
-            logger.info("Setting pixel format to BGR3...")
+            # Step 3: Set pixel format to NV12 for MPP encoder compatibility
+            # The RK3588 MPP hardware JPEG encoder only supports NV12 format.
+            # Different HDMI sources may output different formats (NV24, NV16, etc.)
+            # but we need to request NV12 specifically for the MPP encoder to work.
+            logger.info("Setting pixel format to NV12 (required for MPP encoder)...")
             result = subprocess.run(
-                ['v4l2-ctl', '-d', self.device, '--set-fmt-video', 'pixelformat=BGR3'],
+                ['v4l2-ctl', '-d', self.device, '--set-fmt-video', 'pixelformat=NV12'],
                 capture_output=True, text=True, timeout=5
             )
 
             if result.returncode != 0:
-                # Not fatal - ustreamer may still work
-                logger.warning(f"Failed to set pixel format: {result.stderr}")
+                # Not fatal - but encoding will likely fail
+                logger.warning(f"Failed to set pixel format to NV12: {result.stderr}")
+            else:
+                logger.info("Pixel format set to NV12 successfully")
 
             time.sleep(0.2)
 
@@ -1380,19 +1565,29 @@ class Minus:
 
         port = self.config.ustreamer_port
 
+        # Initialize V4L2 device with proper DV timings
+        # This is critical for adapting to different HDMI sources (FireTV, Roku, AppleTV, etc.)
+        self._init_v4l2_device()
+
         # Probe the device to get current format and resolution
         device_info = probe_v4l2_device(self.device)
-
-        # Use detected format or fall back to defaults
-        video_format = device_info.get('ustreamer_format') or 'NV12'
+        detected_format = device_info.get('ustreamer_format') or 'NV12'
         width = device_info.get('width') or 3840
         height = device_info.get('height') or 2160
+
+        # Use the native format from the source device
+        # The patched ustreamer handles NV24→NV12 conversion internally
+        # for formats that MPP hardware encoder doesn't support natively
+        video_format = detected_format
 
         # Store for later reference (health monitor, recovery)
         self._detected_format = video_format
         self._detected_resolution = f"{width}x{height}"
 
+        logger.info(f"Source outputs {detected_format} at {width}x{height}")
+
         # Start ustreamer with detected format and MPP hardware encoder
+        # The patched ustreamer will convert NV24→NV12 internally if needed
         ustreamer_cmd = [
             USTREAMER_PATH,
             f'--device={self.device}',
@@ -1401,10 +1596,10 @@ class Minus:
             '--persistent',
             f'--port={port}',
             '--host=0.0.0.0',          # Bind to all interfaces for remote access
-            '--encoder=mpp-jpeg',      # Use RK3588 VPU hardware encoding
-            '--encode-scale=4k',       # Native 4K output (no downscaling)
+            '--encoder=mpp-jpeg',       # Use RK3588 VPU hardware encoding
+            '--encode-scale=native',    # Native scaling (auto-downscale 4K to 1080p)
             '--quality=80',
-            '--workers=4',             # 4 parallel MPP encoders (optimal)
+            '--workers=4',              # 4 parallel MPP encoders (optimal)
             '--buffers=5',
             '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
         ]
@@ -2222,7 +2417,7 @@ class Minus:
 
         # Start Fire TV setup early (runs in parallel with VLM loading)
         # 5 second delay ensures display is stable before scanning
-        self._start_fire_tv_setup_delayed(delay_seconds=5.0)
+        self._start_device_setup_delayed(delay_seconds=5.0)
 
         # Load VLM model and start worker thread (with retry)
         if self.vlm:

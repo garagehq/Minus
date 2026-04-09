@@ -404,6 +404,134 @@ class WebUI:
                 return Response(status=503)
 
         # =========================================================================
+        # Device Configuration
+        # =========================================================================
+
+        @self.app.route('/api/device/config')
+        def api_device_config():
+            """Get current device configuration."""
+            try:
+                from src.device_config import get_device_config_manager
+                manager = get_device_config_manager()
+                return jsonify(manager.get_config())
+            except Exception as e:
+                logger.error(f"Error getting device config: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/device/types')
+        def api_device_types():
+            """Get available device types."""
+            try:
+                from src.device_config import get_device_config_manager
+                manager = get_device_config_manager()
+                return jsonify({'devices': manager.get_available_devices()})
+            except Exception as e:
+                logger.error(f"Error getting device types: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/device/select', methods=['POST'])
+        def api_device_select():
+            """Select a device type and switch to appropriate setup."""
+            try:
+                from src.device_config import get_device_config_manager
+                data = request.get_json() or {}
+                device_type = data.get('device_type')
+
+                if not device_type:
+                    return jsonify({'success': False, 'error': 'device_type required'}), 400
+
+                # Disconnect any existing device controllers
+                if hasattr(self.minus, 'roku_controller') and self.minus.roku_controller:
+                    try:
+                        self.minus.roku_controller.disconnect()
+                        self.minus.roku_controller = None
+                        logger.info("[WebUI] Disconnected Roku controller")
+                    except Exception as e:
+                        logger.warning(f"[WebUI] Error disconnecting Roku: {e}")
+
+                if hasattr(self.minus, 'fire_tv_setup') and self.minus.fire_tv_setup:
+                    try:
+                        self.minus.fire_tv_setup.stop_setup()
+                        logger.info("[WebUI] Stopped Fire TV setup")
+                    except Exception as e:
+                        logger.warning(f"[WebUI] Error stopping Fire TV setup: {e}")
+
+                if hasattr(self.minus, 'fire_tv_controller') and self.minus.fire_tv_controller:
+                    try:
+                        self.minus.fire_tv_controller.disconnect()
+                        self.minus.fire_tv_controller = None
+                        logger.info("[WebUI] Disconnected Fire TV controller")
+                    except Exception as e:
+                        logger.warning(f"[WebUI] Error disconnecting Fire TV: {e}")
+
+                # Save the new device type
+                manager = get_device_config_manager()
+                result = manager.set_device_type(device_type)
+                logger.info(f"[WebUI] Device type set to: {device_type}")
+
+                # Show setup instructions overlay for the new device
+                try:
+                    from src.overlay import FireTVNotification, RokuNotification
+                    if device_type in ('fire_tv', 'google_tv'):
+                        notification = FireTVNotification(ustreamer_port=self.minus.config.ustreamer_port)
+                        notification.show_adb_enable_instructions()
+                    elif device_type == 'roku':
+                        notification = RokuNotification(ustreamer_port=self.minus.config.ustreamer_port)
+                        notification.show_setup_instructions()
+                except Exception as e:
+                    logger.warning(f"[WebUI] Could not show setup overlay: {e}")
+
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error selecting device: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/device/ip', methods=['POST'])
+        def api_device_ip():
+            """Set device IP address."""
+            try:
+                from src.device_config import get_device_config_manager
+                data = request.get_json() or {}
+                ip = data.get('ip', '')
+
+                manager = get_device_config_manager()
+                result = manager.set_device_ip(ip)
+                logger.info(f"[WebUI] Device IP set to: {ip}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error setting device IP: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/device/setup-complete', methods=['POST'])
+        def api_device_setup_complete():
+            """Mark device setup as complete."""
+            try:
+                from src.device_config import get_device_config_manager
+                data = request.get_json() or {}
+                complete = data.get('complete', True)
+
+                manager = get_device_config_manager()
+                result = manager.set_setup_complete(complete)
+                logger.info(f"[WebUI] Device setup complete: {complete}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error setting setup complete: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/device/reset', methods=['POST'])
+        def api_device_reset():
+            """Reset device configuration."""
+            try:
+                from src.device_config import get_device_config_manager
+                manager = get_device_config_manager()
+                result = manager.reset()
+                logger.info("[WebUI] Device configuration reset")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error resetting device config: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Fire TV Remote Control
         # =========================================================================
 
@@ -421,6 +549,39 @@ class WebUI:
                 return jsonify({'connected': False, 'state': 'not_initialized'})
             except Exception as e:
                 logger.error(f"Error getting Fire TV status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/firetv/scan')
+        def api_firetv_scan():
+            """Scan for Fire TV devices on the network."""
+            try:
+                from src.fire_tv import FireTVController
+                devices = FireTVController.discover_devices(timeout=10.0)
+                return jsonify({
+                    'devices': devices,
+                    'count': len(devices),
+                })
+            except Exception as e:
+                logger.error(f"Error scanning for Fire TV: {e}")
+                return jsonify({'devices': [], 'error': str(e)}), 500
+
+        @self.app.route('/api/firetv/connect', methods=['POST'])
+        def api_firetv_connect():
+            """Connect to a Fire TV device by IP."""
+            try:
+                data = request.get_json() or {}
+                ip_address = data.get('ip')
+                if not ip_address:
+                    return jsonify({'error': 'IP address required'}), 400
+
+                # Start Fire TV setup with the provided IP
+                if hasattr(self.minus, '_start_fire_tv_setup'):
+                    self.minus._start_fire_tv_setup(saved_ip=ip_address)
+                    return jsonify({'success': True, 'message': f'Connecting to {ip_address}...'})
+                else:
+                    return jsonify({'error': 'Fire TV setup not available'}), 500
+            except Exception as e:
+                logger.error(f"Error connecting to Fire TV: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/firetv/command', methods=['POST'])
@@ -449,6 +610,122 @@ class WebUI:
                 return jsonify({'error': 'Fire TV not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error sending Fire TV command: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Roku Remote Control
+        # =========================================================================
+
+        @self.app.route('/api/roku/status')
+        def api_roku_status():
+            """Get Roku connection status."""
+            try:
+                if hasattr(self.minus, 'roku_controller') and self.minus.roku_controller:
+                    controller = self.minus.roku_controller
+                    return jsonify({
+                        'connected': controller.is_connected(),
+                        'device_info': controller.get_device_info(),
+                    })
+                return jsonify({'connected': False, 'device_info': None})
+            except Exception as e:
+                logger.error(f"Error getting Roku status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/roku/discover')
+        def api_roku_discover():
+            """Discover Roku devices on the network."""
+            try:
+                from src.roku import RokuController
+                devices = RokuController.discover_devices(timeout=5.0)
+                return jsonify({'devices': devices})
+            except Exception as e:
+                logger.error(f"Error discovering Roku devices: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/roku/connect', methods=['POST'])
+        def api_roku_connect():
+            """Connect to a Roku device."""
+            try:
+                data = request.get_json() or {}
+                ip = data.get('ip')
+
+                if not ip:
+                    return jsonify({'success': False, 'error': 'IP address required'}), 400
+
+                # Create or get Roku controller
+                from src.roku import RokuController
+                if not hasattr(self.minus, 'roku_controller') or not self.minus.roku_controller:
+                    self.minus.roku_controller = RokuController()
+
+                if self.minus.roku_controller.connect(ip):
+                    # Update device config
+                    from src.device_config import get_device_config_manager
+                    manager = get_device_config_manager()
+                    manager.set_device_ip(ip)
+                    manager.set_setup_complete(True)
+
+                    # Show connected notification and clear setup overlay
+                    try:
+                        from src.overlay import RokuNotification
+                        device_info = self.minus.roku_controller.get_device_info()
+                        device_name = device_info.get('name', 'Roku') if device_info else 'Roku'
+                        model = device_info.get('model', '') if device_info else ''
+                        full_name = f"{device_name} {model}".strip()
+                        notification = RokuNotification(ustreamer_port=self.minus.config.ustreamer_port)
+                        notification.show_connected(full_name)
+                    except Exception as e:
+                        logger.warning(f"Could not show connected notification: {e}")
+
+                    return jsonify({
+                        'success': True,
+                        'connected': True,
+                        'device_info': self.minus.roku_controller.get_device_info()
+                    })
+                return jsonify({'success': False, 'error': 'Connection failed'}), 503
+            except Exception as e:
+                logger.error(f"Error connecting to Roku: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/roku/command', methods=['POST'])
+        def api_roku_command():
+            """Send a command to Roku."""
+            try:
+                data = request.get_json() or {}
+                command = data.get('command')
+
+                valid_commands = [
+                    'up', 'down', 'left', 'right', 'select', 'back', 'home', 'info',
+                    'play', 'pause', 'play_pause', 'fast_forward', 'rewind',
+                    'volume_up', 'volume_down', 'mute', 'instant_replay', 'search'
+                ]
+
+                if command not in valid_commands:
+                    return jsonify({'error': f'Invalid command. Valid: {valid_commands}'}), 400
+
+                if hasattr(self.minus, 'roku_controller') and self.minus.roku_controller:
+                    if self.minus.roku_controller.is_connected():
+                        self.minus.roku_controller.send_command(command)
+                        return jsonify({'success': True, 'command': command})
+                    return jsonify({'error': 'Roku not connected'}), 503
+
+                return jsonify({'error': 'Roku not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error sending Roku command: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/roku/launch/<app>', methods=['POST'])
+        def api_roku_launch(app):
+            """Launch an app on Roku."""
+            try:
+                if hasattr(self.minus, 'roku_controller') and self.minus.roku_controller:
+                    if self.minus.roku_controller.is_connected():
+                        if self.minus.roku_controller.launch_app(app):
+                            return jsonify({'success': True, 'app': app})
+                        return jsonify({'error': f'Failed to launch {app}'}), 500
+                    return jsonify({'error': 'Roku not connected'}), 503
+                return jsonify({'error': 'Roku not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error launching Roku app: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================

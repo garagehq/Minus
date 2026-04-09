@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from config import MinusConfig
+from v4l2 import probe_v4l2_device
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ class HealthStatus:
     """Current health status of all subsystems."""
     hdmi_signal: bool = False
     hdmi_resolution: str = ""
+    hdmi_format: str = ""  # Pixel format (NV12, NV24, etc.)
     ustreamer_alive: bool = False
     ustreamer_responding: bool = False
     last_frame_age: float = -1
@@ -73,6 +75,13 @@ class HealthMonitor:
         self._hdmi_fps_zero_since = 0  # When captured_fps first dropped to 0
         self._hdmi_signal_loss_threshold = 5.0  # Seconds of 0 FPS before signal is considered lost
 
+        # Format/resolution tracking for adaptive restart
+        self._last_hdmi_format = None  # Last detected V4L2 format (NV12, NV24, etc.)
+        self._last_hdmi_width = 0
+        self._last_hdmi_height = 0
+        self._format_stable_since = 0  # Time when format became stable (debounce)
+        self._format_change_debounce = 2.0  # Wait 2s before triggering restart on format change
+
         # Recovery callbacks
         self._on_hdmi_lost: Optional[Callable] = None
         self._on_hdmi_restored: Optional[Callable] = None
@@ -80,6 +89,7 @@ class HealthMonitor:
         self._on_video_pipeline_stall: Optional[Callable] = None
         self._on_vlm_failure: Optional[Callable] = None
         self._on_memory_critical: Optional[Callable] = None
+        self._on_format_change: Optional[Callable] = None  # Called when HDMI format/resolution changes
 
         # Thresholds (from config)
         self.frame_stale_threshold = self._config.frame_stale_threshold
@@ -116,6 +126,9 @@ class HealthMonitor:
 
         # HDMI signal
         status.hdmi_signal, status.hdmi_resolution = self._check_hdmi_signal()
+
+        # Get current V4L2 format (for format change detection)
+        status.hdmi_format = self._get_v4l2_format()
 
         # ustreamer
         status.ustreamer_alive = self._check_ustreamer_alive()
@@ -188,6 +201,34 @@ class HealthMonitor:
                 logger.debug(f"[HealthMonitor] Initial HDMI signal state: {status.hdmi_signal}")
 
         self._last_hdmi_signal = status.hdmi_signal
+
+        # Format/resolution change detection (for adaptive device switching)
+        # This allows seamless switching between FireTV, Roku, AppleTV, etc.
+        if status.hdmi_signal and status.hdmi_format and uptime > self.startup_grace_period:
+            current_format = status.hdmi_format
+            if self._last_hdmi_format is None:
+                # First detection - just record it
+                self._last_hdmi_format = current_format
+                self._format_stable_since = time.time()
+                logger.info(f"[HealthMonitor] Initial format detected: {current_format}")
+            elif current_format != self._last_hdmi_format:
+                # Format changed - debounce to avoid rapid restarts during negotiation
+                now = time.time()
+                if self._format_stable_since == 0:
+                    # Start debounce timer
+                    self._format_stable_since = now
+                    logger.info(f"[HealthMonitor] Format change detected: {self._last_hdmi_format} -> {current_format} (waiting {self._format_change_debounce}s to stabilize)")
+                elif (now - self._format_stable_since) >= self._format_change_debounce:
+                    # Format has been stable for debounce period - trigger restart
+                    old_format = self._last_hdmi_format
+                    self._last_hdmi_format = current_format
+                    self._format_stable_since = 0
+                    logger.warning(f"[HealthMonitor] HDMI format changed: {old_format} -> {current_format}")
+                    if self._on_format_change:
+                        self._on_format_change(current_format)
+            else:
+                # Format matches - reset debounce
+                self._format_stable_since = 0
 
         # ustreamer health (skip during startup grace period)
         uptime = time.time() - self._start_time
@@ -268,6 +309,22 @@ class HealthMonitor:
             f"mem={status.memory_percent:.0f}% "
             f"disk={status.disk_free_mb:.0f}MB"
         )
+
+    def _get_v4l2_format(self) -> str:
+        """Get current V4L2 device format and resolution.
+
+        Returns format string like 'NV24@1280x720' for change detection.
+        """
+        try:
+            device = getattr(self.minus, 'device', '/dev/video0')
+            info = probe_v4l2_device(device)
+            fmt = info.get('ustreamer_format') or info.get('format') or 'unknown'
+            width = info.get('width', 0)
+            height = info.get('height', 0)
+            return f"{fmt}@{width}x{height}"
+        except Exception as e:
+            logger.debug(f"[HealthMonitor] Error getting V4L2 format: {e}")
+            return ""
 
     def _check_hdmi_signal(self) -> tuple[bool, str]:
         """Check if HDMI signal is present using ustreamer's HTTP API.
@@ -441,3 +498,12 @@ class HealthMonitor:
     def on_memory_critical(self, callback: Callable):
         """Set callback for critical memory usage."""
         self._on_memory_critical = callback
+
+    def on_format_change(self, callback: Callable):
+        """Set callback for HDMI format/resolution change.
+
+        The callback receives the new format string (e.g., 'NV24@1280x720').
+        This allows automatic adaptation when switching between devices
+        like FireTV, Roku, AppleTV, etc.
+        """
+        self._on_format_change = callback

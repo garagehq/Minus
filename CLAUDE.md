@@ -81,6 +81,8 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/health.py` | Unified health monitor for all subsystems |
 | `src/webui.py` | Flask web UI for remote monitoring/control |
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
+| `src/roku.py` | Roku ECP remote control |
+| `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
 | `src/overlay.py` | Notification overlay via ustreamer API |
 | `src/vocabulary.py` | Spanish vocabulary list (120+ words) |
@@ -584,6 +586,30 @@ curl "http://localhost:9090/overlay/set?clear=true"
 
 **Multi-color text auto-detection:** Lines starting with `[` → white (header), `(` → gray (pronunciation), `=` → white (translation), `"` → gray (example), other → purple (Spanish word)
 
+## Overlay Priority System
+
+The overlay system includes a priority mechanism to handle multiple overlays gracefully:
+
+**Persistent Overlays:**
+- Setup instructions (Roku Limited Mode, Fire TV ADB Enable) are "persistent"
+- Registered with duration > 60 seconds
+- Have a background monitor thread that checks every 5 seconds
+- Auto-restore if overwritten by short notifications (VLM status, etc.)
+
+**Short Overlays:**
+- Status notifications (VLM Ready, Connected, etc.) are short-lived (5-10s)
+- Can temporarily interrupt persistent overlays
+- After they expire, the persistent overlay is automatically restored
+
+**State Changes:**
+- Successful device connection calls `_clear_persistent()` to dismiss setup instructions
+- This prevents stale setup overlays from reappearing after connection
+
+**Implementation:**
+- Module-level singleton state in `src/overlay.py` (`_overlay_state` dict)
+- Monitor thread spawned by `_set_persistent()` polls ustreamer overlay API
+- Compares current overlay text to expected text, restores if different
+
 ## Health Monitoring
 
 The health monitor (`src/health.py`) runs in a background thread and checks:
@@ -799,6 +825,60 @@ This structured prompt returns in ~1.0s (vs 5-22s with descriptive prompts).
 - `GET /api/autonomous/logs` - Recent log entries
 
 **Web UI:** Toggle button, schedule time selectors, 24/7 checkbox, stats display in Settings tab.
+
+## Streaming Device Configuration
+
+Minus supports multiple streaming device types with device-specific remote control:
+
+**Supported Devices:**
+| Device | Protocol | Status |
+|--------|----------|--------|
+| Fire TV | ADB over WiFi | Full support |
+| Roku | ECP (External Control Protocol) | Full support |
+| Google TV / Android TV | ADB over WiFi | Full support |
+| Apple TV | MRP/AirPlay | Coming soon |
+| Generic | None | Ad blocking only |
+
+**Web UI Setup:**
+The Remote tab provides a device selector where users can:
+1. Select their streaming device type
+2. Follow device-specific setup instructions
+3. Scan for devices on the network (Fire TV, Roku, Google TV)
+4. Manually enter device IP address
+5. Connect and control their device
+
+**Device Configuration Persistence:**
+- Configuration stored in `~/.minus_device_config.json`
+- Persists device type, IP address, and setup state
+- Survives service restarts
+
+**API Endpoints:**
+- `GET /api/device/config` - Get current configuration
+- `GET /api/device/types` - List available device types
+- `POST /api/device/select` - Select a device type
+- `POST /api/device/ip` - Set device IP address
+- `POST /api/device/setup-complete` - Mark setup complete
+- `POST /api/device/reset` - Reset configuration
+
+**Roku API Endpoints:**
+- `GET /api/roku/status` - Connection status and device info
+- `GET /api/roku/discover` - Scan network via SSDP multicast
+- `POST /api/roku/connect` - Connect to Roku by IP
+- `POST /api/roku/command` - Send remote command
+- `POST /api/roku/launch/<app>` - Launch app (youtube, netflix, etc.)
+
+**Roku Features:**
+- Discovery via SSDP multicast
+- ECP commands over HTTP to port 8060
+- Control mode detection (Limited vs Full)
+- Supports all navigation, media, and volume controls
+- App launching: YouTube, Netflix, Prime, Disney+, Hulu, Plex, HBO, Peacock
+
+**Fire TV API Endpoints:**
+- `GET /api/firetv/status` - Connection status
+- `GET /api/firetv/scan` - Scan network for Fire TV devices
+- `POST /api/firetv/connect` - Connect to Fire TV by IP
+- `POST /api/firetv/command` - Send remote command
 
 ## Fire TV Remote Control
 

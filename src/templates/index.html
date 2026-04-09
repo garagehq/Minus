@@ -55,28 +55,28 @@
                 <div id="inline-remote" class="inline-remote hidden">
                     <div class="remote-grid compact">
                         <div class="remote-row">
-                            <button class="remote-btn" onclick="sendFireTVCommand('back')">&#8592; Back</button>
-                            <button class="remote-btn nav" onclick="sendFireTVCommand('up')">&#9650;</button>
-                            <button class="remote-btn" onclick="sendFireTVCommand('home')">&#8962; Home</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('back')">&#8592; Back</button>
+                            <button class="remote-btn nav" onclick="sendRemoteCommand('up')">&#9650;</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('home')">&#8962; Home</button>
                         </div>
                         <div class="remote-row">
-                            <button class="remote-btn nav" onclick="sendFireTVCommand('left')">&#9664;</button>
-                            <button class="remote-btn select" onclick="sendFireTVCommand('select')">OK</button>
-                            <button class="remote-btn nav" onclick="sendFireTVCommand('right')">&#9654;</button>
+                            <button class="remote-btn nav" onclick="sendRemoteCommand('left')">&#9664;</button>
+                            <button class="remote-btn select" onclick="sendRemoteCommand('select')">OK</button>
+                            <button class="remote-btn nav" onclick="sendRemoteCommand('right')">&#9654;</button>
                         </div>
                         <div class="remote-row">
-                            <button class="remote-btn" onclick="sendFireTVCommand('rewind')">&#9194;</button>
-                            <button class="remote-btn nav" onclick="sendFireTVCommand('down')">&#9660;</button>
-                            <button class="remote-btn" onclick="sendFireTVCommand('fast_forward')">&#9193;</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('rewind')">&#9194;</button>
+                            <button class="remote-btn nav" onclick="sendRemoteCommand('down')">&#9660;</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('fast_forward')">&#9193;</button>
                         </div>
                         <div class="remote-row media">
-                            <button class="remote-btn" onclick="sendFireTVCommand('play_pause')">&#9199; Play/Pause</button>
-                            <button class="remote-btn" onclick="sendFireTVCommand('menu')">&#9776; Menu</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('play_pause')">&#9199; Play/Pause</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('menu')">&#9776; Menu</button>
                         </div>
                         <div class="remote-row volume">
-                            <button class="remote-btn" onclick="sendFireTVCommand('volume_down')">&#128265; Vol -</button>
-                            <button class="remote-btn" onclick="sendFireTVCommand('mute')">&#128263; Mute</button>
-                            <button class="remote-btn" onclick="sendFireTVCommand('volume_up')">&#128266; Vol +</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('volume_down')">&#128265; Vol -</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('mute')">&#128263; Mute</button>
+                            <button class="remote-btn" onclick="sendRemoteCommand('volume_up')">&#128266; Vol +</button>
                         </div>
                     </div>
                     <div class="inline-apps">
@@ -193,49 +193,192 @@
 
         <!-- ===== REMOTE TAB ===== -->
         <div id="tab-remote" class="tab-content">
-            <section class="firetv-section">
-                <div class="firetv-header">
+            <!-- Device Type Selection -->
+            <section class="device-selector-section">
+                <h2>Streaming Device</h2>
+                <div class="device-selector">
+                    <button class="device-btn" data-device="fire_tv" onclick="selectDeviceType('fire_tv')">
+                        <span class="device-icon">&#128293;</span>
+                        <span class="device-name">Fire TV</span>
+                    </button>
+                    <button class="device-btn" data-device="roku" onclick="selectDeviceType('roku')">
+                        <span class="device-icon">&#128250;</span>
+                        <span class="device-name">Roku</span>
+                    </button>
+                    <button class="device-btn" data-device="google_tv" onclick="selectDeviceType('google_tv')">
+                        <span class="device-icon">&#128241;</span>
+                        <span class="device-name">Google TV</span>
+                    </button>
+                    <button class="device-btn" data-device="apple_tv" onclick="selectDeviceType('apple_tv')">
+                        <span class="device-icon">&#127822;</span>
+                        <span class="device-name">Apple TV</span>
+                    </button>
+                    <button class="device-btn" data-device="generic" onclick="selectDeviceType('generic')">
+                        <span class="device-icon">&#9881;</span>
+                        <span class="device-name">Generic</span>
+                    </button>
+                </div>
+                <div id="device-config-status" class="device-config-status">
+                    <span id="selected-device-name">No device selected</span>
+                    <span id="selected-device-status" class="connection-badge disconnected">--</span>
+                </div>
+            </section>
+
+            <!-- Device Setup Section (shown when device not configured) -->
+            <section id="device-setup-section" class="device-setup-section">
+                <h2 id="setup-title">Setup Instructions</h2>
+                <div id="setup-steps" class="setup-steps">
+                    <p class="help-text">Select a device type above to see setup instructions.</p>
+                </div>
+                <div id="device-scan-section" class="device-scan-section hidden">
+                    <button onclick="scanForDevices()" class="action-btn" id="scan-btn">Scan for Devices</button>
+                    <div id="scan-results" class="scan-results hidden"></div>
+                </div>
+                <div id="manual-ip-section" class="manual-ip-section hidden">
+                    <label class="input-label">Or enter IP manually:</label>
+                    <div class="ip-input-row">
+                        <input type="text" id="device-ip-input" placeholder="192.168.1.xxx" class="ip-input">
+                        <button onclick="connectToDeviceIP()" class="action-btn">Connect</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Fire TV Remote (shown when Fire TV selected and connected) -->
+            <section id="firetv-remote-section" class="remote-section hidden">
+                <div class="remote-header">
                     <h2>Fire TV Remote</h2>
                     <span id="firetv-status" class="connection-badge disconnected">Disconnected</span>
                 </div>
                 <div class="remote-grid">
                     <div class="remote-row">
-                        <button class="remote-btn" onclick="sendFireTVCommand('back')">&#8592; Back</button>
-                        <button class="remote-btn nav" onclick="sendFireTVCommand('up')">&#9650;</button>
-                        <button class="remote-btn" onclick="sendFireTVCommand('home')">&#8962; Home</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('back')">&#8592; Back</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('up')">&#9650;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('home')">&#8962; Home</button>
                     </div>
                     <div class="remote-row">
-                        <button class="remote-btn nav" onclick="sendFireTVCommand('left')">&#9664;</button>
-                        <button class="remote-btn select" onclick="sendFireTVCommand('select')">OK</button>
-                        <button class="remote-btn nav" onclick="sendFireTVCommand('right')">&#9654;</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('left')">&#9664;</button>
+                        <button class="remote-btn select" onclick="sendRemoteCommand('select')">OK</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('right')">&#9654;</button>
                     </div>
                     <div class="remote-row">
-                        <button class="remote-btn" onclick="sendFireTVCommand('rewind')">&#9194;</button>
-                        <button class="remote-btn nav" onclick="sendFireTVCommand('down')">&#9660;</button>
-                        <button class="remote-btn" onclick="sendFireTVCommand('fast_forward')">&#9193;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('rewind')">&#9194;</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('down')">&#9660;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('fast_forward')">&#9193;</button>
                     </div>
                     <div class="remote-row media">
-                        <button class="remote-btn" onclick="sendFireTVCommand('play_pause')">&#9199; Play/Pause</button>
-                        <button class="remote-btn" onclick="sendFireTVCommand('menu')">&#9776; Menu</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('play_pause')">&#9199; Play/Pause</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('menu')">&#9776; Menu</button>
                     </div>
                     <div class="remote-row volume">
-                        <button class="remote-btn" onclick="sendFireTVCommand('volume_down')">&#128265; Vol -</button>
-                        <button class="remote-btn" onclick="sendFireTVCommand('mute')">&#128263; Mute</button>
-                        <button class="remote-btn" onclick="sendFireTVCommand('volume_up')">&#128266; Vol +</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('volume_down')">&#128265; Vol -</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('mute')">&#128263; Mute</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('volume_up')">&#128266; Vol +</button>
                     </div>
                 </div>
             </section>
 
-            <section class="apps-section" id="apps-section">
-                <h2>Quick Launch</h2>
-                <div class="apps-grid">
-                    <button class="app-btn" onclick="launchApp('youtube')">YouTube</button>
-                    <button class="app-btn" onclick="launchApp('netflix')">Netflix</button>
-                    <button class="app-btn" onclick="launchApp('prime')">Prime</button>
-                    <button class="app-btn" onclick="launchApp('disney')">Disney+</button>
-                    <button class="app-btn" onclick="launchApp('hulu')">Hulu</button>
-                    <button class="app-btn" onclick="launchApp('plex')">Plex</button>
+            <!-- Roku Remote (shown when Roku selected and connected) -->
+            <section id="roku-remote-section" class="remote-section hidden">
+                <div class="remote-header">
+                    <h2>Roku Remote</h2>
+                    <span id="roku-status" class="connection-badge disconnected">Disconnected</span>
                 </div>
+                <div class="remote-grid">
+                    <div class="remote-row">
+                        <button class="remote-btn" onclick="sendRemoteCommand('back')">&#8592; Back</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('up')">&#9650;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('home')">&#8962; Home</button>
+                    </div>
+                    <div class="remote-row">
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('left')">&#9664;</button>
+                        <button class="remote-btn select" onclick="sendRemoteCommand('select')">OK</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('right')">&#9654;</button>
+                    </div>
+                    <div class="remote-row">
+                        <button class="remote-btn" onclick="sendRemoteCommand('rewind')">&#9194;</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('down')">&#9660;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('fast_forward')">&#9193;</button>
+                    </div>
+                    <div class="remote-row media">
+                        <button class="remote-btn" onclick="sendRemoteCommand('play_pause')">&#9199; Play/Pause</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('instant_replay')">&#8634; Replay</button>
+                    </div>
+                    <div class="remote-row volume">
+                        <button class="remote-btn" onclick="sendRemoteCommand('volume_down')">&#128265; Vol -</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('mute')">&#128263; Mute</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('volume_up')">&#128266; Vol +</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Google TV Remote (shown when Google TV selected and connected) -->
+            <section id="googletv-remote-section" class="remote-section hidden">
+                <div class="remote-header">
+                    <h2>Google TV Remote</h2>
+                    <span id="googletv-status" class="connection-badge disconnected">Disconnected</span>
+                </div>
+                <div class="remote-grid">
+                    <div class="remote-row">
+                        <button class="remote-btn" onclick="sendRemoteCommand('back')">&#8592; Back</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('up')">&#9650;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('home')">&#8962; Home</button>
+                    </div>
+                    <div class="remote-row">
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('left')">&#9664;</button>
+                        <button class="remote-btn select" onclick="sendRemoteCommand('select')">OK</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('right')">&#9654;</button>
+                    </div>
+                    <div class="remote-row">
+                        <button class="remote-btn" onclick="sendRemoteCommand('rewind')">&#9194;</button>
+                        <button class="remote-btn nav" onclick="sendRemoteCommand('down')">&#9660;</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('fast_forward')">&#9193;</button>
+                    </div>
+                    <div class="remote-row media">
+                        <button class="remote-btn" onclick="sendRemoteCommand('play_pause')">&#9199; Play/Pause</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('menu')">&#9776; Menu</button>
+                    </div>
+                    <div class="remote-row volume">
+                        <button class="remote-btn" onclick="sendRemoteCommand('volume_down')">&#128265; Vol -</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('mute')">&#128263; Mute</button>
+                        <button class="remote-btn" onclick="sendRemoteCommand('volume_up')">&#128266; Vol +</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Generic Remote (shown when Generic selected) -->
+            <section id="generic-remote-section" class="remote-section hidden">
+                <div class="remote-header">
+                    <h2>Manual Control</h2>
+                </div>
+                <div class="generic-info">
+                    <p>No automatic remote control available for this device.</p>
+                    <p class="help-text">Ad blocking and detection will still work. Use your physical remote to control the device.</p>
+                </div>
+            </section>
+
+            <!-- Apple TV Info (shown when Apple TV selected - not yet implemented) -->
+            <section id="appletv-remote-section" class="remote-section hidden">
+                <div class="remote-header">
+                    <h2>Apple TV Remote</h2>
+                    <span class="connection-badge warning">Coming Soon</span>
+                </div>
+                <div class="generic-info">
+                    <p>Apple TV remote control is not yet implemented.</p>
+                    <p class="help-text">Apple TV requires the pyatv library and PIN pairing. Ad blocking will still work.</p>
+                </div>
+            </section>
+
+            <!-- Quick Launch Apps Section -->
+            <section id="apps-section" class="apps-section hidden">
+                <h2>Quick Launch</h2>
+                <div id="apps-grid" class="apps-grid">
+                    <!-- Apps will be populated based on device type -->
+                </div>
+            </section>
+
+            <!-- Device Reset -->
+            <section class="device-reset-section">
+                <button onclick="resetDeviceConfig()" class="warning-btn">Reset Device Configuration</button>
             </section>
         </div>
 
@@ -840,30 +983,33 @@
         }
 
         async function updateFireTVStatus() {
+            // Device-aware remote status update
             try {
-                const response = await fetch('/api/firetv/status');
+                const response = await fetch('/api/status');
                 if (!response.ok) return;
 
-                const data = await response.json();
-                const badge = document.getElementById('firetv-status');
-                const appsSection = document.getElementById('apps-section');
+                const status = await response.json();
+                const connected = status.remote_connected || false;
+                const deviceType = status.remote_device_type || 'none';
 
-                // Also update inline remote badge
+                // Update inline remote badge on home screen
                 const inlineBadge = document.getElementById('firetv-inline-status');
-
-                if (data.connected) {
-                    badge.textContent = 'Connected';
-                    badge.className = 'connection-badge connected';
-                    if (inlineBadge) { inlineBadge.textContent = 'Connected'; inlineBadge.className = 'connection-badge-sm connected'; }
-                    if (appsSection) appsSection.classList.remove('hidden');
-                } else {
-                    badge.textContent = data.state === 'not_initialized' ? 'Not Setup' : 'Disconnected';
-                    badge.className = 'connection-badge disconnected';
-                    if (inlineBadge) { inlineBadge.textContent = 'Disconnected'; inlineBadge.className = 'connection-badge-sm disconnected'; }
-                    if (appsSection) appsSection.classList.add('hidden');
+                if (inlineBadge) {
+                    if (deviceType === 'none') {
+                        inlineBadge.textContent = 'Not Setup';
+                        inlineBadge.className = 'connection-badge-sm disconnected';
+                    } else if (connected) {
+                        inlineBadge.textContent = 'Connected';
+                        inlineBadge.className = 'connection-badge-sm connected';
+                    } else {
+                        inlineBadge.textContent = 'Disconnected';
+                        inlineBadge.className = 'connection-badge-sm disconnected';
+                    }
                 }
+
+                // Update device-specific status in Remote tab (handled by updateDeviceConnectionStatus)
             } catch (error) {
-                console.error('Fire TV status update failed:', error);
+                console.error('Remote status update failed:', error);
             }
         }
 
@@ -2277,6 +2423,392 @@
         if (e.key === 'ArrowLeft') completeSwipe('left');
         if (e.key === 'z' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); undoReview(); }
     });
+
+    // =========================================================================
+    // Device Configuration and Remote Control
+    // =========================================================================
+
+    let currentDeviceType = 'none';
+    let deviceConfig = null;
+
+    const DEVICE_SETUP_STEPS = {
+        fire_tv: [
+            'Enable Developer Options: Settings > My Fire TV > About > click device name 7 times',
+            'Enable ADB Debugging: Settings > My Fire TV > Developer Options > ADB Debugging',
+            'Note your Fire TV IP: Settings > My Fire TV > About > Network',
+            'When prompted, approve the connection on your TV screen'
+        ],
+        roku: [
+            'Enable Device Connect: Settings > System > Advanced system settings > Control by mobile apps',
+            'Set to "Default" or "Permissive"',
+            'Note your Roku IP: Settings > Network > About'
+        ],
+        google_tv: [
+            'Enable Developer Options: Settings > About > click Build number 7 times',
+            'Enable USB/Network Debugging: Settings > System > Developer options > Debugging',
+            'Note your device IP: Settings > Network & Internet',
+            'When prompted, approve the connection on your TV screen'
+        ],
+        apple_tv: [
+            'Enable AirPlay: Settings > AirPlay and HomeKit',
+            'Note your Apple TV IP: Settings > Network',
+            'When prompted, enter the PIN shown on your TV'
+        ],
+        generic: [
+            'No automatic remote control for this device',
+            'Ad blocking and detection will still work',
+            'Use your physical remote to control the device'
+        ]
+    };
+
+    const DEVICE_APPS = {
+        fire_tv: ['youtube', 'netflix', 'prime', 'disney', 'hulu', 'plex'],
+        roku: ['youtube', 'netflix', 'prime', 'disney', 'hulu', 'plex', 'hbo', 'peacock'],
+        google_tv: ['youtube', 'netflix', 'prime', 'disney', 'hulu', 'plex'],
+        apple_tv: ['youtube', 'netflix', 'prime', 'disney', 'hulu', 'plex'],
+        generic: []
+    };
+
+    async function loadDeviceConfig() {
+        try {
+            const response = await fetch('/api/device/config');
+            if (!response.ok) return;
+
+            deviceConfig = await response.json();
+            currentDeviceType = deviceConfig.device_type || 'none';
+
+            updateDeviceUI();
+        } catch (error) {
+            console.error('Failed to load device config:', error);
+        }
+    }
+
+    function updateDeviceUI() {
+        // Update device selector buttons
+        document.querySelectorAll('.device-btn').forEach(btn => {
+            const deviceType = btn.getAttribute('data-device');
+            btn.classList.toggle('selected', deviceType === currentDeviceType);
+        });
+
+        // Update status display
+        const nameEl = document.getElementById('selected-device-name');
+        const statusEl = document.getElementById('selected-device-status');
+
+        if (deviceConfig && deviceConfig.info) {
+            nameEl.textContent = `${deviceConfig.info.icon || ''} ${deviceConfig.info.name}`;
+        } else {
+            nameEl.textContent = 'No device selected';
+        }
+
+        // Show/hide sections based on device type and setup status
+        const setupSection = document.getElementById('device-setup-section');
+        const scanSection = document.getElementById('device-scan-section');
+        const manualIpSection = document.getElementById('manual-ip-section');
+
+        // Hide all remote sections first
+        document.querySelectorAll('.remote-section').forEach(s => s.classList.add('hidden'));
+        document.getElementById('apps-section').classList.add('hidden');
+
+        if (currentDeviceType === 'none') {
+            setupSection.classList.remove('hidden');
+            scanSection.classList.add('hidden');
+            manualIpSection.classList.add('hidden');
+            document.getElementById('setup-title').textContent = 'Setup Instructions';
+            document.getElementById('setup-steps').innerHTML = '<p class="help-text">Select a device type above to get started.</p>';
+            statusEl.textContent = '--';
+            statusEl.className = 'connection-badge disconnected';
+            return;
+        }
+
+        // Show setup steps for selected device
+        const steps = DEVICE_SETUP_STEPS[currentDeviceType] || [];
+        document.getElementById('setup-title').textContent = `${deviceConfig.info?.name || currentDeviceType} Setup`;
+        document.getElementById('setup-steps').innerHTML = steps.map((step, i) =>
+            `<div class="setup-step"><span class="step-number">${i + 1}</span>${step}</div>`
+        ).join('');
+
+        // Show scan/IP input for supported devices
+        if (['fire_tv', 'roku', 'google_tv'].includes(currentDeviceType)) {
+            scanSection.classList.remove('hidden');
+            manualIpSection.classList.remove('hidden');
+        } else {
+            scanSection.classList.add('hidden');
+            manualIpSection.classList.add('hidden');
+        }
+
+        // Update connection status and show appropriate remote
+        updateDeviceConnectionStatus();
+    }
+
+    async function updateDeviceConnectionStatus() {
+        const statusEl = document.getElementById('selected-device-status');
+        let connected = false;
+
+        if (currentDeviceType === 'fire_tv') {
+            try {
+                const resp = await fetch('/api/firetv/status');
+                const data = await resp.json();
+                connected = data.connected;
+                document.getElementById('firetv-status').textContent = connected ? 'Connected' : 'Disconnected';
+                document.getElementById('firetv-status').className = 'connection-badge ' + (connected ? 'connected' : 'disconnected');
+            } catch (e) {}
+
+            if (connected) {
+                document.getElementById('firetv-remote-section').classList.remove('hidden');
+                document.getElementById('device-setup-section').classList.add('hidden');
+                showAppsForDevice('fire_tv');
+            }
+        } else if (currentDeviceType === 'roku') {
+            try {
+                const resp = await fetch('/api/roku/status');
+                const data = await resp.json();
+                connected = data.connected;
+                document.getElementById('roku-status').textContent = connected ? 'Connected' : 'Disconnected';
+                document.getElementById('roku-status').className = 'connection-badge ' + (connected ? 'connected' : 'disconnected');
+            } catch (e) {}
+
+            if (connected) {
+                document.getElementById('roku-remote-section').classList.remove('hidden');
+                document.getElementById('device-setup-section').classList.add('hidden');
+                showAppsForDevice('roku');
+            }
+        } else if (currentDeviceType === 'google_tv') {
+            // Google TV uses same status as Fire TV (both ADB)
+            try {
+                const resp = await fetch('/api/firetv/status');
+                const data = await resp.json();
+                connected = data.connected;
+                document.getElementById('googletv-status').textContent = connected ? 'Connected' : 'Disconnected';
+                document.getElementById('googletv-status').className = 'connection-badge ' + (connected ? 'connected' : 'disconnected');
+            } catch (e) {}
+
+            if (connected) {
+                document.getElementById('googletv-remote-section').classList.remove('hidden');
+                document.getElementById('device-setup-section').classList.add('hidden');
+                showAppsForDevice('google_tv');
+            }
+        } else if (currentDeviceType === 'apple_tv') {
+            document.getElementById('appletv-remote-section').classList.remove('hidden');
+        } else if (currentDeviceType === 'generic') {
+            document.getElementById('generic-remote-section').classList.remove('hidden');
+            document.getElementById('device-setup-section').classList.add('hidden');
+        }
+
+        statusEl.textContent = connected ? 'Connected' : (currentDeviceType === 'none' ? '--' : 'Not Connected');
+        statusEl.className = 'connection-badge ' + (connected ? 'connected' : 'disconnected');
+    }
+
+    function showAppsForDevice(deviceType) {
+        const apps = DEVICE_APPS[deviceType] || [];
+        if (apps.length === 0) {
+            document.getElementById('apps-section').classList.add('hidden');
+            return;
+        }
+
+        const grid = document.getElementById('apps-grid');
+        grid.innerHTML = apps.map(app =>
+            `<button class="app-btn" onclick="launchAppForDevice('${app}')">${app.charAt(0).toUpperCase() + app.slice(1)}</button>`
+        ).join('');
+        document.getElementById('apps-section').classList.remove('hidden');
+    }
+
+    async function selectDeviceType(deviceType) {
+        try {
+            const response = await fetch('/api/device/select', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ device_type: deviceType })
+            });
+            const data = await response.json();
+            if (data.success) {
+                deviceConfig = data.config;
+                currentDeviceType = deviceType;
+                updateDeviceUI();
+            }
+        } catch (error) {
+            console.error('Failed to select device type:', error);
+        }
+    }
+
+    async function scanForDevices() {
+        const btn = document.getElementById('scan-btn');
+        const results = document.getElementById('scan-results');
+
+        btn.disabled = true;
+        btn.textContent = 'Scanning...';
+        results.classList.remove('hidden');
+        results.innerHTML = '<div class="scanning">Scanning network...</div>';
+
+        try {
+            let endpoint = '';
+            if (currentDeviceType === 'roku') {
+                endpoint = '/api/roku/discover';
+            } else if (currentDeviceType === 'fire_tv' || currentDeviceType === 'google_tv') {
+                // For Fire TV / Google TV, we'll use the Fire TV scan
+                endpoint = '/api/firetv/scan';
+            }
+
+            if (endpoint) {
+                const response = await fetch(endpoint);
+                const data = await response.json();
+                const devices = data.devices || [];
+
+                if (devices.length > 0) {
+                    results.innerHTML = devices.map(d =>
+                        `<div class="scan-result" onclick="connectToDevice('${d.ip}')">
+                            <span class="device-found-name">${d.name || 'Unknown'}</span>
+                            <span class="device-found-info">${d.model || ''} - ${d.ip}</span>
+                        </div>`
+                    ).join('');
+                } else {
+                    results.innerHTML = '<div class="empty-state">No devices found. Check that your device is on and connected to the same network.</div>';
+                }
+            }
+        } catch (error) {
+            console.error('Device scan failed:', error);
+            results.innerHTML = '<div class="error-state">Scan failed. Try entering IP manually.</div>';
+        }
+
+        btn.disabled = false;
+        btn.textContent = 'Scan for Devices';
+    }
+
+    async function connectToDevice(ip) {
+        try {
+            let endpoint = '';
+            if (currentDeviceType === 'roku') {
+                endpoint = '/api/roku/connect';
+            } else if (currentDeviceType === 'fire_tv' || currentDeviceType === 'google_tv') {
+                endpoint = '/api/firetv/connect';
+            }
+
+            if (endpoint) {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ ip })
+                });
+                const data = await response.json();
+
+                if (data.success || data.connected) {
+                    // Update device config with IP
+                    await fetch('/api/device/ip', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ ip })
+                    });
+                    await fetch('/api/device/setup-complete', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ complete: true })
+                    });
+
+                    loadDeviceConfig();
+                } else {
+                    alert(data.error || 'Connection failed');
+                }
+            }
+        } catch (error) {
+            console.error('Device connect failed:', error);
+            alert('Connection failed');
+        }
+    }
+
+    function connectToDeviceIP() {
+        const ip = document.getElementById('device-ip-input').value.trim();
+        if (!ip) {
+            alert('Please enter an IP address');
+            return;
+        }
+        connectToDevice(ip);
+    }
+
+    async function sendRemoteCommand(command) {
+        try {
+            let endpoint = '';
+            if (currentDeviceType === 'fire_tv' || currentDeviceType === 'google_tv') {
+                endpoint = '/api/firetv/command';
+            } else if (currentDeviceType === 'roku') {
+                endpoint = '/api/roku/command';
+            }
+
+            if (endpoint) {
+                const response = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command })
+                });
+                if (!response.ok) {
+                    console.error('Remote command failed');
+                }
+            }
+        } catch (error) {
+            console.error('Remote command error:', error);
+        }
+    }
+
+    async function launchAppForDevice(app) {
+        try {
+            let endpoint = '';
+            if (currentDeviceType === 'fire_tv' || currentDeviceType === 'google_tv') {
+                endpoint = `/api/firetv/launch/${app}`;
+            } else if (currentDeviceType === 'roku') {
+                endpoint = `/api/roku/launch/${app}`;
+            }
+
+            if (endpoint) {
+                const response = await fetch(endpoint, { method: 'POST' });
+                if (!response.ok) {
+                    console.error('App launch failed');
+                }
+            }
+        } catch (error) {
+            console.error('App launch error:', error);
+        }
+    }
+
+    // Legacy functions for backwards compatibility with inline remote
+    async function sendFireTVCommand(command) {
+        try {
+            const response = await fetch('/api/firetv/command', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command })
+            });
+        } catch (error) {
+            console.error('Fire TV command error:', error);
+        }
+    }
+
+    async function launchApp(app) {
+        // Determine which device to launch on based on current config
+        if (currentDeviceType === 'roku') {
+            await fetch(`/api/roku/launch/${app}`, { method: 'POST' });
+        } else {
+            await fetch(`/api/firetv/launch/${app}`, { method: 'POST' });
+        }
+    }
+
+    async function resetDeviceConfig() {
+        if (!confirm('Reset device configuration? You will need to set up your device again.')) return;
+
+        try {
+            await fetch('/api/device/reset', { method: 'POST' });
+            loadDeviceConfig();
+        } catch (error) {
+            console.error('Device reset failed:', error);
+        }
+    }
+
+    // Load device config on page load
+    loadDeviceConfig();
+
+    // Periodically update device connection status
+    setInterval(() => {
+        if (currentTab === 'remote') {
+            updateDeviceConnectionStatus();
+        }
+    }, 5000);
     </script>
 
     <!-- Review Modal -->

@@ -134,6 +134,9 @@ class FireTVSetupManager:
         # Fire TV info (once connected)
         self._fire_tv_info: Optional[dict] = None
 
+        # Preferred IP to try first (set via set_preferred_ip)
+        self._preferred_ip: Optional[str] = None
+
         # Initialize notification overlay using ustreamer API
         # This renders text directly in the MPP encoder - no GStreamer pipeline issues
         try:
@@ -170,6 +173,18 @@ class FireTVSetupManager:
         """Set callbacks for state changes and connection success."""
         self._on_state_change = on_state_change
         self._on_connected = on_connected
+
+    def set_preferred_ip(self, ip_address: str):
+        """Set a preferred IP address to try first before scanning.
+
+        If this IP is set and valid, the setup will try to connect
+        to it directly instead of scanning for devices.
+
+        Args:
+            ip_address: IP address of the Fire TV device
+        """
+        self._preferred_ip = ip_address
+        logger.info(f"[FireTVSetup] Preferred IP set to: {ip_address}")
 
     def start_setup(self, blocking: bool = False) -> bool:
         """
@@ -263,7 +278,34 @@ class FireTVSetupManager:
 
             self.controller = FireTVController()
 
-            # Phase 1: Scan for devices
+            # Phase 1: Try preferred IP first, then scan for devices
+            devices = []
+
+            # If we have a preferred IP, try to connect directly
+            if self._preferred_ip:
+                logger.info(f"[FireTVSetup] Trying preferred IP: {self._preferred_ip}")
+                if self._notification:
+                    self._notification.show(f"Connecting to {self._preferred_ip}...", duration=None)
+
+                # Try to connect directly to the preferred IP
+                self.state = self.STATE_WAITING_AUTH
+                success = self._connect_with_retry(self._preferred_ip)
+
+                if self._stop_setup.is_set():
+                    return
+
+                if success:
+                    self._hide_guidance()
+                    self.state = self.STATE_CONNECTED
+                    self._show_success_message()
+
+                    if self._on_connected and self._fire_tv_info:
+                        self._on_connected(self._fire_tv_info)
+                    return  # Done - connected via preferred IP
+
+                # Preferred IP failed, fall through to scanning
+                logger.info("[FireTVSetup] Preferred IP failed, falling back to scan")
+
             self.state = self.STATE_SCANNING
             devices = self._scan_for_devices()
 
