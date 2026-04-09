@@ -77,11 +77,12 @@ KEY_CODES = {
     "next": "KEYCODE_MEDIA_NEXT",
     "previous": "KEYCODE_MEDIA_PREVIOUS",
 
-    # Fire TV specific
+    # Fire TV / Android TV specific
     "back": "KEYCODE_BACK",
     "home": "KEYCODE_HOME",
     "menu": "KEYCODE_MENU",
     "search": "KEYCODE_SEARCH",
+    "assistant": "KEYCODE_ASSIST",  # Google Assistant on Google TV
 
     # Volume
     "volume_up": "KEYCODE_VOLUME_UP",

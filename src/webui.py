@@ -613,6 +613,96 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # Google TV / Android TV Remote Control (uses ADB like Fire TV)
+        # =========================================================================
+
+        @self.app.route('/api/googletv/status')
+        def api_googletv_status():
+            """Get Google TV connection status."""
+            try:
+                # Google TV uses the same ADB controller as Fire TV
+                if hasattr(self.minus, 'fire_tv_setup') and self.minus.fire_tv_setup:
+                    controller = self.minus.fire_tv_setup.get_controller()
+                    if controller:
+                        return jsonify({
+                            'connected': controller.is_connected,
+                            'device_info': {
+                                'ip': controller._ip_address,
+                                'device_type': 'google_tv',
+                            } if controller.is_connected else None
+                        })
+                return jsonify({'connected': False, 'device_info': None})
+            except Exception as e:
+                logger.error(f"Error getting Google TV status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/googletv/scan')
+        def api_googletv_scan():
+            """Scan for Google TV / Android TV devices on the network."""
+            try:
+                from src.fire_tv import FireTVController
+                # Use the same discovery as Fire TV - both use ADB
+                devices = FireTVController.discover_devices(timeout=10.0)
+                # Filter or label as Google TV
+                for device in devices:
+                    device['device_type'] = 'google_tv'
+                return jsonify({
+                    'devices': devices,
+                    'count': len(devices),
+                })
+            except Exception as e:
+                logger.error(f"Error scanning for Google TV: {e}")
+                return jsonify({'devices': [], 'error': str(e)}), 500
+
+        @self.app.route('/api/googletv/connect', methods=['POST'])
+        def api_googletv_connect():
+            """Connect to a Google TV device by IP."""
+            try:
+                data = request.get_json() or {}
+                ip_address = data.get('ip')
+                if not ip_address:
+                    return jsonify({'error': 'IP address required'}), 400
+
+                # Start setup with the provided IP (uses same ADB setup as Fire TV)
+                if hasattr(self.minus, '_start_fire_tv_setup'):
+                    self.minus._start_fire_tv_setup(saved_ip=ip_address)
+                    return jsonify({'success': True, 'message': f'Connecting to {ip_address}...'})
+                else:
+                    return jsonify({'error': 'Google TV setup not available'}), 500
+            except Exception as e:
+                logger.error(f"Error connecting to Google TV: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/googletv/command', methods=['POST'])
+        def api_googletv_command():
+            """Send a command to Google TV."""
+            try:
+                data = request.get_json() or {}
+                command = data.get('command')
+
+                valid_commands = [
+                    'up', 'down', 'left', 'right', 'select', 'back', 'home', 'menu',
+                    'play', 'pause', 'play_pause', 'fast_forward', 'rewind',
+                    'volume_up', 'volume_down', 'mute', 'assistant'
+                ]
+
+                if command not in valid_commands:
+                    return jsonify({'error': f'Invalid command. Valid: {valid_commands}'}), 400
+
+                # Google TV uses the same ADB controller as Fire TV
+                if hasattr(self.minus, 'fire_tv_setup') and self.minus.fire_tv_setup:
+                    controller = self.minus.fire_tv_setup.get_controller()
+                    if controller and controller.is_connected:
+                        controller.send_command(command)
+                        return jsonify({'success': True, 'command': command})
+                    return jsonify({'error': 'Google TV not connected'}), 503
+
+                return jsonify({'error': 'Google TV not initialized'}), 500
+            except Exception as e:
+                logger.error(f"Error sending Google TV command: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Roku Remote Control
         # =========================================================================
 
