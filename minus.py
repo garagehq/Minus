@@ -864,7 +864,7 @@ class Minus:
 
             # Handle based on device type
             if device_type in ('fire_tv', 'google_tv'):
-                self._start_fire_tv_setup(device_ip if setup_complete else None)
+                self._start_fire_tv_setup(device_ip if setup_complete else None, device_type=device_type)
             elif device_type == 'roku':
                 self._start_roku_connection(device_ip if setup_complete else None)
             else:
@@ -877,17 +877,19 @@ class Minus:
         )
         self._fire_tv_setup_thread.start()
 
-    def _start_fire_tv_setup(self, saved_ip: str = None):
+    def _start_fire_tv_setup(self, saved_ip: str = None, device_type: str = 'fire_tv'):
         """Start Fire TV / Google TV setup flow."""
         if not HAS_FIRE_TV:
             logger.info("[FireTV] Fire TV module not available")
             return
 
-        logger.info("[FireTV] Initializing Fire TV setup manager...")
+        device_name = "Google TV" if device_type == 'google_tv' else "Fire TV"
+        logger.info(f"[{device_name}] Initializing setup manager...")
         self.fire_tv_setup = FireTVSetupManager(
             ad_blocker=self.ad_blocker,
             ocr_worker=self.ocr,
-            ustreamer_port=self.config.ustreamer_port
+            ustreamer_port=self.config.ustreamer_port,
+            device_type=device_type
         )
 
         # Set callbacks

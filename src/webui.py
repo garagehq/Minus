@@ -471,10 +471,13 @@ class WebUI:
 
                 # Show setup instructions overlay for the new device
                 try:
-                    from src.overlay import FireTVNotification, RokuNotification
-                    if device_type in ('fire_tv', 'google_tv'):
+                    from src.overlay import FireTVNotification, GoogleTVNotification, RokuNotification
+                    if device_type == 'fire_tv':
                         notification = FireTVNotification(ustreamer_port=self.minus.config.ustreamer_port)
-                        notification.show_adb_enable_instructions()
+                        notification.show_adb_enable_instructions(timeout_remaining=300)
+                    elif device_type == 'google_tv':
+                        notification = GoogleTVNotification(ustreamer_port=self.minus.config.ustreamer_port)
+                        notification.show_adb_enable_instructions(timeout_remaining=300)
                     elif device_type == 'roku':
                         notification = RokuNotification(ustreamer_port=self.minus.config.ustreamer_port)
                         notification.show_setup_instructions()
@@ -576,7 +579,7 @@ class WebUI:
 
                 # Start Fire TV setup with the provided IP
                 if hasattr(self.minus, '_start_fire_tv_setup'):
-                    self.minus._start_fire_tv_setup(saved_ip=ip_address)
+                    self.minus._start_fire_tv_setup(saved_ip=ip_address, device_type='fire_tv')
                     return jsonify({'success': True, 'message': f'Connecting to {ip_address}...'})
                 else:
                     return jsonify({'error': 'Fire TV setup not available'}), 500
@@ -665,7 +668,7 @@ class WebUI:
 
                 # Start setup with the provided IP (uses same ADB setup as Fire TV)
                 if hasattr(self.minus, '_start_fire_tv_setup'):
-                    self.minus._start_fire_tv_setup(saved_ip=ip_address)
+                    self.minus._start_fire_tv_setup(saved_ip=ip_address, device_type='google_tv')
                     return jsonify({'success': True, 'message': f'Connecting to {ip_address}...'})
                 else:
                     return jsonify({'error': 'Google TV setup not available'}), 500

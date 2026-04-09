@@ -459,6 +459,82 @@ class FireTVNotification(NotificationOverlay):
         self.show(text, duration=5.0)
 
 
+class GoogleTVNotification(NotificationOverlay):
+    """
+    Specialized notification overlay for Google TV / Android TV setup guidance.
+
+    Shows compact setup instructions in the top-right corner
+    while the user navigates their Google TV to enable ADB or
+    authorize the connection.
+    """
+
+    def __init__(self, ustreamer_port: int = 9090):
+        super().__init__(ustreamer_port=ustreamer_port, position=NotificationOverlay.POS_TOP_RIGHT)
+        self._scale = 3
+
+    def show_scanning(self):
+        """Show 'Scanning for Google TV...' notification."""
+        text = "Scanning for Google TV..."
+        self.show(text, duration=None)
+
+    def show_adb_enable_instructions(self, timeout_remaining: int = None):
+        """Show instructions for enabling ADB debugging."""
+        lines = [
+            "Google TV Setup",
+            "",
+            "Enable ADB Debugging:",
+            "1. Settings > System > About",
+            "2. Click Build number 7 times",
+            "3. Go back to System",
+            "4. Developer options",
+            "5. Turn ON USB debugging",
+        ]
+
+        if timeout_remaining is not None:
+            lines.append("")
+            lines.append(f"Scanning... ({timeout_remaining}s)")
+
+        text = "\n".join(lines)
+        self.show(text, duration=None)
+
+    def show_auth_instructions(self, ip_address: str = None, attempt: int = None, timeout_remaining: int = None):
+        """Show instructions for authorizing ADB connection."""
+        lines = [
+            "Google TV Found!",
+            "",
+            "On your TV, press Allow",
+            "on the USB Debugging dialog.",
+            "",
+            "Check: Always allow",
+        ]
+
+        if ip_address:
+            lines.insert(1, f"IP: {ip_address}")
+
+        if attempt is not None and timeout_remaining is not None:
+            lines.append("")
+            lines.append(f"Attempt {attempt}... ({timeout_remaining}s)")
+
+        text = "\n".join(lines)
+        self.show(text, duration=None)
+
+    def show_connected(self, device_name: str = "Google TV"):
+        """Show connection success notification. Clears any pending setup overlays."""
+        _clear_persistent()
+        text = f"{device_name} Connected!\n\nRemote control enabled."
+        self.show(text, duration=5.0)
+
+    def show_failed(self, reason: str = "Connection failed"):
+        """Show connection failure notification."""
+        text = f"{reason}\n\nGoogle TV control disabled."
+        self.show(text, duration=10.0)
+
+    def show_skipped(self):
+        """Show setup skipped notification."""
+        text = "Google TV setup skipped.\n\nRemote control unavailable."
+        self.show(text, duration=5.0)
+
+
 class RokuNotification(NotificationOverlay):
     """
     Specialized notification overlay for Roku setup guidance.
