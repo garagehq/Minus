@@ -623,8 +623,11 @@ class DRMAdBlocker:
                         error_msg = f"{err.message} (debug: {debug})"
                 logger.error(f"[DRMAdBlocker] Failed to start no-signal pipeline: {error_msg}")
                 logger.error(f"[DRMAdBlocker] Pipeline was: plane={self.plane_id}, connector={self.connector_id}")
-                # Clean up failed pipeline
+                # Clean up failed pipeline - CRITICAL: must remove bus signal watch to avoid FD leak
                 try:
+                    if self.bus:
+                        self.bus.remove_signal_watch()
+                        self.bus = None
                     self.pipeline.set_state(Gst.State.NULL)
                 except Exception as e:
                     logger.debug(f"[DRMAdBlocker] Error during no-signal pipeline cleanup: {e}")
@@ -643,6 +646,16 @@ class DRMAdBlocker:
             logger.error(f"[DRMAdBlocker] Failed to start no-signal mode: {e}")
             import traceback
             traceback.print_exc()
+            # Clean up on exception - avoid FD leaks
+            try:
+                if self.bus:
+                    self.bus.remove_signal_watch()
+                    self.bus = None
+                if self.pipeline:
+                    self.pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self.pipeline = None
             return False
 
     def _start_no_signal_animation(self):
@@ -774,6 +787,15 @@ class DRMAdBlocker:
             ret = self.pipeline.set_state(Gst.State.PLAYING)
             if ret == Gst.StateChangeReturn.FAILURE:
                 logger.error("[DRMAdBlocker] Failed to start loading pipeline")
+                # Clean up failed pipeline - CRITICAL: must remove bus signal watch to avoid FD leak
+                try:
+                    if self.bus:
+                        self.bus.remove_signal_watch()
+                        self.bus = None
+                    self.pipeline.set_state(Gst.State.NULL)
+                except Exception as e:
+                    logger.debug(f"[DRMAdBlocker] Error during loading pipeline cleanup: {e}")
+                self.pipeline = None
                 return False
 
             self.is_visible = True
@@ -786,6 +808,16 @@ class DRMAdBlocker:
             return True
         except Exception as e:
             logger.error(f"[DRMAdBlocker] Failed to start loading mode: {e}")
+            # Clean up on exception - avoid FD leaks
+            try:
+                if self.bus:
+                    self.bus.remove_signal_watch()
+                    self.bus = None
+                if self.pipeline:
+                    self.pipeline.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            self.pipeline = None
             return False
 
     def _start_loading_animation(self):

@@ -84,6 +84,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/roku.py` | Roku ECP remote control |
 | `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
+| `src/wifi_manager.py` | WiFi captive portal and AP mode management |
 | `src/overlay.py` | Notification overlay via ustreamer API |
 | `src/vocabulary.py` | Spanish vocabulary list (120+ words) |
 | `src/console.py` | Console blanking/restore functions |
@@ -829,6 +830,51 @@ This structured prompt returns in ~1.0s (vs 5-22s with descriptive prompts).
 
 **Web UI:** Toggle button, schedule time selectors, 24/7 checkbox, stats display in Settings tab.
 
+## WiFi Captive Portal
+
+Minus includes a WiFi captive portal system for easy network configuration when no WiFi is connected.
+
+**How it works:**
+1. If WiFi disconnects for 30+ seconds, Minus creates a "Minus" hotspot AP
+2. Users connect to the hotspot and get redirected to a setup page
+3. Setup page shows available networks with signal strength
+4. User selects network and enters password
+5. Minus connects and stops the AP automatically
+
+**Hotspot Configuration:**
+- **SSID:** `Minus`
+- **Password:** `minus123`
+- **IP:** `10.42.0.1`
+- **Band:** 2.4GHz (802.11 b/g)
+
+**Captive Portal Detection:**
+The portal supports automatic detection on mobile devices:
+- `GET /generate_204` - Android captive portal check
+- `GET /hotspot-detect.html` - Apple captive portal check
+- `GET /connecttest.txt` - Windows captive portal check
+
+**API Endpoints:**
+- `GET /api/wifi/status` - Current connection status, AP mode state
+- `GET /api/wifi/scan` - Scan for available networks
+- `POST /api/wifi/connect` - Connect to a network (ssid, password)
+- `POST /api/wifi/disconnect` - Disconnect from current network
+- `POST /api/wifi/ap/start` - Start AP mode manually
+- `POST /api/wifi/ap/stop` - Stop AP mode
+- `GET /wifi-setup` - Captive portal setup page
+
+**Settings Tab Integration:**
+The Settings tab in the web UI shows:
+- Current WiFi status (SSID, IP, signal strength)
+- Disconnect button for current network
+- Manual AP mode start/stop buttons
+
+**Files:**
+- `src/wifi_manager.py` - WiFi/AP management module
+- `src/templates/wifi_setup.html` - Captive portal page
+- `tests/test_wifi_portal.py` - Playwright tests (30 tests)
+
+**Note:** The Radxa's internal WiFi antenna has limited range. For better AP coverage in production, consider using a USB WiFi adapter with external antenna.
+
 ## Streaming Device Configuration
 
 Minus supports multiple streaming device types with device-specific remote control:
@@ -1266,3 +1312,19 @@ This caused the new pipeline to fail with "device in use" because the old pipeli
 **Symptom:** After successfully skipping an ad via Fire TV, the blocking overlay stayed for 2-3+ seconds waiting for OCR to detect the ad was gone.
 
 **Solution:** After a successful skip command (auto or manual via web UI), blocking is now removed after a 1.5s delay instead of waiting for 3 OCR cycles. The delay allows the skip animation to complete, then force-unblocks by resetting all detection state.
+
+### GStreamer Bus Signal Watch FD Leak (Fixed - Apr 2026)
+
+**Symptom:** After running for 12+ hours with no HDMI signal, the web server becomes unresponsive. Logs show `[Errno 24] Too many open files` errors. The service cannot open new files or sockets.
+
+**Root Cause:** When the no-signal or loading GStreamer pipelines failed to start, the cleanup code did not remove the bus signal watch before destroying the pipeline. Each failed attempt leaked a file descriptor from `bus.add_signal_watch()`. With retries every 10 seconds, the 1024 FD limit was reached in ~3 hours.
+
+**Solution:** Added proper bus cleanup in all pipeline failure paths:
+```python
+# Before destroying failed pipeline:
+if self.bus:
+    self.bus.remove_signal_watch()
+    self.bus = None
+```
+
+Fixed in `src/ad_blocker.py`: `start_no_signal_mode()` and `start_loading_mode()` failure paths and exception handlers.

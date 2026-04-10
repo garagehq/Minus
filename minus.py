@@ -177,6 +177,14 @@ except ImportError as e:
     logger.warning(f"Overlay module not available: {e}")
     HAS_OVERLAY = False
 
+# Import WiFi Manager
+try:
+    from wifi_manager import get_wifi_manager, WiFiManager
+    HAS_WIFI_MANAGER = True
+except ImportError as e:
+    logger.warning(f"WiFi Manager module not available: {e}")
+    HAS_WIFI_MANAGER = False
+
 
 class Minus:
     """
@@ -2332,6 +2340,54 @@ class Minus:
                 logger.warning(f"Failed to start Web UI: {e}")
                 self.webui = None
 
+        # Start WiFi manager and monitor thread
+        # If no WiFi, it will auto-start AP mode after 30 seconds
+        if HAS_WIFI_MANAGER:
+            try:
+                self.wifi_manager = get_wifi_manager()
+
+                # Define callbacks for AP mode events
+                def on_ap_started():
+                    logger.info("[WiFi] AP mode started - captive portal available")
+                    if HAS_OVERLAY:
+                        try:
+                            overlay = SystemNotification(ustreamer_port=self.config.ustreamer_port)
+                            overlay.show(
+                                "Connect to WiFi: Minus\nPassword: minussetup\nOpen browser to configure",
+                                duration=0,  # Persistent until AP stops
+                                position='center'
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to show AP overlay: {e}")
+
+                def on_ap_stopped():
+                    logger.info("[WiFi] AP mode stopped - connected to WiFi")
+                    if HAS_OVERLAY:
+                        try:
+                            overlay = SystemNotification(ustreamer_port=self.config.ustreamer_port)
+                            overlay.hide()
+                        except Exception as e:
+                            logger.warning(f"Failed to hide AP overlay: {e}")
+
+                self.wifi_manager._on_ap_started = on_ap_started
+                self.wifi_manager._on_ap_stopped = on_ap_stopped
+
+                # Start the WiFi monitor thread
+                self.wifi_manager.start_monitor()
+                logger.info("[WiFi] WiFi manager and monitor started")
+
+                # Log current WiFi status
+                status = self.wifi_manager.get_status()
+                if status.connected:
+                    logger.info(f"[WiFi] Connected to: {status.ssid} ({status.ip_address})")
+                else:
+                    logger.info("[WiFi] Not connected - AP will start in 30 seconds if no connection")
+            except Exception as e:
+                logger.warning(f"Failed to start WiFi manager: {e}")
+                self.wifi_manager = None
+        else:
+            self.wifi_manager = None
+
         # Start health monitor early so status is available
         if self.health_monitor:
             self.health_monitor.start()
@@ -2509,6 +2565,14 @@ class Minus:
         """Stop everything."""
         logger.info("Stopping...")
         self.running = False
+
+        # Stop WiFi manager
+        if hasattr(self, 'wifi_manager') and self.wifi_manager:
+            self.wifi_manager.stop_monitor()
+            # Stop AP mode if active
+            if self.wifi_manager._ap_mode_active:
+                self.wifi_manager.stop_ap_mode()
+            self.wifi_manager = None
 
         # Stop night mode
         if self.autonomous_mode:

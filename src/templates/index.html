@@ -594,6 +594,34 @@
             <!-- WiFi Management -->
             <section class="wifi-section">
                 <h2>WiFi Networks</h2>
+
+                <!-- WiFi Status Card -->
+                <div class="wifi-status-card" id="wifi-status-card">
+                    <div class="wifi-status-row">
+                        <span class="wifi-status-label">Status:</span>
+                        <span class="wifi-status-value" id="wifi-status-text">Loading...</span>
+                    </div>
+                    <div class="wifi-status-row" id="wifi-ssid-row" style="display:none;">
+                        <span class="wifi-status-label">Network:</span>
+                        <span class="wifi-status-value" id="wifi-ssid-text"></span>
+                    </div>
+                    <div class="wifi-status-row" id="wifi-ip-row" style="display:none;">
+                        <span class="wifi-status-label">IP:</span>
+                        <span class="wifi-status-value" id="wifi-ip-text"></span>
+                    </div>
+                    <div class="wifi-status-row" id="wifi-ap-row" style="display:none;">
+                        <span class="wifi-status-label">AP Clients:</span>
+                        <span class="wifi-status-value" id="wifi-ap-clients">0</span>
+                    </div>
+                </div>
+
+                <!-- AP Mode Controls -->
+                <div class="wifi-ap-controls">
+                    <button onclick="disconnectWifi()" class="action-btn" id="wifi-disconnect-btn" style="display:none;">Disconnect</button>
+                    <button onclick="startApMode()" class="action-btn" id="wifi-start-ap-btn" style="display:none;">Start AP Mode</button>
+                    <button onclick="stopApMode()" class="warning-btn" id="wifi-stop-ap-btn" style="display:none;">Stop AP Mode</button>
+                </div>
+
                 <div class="wifi-tabs">
                     <button class="tab-btn active" onclick="showWifiTab('saved')">Saved</button>
                     <button class="tab-btn" onclick="showWifiTab('scan')">Scan</button>
@@ -605,6 +633,7 @@
                     <button onclick="scanWifi()" class="scan-btn">Scan for Networks</button>
                     <div id="wifi-scan-results"></div>
                 </div>
+                <p class="help-text">AP Mode creates a "Minus" hotspot for WiFi configuration via captive portal.</p>
             </section>
 
             <!-- Network Info -->
@@ -721,6 +750,7 @@
             if (tabName === 'screenshots') {
                 loadScreenshots();
             } else if (tabName === 'settings') {
+                loadWifiStatus();
                 loadWifiConnections();
                 loadAdbKeys();
                 loadNetworkInfo();
@@ -1883,6 +1913,116 @@
             document.getElementById('wifi-saved').classList.toggle('hidden', tab !== 'saved');
             document.getElementById('wifi-scan').classList.toggle('hidden', tab !== 'scan');
             if (tab === 'saved') loadWifiConnections();
+        }
+
+        // WiFi Status and AP Mode
+        async function loadWifiStatus() {
+            try {
+                const response = await fetch('/api/wifi/status');
+                if (!response.ok) return;
+
+                const data = await response.json();
+                const statusText = document.getElementById('wifi-status-text');
+                const ssidRow = document.getElementById('wifi-ssid-row');
+                const ipRow = document.getElementById('wifi-ip-row');
+                const apRow = document.getElementById('wifi-ap-row');
+                const disconnectBtn = document.getElementById('wifi-disconnect-btn');
+                const startApBtn = document.getElementById('wifi-start-ap-btn');
+                const stopApBtn = document.getElementById('wifi-stop-ap-btn');
+
+                if (data.ap_mode_active) {
+                    statusText.textContent = 'AP Mode Active';
+                    statusText.className = 'wifi-status-value warning';
+                    ssidRow.style.display = 'flex';
+                    document.getElementById('wifi-ssid-text').textContent = 'Minus (hotspot)';
+                    ipRow.style.display = 'flex';
+                    document.getElementById('wifi-ip-text').textContent = '10.42.0.1';
+                    apRow.style.display = 'flex';
+                    document.getElementById('wifi-ap-clients').textContent = data.ap_clients || 0;
+                    disconnectBtn.style.display = 'none';
+                    startApBtn.style.display = 'none';
+                    stopApBtn.style.display = 'inline-block';
+                } else if (data.connected) {
+                    statusText.textContent = 'Connected';
+                    statusText.className = 'wifi-status-value ok';
+                    ssidRow.style.display = 'flex';
+                    document.getElementById('wifi-ssid-text').textContent = data.ssid;
+                    ipRow.style.display = 'flex';
+                    document.getElementById('wifi-ip-text').textContent = data.ip_address || 'N/A';
+                    apRow.style.display = 'none';
+                    disconnectBtn.style.display = 'inline-block';
+                    startApBtn.style.display = 'none';
+                    stopApBtn.style.display = 'none';
+                } else {
+                    statusText.textContent = 'Disconnected';
+                    statusText.className = 'wifi-status-value error';
+                    ssidRow.style.display = 'none';
+                    ipRow.style.display = 'none';
+                    apRow.style.display = 'none';
+                    disconnectBtn.style.display = 'none';
+                    startApBtn.style.display = 'inline-block';
+                    stopApBtn.style.display = 'none';
+                }
+            } catch (error) {
+                console.error('WiFi status load failed:', error);
+            }
+        }
+
+        async function disconnectWifi() {
+            if (!confirm('Disconnect from current WiFi network?')) return;
+
+            try {
+                const response = await fetch('/api/wifi/disconnect', {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    loadWifiStatus();
+                    loadWifiConnections();
+                } else {
+                    const data = await response.json();
+                    alert(data.error || 'Disconnect failed');
+                }
+            } catch (error) {
+                console.error('WiFi disconnect failed:', error);
+            }
+        }
+
+        async function startApMode() {
+            if (!confirm('Start AP Mode? This will disconnect from current WiFi.')) return;
+
+            try {
+                const response = await fetch('/api/wifi/ap/start', {
+                    method: 'POST'
+                });
+                const data = await response.json();
+                if (data.success) {
+                    alert(`AP Mode started!\nSSID: ${data.ssid}\nPassword: ${data.password}\nIP: ${data.ip}`);
+                    loadWifiStatus();
+                } else {
+                    alert(data.error || 'Failed to start AP mode');
+                }
+            } catch (error) {
+                console.error('AP start failed:', error);
+                alert('Failed to start AP mode');
+            }
+        }
+
+        async function stopApMode() {
+            if (!confirm('Stop AP Mode? Connected devices will be disconnected.')) return;
+
+            try {
+                const response = await fetch('/api/wifi/ap/stop', {
+                    method: 'POST'
+                });
+                if (response.ok) {
+                    loadWifiStatus();
+                } else {
+                    const data = await response.json();
+                    alert(data.error || 'Failed to stop AP mode');
+                }
+            } catch (error) {
+                console.error('AP stop failed:', error);
+            }
         }
 
         // =========================================================================
