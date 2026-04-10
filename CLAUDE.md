@@ -84,6 +84,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/roku.py` | Roku ECP remote control |
 | `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
+| `src/wifi_manager.py` | WiFi captive portal and AP mode management |
 | `src/overlay.py` | Notification overlay via ustreamer API |
 | `src/vocabulary.py` | Spanish vocabulary list (120+ words) |
 | `src/console.py` | Console blanking/restore functions |
@@ -828,6 +829,51 @@ This structured prompt returns in ~1.0s (vs 5-22s with descriptive prompts).
 - `GET /api/autonomous/logs` - Recent log entries
 
 **Web UI:** Toggle button, schedule time selectors, 24/7 checkbox, stats display in Settings tab.
+
+## WiFi Captive Portal
+
+Minus includes a WiFi captive portal system for easy network configuration when no WiFi is connected.
+
+**How it works:**
+1. If WiFi disconnects for 30+ seconds, Minus creates a "Minus" hotspot AP
+2. Users connect to the hotspot and get redirected to a setup page
+3. Setup page shows available networks with signal strength
+4. User selects network and enters password
+5. Minus connects and stops the AP automatically
+
+**Hotspot Configuration:**
+- **SSID:** `Minus`
+- **Password:** `minus123`
+- **IP:** `10.42.0.1`
+- **Band:** 2.4GHz (802.11 b/g)
+
+**Captive Portal Detection:**
+The portal supports automatic detection on mobile devices:
+- `GET /generate_204` - Android captive portal check
+- `GET /hotspot-detect.html` - Apple captive portal check
+- `GET /connecttest.txt` - Windows captive portal check
+
+**API Endpoints:**
+- `GET /api/wifi/status` - Current connection status, AP mode state
+- `GET /api/wifi/scan` - Scan for available networks
+- `POST /api/wifi/connect` - Connect to a network (ssid, password)
+- `POST /api/wifi/disconnect` - Disconnect from current network
+- `POST /api/wifi/ap/start` - Start AP mode manually
+- `POST /api/wifi/ap/stop` - Stop AP mode
+- `GET /wifi-setup` - Captive portal setup page
+
+**Settings Tab Integration:**
+The Settings tab in the web UI shows:
+- Current WiFi status (SSID, IP, signal strength)
+- Disconnect button for current network
+- Manual AP mode start/stop buttons
+
+**Files:**
+- `src/wifi_manager.py` - WiFi/AP management module
+- `src/templates/wifi_setup.html` - Captive portal page
+- `tests/test_wifi_portal.py` - Playwright tests (30 tests)
+
+**Note:** The Radxa's internal WiFi antenna has limited range. For better AP coverage in production, consider using a USB WiFi adapter with external antenna.
 
 ## Streaming Device Configuration
 

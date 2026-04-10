@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Minus - WiFi Setup</title>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #000000;
+            --bg-secondary: #0a0a0a;
+            --bg-card: #0d0d0d;
+            --text-primary: #e0e0e0;
+            --text-secondary: #707070;
+            --accent: #00ff41;
+            --danger: #ff0040;
+            --border: #1a1a1a;
+            --font-body: 'IBM Plex Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: var(--font-body);
+            background: var(--bg-primary);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        .container {
+            max-width: 400px;
+            margin: 0 auto;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+            padding-top: 20px;
+        }
+
+        .logo {
+            font-size: 48px;
+            font-weight: 600;
+            background: linear-gradient(90deg, #ff0040 0%, #ff6666 50%, #ffffff 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: var(--text-secondary);
+            font-size: 14px;
+            margin-top: 8px;
+        }
+
+        .card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .section-title {
+            color: var(--accent);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .section-title::before {
+            content: '>';
+            color: var(--accent);
+        }
+
+        .network-list {
+            list-style: none;
+        }
+
+        .network-item {
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            margin-bottom: 8px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .network-item:hover, .network-item:focus {
+            border-color: var(--accent);
+            background: rgba(0, 255, 65, 0.05);
+        }
+
+        .network-item.selected {
+            border-color: var(--accent);
+            background: rgba(0, 255, 65, 0.1);
+        }
+
+        .network-icon {
+            width: 24px;
+            margin-right: 12px;
+            text-align: center;
+        }
+
+        .signal-bars {
+            display: inline-flex;
+            gap: 2px;
+            align-items: flex-end;
+            height: 16px;
+        }
+
+        .signal-bar {
+            width: 4px;
+            background: var(--border);
+            border-radius: 1px;
+        }
+
+        .signal-bar.active {
+            background: var(--accent);
+        }
+
+        .signal-bar:nth-child(1) { height: 4px; }
+        .signal-bar:nth-child(2) { height: 8px; }
+        .signal-bar:nth-child(3) { height: 12px; }
+        .signal-bar:nth-child(4) { height: 16px; }
+
+        .network-info {
+            flex: 1;
+            min-width: 0;
+            overflow: hidden;
+        }
+
+        .network-name {
+            font-weight: 500;
+            margin-bottom: 2px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .network-security {
+            font-size: 11px;
+            color: var(--text-secondary);
+        }
+
+        .network-lock {
+            color: var(--text-secondary);
+            margin-left: 8px;
+        }
+
+        .password-section {
+            display: none;
+            margin-top: 15px;
+            animation: slideDown 0.2s ease;
+        }
+
+        .password-section.visible {
+            display: block;
+        }
+
+        @keyframes slideDown {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        .input-label {
+            display: block;
+            color: var(--text-secondary);
+            font-size: 12px;
+            margin-bottom: 6px;
+        }
+
+        .input-field {
+            width: 100%;
+            padding: 12px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: var(--font-body);
+            font-size: 14px;
+            transition: border-color 0.2s ease;
+        }
+
+        .input-field:focus {
+            outline: none;
+            border-color: var(--accent);
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 6px;
+            font-family: var(--font-body);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }
+
+        .btn-primary {
+            background: var(--accent);
+            color: var(--bg-primary);
+        }
+
+        .btn-primary:hover {
+            background: #00cc33;
+        }
+
+        .btn-primary:disabled {
+            background: var(--border);
+            color: var(--text-secondary);
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+
+        .btn-secondary:hover {
+            border-color: var(--text-secondary);
+        }
+
+        .status-message {
+            text-align: center;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 15px;
+            display: none;
+        }
+
+        .status-message.visible {
+            display: block;
+        }
+
+        .status-message.error {
+            background: rgba(255, 0, 64, 0.1);
+            border: 1px solid var(--danger);
+            color: var(--danger);
+        }
+
+        .status-message.success {
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+        }
+
+        .status-message.loading {
+            background: rgba(0, 255, 65, 0.05);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .refresh-btn {
+            float: right;
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            cursor: pointer;
+            padding: 4px 8px;
+            font-size: 12px;
+            transition: color 0.2s ease;
+        }
+
+        .refresh-btn:hover {
+            color: var(--accent);
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: var(--text-secondary);
+        }
+
+        .empty-state-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+
+        .footer {
+            text-align: center;
+            margin-top: 30px;
+            padding: 20px;
+            color: var(--text-secondary);
+            font-size: 12px;
+        }
+
+        .footer a {
+            color: var(--accent);
+            text-decoration: none;
+        }
+
+        /* Hide scrollbar but keep functionality */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: var(--bg-secondary);
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <div class="logo">Minus</div>
+            <p class="subtitle">WiFi Setup</p>
+        </header>
+
+        <div id="status-message" class="status-message"></div>
+
+        <div class="card">
+            <div class="section-title">
+                Available Networks
+                <button class="refresh-btn" onclick="scanNetworks()" id="refresh-btn">Refresh</button>
+            </div>
+
+            <ul class="network-list" id="network-list">
+                <li class="empty-state">
+                    <div class="empty-state-icon">
+                        <span class="spinner" style="width:24px;height:24px;border-width:3px;"></span>
+                    </div>
+                    <p>Scanning for networks...</p>
+                </li>
+            </ul>
+
+            <div class="password-section" id="password-section">
+                <div class="input-group">
+                    <label class="input-label" for="password-input">Password for <span id="selected-ssid"></span></label>
+                    <input type="password" id="password-input" class="input-field" placeholder="Enter WiFi password" autocomplete="off">
+                </div>
+                <button class="btn btn-primary" id="connect-btn" onclick="connectToNetwork()">Connect</button>
+            </div>
+        </div>
+
+        <button class="btn btn-secondary" onclick="skipSetup()">Skip for now</button>
+
+        <footer class="footer">
+            <p>Connected to <strong>Minus</strong> hotspot</p>
+            <p>Password: <code>minus123</code></p>
+        </footer>
+    </div>
+
+    <script>
+        let selectedNetwork = null;
+        let networks = [];
+
+        // Check for captive portal redirect
+        function checkConnection() {
+            fetch('/api/wifi/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.connected && !data.ap_mode_active) {
+                        showStatus('Connected! Redirecting...', 'success');
+                        setTimeout(() => {
+                            window.location.href = '/';
+                        }, 1500);
+                    }
+                })
+                .catch(() => {});
+        }
+
+        function showStatus(message, type) {
+            const el = document.getElementById('status-message');
+            el.className = 'status-message visible ' + type;
+            if (type === 'loading') {
+                el.innerHTML = '<span class="spinner"></span>' + message;
+            } else {
+                el.textContent = message;
+            }
+        }
+
+        function hideStatus() {
+            document.getElementById('status-message').className = 'status-message';
+        }
+
+        function getSignalBars(signal) {
+            const bars = [
+                signal >= 20,
+                signal >= 40,
+                signal >= 60,
+                signal >= 80
+            ];
+            return bars.map(active =>
+                `<span class="signal-bar ${active ? 'active' : ''}"></span>`
+            ).join('');
+        }
+
+        function renderNetworks() {
+            const list = document.getElementById('network-list');
+
+            if (networks.length === 0) {
+                list.innerHTML = `
+                    <li class="empty-state">
+                        <div class="empty-state-icon">📡</div>
+                        <p>No networks found</p>
+                        <p style="font-size:12px;margin-top:8px;">Try refreshing the list</p>
+                    </li>
+                `;
+                return;
+            }
+
+            list.innerHTML = networks.map(net => `
+                <li class="network-item ${selectedNetwork === net.ssid ? 'selected' : ''}"
+                    onclick="selectNetwork('${net.ssid.replace(/'/g, "\\'")}', '${net.security}')"
+                    tabindex="0">
+                    <span class="network-icon">
+                        <span class="signal-bars">${getSignalBars(net.signal)}</span>
+                    </span>
+                    <div class="network-info">
+                        <div class="network-name">${escapeHtml(net.ssid)}</div>
+                        <div class="network-security">${net.security}</div>
+                    </div>
+                    ${net.security !== 'Open' ? '<span class="network-lock">🔒</span>' : ''}
+                </li>
+            `).join('');
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function selectNetwork(ssid, security) {
+            selectedNetwork = ssid;
+            document.getElementById('selected-ssid').textContent = ssid;
+
+            const passwordSection = document.getElementById('password-section');
+
+            if (security === 'Open') {
+                passwordSection.classList.remove('visible');
+                connectToNetwork();
+            } else {
+                passwordSection.classList.add('visible');
+                document.getElementById('password-input').focus();
+            }
+
+            renderNetworks();
+        }
+
+        async function scanNetworks() {
+            const btn = document.getElementById('refresh-btn');
+            btn.disabled = true;
+            btn.textContent = 'Scanning...';
+
+            document.getElementById('network-list').innerHTML = `
+                <li class="empty-state">
+                    <div class="empty-state-icon">
+                        <span class="spinner" style="width:24px;height:24px;border-width:3px;"></span>
+                    </div>
+                    <p>Scanning for networks...</p>
+                </li>
+            `;
+
+            try {
+                const response = await fetch('/api/wifi/scan');
+                const data = await response.json();
+
+                if (data.networks) {
+                    networks = data.networks;
+                    renderNetworks();
+                }
+            } catch (error) {
+                console.error('Scan error:', error);
+                document.getElementById('network-list').innerHTML = `
+                    <li class="empty-state">
+                        <div class="empty-state-icon">⚠️</div>
+                        <p>Scan failed</p>
+                        <p style="font-size:12px;margin-top:8px;">Try again in a moment</p>
+                    </li>
+                `;
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Refresh';
+            }
+        }
+
+        async function connectToNetwork() {
+            if (!selectedNetwork) return;
+
+            const password = document.getElementById('password-input').value;
+            const connectBtn = document.getElementById('connect-btn');
+
+            connectBtn.disabled = true;
+            showStatus('Connecting to ' + selectedNetwork + '...', 'loading');
+
+            try {
+                const response = await fetch('/api/wifi/connect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        ssid: selectedNetwork,
+                        password: password
+                    })
+                });
+
+                const data = await response.json();
+
+                if (data.success) {
+                    showStatus('Connected! Redirecting to Minus...', 'success');
+                    // Wait for AP to stop and redirect
+                    setTimeout(() => {
+                        // Try to redirect - may fail if AP stopped
+                        window.location.href = '/';
+                    }, 3000);
+                } else {
+                    showStatus(data.error || 'Connection failed', 'error');
+                    document.getElementById('password-input').value = '';
+                    document.getElementById('password-input').focus();
+                }
+            } catch (error) {
+                showStatus('Connection failed: ' + error.message, 'error');
+            } finally {
+                connectBtn.disabled = false;
+            }
+        }
+
+        function skipSetup() {
+            showStatus('You can configure WiFi later in Settings', 'loading');
+            setTimeout(() => {
+                window.location.href = '/';
+            }, 2000);
+        }
+
+        // Enter key to submit password
+        document.getElementById('password-input').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                connectToNetwork();
+            }
+        });
+
+        // Initial scan
+        scanNetworks();
+
+        // Periodic connection check
+        setInterval(checkConnection, 5000);
+    </script>
+</body>
+</html>

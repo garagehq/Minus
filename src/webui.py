@@ -27,8 +27,10 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, jsonify, request, Response, send_from_directory
+from flask import Flask, jsonify, request, Response, send_from_directory, redirect
 import requests
+
+from src.wifi_manager import get_wifi_manager
 
 # Reviewed screenshots tracking
 REVIEWED_FILE = Path("/home/radxa/.minus_reviewed_screenshots.json")
@@ -1229,29 +1231,20 @@ class WebUI:
         def api_wifi_scan():
             """Scan for available WiFi networks."""
             try:
-                # Trigger a rescan
-                subprocess.run(['nmcli', 'device', 'wifi', 'rescan'], capture_output=True, timeout=15)
-                time.sleep(2)  # Wait for scan to complete
-
-                result = subprocess.run(
-                    ['nmcli', '-t', '-f', 'SSID,SIGNAL,SECURITY,BSSID', 'device', 'wifi', 'list'],
-                    capture_output=True, text=True, timeout=10
-                )
-                networks = []
-                seen_ssids = set()
-                for line in result.stdout.strip().split('\n'):
-                    if line:
-                        parts = line.split(':')
-                        if len(parts) >= 3 and parts[0] and parts[0] not in seen_ssids:
-                            seen_ssids.add(parts[0])
-                            networks.append({
-                                'ssid': parts[0],
-                                'signal': int(parts[1]) if parts[1] else 0,
-                                'security': parts[2] if len(parts) > 2 else 'Open',
-                            })
-                # Sort by signal strength
-                networks.sort(key=lambda x: x['signal'], reverse=True)
-                return jsonify({'networks': networks})
+                wifi_mgr = get_wifi_manager()
+                networks = wifi_mgr.scan_networks()
+                # Convert dataclass objects to dicts
+                return jsonify({
+                    'networks': [
+                        {
+                            'ssid': n.ssid,
+                            'signal': n.signal,
+                            'security': n.security,
+                            'in_use': n.in_use
+                        }
+                        for n in networks
+                    ]
+                })
             except Exception as e:
                 logger.error(f"Error scanning WiFi: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
@@ -1262,42 +1255,20 @@ class WebUI:
             try:
                 data = request.get_json() or {}
                 ssid = data.get('ssid')
-                password = data.get('password')
-                priority = data.get('priority', 0)
+                password = data.get('password', '')
 
                 if not ssid:
                     return jsonify({'error': 'SSID is required'}), 400
 
-                # Check if connection already exists
-                check = subprocess.run(
-                    ['nmcli', 'connection', 'show', ssid],
-                    capture_output=True, timeout=5
-                )
+                # Use WiFiManager for better error handling and AP mode management
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.connect_to_network(ssid, password)
 
-                if check.returncode == 0:
-                    # Connection exists, just activate it
-                    result = subprocess.run(
-                        ['nmcli', 'connection', 'up', ssid],
-                        capture_output=True, text=True, timeout=30
-                    )
+                if result.get('success'):
+                    logger.info(f"[WebUI] Connected to WiFi: {ssid}")
+                    return jsonify({'success': True, 'message': f'Connected to {ssid}', 'ssid': ssid})
                 else:
-                    # Create new connection
-                    cmd = ['nmcli', 'device', 'wifi', 'connect', ssid]
-                    if password:
-                        cmd.extend(['password', password])
-                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-                    # Set priority if specified
-                    if result.returncode == 0 and priority:
-                        subprocess.run(
-                            ['nmcli', 'connection', 'modify', ssid, 'connection.autoconnect-priority', str(priority)],
-                            capture_output=True, timeout=5
-                        )
-
-                if result.returncode == 0:
-                    return jsonify({'success': True, 'message': f'Connected to {ssid}'})
-                else:
-                    return jsonify({'error': result.stderr or 'Connection failed'}), 500
+                    return jsonify({'success': False, 'error': result.get('error', 'Connection failed')}), 400
             except Exception as e:
                 logger.error(f"Error connecting to WiFi: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
@@ -1312,15 +1283,14 @@ class WebUI:
                 if not name:
                     return jsonify({'error': 'Connection name is required'}), 400
 
-                result = subprocess.run(
-                    ['nmcli', 'connection', 'delete', name],
-                    capture_output=True, text=True, timeout=10
-                )
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.forget_network(name)
 
-                if result.returncode == 0:
+                if result.get('success'):
+                    logger.info(f"[WebUI] Deleted WiFi connection: {name}")
                     return jsonify({'success': True, 'message': f'Deleted {name}'})
                 else:
-                    return jsonify({'error': result.stderr or 'Delete failed'}), 500
+                    return jsonify({'success': False, 'error': result.get('error', 'Delete failed')}), 500
             except Exception as e:
                 logger.error(f"Error deleting WiFi connection: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
@@ -1348,6 +1318,144 @@ class WebUI:
             except Exception as e:
                 logger.error(f"Error updating WiFi priority: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/status')
+        def api_wifi_status():
+            """Get current WiFi status including AP mode."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                status = wifi_mgr.get_status()
+                return jsonify({
+                    'connected': status.connected,
+                    'ssid': status.ssid,
+                    'ip_address': status.ip_address,
+                    'signal': status.signal,
+                    'ap_mode_active': status.ap_mode_active,
+                    'ap_clients': status.ap_clients
+                })
+            except Exception as e:
+                logger.error(f"Error getting WiFi status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/disconnect', methods=['POST'])
+        def api_wifi_disconnect():
+            """Disconnect from current WiFi network."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.disconnect_network()
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error disconnecting WiFi: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/ap/start', methods=['POST'])
+        def api_wifi_ap_start():
+            """Start the Minus WiFi access point."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.start_ap_mode()
+                if result.get('success'):
+                    logger.info("[WebUI] AP mode started via API")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error starting AP mode: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/ap/stop', methods=['POST'])
+        def api_wifi_ap_stop():
+            """Stop the Minus WiFi access point."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.stop_ap_mode()
+                if result.get('success'):
+                    logger.info("[WebUI] AP mode stopped via API")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error stopping AP mode: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/ap/status')
+        def api_wifi_ap_status():
+            """Get AP mode status."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                status = wifi_mgr.get_ap_status()
+                return jsonify(status)
+            except Exception as e:
+                logger.error(f"Error getting AP status: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Captive Portal Detection Routes
+        # These endpoints trigger the captive portal popup on mobile devices
+        # =========================================================================
+
+        @self.app.route('/wifi-setup')
+        def wifi_setup():
+            """Serve the WiFi setup/captive portal page."""
+            return send_from_directory(
+                self.app.template_folder,
+                'wifi_setup.html'
+            )
+
+        @self.app.route('/generate_204')
+        def captive_portal_android():
+            """Android captive portal detection.
+            Returns 204 if connected to internet, 302 redirect if in AP mode.
+            """
+            try:
+                wifi_mgr = get_wifi_manager()
+                if wifi_mgr._ap_mode_active:
+                    return redirect('/wifi-setup')
+                return '', 204
+            except Exception:
+                return '', 204
+
+        @self.app.route('/hotspot-detect.html')
+        def captive_portal_apple():
+            """Apple captive portal detection.
+            Returns 'Success' if connected, redirects if in AP mode.
+            """
+            try:
+                wifi_mgr = get_wifi_manager()
+                if wifi_mgr._ap_mode_active:
+                    return redirect('/wifi-setup')
+                return '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
+            except Exception:
+                return '<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>'
+
+        @self.app.route('/connecttest.txt')
+        def captive_portal_windows():
+            """Windows captive portal detection."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                if wifi_mgr._ap_mode_active:
+                    return redirect('/wifi-setup')
+                return 'Microsoft Connect Test'
+            except Exception:
+                return 'Microsoft Connect Test'
+
+        @self.app.route('/ncsi.txt')
+        def captive_portal_windows_ncsi():
+            """Windows NCSI captive portal detection."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                if wifi_mgr._ap_mode_active:
+                    return redirect('/wifi-setup')
+                return 'Microsoft NCSI'
+            except Exception:
+                return 'Microsoft NCSI'
+
+        @self.app.route('/success.txt')
+        def captive_portal_firefox():
+            """Firefox captive portal detection."""
+            try:
+                wifi_mgr = get_wifi_manager()
+                if wifi_mgr._ap_mode_active:
+                    return redirect('/wifi-setup')
+                return 'success\n'
+            except Exception:
+                return 'success\n'
 
         # =========================================================================
         # ADB RSA Key Management

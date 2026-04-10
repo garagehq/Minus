@@ -1491,6 +1491,54 @@ input:checked + .toggle-slider:before {
     margin-bottom: 1rem;
 }
 
+.wifi-status-card {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    padding: 0.75rem;
+    margin-bottom: 1rem;
+    border-radius: 4px;
+}
+
+.wifi-status-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 0.25rem 0;
+}
+
+.wifi-status-label {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+.wifi-status-value {
+    color: var(--text-primary);
+    font-size: 0.85rem;
+    font-family: var(--font-body);
+}
+
+.wifi-status-value.ok {
+    color: var(--success);
+}
+
+.wifi-status-value.error {
+    color: var(--danger);
+}
+
+.wifi-status-value.warning {
+    color: var(--warning);
+}
+
+.wifi-ap-controls {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+}
+
+.wifi-ap-controls .action-btn,
+.wifi-ap-controls .warning-btn {
+    flex: 1;
+}
+
 .wifi-list {
     max-height: 250px;
     overflow-y: auto;
