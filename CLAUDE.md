@@ -1312,3 +1312,19 @@ This caused the new pipeline to fail with "device in use" because the old pipeli
 **Symptom:** After successfully skipping an ad via Fire TV, the blocking overlay stayed for 2-3+ seconds waiting for OCR to detect the ad was gone.
 
 **Solution:** After a successful skip command (auto or manual via web UI), blocking is now removed after a 1.5s delay instead of waiting for 3 OCR cycles. The delay allows the skip animation to complete, then force-unblocks by resetting all detection state.
+
+### GStreamer Bus Signal Watch FD Leak (Fixed - Apr 2026)
+
+**Symptom:** After running for 12+ hours with no HDMI signal, the web server becomes unresponsive. Logs show `[Errno 24] Too many open files` errors. The service cannot open new files or sockets.
+
+**Root Cause:** When the no-signal or loading GStreamer pipelines failed to start, the cleanup code did not remove the bus signal watch before destroying the pipeline. Each failed attempt leaked a file descriptor from `bus.add_signal_watch()`. With retries every 10 seconds, the 1024 FD limit was reached in ~3 hours.
+
+**Solution:** Added proper bus cleanup in all pipeline failure paths:
+```python
+# Before destroying failed pipeline:
+if self.bus:
+    self.bus.remove_signal_watch()
+    self.bus = None
+```
+
+Fixed in `src/ad_blocker.py`: `start_no_signal_mode()` and `start_loading_mode()` failure paths and exception handlers.
