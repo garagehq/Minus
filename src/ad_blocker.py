@@ -1206,6 +1206,12 @@ class DRMAdBlocker:
             if self.audio:
                 self.audio.mute()
 
+            # Calculate text scales based on resolution (scales designed for 4K @ 10/4)
+            # At 1080p (1920 width): vocab_scale=5, stats_scale=2
+            # At 4K (3840 width): vocab_scale=10, stats_scale=4
+            vocab_scale = max(3, min(12, self._frame_width // 384))
+            stats_scale = max(2, min(5, self._frame_width // 960))
+
             # Enable blocking immediately (background will upload async)
             self._blocking_api_call('/blocking/set', {
                 'enabled': 'true',
@@ -1213,6 +1219,8 @@ class DRMAdBlocker:
                 'preview_w': str(self._frame_width), 'preview_h': str(self._frame_height),
                 'preview_enabled': 'true' if self._preview_enabled else 'false',
                 'text_vocab': '', 'text_stats': '',
+                'text_vocab_scale': str(vocab_scale),
+                'text_stats_scale': str(stats_scale),
                 'box_alpha': str(self._box_alpha),
                 'text_y': str(self._text_y),
                 'text_u': str(self._text_u),
