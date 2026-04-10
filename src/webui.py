@@ -2088,6 +2088,43 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # System Settings
+        # =========================================================================
+
+        @self.app.route('/api/settings', methods=['GET'])
+        def api_settings_get():
+            """Get system settings."""
+            try:
+                settings = self.minus.get_system_settings()
+                return jsonify(settings)
+            except Exception as e:
+                logger.error(f"Error getting system settings: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/settings/vlm-preload', methods=['GET', 'POST'])
+        def api_vlm_preload():
+            """Get or set VLM preload preference.
+
+            GET: Returns current vlm_preload setting
+            POST: Set vlm_preload (body: {"enabled": true/false})
+
+            When enabled (default), VLM loads at startup even without HDMI signal.
+            When disabled, VLM waits for HDMI signal before loading.
+            """
+            try:
+                if request.method == 'GET':
+                    return jsonify({'vlm_preload': self.minus.vlm_preload})
+
+                # POST
+                data = request.get_json() or {}
+                enabled = data.get('enabled', True)
+                result = self.minus.set_vlm_preload(bool(enabled))
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error with VLM preload setting: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Blocking Control
         # =========================================================================
 

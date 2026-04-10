@@ -2,8 +2,10 @@
 Autonomous Mode for Minus - Automated YouTube playback for training data collection.
 
 Configurable schedule with support for 24/7 operation. Keeps YouTube playing
-on Fire TV to collect ad detection training data. Uses VLM to understand
-screen state and take intelligent actions.
+on streaming devices (Fire TV, Roku, Google TV) to collect ad detection training data.
+Uses VLM to understand screen state and take intelligent actions.
+
+Device-agnostic design supports any streaming device with remote control capability.
 """
 
 import json
@@ -25,13 +27,18 @@ SETTINGS_FILE = Path("/home/radxa/.minus_autonomous_mode.json")
 # Eastern timezone (default, but schedule hours are timezone-agnostic for simplicity)
 ET = ZoneInfo("America/New_York")
 
-# YouTube package names (Fire TV can use different packages)
+# YouTube package names (Fire TV/Android TV use Android packages)
 YOUTUBE_PACKAGES = [
     "com.amazon.firetv.youtube",
     "com.google.android.youtube.tv",
     "com.google.android.youtube",
     "youtube",
 ]
+
+# Supported device types for autonomous mode
+DEVICE_TYPE_FIRE_TV = 'fire_tv'
+DEVICE_TYPE_ROKU = 'roku'
+DEVICE_TYPE_GOOGLE_TV = 'google_tv'
 
 # Timing constants
 CHECK_INTERVAL = 60.0          # Check every minute
@@ -80,29 +87,39 @@ class AutonomousMode:
     Features:
     - Configurable schedule (start/end hours, or 24/7 mode)
     - Manual enable/disable toggle
-    - Keeps YouTube playing on Fire TV
+    - Keeps YouTube playing on streaming device (Fire TV, Roku, Google TV)
+    - Uses VLM for intelligent screen understanding
     - Tracks statistics
     - Integrates with ad blocking system
+
+    Device-agnostic: works with any controller that has is_connected() and send_command().
     """
 
     # Default schedule
     DEFAULT_START_HOUR = 0   # Midnight
     DEFAULT_END_HOUR = 8     # 8 AM
 
-    def __init__(self, fire_tv_controller=None, ad_blocker=None, vlm=None, frame_capture=None):
+    def __init__(self, device_controller=None, ad_blocker=None, vlm=None, frame_capture=None,
+                 fire_tv_controller=None):
         """
         Initialize autonomous mode.
 
         Args:
-            fire_tv_controller: FireTVController instance for device control
+            device_controller: Generic device controller (FireTV, Roku, GoogleTV)
             ad_blocker: DRMAdBlocker instance for ad detection stats
             vlm: VLMManager instance for screen understanding
             frame_capture: UstreamerCapture instance for grabbing frames
+            fire_tv_controller: Deprecated, use device_controller instead
         """
-        self._fire_tv = fire_tv_controller
+        # Support both new device_controller and legacy fire_tv_controller param
+        self._device_controller = device_controller or fire_tv_controller
+        self._device_type: Optional[str] = None  # Detected at runtime
         self._ad_blocker = ad_blocker
         self._vlm = vlm
         self._frame_capture = frame_capture
+
+        # Legacy alias for backwards compatibility
+        self._fire_tv = self._device_controller
 
         # State
         self._enabled = False          # User toggle
@@ -163,9 +180,45 @@ class AutonomousMode:
         except Exception as e:
             logger.warning(f"[AutonomousMode] Could not save settings: {e}")
 
+    def set_device_controller(self, controller, device_type: Optional[str] = None):
+        """Set device controller reference.
+
+        Args:
+            controller: Device controller (FireTV, Roku, GoogleTV)
+            device_type: Optional device type hint ('fire_tv', 'roku', 'google_tv')
+                        If not provided, will be detected from controller class name.
+        """
+        self._device_controller = controller
+        self._fire_tv = controller  # Legacy alias
+
+        if device_type:
+            self._device_type = device_type
+        else:
+            # Auto-detect device type from controller class name
+            self._device_type = self._detect_device_type(controller)
+
+        logger.info(f"[AutonomousMode] Device controller set: {self._device_type}")
+
     def set_fire_tv(self, controller):
-        """Set Fire TV controller reference."""
-        self._fire_tv = controller
+        """Set Fire TV controller reference (legacy, use set_device_controller)."""
+        self.set_device_controller(controller, DEVICE_TYPE_FIRE_TV)
+
+    def set_roku(self, controller):
+        """Set Roku controller reference."""
+        self.set_device_controller(controller, DEVICE_TYPE_ROKU)
+
+    def _detect_device_type(self, controller) -> str:
+        """Detect device type from controller class name."""
+        if controller is None:
+            return DEVICE_TYPE_FIRE_TV  # Default
+
+        class_name = controller.__class__.__name__.lower()
+        if 'roku' in class_name:
+            return DEVICE_TYPE_ROKU
+        elif 'google' in class_name or 'android' in class_name:
+            return DEVICE_TYPE_GOOGLE_TV
+        else:
+            return DEVICE_TYPE_FIRE_TV  # Default to Fire TV for backwards compatibility
 
     def set_ad_blocker(self, blocker):
         """Set ad blocker reference."""
@@ -350,6 +403,14 @@ class AutonomousMode:
 
         schedule_str = "24/7" if self._always_on else f"{self._start_hour:02d}:00-{self._end_hour:02d}:00"
 
+        # Check device connection (works for any device type)
+        device_connected = False
+        if self._device_controller:
+            try:
+                device_connected = self._device_controller.is_connected()
+            except Exception:
+                device_connected = False
+
         return {
             "enabled": self._enabled,
             "active": self._active,
@@ -363,7 +424,10 @@ class AutonomousMode:
             "next_window_start": next_start.strftime("%Y-%m-%d %H:%M:%S") if not self._always_on else None,
             "next_window_end": next_end.strftime("%Y-%m-%d %H:%M:%S") if not self._always_on else None,
             "time_until_window": str(time_until).split(".")[0] if time_until else None,
-            "fire_tv_connected": self._fire_tv.is_connected() if self._fire_tv else False,
+            "device_type": self._device_type,
+            "device_connected": device_connected,
+            # Legacy field for backwards compatibility
+            "fire_tv_connected": device_connected if self._device_type == DEVICE_TYPE_FIRE_TV else False,
             "stats": self.stats.to_dict(),
         }
 
@@ -562,47 +626,90 @@ class AutonomousMode:
         return "none"
 
     def _launch_youtube(self) -> bool:
-        """Launch YouTube app on Fire TV."""
-        if not self._fire_tv or not self._fire_tv.is_connected():
-            logger.warning("[AutonomousMode] Fire TV not connected, cannot launch YouTube")
+        """Launch YouTube app on the connected streaming device."""
+        if not self._device_controller or not self._device_controller.is_connected():
+            logger.warning(f"[AutonomousMode] {self._device_type or 'Device'} not connected, cannot launch YouTube")
             return False
 
         try:
-            # Check current app
-            current = self._fire_tv.get_current_app()
-            logger.debug(f"[AutonomousMode] Current app: {current}")
-
-            if self._is_youtube_app(current):
-                logger.debug("[AutonomousMode] YouTube already running")
-                return True
-
-            # Launch YouTube via intent
-            logger.info("[AutonomousMode] Launching YouTube...")
-            with self._fire_tv._lock:
-                if self._fire_tv._device:
-                    # Try multiple package names
-                    for pkg in YOUTUBE_PACKAGES:
-                        try:
-                            self._fire_tv._device.adb_shell(
-                                f"am start -a android.intent.action.MAIN -c android.intent.category.LEANBACK_LAUNCHER {pkg}"
-                            )
-                            break
-                        except Exception:
-                            continue
-
-            time.sleep(3)
-            logger.info("[AutonomousMode] YouTube launched")
-            self._log_event("YouTube launched")
-            return True
+            # Device-specific YouTube launch
+            if self._device_type == DEVICE_TYPE_ROKU:
+                return self._launch_youtube_roku()
+            elif self._device_type in (DEVICE_TYPE_FIRE_TV, DEVICE_TYPE_GOOGLE_TV):
+                return self._launch_youtube_android()
+            else:
+                # Fallback: try Android method
+                return self._launch_youtube_android()
 
         except Exception as e:
             logger.error(f"[AutonomousMode] Failed to launch YouTube: {e}")
             self.stats.errors += 1
             return False
 
+    def _launch_youtube_roku(self) -> bool:
+        """Launch YouTube on Roku using ECP launch API."""
+        try:
+            logger.info("[AutonomousMode] Launching YouTube on Roku...")
+
+            # Roku controller has launch_app method
+            if hasattr(self._device_controller, 'launch_app'):
+                result = self._device_controller.launch_app('youtube')
+                if result:
+                    time.sleep(3)
+                    logger.info("[AutonomousMode] YouTube launched on Roku")
+                    self._log_event("YouTube launched (Roku)")
+                    return True
+                else:
+                    logger.error("[AutonomousMode] Roku launch_app returned False")
+                    return False
+            else:
+                logger.error("[AutonomousMode] Roku controller missing launch_app method")
+                return False
+
+        except Exception as e:
+            logger.error(f"[AutonomousMode] Roku YouTube launch error: {e}")
+            return False
+
+    def _launch_youtube_android(self) -> bool:
+        """Launch YouTube on Fire TV / Android TV / Google TV using ADB."""
+        try:
+            # Check current app if the controller supports it
+            if hasattr(self._device_controller, 'get_current_app'):
+                current = self._device_controller.get_current_app()
+                logger.debug(f"[AutonomousMode] Current app: {current}")
+                if self._is_youtube_app(current):
+                    logger.debug("[AutonomousMode] YouTube already running")
+                    return True
+
+            # Launch YouTube via ADB intent
+            logger.info(f"[AutonomousMode] Launching YouTube on {self._device_type}...")
+
+            # Access internal _device for ADB shell command
+            if hasattr(self._device_controller, '_lock') and hasattr(self._device_controller, '_device'):
+                with self._device_controller._lock:
+                    if self._device_controller._device:
+                        # Try multiple package names
+                        for pkg in YOUTUBE_PACKAGES:
+                            try:
+                                self._device_controller._device.adb_shell(
+                                    f"am start -a android.intent.action.MAIN -c android.intent.category.LEANBACK_LAUNCHER {pkg}"
+                                )
+                                break
+                            except Exception:
+                                continue
+
+            time.sleep(3)
+            logger.info("[AutonomousMode] YouTube launched")
+            self._log_event(f"YouTube launched ({self._device_type})")
+            return True
+
+        except Exception as e:
+            logger.error(f"[AutonomousMode] Android YouTube launch error: {e}")
+            return False
+
     def _ensure_youtube_playing(self):
         """Use VLM to understand screen state and take appropriate action."""
-        if not self._fire_tv or not self._fire_tv.is_connected():
+        if not self._device_controller or not self._device_controller.is_connected():
             return
 
         try:
@@ -618,60 +725,77 @@ class AutonomousMode:
             self._log_event(f"VLM action: {action}")
 
             if action == "play":
-                # Video is paused - use play_pause (more reliable on Fire TV YouTube)
-                self._fire_tv.send_command("play_pause")
+                # Video is paused - use play_pause (works on all devices)
+                self._device_controller.send_command("play_pause")
                 logger.info("[AutonomousMode] Sent play_pause command (video was paused)")
 
             elif action == "dismiss":
                 # Dialog like "Are you still watching?" - press select to dismiss
-                self._fire_tv.send_command("select")
+                self._device_controller.send_command("select")
                 time.sleep(1.5)
                 # After dismissing, send play_pause to ensure playback resumes
-                self._fire_tv.send_command("play_pause")
+                self._device_controller.send_command("play_pause")
                 logger.info("[AutonomousMode] Dismissed dialog and sent play_pause")
 
             elif action == "select":
                 # On home/menu screen - navigate to a video
-                self._fire_tv.send_command("down")
+                self._device_controller.send_command("down")
                 time.sleep(0.5)
-                self._fire_tv.send_command("select")
+                self._device_controller.send_command("select")
                 self.stats.videos_played += 1
                 logger.info("[AutonomousMode] Selected video from menu")
                 self._log_event("Selected video from menu")
 
             elif action == "launch":
                 # Screensaver/sleep - wake up and launch YouTube
-                self._fire_tv.send_command("wakeup")
+                self._wake_device()
                 time.sleep(2)
                 self._launch_youtube()
                 time.sleep(2)
-                self._fire_tv.send_command("down")
+                self._device_controller.send_command("down")
                 time.sleep(0.5)
-                self._fire_tv.send_command("select")
+                self._device_controller.send_command("select")
                 self.stats.videos_played += 1
                 logger.info("[AutonomousMode] Woke up and launched YouTube")
                 self._log_event("Woke up device and launched YouTube")
 
             elif action == "back":
-                self._fire_tv.send_command("back")
+                self._device_controller.send_command("back")
                 time.sleep(1)
-                self._fire_tv.send_command("play")
+                self._device_controller.send_command("play")
 
         except Exception as e:
             logger.error(f"[AutonomousMode] Error in ensure_youtube_playing: {e}")
             self.stats.errors += 1
 
+    def _wake_device(self):
+        """Wake up the device from screensaver/sleep."""
+        try:
+            if self._device_type == DEVICE_TYPE_ROKU:
+                # Roku: power on or home button
+                if hasattr(self._device_controller, 'send_command'):
+                    # Try power first, then home as fallback
+                    self._device_controller.send_command("power")
+                    time.sleep(0.5)
+                    self._device_controller.send_command("home")
+            else:
+                # Fire TV / Android TV: wakeup command
+                if hasattr(self._device_controller, 'send_command'):
+                    self._device_controller.send_command("wakeup")
+        except Exception as e:
+            logger.warning(f"[AutonomousMode] Wake device error: {e}")
+
     def play_next_video(self):
         """Skip to next video in YouTube."""
-        if not self._fire_tv or not self._fire_tv.is_connected():
+        if not self._device_controller or not self._device_controller.is_connected():
             return False
 
         try:
-            self._fire_tv.send_command("right")
+            self._device_controller.send_command("right")
             time.sleep(0.3)
-            self._fire_tv.send_command("right")
+            self._device_controller.send_command("right")
             time.sleep(0.3)
-            self._fire_tv.send_command("select")
+            self._device_controller.send_command("select")
 
             self.stats.videos_played += 1
             return True

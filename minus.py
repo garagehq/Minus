@@ -31,12 +31,16 @@ import logging.handlers
 import threading
 import subprocess
 import re
+import json
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 import numpy as np
 import cv2
+
+# System settings file
+SYSTEM_SETTINGS_FILE = Path.home() / '.minus_system_settings.json'
 
 
 # =============================================================================
@@ -343,6 +347,9 @@ class Minus:
         self.blocking_paused_until = 0  # Timestamp when pause expires
         from collections import deque
         self.detection_history = deque(maxlen=50)  # Recent detections for web UI
+
+        # System settings (loaded from ~/.minus_system_settings.json)
+        self._system_settings = self._load_system_settings()
 
         # Remote control state
         self.fire_tv_setup = None
@@ -937,6 +944,11 @@ class Minus:
 
                     logger.info(f"[Roku] Connected to {full_name} at {saved_ip}")
 
+                    # Connect autonomous mode to Roku controller
+                    if self.autonomous_mode:
+                        self.autonomous_mode.set_device_controller(self.roku_controller, 'roku')
+                        logger.info("[AutonomousMode] Roku controller connected")
+
                     # Check if Roku is in limited mode
                     control_mode = self.roku_controller.check_control_mode()
                     if control_mode == 'limited':
@@ -997,9 +1009,9 @@ class Minus:
         # Add to detection history
         self.add_detection('FireTV', [f"Connected to {manufacturer} {model}"])
 
-        # Connect night mode to Fire TV controller
+        # Connect autonomous mode to Fire TV controller
         if self.autonomous_mode:
-            self.autonomous_mode.set_fire_tv(self.fire_tv_controller)
+            self.autonomous_mode.set_device_controller(self.fire_tv_controller, 'fire_tv')
             logger.info("[AutonomousMode] Fire TV controller connected")
 
     def _check_ocr_for_fire_tv_dialog(self, ocr_results: list) -> bool:
@@ -1463,6 +1475,101 @@ class Minus:
             threshold += self.vlm_hysteresis_boost
 
         return no_ad_ratio >= threshold
+
+    # =========================================================================
+    # System Settings
+    # =========================================================================
+
+    def _load_system_settings(self) -> dict:
+        """Load system settings from disk."""
+        defaults = {
+            'vlm_preload': True,  # Load VLM at startup (vs wait for HDMI)
+        }
+        try:
+            if SYSTEM_SETTINGS_FILE.exists():
+                with open(SYSTEM_SETTINGS_FILE) as f:
+                    saved = json.load(f)
+                    # Merge with defaults
+                    for key in defaults:
+                        if key in saved:
+                            defaults[key] = saved[key]
+                    logger.info(f"Loaded system settings: vlm_preload={defaults['vlm_preload']}")
+        except Exception as e:
+            logger.warning(f"Could not load system settings: {e}")
+        return defaults
+
+    def _save_system_settings(self):
+        """Save system settings to disk."""
+        try:
+            with open(SYSTEM_SETTINGS_FILE, 'w') as f:
+                json.dump(self._system_settings, f, indent=2)
+            logger.info(f"Saved system settings to {SYSTEM_SETTINGS_FILE}")
+        except Exception as e:
+            logger.warning(f"Could not save system settings: {e}")
+
+    def get_system_settings(self) -> dict:
+        """Get current system settings."""
+        return self._system_settings.copy()
+
+    def set_vlm_preload(self, enabled: bool) -> dict:
+        """Set VLM preload preference.
+
+        Args:
+            enabled: True to load VLM at startup, False to load when HDMI arrives
+
+        Returns:
+            dict with success status and current settings
+        """
+        self._system_settings['vlm_preload'] = enabled
+        self._save_system_settings()
+        return {'success': True, 'vlm_preload': enabled}
+
+    @property
+    def vlm_preload(self) -> bool:
+        """Whether to preload VLM at startup."""
+        return self._system_settings.get('vlm_preload', True)
+
+    def _load_vlm_model(self) -> bool:
+        """Load VLM model with retry logic.
+
+        Returns:
+            True if VLM loaded successfully, False otherwise
+        """
+        if not self.vlm:
+            return False
+
+        # Show loading notification
+        if self.system_notification:
+            self.system_notification.show_vlm_loading()
+
+        vlm_loaded = False
+        for attempt in range(1, 4):
+            logger.info(f"Loading VLM model (FastVLM-1.5B)... attempt {attempt}/3")
+            try:
+                if self.vlm.load_model():
+                    logger.info("VLM model loaded successfully")
+                    vlm_loaded = True
+                    break
+                else:
+                    logger.warning(f"VLM load_model returned False (attempt {attempt}/3)")
+            except Exception as e:
+                logger.warning(f"VLM load_model error (attempt {attempt}/3): {e}")
+            if attempt < 3:
+                logger.info("Retrying VLM load in 5 seconds...")
+                time.sleep(5)
+
+        if vlm_loaded:
+            # Show success notification (auto-hides after 5s)
+            if self.system_notification:
+                self.system_notification.show_vlm_ready()
+        else:
+            logger.error("VLM failed after 3 attempts - continuing without VLM")
+            self.vlm = None
+            # Show failure notification (auto-hides after 8s)
+            if self.system_notification:
+                self.system_notification.show_vlm_failed()
+
+        return vlm_loaded
 
     def check_hdmi_signal(self):
         """Check HDMI signal and return resolution."""
@@ -2393,6 +2500,12 @@ class Minus:
             self.health_monitor.start()
             logger.info("Health monitor started")
 
+        # Preload VLM at startup if enabled (so it's ready when HDMI arrives)
+        vlm_preloaded = False
+        if self.vlm_preload and self.vlm:
+            logger.info("Preloading VLM model at startup (vlm_preload=True)...")
+            vlm_preloaded = self._load_vlm_model()
+
         # Check signal
         signal_info = self.check_hdmi_signal()
         if not signal_info:
@@ -2477,43 +2590,19 @@ class Minus:
         # 5 second delay ensures display is stable before scanning
         self._start_device_setup_delayed(delay_seconds=5.0)
 
-        # Load VLM model and start worker thread (with retry)
+        # Load VLM model and start worker thread
+        # If vlm_preload=True, model was already loaded above. Otherwise load now.
         if self.vlm:
-            # Show loading notification
-            if self.system_notification:
-                self.system_notification.show_vlm_loading()
+            if not vlm_preloaded:
+                # Load VLM now (vlm_preload=False means wait for HDMI)
+                logger.info("Loading VLM model after HDMI detected (vlm_preload=False)...")
+                vlm_preloaded = self._load_vlm_model()
 
-            vlm_loaded = False
-            for attempt in range(1, 4):
-                logger.info(f"Loading VLM model (FastVLM-1.5B)... attempt {attempt}/3")
-                try:
-                    if self.vlm.load_model():
-                        logger.info("VLM model loaded successfully")
-                        vlm_loaded = True
-                        break
-                    else:
-                        logger.warning(f"VLM load_model returned False (attempt {attempt}/3)")
-                except Exception as e:
-                    logger.warning(f"VLM load_model error (attempt {attempt}/3): {e}")
-                if attempt < 3:
-                    logger.info("Retrying VLM load in 5 seconds...")
-                    time.sleep(5)
-
-            if vlm_loaded:
+            # Start VLM worker thread if model is loaded
+            if vlm_preloaded and self.vlm:
                 self.vlm_thread = threading.Thread(target=self.vlm_worker, daemon=True)
                 self.vlm_thread.start()
                 logger.info(f"VLM worker started with prompt: \"{self.vlm.AD_PROMPT}\"")
-
-                # Show success notification (auto-hides after 5s)
-                if self.system_notification:
-                    self.system_notification.show_vlm_ready()
-            else:
-                logger.error("VLM failed after 3 attempts - continuing without VLM")
-                self.vlm = None
-
-                # Show failure notification (auto-hides after 8s)
-                if self.system_notification:
-                    self.system_notification.show_vlm_failed()
 
         # Start night mode if it was enabled (persisted setting)
         if self.autonomous_mode:
