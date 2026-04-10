@@ -167,15 +167,28 @@ class DRMAdBlocker:
         self._start_snapshot_buffer()
 
     def _detect_frame_resolution(self):
-        """Detect actual capture frame resolution from ustreamer."""
+        """Detect actual encoder output resolution from ustreamer snapshot.
+
+        Note: This gets the actual JPEG output dimensions, not the source resolution.
+        With --encode-scale=native, 4K NV12 input is downscaled to 1080p output.
+        We need the output resolution for correct font scaling in blocking mode.
+        """
         try:
-            url = f"http://localhost:{self.ustreamer_port}/state"
-            with urllib.request.urlopen(url, timeout=2.0) as response:
-                data = json.loads(response.read().decode('utf-8'))
-                width = data.get('result', {}).get('source', {}).get('resolution', {}).get('width', 1920)
-                height = data.get('result', {}).get('source', {}).get('resolution', {}).get('height', 1080)
-                logger.info(f"[DRMAdBlocker] Detected frame resolution: {width}x{height}")
-                return width, height
+            # Get actual JPEG dimensions by downloading snapshot
+            # This is more reliable than /state which only shows source resolution
+            url = f"http://localhost:{self.ustreamer_port}/snapshot"
+            with urllib.request.urlopen(url, timeout=3.0) as response:
+                jpeg_data = response.read()
+                # Decode JPEG to get actual dimensions
+                img_array = np.frombuffer(jpeg_data, dtype=np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_GRAYSCALE)  # Grayscale is faster
+                if img is not None:
+                    height, width = img.shape[:2]
+                    logger.info(f"[DRMAdBlocker] Detected encoder output resolution: {width}x{height}")
+                    return width, height
+                else:
+                    logger.warning("[DRMAdBlocker] Failed to decode snapshot, using 1920x1080")
+                    return 1920, 1080
         except Exception as e:
             logger.warning(f"[DRMAdBlocker] Could not detect frame resolution: {e}, using 1920x1080")
             return 1920, 1080
