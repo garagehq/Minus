@@ -28,6 +28,9 @@ import json
 from collections import deque
 from pathlib import Path
 
+import numpy as np
+import cv2
+
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
