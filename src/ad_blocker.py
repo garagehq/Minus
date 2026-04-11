@@ -1230,9 +1230,9 @@ class DRMAdBlocker:
 
     def show(self, source='default'):
         with self._lock:
-            if not self.pipeline:
-                logger.warning("[DRMAdBlocker] Pipeline not initialized")
-                return
+            # Note: We still enable ustreamer blocking even without display pipeline
+            # because blocking overlay works via ustreamer (for web stream) independently
+            # of GStreamer display pipeline (for TV output via DRM)
 
             if self.is_visible and self._animation_direction != 'end':
                 if self.current_source != source:
@@ -1333,8 +1333,15 @@ class DRMAdBlocker:
             self._blocking_api_call('/blocking/set', {'text_vocab': '', 'text_stats': ''})
 
             if not self.pipeline:
-                if was_visible:
-                    logger.warning("[DRMAdBlocker] Pipeline not initialized")
+                # Still disable ustreamer blocking even without display pipeline
+                # (blocking overlay works via ustreamer independently)
+                self._blocking_api_call('/blocking/set', {'enabled': 'false'}, timeout=0.5)
+                # Write blocking state to file
+                try:
+                    with open('/dev/shm/minus_blocking_state', 'w') as f:
+                        f.write('0')
+                except Exception:
+                    pass
                 if self.audio:
                     self.audio.unmute()
                 return
