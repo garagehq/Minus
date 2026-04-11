@@ -518,6 +518,14 @@
                     <span class="status-text">Status: <span id="vlm-status-text">Loading...</span></span>
                 </div>
                 <p class="help-text">Disabling VLM unloads the model from the Axera NPU to free memory. Re-enabling takes ~13 seconds to load.</p>
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">Preload VLM at Startup</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="vlm-preload-toggle" checked onchange="toggleVLMPreload(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text">When enabled, VLM loads immediately at startup (even without HDMI signal). When disabled, VLM waits for HDMI signal before loading. Takes effect on next restart.</p>
             </section>
 
             <!-- Autonomous Mode Settings -->
@@ -1319,6 +1327,34 @@
             vlmOperationInProgress = false;
         }
 
+        async function toggleVLMPreload(enabled) {
+            try {
+                const response = await fetch('/api/settings/vlm-preload', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled: enabled })
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    document.getElementById('vlm-preload-toggle').checked = !enabled;
+                    console.error('VLM preload toggle failed:', data.error);
+                }
+            } catch (error) {
+                console.error('VLM preload toggle error:', error);
+                document.getElementById('vlm-preload-toggle').checked = !enabled;
+            }
+        }
+
+        async function loadVLMPreloadSetting() {
+            try {
+                const response = await fetch('/api/settings/vlm-preload');
+                const data = await response.json();
+                document.getElementById('vlm-preload-toggle').checked = data.vlm_preload;
+            } catch (error) {
+                console.error('Failed to load VLM preload setting:', error);
+            }
+        }
+
         async function updateVLMStatus() {
             try {
                 const response = await fetch('/api/vlm/status');
@@ -1470,8 +1506,10 @@
             const startHour = parseInt(document.getElementById('auto-start-hour').value);
             const endHour = parseInt(document.getElementById('auto-end-hour').value);
             const alwaysOn = document.getElementById('auto-always-on').checked;
+            const toggle = document.getElementById('autonomous-toggle');
 
             try {
+                // Update schedule
                 const response = await fetch('/api/autonomous/schedule', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1480,6 +1518,13 @@
                 const data = await response.json();
                 if (data.schedule) {
                     console.log('Schedule updated:', data.schedule);
+                }
+
+                // Auto-enable when 24/7 is checked
+                if (alwaysOn && !toggle.checked) {
+                    console.log('24/7 mode selected - auto-enabling autonomous mode');
+                    await toggleAutonomousMode(true);
+                    return;  // toggleAutonomousMode will update the UI
                 }
             } catch (error) {
                 console.error('Failed to update schedule:', error);
@@ -2329,6 +2374,7 @@
         fetchColorSettings();
         updateFireTVStatus();
         updateVLMStatus();
+        loadVLMPreloadSetting();
         updateAutonomousModeStatus();
 
         setInterval(updateStatus, 1000);
