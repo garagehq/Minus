@@ -1448,6 +1448,9 @@
             }
         }
 
+        // Flag to prevent onchange firing during programmatic UI updates
+        let autonomousUIUpdating = false;
+
         function updateAutonomousModeUI(data) {
             const toggle = document.getElementById('autonomous-toggle');
             const statusText = document.getElementById('autonomous-status-text');
@@ -1459,6 +1462,9 @@
             const endHour = document.getElementById('auto-end-hour');
             const alwaysOn = document.getElementById('auto-always-on');
 
+            // Prevent onchange from firing during programmatic updates
+            autonomousUIUpdating = true;
+
             // Update toggle
             toggle.checked = data.enabled;
 
@@ -1466,6 +1472,9 @@
             if (data.start_hour !== undefined) startHour.value = data.start_hour;
             if (data.end_hour !== undefined) endHour.value = data.end_hour;
             if (data.always_on !== undefined) alwaysOn.checked = data.always_on;
+
+            // Re-enable onchange after a short delay
+            setTimeout(() => { autonomousUIUpdating = false; }, 50);
 
             // Update status text
             if (data.active) {
@@ -1503,6 +1512,9 @@
         }
 
         async function updateAutonomousSchedule() {
+            // Ignore if this is a programmatic update (not user action)
+            if (autonomousUIUpdating) return;
+
             const startHour = parseInt(document.getElementById('auto-start-hour').value);
             const endHour = parseInt(document.getElementById('auto-end-hour').value);
             const alwaysOn = document.getElementById('auto-always-on').checked;
