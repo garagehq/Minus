@@ -793,20 +793,44 @@ The web UI includes a swipe-based review system for classifying screenshots:
 
 ## Autonomous Mode
 
-Autonomous Mode keeps YouTube playing on Fire TV during scheduled hours so Minus can collect ad detection training data unattended. Uses VLM to understand screen state and take intelligent actions.
+Autonomous Mode keeps YouTube playing on streaming devices during scheduled hours so Minus can collect ad detection training data unattended. Device-agnostic design supports Fire TV, Roku, and Google TV. Uses VLM to understand screen state and take intelligent actions.
 
 **How it works:**
 1. **Schedule** — Configurable start/end hours (e.g., 22:00–06:00), or 24/7 mode
 2. **VLM-guided keepalive** — Every 2 minutes, captures a frame and asks VLM to classify the screen state
-3. **Smart actions** — Based on VLM response, takes the minimum necessary action:
+3. **Roku ECP active app check** — Before VLM, queries Roku's `/query/active-app` API to detect if YouTube exited or screensaver activated (more reliable than VLM for Roku)
+4. **Frame-change + audio verification** — After VLM says "PLAYING", verifies with dHash frame comparison + audio flow check to catch paused videos VLM misclassifies
+5. **Smart actions** — Based on combined signals, takes the minimum necessary action:
 
-| VLM Response | Action | Command |
-|-------------|--------|---------|
-| PLAYING | None | Video is fine |
-| PAUSED | Play | `play_pause` key |
-| DIALOG | Dismiss | `select` + `play_pause` |
-| MENU | Select video | `down` + `select` |
-| SCREENSAVER | Wake + launch | `wakeup` + launch YouTube |
+| Signal | Action | Command |
+|--------|--------|---------|
+| VLM: PLAYING + frames changing | None | Video is fine |
+| VLM: PLAYING + static + no audio | Play | `play_pause` (paused video VLM missed) |
+| VLM: PLAYING + static + audio flowing | None | Music stream with static image (lo-fi) |
+| VLM: PAUSED | Play | `play_pause` key |
+| VLM: DIALOG | Dismiss | `select` + `play_pause` |
+| VLM: MENU | Select video | `down` + `select` |
+| VLM: SCREENSAVER | Wake + launch | `wakeup` + launch YouTube |
+| Roku: screensaver overlay | Dismiss | `select` (wake from screensaver) |
+| Roku: not on YouTube | Relaunch | `launch_app('youtube')` |
+
+**Device-agnostic design:**
+- `set_device_controller(controller, device_type)` accepts any controller
+- Device type auto-detected from controller class name
+- YouTube launch uses device-specific methods (Roku ECP `launch_app`, Android ADB intent)
+- Skip command routes through active device controller
+
+**Roku-specific features:**
+- **Active app check** via ECP `/query/active-app` — definitively knows if YouTube is running
+- **Screensaver detection** — checks for `<screensaver>` element in active-app response (Roku City screensaver overlays YouTube without closing it)
+- **YouTube app ID**: 837
+
+**Frame-change verification (pause detection):**
+- dHash (difference hash) compares two frames 3 seconds apart
+- Hamming distance < 3 = truly static (paused or stuck)
+- Audio flow check via ad_blocker's audio module (`last_buffer_age < 3s`) or ALSA `/proc/asound` status
+- Static frames + audio flowing = music stream (not paused) — prevents false play_pause
+- Static frames + no audio = truly paused — sends play_pause after 2 consecutive checks
 
 **VLM Screen Query Prompt:**
 ```
@@ -821,14 +845,30 @@ This structured prompt returns in ~1.0s (vs 5-22s with descriptive prompts).
 {"enabled": true, "start_hour": 22, "end_hour": 6, "always_on": false}
 ```
 
+**System settings:** `/home/radxa/.minus_system_settings.json`
+```json
+{"vlm_preload": true}
+```
+VLM preload loads the model at startup before HDMI signal arrives (configurable in Settings tab).
+
 **API endpoints:**
-- `GET /api/autonomous` - Current status (active, schedule, stats)
+- `GET /api/autonomous` - Current status (active, schedule, stats, device_type, device_connected)
 - `POST /api/autonomous/enable` / `disable` / `toggle`
 - `POST /api/autonomous/start` - Start immediately (manual override)
 - `POST /api/autonomous/schedule` - Set hours and always_on flag
 - `GET /api/autonomous/logs` - Recent log entries
+- `GET/POST /api/settings/vlm-preload` - VLM preload toggle
 
-**Web UI:** Toggle button, schedule time selectors, 24/7 checkbox, stats display in Settings tab.
+**Web UI:** Toggle button, schedule time selectors, 24/7 checkbox (auto-enables mode), stats display in Settings tab, VLM preload toggle.
+
+**24h stability test results (Apr 10-11, 2026):**
+- Memory: stable at ~1.65GB RSS, no leak (tested 21+ hours continuous)
+- FD count: stable at ~35, no leak
+- Autonomous actions: 10+ DIALOG dismissals, 6+ screensaver auto-dismissals, all successful
+- Ads blocked: 15+ ad breaks (OCR+VLM), all legitimate
+- Audio-aware static detection: prevented 100+ false play_pause commands on lo-fi streams
+- Audio restarts: 3 total (isolated, all self-recovered)
+- Zero errors throughout
 
 ## WiFi Captive Portal
 
@@ -1309,9 +1349,9 @@ This caused the new pipeline to fail with "device in use" because the old pipeli
 
 ### Skip-to-Unblock Delay (Fixed - Apr 2026)
 
-**Symptom:** After successfully skipping an ad via Fire TV, the blocking overlay stayed for 2-3+ seconds waiting for OCR to detect the ad was gone.
+**Symptom:** After successfully skipping an ad, the blocking overlay stayed for 2-3+ seconds waiting for OCR to detect the ad was gone.
 
-**Solution:** After a successful skip command (auto or manual via web UI), blocking is now removed after a 1.5s delay instead of waiting for 3 OCR cycles. The delay allows the skip animation to complete, then force-unblocks by resetting all detection state.
+**Solution:** After a successful skip command (auto or manual via web UI), blocking is now removed after a 1.5s delay instead of waiting for 3 OCR cycles. The delay allows the skip animation to complete, then force-unblocks by resetting all detection state. Skip command is device-agnostic — routes to Fire TV (`skip_ad()`), Roku (`send_command('select')`), or Google TV based on the configured device type.
 
 ### GStreamer Bus Signal Watch FD Leak (Fixed - Apr 2026)
 

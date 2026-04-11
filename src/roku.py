@@ -340,7 +340,8 @@ class RokuController:
         try:
             url = f'http://{self._ip_address}:{ROKU_PORT}/keypress/{key}'
             response = requests.post(url, timeout=2)
-            if response.status_code == 200:
+            # Roku returns 200 or 204 for successful key presses
+            if response.status_code in (200, 204):
                 logger.debug(f"[Roku] Sent key: {key}")
                 return True
             else:
@@ -383,7 +384,8 @@ class RokuController:
         try:
             url = f'http://{self._ip_address}:{ROKU_PORT}/launch/{app_id}'
             response = requests.post(url, timeout=5)
-            if response.status_code == 200:
+            # Roku returns 200 or 204 for successful launches
+            if response.status_code in (200, 204):
                 logger.info(f"[Roku] Launched app: {app_name}")
                 return True
             else:
@@ -391,6 +393,69 @@ class RokuController:
                 return False
         except Exception as e:
             logger.error(f"[Roku] App launch error: {e}")
+            return False
+
+    def get_active_app(self) -> Optional[str]:
+        """Get the currently active app on Roku via ECP.
+
+        Returns the app name (e.g., 'YouTube', 'Home'), or None if unavailable.
+        """
+        if not self._connected or not self._ip_address:
+            return None
+
+        try:
+            url = f'http://{self._ip_address}:{ROKU_PORT}/query/active-app'
+            response = requests.get(url, timeout=3)
+            if response.status_code == 200:
+                import re
+                # Extract app name from XML: <app ...>AppName</app>
+                match = re.search(r'<app[^>]*>([^<]+)</app>', response.text)
+                if match:
+                    return match.group(1)
+            return None
+        except Exception as e:
+            logger.debug(f"[Roku] Active app query error: {e}")
+            return None
+
+    def get_active_app_id(self) -> Optional[str]:
+        """Get the currently active app ID on Roku.
+
+        Returns the app ID (e.g., '837' for YouTube, '562859' for Home).
+        """
+        if not self._connected or not self._ip_address:
+            return None
+
+        try:
+            url = f'http://{self._ip_address}:{ROKU_PORT}/query/active-app'
+            response = requests.get(url, timeout=3)
+            if response.status_code == 200:
+                import re
+                match = re.search(r'<app\s+id="(\d+)"', response.text)
+                if match:
+                    return match.group(1)
+            return None
+        except Exception as e:
+            logger.debug(f"[Roku] Active app ID query error: {e}")
+            return None
+
+    def is_screensaver_active(self) -> bool:
+        """Check if the Roku screensaver is currently active.
+
+        When the screensaver activates, the /query/active-app response includes
+        a <screensaver> element alongside the <app> element. The app may still
+        be YouTube, but the screensaver overlays it.
+        """
+        if not self._connected or not self._ip_address:
+            return False
+
+        try:
+            url = f'http://{self._ip_address}:{ROKU_PORT}/query/active-app'
+            response = requests.get(url, timeout=3)
+            if response.status_code == 200:
+                return '<screensaver' in response.text.lower()
+            return False
+        except Exception as e:
+            logger.debug(f"[Roku] Screensaver check error: {e}")
             return False
 
     def get_device_info(self) -> Optional[Dict[str, Any]]:

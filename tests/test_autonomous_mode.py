@@ -758,11 +758,13 @@ class TestStateManagement(unittest.TestCase):
             "enabled", "active", "manual_override", "is_scheduled_time",
             "always_on", "start_hour", "end_hour", "schedule",
             "current_time_et", "next_window_start", "next_window_end",
-            "time_until_window", "fire_tv_connected", "stats",
+            "time_until_window", "fire_tv_connected", "device_type",
+            "device_connected", "stats",
         }
         self.assertEqual(set(status.keys()), expected_keys)
 
     def test_get_status_fire_tv_connected(self):
+        self.mode._device_type = 'fire_tv'
         self.mode._fire_tv.is_connected.return_value = True
         status = self.mode.get_status()
         self.assertTrue(status["fire_tv_connected"])
@@ -1204,6 +1206,328 @@ class TestScreenQueryPrompt(unittest.TestCase):
     def test_prompt_mentions_categories(self):
         for cat in ("PLAYING", "PAUSED", "DIALOG", "MENU", "SCREENSAVER"):
             self.assertIn(cat, AutonomousMode.SCREEN_QUERY_PROMPT)
+
+
+# =============================================================================
+# Roku Device Controller Tests
+# =============================================================================
+
+
+class TestAutonomousModeRoku(unittest.TestCase):
+    """Tests for Roku-specific autonomous mode features."""
+
+    def test_set_device_controller_roku(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.__class__.__name__ = "RokuController"
+            mode.set_device_controller(roku, 'roku')
+            self.assertEqual(mode._device_type, 'roku')
+            self.assertIs(mode._device_controller, roku)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_detect_device_type_roku(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.__class__.__name__ = "RokuController"
+            detected = mode._detect_device_type(roku)
+            self.assertEqual(detected, 'roku')
+        finally:
+            _cleanup_mode(mode)
+
+    def test_detect_device_type_fire_tv(self):
+        mode = _make_mode()
+        try:
+            ftv = MagicMock()
+            ftv.__class__.__name__ = "FireTVController"
+            detected = mode._detect_device_type(ftv)
+            self.assertEqual(detected, 'fire_tv')
+        finally:
+            _cleanup_mode(mode)
+
+    def test_detect_device_type_google_tv(self):
+        mode = _make_mode()
+        try:
+            gtv = MagicMock()
+            gtv.__class__.__name__ = "GoogleTVController"
+            detected = mode._detect_device_type(gtv)
+            self.assertEqual(detected, 'google_tv')
+        finally:
+            _cleanup_mode(mode)
+
+    def test_launch_youtube_roku(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.is_connected.return_value = True
+            roku.launch_app.return_value = True
+            mode.set_device_controller(roku, 'roku')
+            result = mode._launch_youtube()
+            self.assertTrue(result)
+            roku.launch_app.assert_called_once_with('youtube')
+        finally:
+            _cleanup_mode(mode)
+
+    def test_launch_youtube_roku_fails(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.is_connected.return_value = True
+            roku.launch_app.return_value = False
+            mode.set_device_controller(roku, 'roku')
+            result = mode._launch_youtube()
+            self.assertFalse(result)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_launch_youtube_device_disconnected(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.is_connected.return_value = False
+            mode.set_device_controller(roku, 'roku')
+            result = mode._launch_youtube()
+            self.assertFalse(result)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_status_includes_device_type(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.is_connected.return_value = True
+            mode.set_device_controller(roku, 'roku')
+            status = mode.get_status()
+            self.assertEqual(status['device_type'], 'roku')
+            self.assertTrue(status['device_connected'])
+        finally:
+            _cleanup_mode(mode)
+
+
+class TestAutonomousModeRokuActiveApp(unittest.TestCase):
+    """Tests for Roku ECP active app checking."""
+
+    def test_check_roku_active_app_youtube_running(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.get_active_app_id.return_value = '837'
+            roku.is_screensaver_active.return_value = False
+            mode.set_device_controller(roku, 'roku')
+            result = mode._check_roku_active_app()
+            self.assertTrue(result)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_check_roku_active_app_not_youtube(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.get_active_app_id.return_value = '562859'  # Home
+            roku.get_active_app.return_value = 'Home'
+            roku.is_screensaver_active.return_value = False
+            mode.set_device_controller(roku, 'roku')
+            result = mode._check_roku_active_app()
+            self.assertFalse(result)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_check_roku_screensaver_active(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.is_screensaver_active.return_value = True
+            roku.send_command.return_value = True
+            mode.set_device_controller(roku, 'roku')
+            result = mode._check_roku_active_app()
+            self.assertTrue(result)  # Returns True because screensaver was dismissed
+            roku.send_command.assert_called_with('select')
+        finally:
+            _cleanup_mode(mode)
+
+    def test_check_roku_skipped_for_fire_tv(self):
+        mode = _make_mode()
+        try:
+            ftv = MagicMock()
+            mode.set_device_controller(ftv, 'fire_tv')
+            result = mode._check_roku_active_app()
+            self.assertTrue(result)  # Non-Roku devices always return True
+        finally:
+            _cleanup_mode(mode)
+
+    def test_check_roku_query_fails_gracefully(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.is_screensaver_active.return_value = False
+            roku.get_active_app_id.return_value = None  # Query failed
+            mode.set_device_controller(roku, 'roku')
+            result = mode._check_roku_active_app()
+            self.assertTrue(result)  # Don't interfere on failure
+        finally:
+            _cleanup_mode(mode)
+
+
+# =============================================================================
+# Static Detection + Audio Flow Tests
+# =============================================================================
+
+
+class TestAutonomousModeStaticDetection(unittest.TestCase):
+    """Tests for frame-change and audio-aware static detection."""
+
+    def test_compute_frame_hash(self):
+        """Frame hash should return an integer."""
+        import numpy as np
+        mode = _make_mode()
+        try:
+            frame = np.zeros((100, 100, 3), dtype=np.uint8)
+            h = mode._compute_frame_hash(frame)
+            self.assertIsInstance(h, int)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_compute_frame_hash_different_frames(self):
+        """Different frames should produce different hashes."""
+        import numpy as np
+        mode = _make_mode()
+        try:
+            # Use frames with actual gradient differences (not solid colors)
+            frame1 = np.zeros((100, 100, 3), dtype=np.uint8)
+            frame2 = np.random.randint(50, 200, (100, 100, 3), dtype=np.uint8)
+            h1 = mode._compute_frame_hash(frame1)
+            h2 = mode._compute_frame_hash(frame2)
+            # Hashes should differ for visually different frames
+            hamming = bin(h1 ^ h2).count('1')
+            self.assertGreater(hamming, 0)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_compute_frame_hash_identical_frames(self):
+        """Identical frames should produce identical hashes."""
+        import numpy as np
+        mode = _make_mode()
+        try:
+            frame = np.random.randint(0, 255, (100, 100, 3), dtype=np.uint8)
+            h1 = mode._compute_frame_hash(frame)
+            h2 = mode._compute_frame_hash(frame.copy())
+            self.assertEqual(h1, h2)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_is_audio_flowing_with_ad_blocker(self):
+        """Audio flowing check via ad_blocker audio module."""
+        mode = _make_mode()
+        try:
+            mode._ad_blocker = MagicMock()
+            mode._ad_blocker.audio = MagicMock()
+            mode._ad_blocker.audio.get_status.return_value = {'last_buffer_age': 0.5}
+            self.assertTrue(mode._is_audio_flowing())
+
+            mode._ad_blocker.audio.get_status.return_value = {'last_buffer_age': 10.0}
+            self.assertFalse(mode._is_audio_flowing())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_consecutive_static_counter_resets_on_action(self):
+        """Static counter should reset when an action is taken."""
+        mode = _make_mode()
+        try:
+            mode._consecutive_static = 5
+            roku = MagicMock()
+            roku.is_connected.return_value = True
+            roku.send_command.return_value = True
+            mode.set_device_controller(roku, 'roku')
+
+            # Simulate VLM returning PAUSED
+            mode._vlm = MagicMock()
+            mode._vlm.is_ready = True
+            mode._query_screen = MagicMock(return_value="PAUSED")
+
+            mode._ensure_youtube_playing()
+            self.assertEqual(mode._consecutive_static, 0)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_playing(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("PLAYING"), "none")
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_paused(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("PAUSED"), "play")
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_dialog(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("DIALOG"), "dismiss")
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_screensaver(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("SCREENSAVER"), "launch")
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_menu(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("MENU"), "select")
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_unknown(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("UNKNOWN_STATE"), "none")
+        finally:
+            _cleanup_mode(mode)
+
+    def test_determine_action_still_watching(self):
+        mode = _make_mode()
+        try:
+            self.assertEqual(mode._determine_action("Are you still watching?"), "dismiss")
+        finally:
+            _cleanup_mode(mode)
+
+
+class TestAutonomousModeWakeDevice(unittest.TestCase):
+    """Tests for device wake functionality."""
+
+    def test_wake_roku(self):
+        mode = _make_mode()
+        try:
+            roku = MagicMock()
+            roku.send_command.return_value = True
+            mode.set_device_controller(roku, 'roku')
+            mode._wake_device()
+            # Roku wake sends power then home
+            calls = [c[0][0] for c in roku.send_command.call_args_list]
+            self.assertIn('power', calls)
+            self.assertIn('home', calls)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_wake_fire_tv(self):
+        mode = _make_mode()
+        try:
+            ftv = MagicMock()
+            ftv.send_command.return_value = True
+            mode.set_device_controller(ftv, 'fire_tv')
+            mode._wake_device()
+            ftv.send_command.assert_called_with('wakeup')
+        finally:
+            _cleanup_mode(mode)
 
 
 # =============================================================================

@@ -2130,21 +2130,22 @@ class WebUI:
 
         @self.app.route('/api/blocking/skip', methods=['POST'])
         def api_blocking_skip():
-            """Trigger Fire TV skip button press to skip current ad.
+            """Trigger skip button press on the connected streaming device.
 
-            Sends the 'select' command to Fire TV which usually skips skippable ads.
+            Uses the device-agnostic try_skip_ad() which works with
+            Fire TV, Roku, and Google TV.
             """
             try:
-                if not hasattr(self.minus, 'fire_tv_setup') or not self.minus.fire_tv_setup:
-                    return jsonify({'success': False, 'error': 'Fire TV not initialized'}), 500
+                if not self.minus._is_remote_connected():
+                    device_type = self.minus._get_configured_device_type()
+                    return jsonify({'success': False, 'error': f'{device_type} not connected'}), 503
 
-                controller = self.minus.fire_tv_setup.get_controller()
-                if not controller or not controller.is_connected:
-                    return jsonify({'success': False, 'error': 'Fire TV not connected'}), 503
+                result = self.minus.try_skip_ad()
+                if not result:
+                    return jsonify({'success': False, 'error': 'Skip command failed'}), 500
 
-                # Send select command (usually skips ads)
-                controller.send_command('select')
-                logger.info("[WebUI] Skip ad command sent to Fire TV")
+                device_type = self.minus._get_configured_device_type()
+                logger.info(f"[WebUI] Skip ad command sent to {device_type}")
 
                 # Force unblock after brief delay (don't wait for OCR to detect)
                 def _unblock_after_skip():

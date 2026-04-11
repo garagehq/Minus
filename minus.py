@@ -1137,15 +1137,40 @@ class Minus:
             # Thread will exit on next iteration
 
     def try_skip_ad(self):
-        """Attempt to skip ad on Fire TV if connected."""
-        if self.fire_tv_controller and self.fire_tv_controller.is_connected():
-            try:
-                result = self.fire_tv_controller.skip_ad()
-                if result:
-                    logger.info("[FireTV] Sent skip command")
-                return result
-            except Exception as e:
-                logger.warning(f"[FireTV] Skip command failed: {e}")
+        """Attempt to skip ad on the connected streaming device.
+
+        Works with Fire TV, Roku, and Google TV — uses whichever is connected.
+        For Fire TV/Google TV: uses skip_ad() (ADB select command).
+        For Roku: sends 'select' via ECP (same effect as pressing OK on remote).
+        """
+        device_type = self._get_configured_device_type()
+
+        # Try Fire TV / Google TV (has dedicated skip_ad method)
+        if device_type in ('fire_tv', 'google_tv'):
+            if self.fire_tv_controller and self.fire_tv_controller.is_connected():
+                try:
+                    result = self.fire_tv_controller.skip_ad()
+                    if result:
+                        logger.info(f"[{device_type.upper()}] Sent skip command")
+                    return result
+                except Exception as e:
+                    logger.warning(f"[{device_type.upper()}] Skip command failed: {e}")
+            return False
+
+        # Try Roku (send 'select' which presses the skip button)
+        if device_type == 'roku':
+            if self.roku_controller and self.roku_controller.is_connected():
+                try:
+                    result = self.roku_controller.send_command('select')
+                    if result:
+                        logger.info("[ROKU] Sent skip command (select)")
+                    return result
+                except Exception as e:
+                    logger.warning(f"[ROKU] Skip command failed: {e}")
+            return False
+
+        # No device connected
+        logger.debug("[SKIP] No streaming device connected for skip")
         return False
 
     # ===== Web UI Methods =====
@@ -2190,7 +2215,7 @@ class Minus:
                                     self.audio.unmute()
                             threading.Thread(target=_unblock_after_skip, daemon=True).start()
                         else:
-                            logger.warning(f"[SKIP] Skip command failed (Fire TV not connected?)")
+                            logger.warning(f"[SKIP] Skip command failed (device not connected?)")
 
                 elif is_skippable and not skip_delay_passed:
                     wait_remaining = int(self.SKIP_DELAY_SECONDS - time_since_blocking)

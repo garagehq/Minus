@@ -19,6 +19,9 @@ from pathlib import Path
 from typing import Optional, Callable
 from zoneinfo import ZoneInfo
 
+import cv2
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # Settings file for persistence (use absolute path to work regardless of running user)
@@ -142,6 +145,11 @@ class AutonomousMode:
 
         # Callbacks
         self._on_status_change: Optional[Callable[[dict], None]] = None
+
+        # Frame change detection for pause verification
+        self._prev_frame_hash: Optional[int] = None
+        self._consecutive_static: int = 0
+        self._STATIC_PAUSE_THRESHOLD = 2  # Consecutive static checks before forcing play
 
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
@@ -557,7 +565,6 @@ class AutonomousMode:
             return None
 
         try:
-            import cv2
             frame = self._frame_capture.capture()
             if frame is None:
                 return None
@@ -707,19 +714,198 @@ class AutonomousMode:
             logger.error(f"[AutonomousMode] Android YouTube launch error: {e}")
             return False
 
+    def _compute_frame_hash(self, frame) -> int:
+        """Compute a perceptual hash (dHash) of a frame for change detection.
+
+        Returns a 64-bit integer hash. Frames that look similar will have
+        hashes with low Hamming distance.
+        """
+        small = cv2.resize(frame, (9, 8), interpolation=cv2.INTER_AREA)
+        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if len(small.shape) == 3 else small
+        diff = gray[:, 1:] > gray[:, :-1]
+        return int(np.packbits(diff.flatten())[:8].view(np.uint64)[0])
+
+    def _is_audio_flowing(self) -> bool:
+        """Check if audio is currently flowing (music/sound playing).
+
+        Uses the ad_blocker's audio module if available, otherwise checks
+        ALSA capture device status directly via /proc/asound.
+
+        Returns True if audio buffers are actively flowing.
+        """
+        # Method 1: Check via ad_blocker's audio module
+        if self._ad_blocker and hasattr(self._ad_blocker, 'audio') and self._ad_blocker.audio:
+            try:
+                status = self._ad_blocker.audio.get_status()
+                buffer_age = status.get('last_buffer_age', 999)
+                is_flowing = buffer_age < 3.0  # Buffer received within last 3 seconds
+                logger.debug(f"[AutonomousMode] Audio buffer age: {buffer_age:.1f}s, flowing={is_flowing}")
+                return is_flowing
+            except Exception:
+                pass
+
+        # Method 2: Check ALSA capture device status directly
+        try:
+            alsa_status_path = "/proc/asound/card4/pcm0c/sub0/status"
+            with open(alsa_status_path, 'r') as f:
+                content = f.read()
+            is_running = 'state: RUNNING' in content
+            logger.debug(f"[AutonomousMode] ALSA capture: {'RUNNING' if is_running else 'not running'}")
+            return is_running
+        except Exception:
+            return False
+
+    def _is_screen_static(self) -> bool:
+        """Check if screen is truly paused by combining frame analysis with audio state.
+
+        A truly paused screen has:
+        - Static frames (identical between captures)
+        - No audio flowing (music stopped)
+
+        A music stream with a static image has:
+        - Static or near-static frames
+        - Audio still flowing (music playing)
+
+        Returns True only if screen is static AND audio is not flowing (truly paused).
+        """
+        if not self._frame_capture:
+            return False
+
+        try:
+            frame1 = self._frame_capture.capture()
+            if frame1 is None:
+                return False
+
+            time.sleep(3)
+
+            frame2 = self._frame_capture.capture()
+            if frame2 is None:
+                return False
+
+            hash1 = self._compute_frame_hash(frame1)
+            hash2 = self._compute_frame_hash(frame2)
+
+            # Hamming distance - low distance means nearly identical frames
+            # Truly paused screens: hamming = 0 (identical JPEG captures)
+            # Slow animations (lo-fi streams): hamming = 3-10 (subtle changes)
+            # Active video: hamming = 15-40 (clear changes)
+            hamming = bin(hash1 ^ hash2).count('1')
+            frames_static = hamming < 3  # Only truly frozen screens
+
+            if not frames_static:
+                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, video is changing")
+                return False
+
+            # Frames are static - check if audio is still playing
+            audio_flowing = self._is_audio_flowing()
+
+            if audio_flowing:
+                # Static image but audio playing = music stream (lo-fi, etc.) - NOT paused
+                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
+                           f"frames static but audio flowing (music stream, not paused)")
+                return False
+            else:
+                # Static image AND no audio = truly paused
+                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
+                           f"frames static + no audio = PAUSED")
+                return True
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Frame change check error: {e}")
+            return False
+
+    def _check_roku_active_app(self) -> bool:
+        """For Roku devices, check if YouTube is the active app via ECP.
+
+        This is more reliable than VLM because the Roku ECP definitively
+        reports which app is running. VLM can confuse the Roku City screensaver
+        with a playing video.
+
+        Returns True if YouTube is running (or if not a Roku device).
+        Returns False if Roku is on home/screensaver (YouTube needs relaunch).
+        """
+        if self._device_type != DEVICE_TYPE_ROKU:
+            return True  # Not a Roku, skip this check
+
+        if not hasattr(self._device_controller, 'get_active_app_id'):
+            return True  # Controller doesn't support active app query
+
+        try:
+            # Check for screensaver overlay first — this can happen even when
+            # YouTube is the "active" app (screensaver overlays it)
+            if hasattr(self._device_controller, 'is_screensaver_active'):
+                if self._device_controller.is_screensaver_active():
+                    logger.info("[AutonomousMode] Roku screensaver active — dismissing")
+                    self._device_controller.send_command('select')  # Wake from screensaver
+                    self._log_event("Roku screensaver dismissed")
+                    time.sleep(1)
+                    return True  # Screensaver dismissed, YouTube should resume
+
+            app_id = self._device_controller.get_active_app_id()
+            if app_id is None:
+                return True  # Query failed, don't interfere
+
+            youtube_app_id = '837'  # Roku YouTube app ID
+            if app_id == youtube_app_id:
+                return True
+
+            # Not YouTube — check what's running
+            app_name = self._device_controller.get_active_app() or f"app_id={app_id}"
+            logger.info(f"[AutonomousMode] Roku active app is '{app_name}' (not YouTube) — relaunching")
+            self._log_event(f"Roku not on YouTube (active: {app_name}), relaunching")
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Roku active app check error: {e}")
+            return True  # On error, don't interfere
+
     def _ensure_youtube_playing(self):
-        """Use VLM to understand screen state and take appropriate action."""
+        """Use VLM to understand screen state and take appropriate action.
+
+        For Roku: first checks active app via ECP (definitive) before VLM.
+        VLM can confuse the Roku City screensaver with a playing video.
+
+        Includes frame-change verification: if VLM says PLAYING but the screen
+        is actually static (not changing), the video is likely paused. VLM is
+        unreliable at distinguishing paused from playing states.
+        """
         if not self._device_controller or not self._device_controller.is_connected():
             return
 
         try:
+            # For Roku: check active app via ECP before VLM
+            # This catches the case where Roku exits YouTube to screensaver/home
+            # and VLM misclassifies the animated screensaver as "PLAYING"
+            if not self._check_roku_active_app():
+                self._launch_youtube()
+                self._consecutive_static = 0
+                return
+
             # Use VLM to understand what's on screen
             screen_desc = self._query_screen()
             action = self._determine_action(screen_desc)
 
             if action == "none":
-                logger.debug("[AutonomousMode] Screen looks good, no action needed")
+                # VLM says PLAYING - verify with frame change detection
+                if self._is_screen_static():
+                    self._consecutive_static += 1
+                    logger.info(f"[AutonomousMode] VLM says PLAYING but screen is static "
+                               f"({self._consecutive_static}/{self._STATIC_PAUSE_THRESHOLD})")
+
+                    if self._consecutive_static >= self._STATIC_PAUSE_THRESHOLD:
+                        # Screen hasn't changed for multiple checks - likely paused
+                        logger.info("[AutonomousMode] Static screen detected - sending play_pause")
+                        self._device_controller.send_command("play_pause")
+                        self._log_event("Static screen override: sent play_pause (VLM said PLAYING)")
+                        self._consecutive_static = 0
+                else:
+                    # Screen is changing - truly playing
+                    self._consecutive_static = 0
+                    logger.debug("[AutonomousMode] Screen looks good, video is playing")
                 return
+
+            # Taking an action - reset static counter
+            self._consecutive_static = 0
 
             logger.info(f"[AutonomousMode] Action needed: {action} (screen: {screen_desc})")
             self._log_event(f"VLM action: {action}")
