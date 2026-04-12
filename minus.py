@@ -2408,7 +2408,13 @@ class Minus:
 
                 if not self.vlm_ad_detected:
                     # Not currently detecting - check if we should START
-                    if self._should_vlm_start_blocking():
+                    # If OCR already triggered blocking, VLM can confirm immediately
+                    # Otherwise, VLM needs sliding window agreement to trigger alone
+                    if self.ad_detected and self.blocking_source == "ocr" and is_ad:
+                        # VLM confirming OCR detection - upgrade to "both" immediately
+                        self.vlm_ad_detected = True
+                        logger.info(f"VLM confirming OCR detection: \"{response[:50] if response else ''}\"")
+                    elif self._should_vlm_start_blocking():
                         self.vlm_ad_detected = True
                         self.vlm_last_state_change = now
                         self.vlm_cooldown_active = True
