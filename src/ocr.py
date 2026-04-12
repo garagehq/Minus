@@ -566,14 +566,18 @@ class PaddleOCR:
                 matched.append(('ad countdown', text))
 
             # "0:30 | Ad", "Ad | 0:30", "Ad 0:30" - Hulu-style ad with timestamp
-            # Matches "Ad" (as whole word) appearing with a timestamp like X:XX
+            # Matches "Ad" (as whole word) appearing with a timestamp like X:XX in same element
             if re.search(r'\bad\b', text_lower) and re.search(r'\d:\d{2}', text):
                 matched.append(('ad with timestamp', text))
 
-            # Standalone "Ad" only if the text is very short (likely an ad indicator)
-            # Avoids matching "ad" in longer garbled OCR noise
-            if text_lower.strip() == 'ad' or re.match(r'^ad\s*$', text_lower):
-                matched.append(('ad indicator', text))
+        # Cross-element check: "Ad" in one element + timestamp in another (Hulu-style)
+        # Only if we haven't already matched and there are few text elements (not noisy OCR)
+        if not matched and len(all_texts) <= 5:
+            combined = ' '.join(all_texts).lower()
+            has_ad_word = re.search(r'\bad\b', combined)
+            has_timestamp = re.search(r'\d:\d{2}', ' '.join(all_texts))
+            if has_ad_word and has_timestamp:
+                matched.append(('ad with timestamp (cross-element)', combined[:50]))
 
         # Check if this appears to be terminal content
         is_terminal = self.is_terminal_content(all_texts)

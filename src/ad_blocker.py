@@ -1237,11 +1237,14 @@ class DRMAdBlocker:
             if self.is_visible and self._animation_direction != 'end':
                 if self.current_source != source:
                     self.current_source = source
+                    # Update overlay text to reflect new source (e.g., OCR -> OCR+VLM)
+                    self._blocking_api_call('/blocking/set', {'text_vocab': self._get_blocking_text(source)})
                 return
 
             if self._animating and self._animation_direction == 'start':
                 if self.current_source != source:
                     self.current_source = source
+                    self._blocking_api_call('/blocking/set', {'text_vocab': self._get_blocking_text(source)})
                 return
 
             if self._animating and self._animation_direction == 'end':
