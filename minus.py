@@ -2433,6 +2433,11 @@ class Minus:
                 response_preview = response[:40] if response else "no response"
                 logger.info(f"VLM #{self.vlm_frame_count}: {elapsed:.1f}s [{ad_status}] conf={confidence:.0%} \"{response_preview}\"")
 
+                # Add VLM detection to history whenever VLM detects an ad
+                # (not just when VLM triggers blocking alone - also when confirming OCR)
+                if is_ad:
+                    self.add_detection('VLM', [f"[AD] {response[:80]}" if response else "[AD]"])
+
                 self.vlm_prev_frame = frame.copy()
                 self.vlm_prev_frame_had_ad = is_ad
                 self.vlm_scene_skip_count = 0  # Reset skip counter after processing
