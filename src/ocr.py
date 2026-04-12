@@ -179,7 +179,7 @@ class PaddleOCR:
     ]
     # Keywords that need word boundary matching (avoid matching inside words)
     AD_KEYWORDS_WORD = [
-        'skip', 'sponsor',
+        'skip', 'sponsor', 'ad',  # 'ad' matches standalone word like Hulu's "0:59 | Ad"
         # Spanish word-boundary keywords
         'patroci',  # Catches patrocinado, patrocinador, etc.
     ]
