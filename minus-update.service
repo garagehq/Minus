@@ -1,0 +1,11 @@
+[Unit]
+Description=Minus Daily Update - Pull latest code and rebuild
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/radxa/minus-update.sh
+User=root
+StandardOutput=journal
+StandardError=journal

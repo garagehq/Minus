@@ -58,6 +58,11 @@ class VLMManager:
     INPUT_SIZE = 512  # Vision encoder input size
     TOKEN_LENGTH = 64  # Number of image tokens for 512x512 input
 
+    # Timeout for response rejection (in seconds)
+    # Based on benchmark: responses > 1.0s correlate with model uncertainty
+    # When timeout occurs, return low confidence to avoid false positives
+    RESPONSE_TIMEOUT = 1.0
+
     def __init__(self):
         """Initialize VLM manager."""
         self.is_ready = False
@@ -351,6 +356,13 @@ class VLMManager:
                 )
 
                 elapsed = time.time() - start_time
+
+                # Timeout-based rejection: if response took too long, model is uncertain
+                # Return False with low confidence to avoid blocking (conservative)
+                if elapsed > self.RESPONSE_TIMEOUT:
+                    logger.debug(f"VLM response timeout ({elapsed:.2f}s > {self.RESPONSE_TIMEOUT}s), treating as uncertain")
+                    return False, response, elapsed, 0.2
+
                 is_ad, confidence = self._is_ad_response(response)
 
                 return is_ad, response, elapsed, confidence
