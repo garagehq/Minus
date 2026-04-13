@@ -38,6 +38,10 @@ from gi.repository import Gst
 # Import vocabulary from extracted module
 from vocabulary import SPANISH_VOCABULARY
 from config import MinusConfig
+from drm import (
+    get_color_format, set_color_format, is_connector_connected,
+    check_hdmi_i2c_errors, COLOR_FORMAT_YCBCR420, COLOR_FORMAT_NAMES
+)
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -163,6 +167,18 @@ class DRMAdBlocker:
         self._snapshot_buffer_thread = None
         self._stop_snapshot_buffer = threading.Event()
         self._snapshot_interval = 2.0
+
+        # Adaptive bandwidth fallback for problematic HDMI cables
+        # Uses i2c error detection: when HDMI signal fails at high bandwidth,
+        # the dwhdmi driver floods dmesg with "i2c read err!" messages.
+        # This is more reliable than FPS detection since the pipeline can report
+        # frames flowing even when the TV shows "No Signal".
+        self._bandwidth_fallback_attempted = False
+        self._bandwidth_fallback_applied = False  # True if currently running with fallback
+        self._i2c_error_check_interval = 3.0  # How often to check for i2c errors
+        self._last_i2c_error_check = 0.0
+        self._i2c_error_threshold = 10  # Number of errors indicating failure
+        self._i2c_error_window = 5.0  # Time window for error counting
 
         # Initialize GStreamer
         Gst.init(None)
@@ -488,11 +504,56 @@ class DRMAdBlocker:
             # Don't restart if we're intentionally in a special mode
             if self.current_source in ('no_hdmi_device', 'loading'):
                 continue
+
+            current_time = time.time()
+            time_since_buffer = current_time - self._last_buffer_time if self._last_buffer_time > 0 else 0
+
+            # Check for HDMI bandwidth issues using i2c error detection
+            # When HDMI signal fails at high bandwidth, the dwhdmi driver floods
+            # dmesg with "i2c read err!" messages. This is the ONLY reliable heuristic
+            # because GStreamer FPS stays at 30 even when TV shows "No Signal".
+            # We use a sustained error check - errors must persist for multiple checks.
+            if (current_time - self._last_i2c_error_check >= self._i2c_error_check_interval and
+                not self._bandwidth_fallback_attempted):
+                self._last_i2c_error_check = current_time
+
+                has_errors, error_count, errors_per_sec = check_hdmi_i2c_errors(
+                    threshold=self._i2c_error_threshold,
+                    window_seconds=self._i2c_error_window
+                )
+
+                if has_errors and is_connector_connected(self.connector_id):
+                    # Track consecutive checks with errors
+                    if not hasattr(self, '_i2c_error_consecutive'):
+                        self._i2c_error_consecutive = 0
+                    self._i2c_error_consecutive += 1
+
+                    # Require 3 consecutive checks with errors (9+ seconds) to avoid
+                    # false positives during mode switching/startup
+                    if self._i2c_error_consecutive >= 3:
+                        logger.warning(f"[DRMAdBlocker] HDMI signal failing: sustained i2c errors "
+                                     f"({error_count} errors, {errors_per_sec:.1f}/s) for "
+                                     f"{self._i2c_error_consecutive} checks - attempting bandwidth fallback")
+
+                        if self._attempt_bandwidth_fallback():
+                            # Fallback was applied, restart pipeline with new settings
+                            self._i2c_error_consecutive = 0
+                            self._restart_pipeline()
+                            continue
+                    else:
+                        logger.info(f"[DRMAdBlocker] i2c errors detected ({error_count}), "
+                                  f"check {self._i2c_error_consecutive}/3")
+                else:
+                    # Reset consecutive counter when no errors
+                    if hasattr(self, '_i2c_error_consecutive'):
+                        self._i2c_error_consecutive = 0
+
+            # Original stall detection and restart logic
             if self._last_buffer_time > 0:
-                time_since_buffer = time.time() - self._last_buffer_time
                 if time_since_buffer > self._stall_threshold:
                     logger.warning(f"[DRMAdBlocker] Pipeline stalled ({time_since_buffer:.1f}s)")
                     self._restart_pipeline()
+
             if self.pipeline:
                 try:
                     state_ret, state, pending = self.pipeline.get_state(0)
@@ -554,6 +615,92 @@ class DRMAdBlocker:
     def restart(self):
         logger.info("[DRMAdBlocker] External restart requested")
         threading.Thread(target=self._restart_pipeline, daemon=True).start()
+
+    def _attempt_bandwidth_fallback(self) -> bool:
+        """
+        Attempt to fix display by falling back to lower bandwidth color format.
+
+        This handles the case where the display is connected (EDID readable, TV is on)
+        but we're getting 0 FPS due to HDMI bandwidth/signal integrity issues.
+
+        YCbCr 4:2:0 uses half the bandwidth of YCbCr 4:4:4, making 4K@60Hz work
+        with cables that can't handle full 18 Gbps bandwidth.
+
+        Returns:
+            True if fallback was applied and should retry, False otherwise
+        """
+        if self._bandwidth_fallback_attempted:
+            logger.debug("[DRMAdBlocker] Bandwidth fallback already attempted")
+            return False
+
+        # Check if connector is actually connected (TV is on, EDID readable)
+        if not is_connector_connected(self.connector_id):
+            logger.debug("[DRMAdBlocker] Connector not connected, bandwidth fallback not applicable")
+            return False
+
+        # Check current color format
+        current_value, current_name = get_color_format(self.connector_id)
+        logger.info(f"[DRMAdBlocker] Current color format: {current_name} (value={current_value})")
+
+        # If already at lowest bandwidth, nothing more we can do
+        if current_value == COLOR_FORMAT_YCBCR420:
+            logger.info("[DRMAdBlocker] Already at YCbCr 4:2:0, no further fallback possible")
+            self._bandwidth_fallback_attempted = True
+            self._bandwidth_fallback_applied = True  # Mark as applied since we're running at 4:2:0
+            return False
+
+        # Apply bandwidth fallback by restarting the service
+        # The GStreamer kmssink element holds DRM inside our process, making it
+        # impossible to change color_format while running. Instead, we write a
+        # marker file and restart the service - on startup, the color_format
+        # will be set before any DRM-using processes start.
+        logger.warning("[DRMAdBlocker] Display connected but signal failing - triggering service restart for bandwidth fallback")
+
+        # Write marker file indicating fallback is needed
+        marker_file = '/tmp/minus_bandwidth_fallback_needed'
+        try:
+            import subprocess
+            with open(marker_file, 'w') as f:
+                f.write(f"{self.connector_id}\n")
+            logger.info(f"[DRMAdBlocker] Wrote fallback marker to {marker_file}")
+
+            # Mark that we've attempted fallback (will be reset on restart anyway)
+            self._bandwidth_fallback_attempted = True
+
+            # Restart the service - this will fully release DRM
+            logger.info("[DRMAdBlocker] Restarting minus service to apply bandwidth fallback...")
+            subprocess.Popen(['sudo', 'systemctl', 'restart', 'minus'],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            # Give the restart command time to take effect before we continue
+            # (the process should be killed shortly after this)
+            time.sleep(5)
+
+            # If we're still here, something went wrong with restart
+            logger.warning("[DRMAdBlocker] Service restart may have failed")
+            return False
+
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] Error triggering fallback restart: {e}")
+            self._bandwidth_fallback_attempted = True
+            return False
+
+    def get_bandwidth_status(self) -> dict:
+        """Get current bandwidth/color format status for API."""
+        current_value, current_name = get_color_format(self.connector_id)
+        has_i2c_errors, error_count, errors_per_sec = check_hdmi_i2c_errors(
+            threshold=self._i2c_error_threshold,
+            window_seconds=self._i2c_error_window
+        )
+        return {
+            'color_format': current_name,
+            'color_format_value': current_value,
+            'bandwidth_fallback_applied': self._bandwidth_fallback_applied,
+            'bandwidth_fallback_attempted': self._bandwidth_fallback_attempted,
+            'i2c_errors_detected': has_i2c_errors,
+            'i2c_error_count': error_count,
+            'i2c_errors_per_second': round(errors_per_sec, 1),
+        }
 
     def start_no_signal_mode(self):
         """Start a standalone display for 'No Signal' message with DVD-style bouncing.

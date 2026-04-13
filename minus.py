@@ -20,6 +20,76 @@ Performance:
 - Ad blocking: INSTANT switching via input-selector
 """
 
+# ============================================================================
+# EARLY BANDWIDTH FALLBACK CHECK
+# Must run BEFORE any imports that might touch DRM/GStreamer
+# ============================================================================
+import os as _os
+import subprocess as _subprocess
+import time as _time
+
+_FALLBACK_MARKER = '/tmp/minus_bandwidth_fallback_needed'
+if _os.path.exists(_FALLBACK_MARKER):
+    try:
+        with open(_FALLBACK_MARKER, 'r') as _f:
+            _connector_id = _f.read().strip()
+        _os.remove(_FALLBACK_MARKER)
+        print(f"[EARLY INIT] Bandwidth fallback marker found for connector {_connector_id}")
+
+        # Aggressively kill ALL modetest and ustreamer processes to ensure DRM is free
+        # The previous service instance might have left stuck processes
+        print("[EARLY INIT] Killing any stuck DRM processes...")
+        for _attempt in range(5):
+            _subprocess.run(['pkill', '-9', 'modetest'], capture_output=True, timeout=2)
+            _subprocess.run(['pkill', '-9', 'ustreamer'], capture_output=True, timeout=2)
+            _time.sleep(0.5)
+
+            # Check if any are still running
+            _check = _subprocess.run(['pgrep', 'modetest'], capture_output=True)
+            if _check.returncode != 0:  # No modetest found
+                print(f"[EARLY INIT] DRM processes cleared after {_attempt + 1} attempts")
+                break
+        else:
+            print("[EARLY INIT] Warning: Could not clear all modetest processes")
+
+        # Wait for DRM to fully release
+        _time.sleep(2)
+
+        # Set color_format to YCbCr 4:2:0 (value=3) BEFORE any DRM processes start
+        print(f"[EARLY INIT] Setting color_format to YCbCr 4:2:0 on connector {_connector_id}")
+
+        # Try multiple times with short timeout
+        for _attempt in range(5):
+            # Kill any stuck modetest before each attempt
+            _subprocess.run(['pkill', '-9', 'modetest'], capture_output=True, timeout=2)
+            _time.sleep(0.3)
+
+            try:
+                _result = _subprocess.run(
+                    ['sudo', 'modetest', '-M', 'rockchip', '-w', f'{_connector_id}:color_format:3'],
+                    capture_output=True, text=True, timeout=5
+                )
+                if _result.returncode == 0:
+                    print(f"[EARLY INIT] Bandwidth fallback applied successfully on attempt {_attempt + 1}")
+                    break
+                else:
+                    print(f"[EARLY INIT] Attempt {_attempt + 1}: modetest returned {_result.returncode}")
+            except _subprocess.TimeoutExpired:
+                print(f"[EARLY INIT] Attempt {_attempt + 1}: timeout, killing modetest...")
+                _subprocess.run(['pkill', '-9', 'modetest'], capture_output=True, timeout=2)
+                _time.sleep(1)
+        else:
+            print("[EARLY INIT] Failed to apply bandwidth fallback after 5 attempts")
+
+    except Exception as _e:
+        print(f"[EARLY INIT] Error applying bandwidth fallback: {_e}")
+        if _os.path.exists(_FALLBACK_MARKER):
+            _os.remove(_FALLBACK_MARKER)
+
+# Clean up early init variables
+del _os, _subprocess, _time, _FALLBACK_MARKER
+# ============================================================================
+
 import argparse
 import gc
 import os
@@ -1275,6 +1345,9 @@ class Minus:
             'display_connected': self.display_connected,
             'display_error': self.display_error,
 
+            # Bandwidth/color format status
+            **self._get_bandwidth_status(),
+
             # Memory/health
             'memory_percent': health_status.memory_percent if health_status else 0,
             'ustreamer_ok': health_status.ustreamer_responding if health_status else True,
@@ -1296,6 +1369,20 @@ class Minus:
             # Device-aware remote status
             'remote_connected': self._is_remote_connected(),
             'remote_device_type': self._get_configured_device_type(),
+        }
+
+    def _get_bandwidth_status(self) -> dict:
+        """Get HDMI bandwidth/color format status for API."""
+        if self.ad_blocker:
+            try:
+                return self.ad_blocker.get_bandwidth_status()
+            except Exception:
+                pass
+        return {
+            'color_format': None,
+            'color_format_value': None,
+            'bandwidth_fallback_applied': False,
+            'bandwidth_fallback_attempted': False,
         }
 
     def _is_remote_connected(self) -> bool:
@@ -2813,6 +2900,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # NOTE: Bandwidth fallback check moved to early init at top of file
+    # (must run before GStreamer/DRM imports)
 
     config = MinusConfig(
         device=args.device,

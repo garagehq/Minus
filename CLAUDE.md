@@ -88,7 +88,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/overlay.py` | Notification overlay via ustreamer API |
 | `src/vocabulary.py` | Spanish vocabulary list (120+ words) |
 | `src/console.py` | Console blanking/restore functions |
-| `src/drm.py` | DRM output probing (HDMI, resolution, plane) |
+| `src/drm.py` | DRM output probing, adaptive bandwidth fallback |
 | `src/v4l2.py` | V4L2 device probing (format, resolution) |
 | `src/config.py` | MinusConfig dataclass |
 | `src/capture.py` | UstreamerCapture class for snapshot capture |
@@ -133,6 +133,38 @@ python3 minus.py
 - **Audio output device** - Matches ALSA device to the connected HDMI output (hw:0,0 for HDMI-A-1, hw:1,0 for HDMI-A-2)
 
 This allows Minus to work with different displays without manual configuration.
+
+**Adaptive HDMI Bandwidth Fallback:**
+
+4K@60Hz RGB/YCbCr 4:4:4 requires 18 Gbps HDMI bandwidth. Some cables, adapters, or display paths can't handle this, resulting in "No Signal" on the TV even though the kernel reports success.
+
+Minus includes adaptive bandwidth detection via `src/drm.py`:
+
+| Function | Purpose |
+|----------|---------|
+| `get_color_format(connector_id)` | Read current color format (RGB, YCbCr 4:4:4, 4:2:2, 4:2:0) |
+| `set_color_format(connector_id, format)` | Set color format with retry logic |
+| `check_hdmi_i2c_errors(threshold, window)` | Detect signal problems via dmesg |
+
+**Detection heuristic:** When HDMI signal fails at high bandwidth, the dwhdmi driver floods dmesg with `i2c read err!` messages. This is more reliable than kernel connector status (which shows "connected" even when signal fails).
+
+**Color format values:**
+- `COLOR_FORMAT_RGB` (0) - Full bandwidth
+- `COLOR_FORMAT_YCBCR444` (1) - Full bandwidth
+- `COLOR_FORMAT_YCBCR422` (2) - Reduced bandwidth
+- `COLOR_FORMAT_YCBCR420` (3) - **Half bandwidth (9 Gbps)** - use for problematic cables
+
+**Manual fallback:**
+```bash
+# Stop minus first (it holds DRM master lock)
+sudo systemctl stop minus
+
+# Set YCbCr 4:2:0 for half bandwidth
+sudo modetest -M rockchip -w 215:color_format:3
+
+# Restart minus
+sudo systemctl start minus
+```
 
 **Environment variables:**
 ```bash
