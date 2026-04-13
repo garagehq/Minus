@@ -2729,7 +2729,9 @@ class Minus:
 
         # Start night mode if it was enabled (persisted setting)
         if self.autonomous_mode:
-            self.autonomous_mode.set_ad_blocker(self.ad_blocker)
+            # Pass self (MinusAdBlocker) not self.ad_blocker (AdBlocker)
+            # Autonomous mode needs: audio module, last_ocr_texts
+            self.autonomous_mode.set_ad_blocker(self)
             if hasattr(self, 'vlm') and self.vlm:
                 self.autonomous_mode.set_vlm(self.vlm)
             if hasattr(self, 'frame_capture') and self.frame_capture:

@@ -829,13 +829,16 @@ Autonomous Mode keeps YouTube playing on streaming devices during scheduled hour
 
 **How it works:**
 1. **Schedule** — Configurable start/end hours (e.g., 22:00–06:00), or 24/7 mode
-2. **VLM-guided keepalive** — Every 2 minutes, captures a frame and asks VLM to classify the screen state
-3. **Roku ECP active app check** — Before VLM, queries Roku's `/query/active-app` API to detect if YouTube exited or screensaver activated (more reliable than VLM for Roku)
-4. **Frame-change + audio verification** — After VLM says "PLAYING", verifies with dHash frame comparison + audio flow check to catch paused videos VLM misclassifies
-5. **Smart actions** — Based on combined signals, takes the minimum necessary action:
+2. **OCR-based screen detection** — Before VLM, checks OCR text for login/home screen keywords (VLM often misclassifies these static screens as "PLAYING")
+3. **VLM-guided keepalive** — Every 2 minutes, captures a frame and asks VLM to classify the screen state
+4. **Roku ECP active app check** — Before VLM, queries Roku's `/query/active-app` API to detect if YouTube exited or screensaver activated (more reliable than VLM for Roku)
+5. **Frame-change + audio verification** — After VLM says "PLAYING", verifies with dHash frame comparison + audio flow check to catch paused videos VLM misclassifies
+6. **Smart actions** — Based on combined signals, takes the minimum necessary action:
 
 | Signal | Action | Command |
 |--------|--------|---------|
+| OCR: login screen keywords | Select account | `down` + `select` |
+| OCR: home screen keywords + static | Select video | `down` + `select` |
 | VLM: PLAYING + frames changing | None | Video is fine |
 | VLM: PLAYING + static + no audio | Play | `play_pause` (paused video VLM missed) |
 | VLM: PLAYING + static + audio flowing | None | Music stream with static image (lo-fi) |
@@ -857,10 +860,21 @@ Autonomous Mode keeps YouTube playing on streaming devices during scheduled hour
 - **Screensaver detection** — checks for `<screensaver>` element in active-app response (Roku City screensaver overlays YouTube without closing it)
 - **YouTube app ID**: 837
 
+**OCR-based screen detection:**
+VLM often misclassifies static YouTube screens (login, home) as "PLAYING". OCR keywords provide more reliable detection:
+
+| Screen | Keywords | Action |
+|--------|----------|--------|
+| Login/account selection | `watch as guest`, `watchas guest`, `add a kid account`, `kid account`, `choose account`, `switch account` | `down` + `select` to choose account |
+| Home/browse | `new to you`, `newtoyou`, `trending`, `subscriptions`, `library`, `views`, `year ago`, `month ago` | `down` + `select` to pick a video |
+
+Login screen detection runs before VLM query. Home screen detection runs when VLM says "PLAYING" but frames are static.
+
 **Frame-change verification (pause detection):**
 - dHash (difference hash) compares two frames 3 seconds apart
 - Hamming distance < 3 = truly static (paused or stuck)
-- Audio flow check via ad_blocker's audio module (`last_buffer_age < 3s`) or ALSA `/proc/asound` status
+- Audio flow check via ad_blocker's audio module (`0 <= last_buffer_age < 3s`) or ALSA `/proc/asound` status
+- Note: `buffer_age = -1` means no audio ever received (not flowing), fixed to prevent false "audio flowing" detection
 - Static frames + audio flowing = music stream (not paused) — prevents false play_pause
 - Static frames + no audio = truly paused — sends play_pause after 2 consecutive checks
 

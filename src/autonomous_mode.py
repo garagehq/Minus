@@ -742,7 +742,8 @@ class AutonomousMode:
             try:
                 status = self._ad_blocker.audio.get_status()
                 buffer_age = status.get('last_buffer_age', 999)
-                is_flowing = buffer_age < 3.0  # Buffer received within last 3 seconds
+                # -1 means no buffer ever received, so NOT flowing
+                is_flowing = 0 <= buffer_age < 3.0  # Buffer received within last 3 seconds
                 logger.debug(f"[AutonomousMode] Audio buffer age: {buffer_age:.1f}s, flowing={is_flowing}")
                 return is_flowing
             except Exception:
@@ -757,6 +758,96 @@ class AutonomousMode:
             logger.debug(f"[AutonomousMode] ALSA capture: {'RUNNING' if is_running else 'not running'}")
             return is_running
         except Exception:
+            return False
+
+    # Keywords that indicate YouTube login/account selection screen
+    # Includes variants to handle OCR noise (missing/merged spaces)
+    # NOTE: "sign in" removed - too common, appears on home page
+    LOGIN_SCREEN_KEYWORDS = [
+        'watch as guest',
+        'watchas guest',     # OCR sometimes merges "watch as"
+        'add a kid account',
+        'add akid account',  # OCR sometimes merges "a kid"
+        'kid account',       # Specific to account selection
+        'choose account',
+        'switch account',
+    ]
+
+    # Keywords that indicate YouTube home/browse screen (need to select a video)
+    # These appear when showing video recommendations/thumbnails
+    HOME_SCREEN_KEYWORDS = [
+        'new to you',
+        'newtoyou',          # OCR sometimes merges spaces
+        'trending',
+        'subscriptions',
+        'library',
+        'views',             # "3.3M views" indicates video thumbnails
+        'year ago',
+        'month ago',
+        'day ago',
+        'hour ago',
+    ]
+
+    def _is_youtube_login_screen(self) -> bool:
+        """Check if we're on the YouTube login/account selection screen using OCR keywords.
+
+        The login screen shows:
+        - "Watch as guest"
+        - "Add account"
+        - "Add a kid account"
+        - User profile names
+
+        VLM often misclassifies this static screen as PLAYING.
+        Uses the last_ocr_texts from the ad_blocker (most recent OCR results).
+        """
+        try:
+            # Check the most recent OCR texts from ad_blocker
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    for keyword in self.LOGIN_SCREEN_KEYWORDS:
+                        if keyword in combined:
+                            logger.info(f"[AutonomousMode] YouTube login screen detected: '{keyword}'")
+                            return True
+
+            # Fallback: High consecutive static count suggests stuck on login screen
+            if self._consecutive_static >= 4:
+                logger.info("[AutonomousMode] High static count - might be login screen")
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Login screen check failed: {e}")
+            return False
+
+    def _is_youtube_home_screen(self) -> bool:
+        """Check if we're on YouTube home/browse screen showing video thumbnails.
+
+        The home screen shows video recommendations with:
+        - "New to you", "Trending", "Subscriptions", "Library" tabs
+        - Video thumbnails with view counts ("3.3M views · 1 year ago")
+
+        When VLM misclassifies this as PLAYING, we need to select a video
+        instead of sending play_pause.
+        """
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    for keyword in self.HOME_SCREEN_KEYWORDS:
+                        if keyword in combined:
+                            logger.info(f"[AutonomousMode] YouTube home screen detected: '{keyword}'")
+                            return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Home screen check failed: {e}")
             return False
 
     def _is_screen_static(self) -> bool:
@@ -885,6 +976,18 @@ class AutonomousMode:
                 self._consecutive_static = 0
                 return
 
+            # OCR-based login screen detection (VLM often misclassifies this as PLAYING)
+            # Check for YouTube account selection / login screen
+            if self._is_youtube_login_screen():
+                logger.info("[AutonomousMode] YouTube login screen detected via OCR - selecting account")
+                self._log_event("YouTube login screen detected - selecting account")
+                # Navigate down to highlight an account and select it
+                self._device_controller.send_command("down")
+                time.sleep(0.5)
+                self._device_controller.send_command("select")
+                self._consecutive_static = 0
+                return
+
             # Use VLM to understand what's on screen
             screen_desc = self._query_screen()
             action = self._determine_action(screen_desc)
@@ -897,10 +1000,20 @@ class AutonomousMode:
                                f"({self._consecutive_static}/{self._STATIC_PAUSE_THRESHOLD})")
 
                     if self._consecutive_static >= self._STATIC_PAUSE_THRESHOLD:
-                        # Screen hasn't changed for multiple checks - likely paused
-                        logger.info("[AutonomousMode] Static screen detected - sending play_pause")
-                        self._device_controller.send_command("play_pause")
-                        self._log_event("Static screen override: sent play_pause (VLM said PLAYING)")
+                        # Screen hasn't changed for multiple checks
+                        # Check if we're on home screen (need to select a video)
+                        if self._is_youtube_home_screen():
+                            logger.info("[AutonomousMode] Home screen detected - selecting a video")
+                            self._device_controller.send_command("down")
+                            time.sleep(0.5)
+                            self._device_controller.send_command("select")
+                            self._log_event("Home screen: selected video (VLM said PLAYING)")
+                            self.stats.videos_played += 1
+                        else:
+                            # Not home screen - try play_pause for paused video
+                            logger.info("[AutonomousMode] Static screen detected - sending play_pause")
+                            self._device_controller.send_command("play_pause")
+                            self._log_event("Static screen override: sent play_pause (VLM said PLAYING)")
                         self._consecutive_static = 0
                 else:
                     # Screen is changing - truly playing
