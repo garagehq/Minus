@@ -773,8 +773,8 @@ class AutonomousMode:
         'switch account',
     ]
 
-    # Keywords that indicate YouTube home/browse screen (need to select a video)
-    # These appear when showing video recommendations/thumbnails
+    # Keywords that indicate YouTube home/browse screen or video end screen
+    # (need to select a video). These appear when showing video recommendations.
     HOME_SCREEN_KEYWORDS = [
         'new to you',
         'newtoyou',          # OCR sometimes merges spaces
@@ -786,6 +786,9 @@ class AutonomousMode:
         'month ago',
         'day ago',
         'hour ago',
+        # Video end screen / info panel keywords
+        'description',       # Video description section (visible on end/info screens)
+        'subscribe',         # Subscribe button prominent on end screens
     ]
 
     def _is_youtube_login_screen(self) -> bool:
