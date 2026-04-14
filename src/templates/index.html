@@ -599,6 +599,26 @@
                 <p class="help-text">Sends periodic pings to prevent Fire TV ADB disconnects (every ~5 minutes with jitter).</p>
             </section>
 
+            <!-- System -->
+            <section class="settings-section">
+                <h2>System</h2>
+                <div class="system-actions">
+                    <button onclick="restartService()" class="action-btn danger" id="restart-btn">
+                        &#x21bb; Restart Service
+                    </button>
+                    <button onclick="restartVideoPipeline()" class="action-btn" id="restart-video-btn">
+                        &#x25B6; Restart Video
+                    </button>
+                </div>
+                <p class="help-text">Restart Service: Full service restart (~15s downtime). Restart Video: Just the video pipeline (~3s).</p>
+                <div class="system-info">
+                    <span class="stat-label">Uptime:</span>
+                    <span id="system-uptime">--</span>
+                    <span class="stat-label" style="margin-left: 1rem;">Memory:</span>
+                    <span id="system-memory">--</span>
+                </div>
+            </section>
+
             <!-- WiFi Management -->
             <section class="wifi-section">
                 <h2>WiFi Networks</h2>
@@ -863,6 +883,16 @@
                 // Stats
                 document.getElementById('fps-value').textContent = Math.round(status.fps) || '--';
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
+
+                // System info in settings tab
+                const systemUptime = document.getElementById('system-uptime');
+                if (systemUptime) {
+                    systemUptime.textContent = status.uptime_str || '--';
+                }
+                const systemMemory = document.getElementById('system-memory');
+                if (systemMemory && status.memory_percent !== undefined) {
+                    systemMemory.textContent = `${status.memory_percent}%`;
+                }
 
                 // Video overlay - handle HDMI input issues (full overlay)
                 // Display badge - handle HDMI output issues (small corner badge)
@@ -1570,6 +1600,65 @@
                 btn.textContent = originalText;
                 btn.disabled = false;
             }, 2000);
+        }
+
+        async function restartService() {
+            const btn = document.getElementById('restart-btn');
+
+            if (!confirm('Restart the entire Minus service? This will cause ~15 seconds of downtime.')) {
+                return;
+            }
+
+            btn.disabled = true;
+            btn.innerHTML = '&#x21bb; Restarting...';
+
+            try {
+                const response = await fetch('/api/service/restart', { method: 'POST' });
+                const data = await response.json();
+
+                if (data.success) {
+                    btn.innerHTML = '&#x21bb; Restarting...';
+                    // Page will become unavailable, show message
+                    document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#0a0a0a;color:#00ff00;font-family:monospace;"><h1>Service Restarting...</h1><p>Refreshing in 15 seconds...</p></div>';
+                    setTimeout(() => location.reload(), 15000);
+                } else {
+                    btn.innerHTML = '&#x2717; Failed';
+                    console.error('Service restart failed:', data.error);
+                }
+            } catch (error) {
+                // Expected - service is restarting
+                document.body.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#0a0a0a;color:#00ff00;font-family:monospace;"><h1>Service Restarting...</h1><p>Refreshing in 15 seconds...</p></div>';
+                setTimeout(() => location.reload(), 15000);
+            }
+        }
+
+        async function restartVideoPipeline() {
+            const btn = document.getElementById('restart-video-btn');
+            const originalHTML = btn.innerHTML;
+
+            btn.disabled = true;
+            btn.innerHTML = '&#x25B6; Restarting...';
+
+            try {
+                const response = await fetch('/api/video/restart', { method: 'POST' });
+                const data = await response.json();
+
+                if (data.success) {
+                    btn.innerHTML = '&#x2713; Done!';
+                    console.log('Video pipeline restarted');
+                } else {
+                    btn.innerHTML = '&#x2717; Failed';
+                    console.error('Video restart failed:', data.error);
+                }
+            } catch (error) {
+                btn.innerHTML = '&#x2717; Error';
+                console.error('Video restart error:', error);
+            }
+
+            setTimeout(() => {
+                btn.innerHTML = originalHTML;
+                btn.disabled = false;
+            }, 3000);
         }
 
         // =========================================================================

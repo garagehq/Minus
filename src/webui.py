@@ -1853,6 +1853,31 @@ class WebUI:
                 logger.error(f"Error restarting video pipeline: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
+        @self.app.route('/api/service/restart', methods=['POST'])
+        def api_service_restart():
+            """Restart the entire Minus service via systemd.
+
+            This will cause ~15 seconds of downtime while the service restarts.
+            The web UI will become unavailable during this time.
+            """
+            import subprocess
+            import threading
+
+            def do_restart():
+                import time
+                time.sleep(0.5)  # Give response time to send
+                subprocess.run(['sudo', 'systemctl', 'restart', 'minus'],
+                             capture_output=True, timeout=30)
+
+            try:
+                logger.info("[WebUI] Service restart requested")
+                # Run restart in background thread so we can send response first
+                threading.Thread(target=do_restart, daemon=True).start()
+                return jsonify({'success': True, 'message': 'Service restart initiated'})
+            except Exception as e:
+                logger.error(f"Error initiating service restart: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
         # =========================================================================
         # Video Color Settings
         # =========================================================================
@@ -2216,25 +2241,6 @@ class WebUI:
                 return jsonify({'error': 'Detection history not available'}), 500
             except Exception as e:
                 logger.error(f"Error clearing detections: {e}")
-                return jsonify({'success': False, 'error': str(e)}), 500
-
-        # =========================================================================
-        # Service Control
-        # =========================================================================
-
-        @self.app.route('/api/service/restart', methods=['POST'])
-        def api_service_restart():
-            """Schedule service restart."""
-            try:
-                logger.info("[WebUI] Service restart requested")
-                # Schedule restart in background thread to allow response to be sent
-                def restart():
-                    time.sleep(1)
-                    subprocess.run(['systemctl', 'restart', 'minus'], timeout=30)
-                threading.Thread(target=restart, daemon=True).start()
-                return jsonify({'success': True, 'message': 'Service restart scheduled'})
-            except Exception as e:
-                logger.error(f"Error restarting service: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================

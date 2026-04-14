@@ -2037,6 +2037,34 @@ input:checked + .toggle-slider:before {
     color: #000;
 }
 
+.action-btn.danger {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.action-btn.danger:hover {
+    background: var(--danger);
+    color: #000;
+}
+
+/* System Actions */
+.system-actions {
+    display: flex;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+}
+
+.system-info {
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+    color: var(--text-secondary);
+}
+
+.system-info .stat-label {
+    color: var(--text-muted);
+}
+
 /* ==================== RESPONSIVE ==================== */
 @media (max-width: 480px) {
     .container {
