@@ -151,6 +151,12 @@ class AutonomousMode:
         self._consecutive_static: int = 0
         self._STATIC_PAUSE_THRESHOLD = 2  # Consecutive static checks before forcing play
 
+        # No-audio timeout for stuck state recovery
+        self._no_audio_start_time: Optional[float] = None
+        self._NO_AUDIO_TIMEOUT = 30.0  # Seconds without audio before recovery attempt
+        self._last_recovery_time: Optional[float] = None
+        self._RECOVERY_COOLDOWN = 60.0  # Minimum seconds between recovery attempts
+
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
 
@@ -762,7 +768,6 @@ class AutonomousMode:
 
     # Keywords that indicate YouTube login/account selection screen
     # Includes variants to handle OCR noise (missing/merged spaces)
-    # NOTE: "sign in" removed - too common, appears on home page
     LOGIN_SCREEN_KEYWORDS = [
         'watch as guest',
         'watchas guest',     # OCR sometimes merges "watch as"
@@ -770,11 +775,30 @@ class AutonomousMode:
         'add akid account',  # OCR sometimes merges "a kid"
         'kid account',       # Specific to account selection
         'choose account',
+        'choose an account',
         'switch account',
     ]
 
-    # Keywords that indicate YouTube home/browse screen or video end screen
-    # (need to select a video). These appear when showing video recommendations.
+    # Keywords that indicate we're signed out and need to sign in
+    # "Make YouTube your own" is the sign-out state prompt
+    SIGNED_OUT_KEYWORDS = [
+        'make youtube your own',
+        'makeyoutube your own',  # OCR sometimes merges
+        'you are in guest mode',
+        'guest mode',
+        'sign in to see the latest',
+    ]
+
+    # Keywords that indicate a survey/dialog that should be skipped
+    SURVEY_KEYWORDS = [
+        'skip survey',
+        'skipsurvey',
+        'advertiser survey',
+        'submit answers',
+    ]
+
+    # Keywords that indicate YouTube home/browse screen (need to select a video)
+    # NOTE: "subscribe" and "description" removed - they appear on paused videos too
     HOME_SCREEN_KEYWORDS = [
         'new to you',
         'newtoyou',          # OCR sometimes merges spaces
@@ -786,9 +810,6 @@ class AutonomousMode:
         'month ago',
         'day ago',
         'hour ago',
-        # Video end screen / info panel keywords
-        'description',       # Video description section (visible on end/info screens)
-        'subscribe',         # Subscribe button prominent on end screens
     ]
 
     def _is_youtube_login_screen(self) -> bool:
@@ -851,6 +872,53 @@ class AutonomousMode:
 
         except Exception as e:
             logger.debug(f"[AutonomousMode] Home screen check failed: {e}")
+            return False
+
+    def _is_signed_out_screen(self) -> bool:
+        """Check if we're on the signed-out "Make YouTube your own" screen.
+
+        This screen appears when YouTube is launched without a signed-in account.
+        Shows "Make YouTube your own" with a "Sign in" button.
+        We need to click Sign in to get to account selection.
+        """
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    for keyword in self.SIGNED_OUT_KEYWORDS:
+                        if keyword in combined:
+                            logger.info(f"[AutonomousMode] Signed-out screen detected: '{keyword}'")
+                            return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Signed-out screen check failed: {e}")
+            return False
+
+    def _is_survey_screen(self) -> bool:
+        """Check if there's a survey dialog that should be skipped.
+
+        YouTube shows advertiser surveys with "Skip survey" button.
+        We need to navigate to and click the skip button.
+        """
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    for keyword in self.SURVEY_KEYWORDS:
+                        if keyword in combined:
+                            logger.info(f"[AutonomousMode] Survey dialog detected: '{keyword}'")
+                            return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Survey screen check failed: {e}")
             return False
 
     def _is_screen_static(self) -> bool:
@@ -979,7 +1047,31 @@ class AutonomousMode:
                 self._consecutive_static = 0
                 return
 
-            # OCR-based login screen detection (VLM often misclassifies this as PLAYING)
+            # OCR-based screen detection (VLM often misclassifies static screens as PLAYING)
+
+            # Check for survey dialog - need to skip it
+            if self._is_survey_screen():
+                logger.info("[AutonomousMode] Survey dialog detected - skipping")
+                self._log_event("Survey dialog detected - skipping")
+                # Navigate right to "Skip survey" button and press select
+                for _ in range(3):  # Move right a few times to find skip button
+                    self._device_controller.send_command("right")
+                    time.sleep(0.3)
+                self._device_controller.send_command("select")
+                self._consecutive_static = 0
+                return
+
+            # Check for signed-out screen - need to click Sign in
+            if self._is_signed_out_screen():
+                logger.info("[AutonomousMode] Signed-out screen detected - clicking Sign in")
+                self._log_event("Signed-out screen detected - clicking Sign in")
+                # Press right to move to Sign in button, then select
+                self._device_controller.send_command("right")
+                time.sleep(0.5)
+                self._device_controller.send_command("select")
+                self._consecutive_static = 0
+                return
+
             # Check for YouTube account selection / login screen
             if self._is_youtube_login_screen():
                 logger.info("[AutonomousMode] YouTube login screen detected via OCR - selecting account")
@@ -990,6 +1082,46 @@ class AutonomousMode:
                 self._device_controller.send_command("select")
                 self._consecutive_static = 0
                 return
+
+            # 30-second no-audio timeout recovery
+            # If we've been without audio for 30+ seconds, something is stuck
+            audio_flowing = self._is_audio_flowing()
+            current_time = time.time()
+
+            if audio_flowing:
+                # Audio is working, reset the timer
+                self._no_audio_start_time = None
+            else:
+                # No audio - track how long
+                if self._no_audio_start_time is None:
+                    self._no_audio_start_time = current_time
+                    logger.debug("[AutonomousMode] No audio detected, starting timer")
+                else:
+                    no_audio_duration = current_time - self._no_audio_start_time
+                    # Check if we've exceeded the timeout and not in cooldown
+                    in_cooldown = (self._last_recovery_time is not None and
+                                   current_time - self._last_recovery_time < self._RECOVERY_COOLDOWN)
+
+                    if no_audio_duration >= self._NO_AUDIO_TIMEOUT and not in_cooldown:
+                        logger.warning(f"[AutonomousMode] No audio for {no_audio_duration:.1f}s - attempting recovery")
+                        self._log_event(f"No audio for {no_audio_duration:.0f}s - recovery attempt")
+
+                        # Recovery sequence: back → wait → down → down → select
+                        self._device_controller.send_command("back")
+                        time.sleep(1.5)
+                        self._device_controller.send_command("down")
+                        time.sleep(0.5)
+                        self._device_controller.send_command("down")
+                        time.sleep(0.5)
+                        self._device_controller.send_command("select")
+
+                        # Reset timers
+                        self._no_audio_start_time = None
+                        self._last_recovery_time = current_time
+                        self._consecutive_static = 0
+                        self.stats.videos_played += 1
+                        logger.info("[AutonomousMode] Recovery sequence completed")
+                        return
 
             # Use VLM to understand what's on screen
             screen_desc = self._query_screen()
@@ -1003,20 +1135,21 @@ class AutonomousMode:
                                f"({self._consecutive_static}/{self._STATIC_PAUSE_THRESHOLD})")
 
                     if self._consecutive_static >= self._STATIC_PAUSE_THRESHOLD:
-                        # Screen hasn't changed for multiple checks
-                        # Check if we're on home screen (need to select a video)
-                        if self._is_youtube_home_screen():
-                            logger.info("[AutonomousMode] Home screen detected - selecting a video")
-                            self._device_controller.send_command("down")
-                            time.sleep(0.5)
-                            self._device_controller.send_command("select")
-                            self._log_event("Home screen: selected video (VLM said PLAYING)")
-                            self.stats.videos_played += 1
-                        else:
-                            # Not home screen - try play_pause for paused video
-                            logger.info("[AutonomousMode] Static screen detected - sending play_pause")
-                            self._device_controller.send_command("play_pause")
-                            self._log_event("Static screen override: sent play_pause (VLM said PLAYING)")
+                        # Static for 2 checks - try play_pause first (most common: paused video)
+                        logger.info("[AutonomousMode] Static screen detected - sending play_pause")
+                        self._device_controller.send_command("play_pause")
+                        self._log_event("Static screen: sent play_pause")
+                        # Don't reset counter - if still static next check, we'll escalate
+
+                    if self._consecutive_static >= 4:
+                        # Still static after play_pause didn't help - must be home/end screen
+                        # Try selecting a video
+                        logger.info("[AutonomousMode] play_pause didn't help - selecting a video")
+                        self._device_controller.send_command("down")
+                        time.sleep(0.5)
+                        self._device_controller.send_command("select")
+                        self._log_event("Escalated: selected video (play_pause failed)")
+                        self.stats.videos_played += 1
                         self._consecutive_static = 0
                 else:
                     # Screen is changing - truly playing
