@@ -802,9 +802,11 @@ class AutonomousMode:
     HOME_SCREEN_KEYWORDS = [
         'new to you',
         'newtoyou',          # OCR sometimes merges spaces
+        'recommended',       # Main home screen section
         'trending',
         'subscriptions',
         'library',
+        'sponsored',         # Sponsored ads on home screen
         'views',             # "3.3M views" indicates video thumbnails
         'year ago',
         'month ago',
@@ -1080,6 +1082,19 @@ class AutonomousMode:
                 self._device_controller.send_command("down")
                 time.sleep(0.5)
                 self._device_controller.send_command("select")
+                self._consecutive_static = 0
+                return
+
+            # Check for YouTube home screen - need to select a video
+            if self._is_youtube_home_screen():
+                logger.info("[AutonomousMode] YouTube home screen detected via OCR - selecting a video")
+                self._log_event("YouTube home screen detected - selecting a video")
+                # Navigate down past any sponsored content and select a video
+                for _ in range(3):
+                    self._device_controller.send_command("down")
+                    time.sleep(0.3)
+                self._device_controller.send_command("select")
+                self.stats.videos_played += 1
                 self._consecutive_static = 0
                 return
 
