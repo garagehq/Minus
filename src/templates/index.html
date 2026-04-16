@@ -539,7 +539,7 @@
                     </label>
                 </div>
                 <div class="autonomous-schedule">
-                    <div class="schedule-row">
+                    <div class="schedule-row" id="schedule-time-row">
                         <label class="schedule-label">Schedule:</label>
                         <select id="auto-start-hour" onchange="updateAutonomousSchedule()">
                             <option value="0">12 AM</option><option value="1">1 AM</option><option value="2">2 AM</option>
@@ -586,8 +586,8 @@
                 </div>
             </section>
 
-            <!-- Fire TV Settings -->
-            <section class="settings-section">
+            <!-- Fire TV Settings (hidden when not using Fire TV) -->
+            <section class="settings-section" id="firetv-settings-section">
                 <h2>Fire TV Settings</h2>
                 <div class="setting-item">
                     <span class="setting-label">Keep-Alive Pings</span>
@@ -672,8 +672,8 @@
                 </div>
             </section>
 
-            <!-- ADB Keys -->
-            <section class="adb-section">
+            <!-- ADB Keys (hidden when not using Fire TV) -->
+            <section class="adb-section" id="adb-keys-section">
                 <h2>ADB Keys (Fire TV)</h2>
                 <div id="adb-key-info" class="adb-key-info">
                     <div class="empty-state">Loading...</div>
@@ -1503,6 +1503,10 @@
             if (data.end_hour !== undefined) endHour.value = data.end_hour;
             if (data.always_on !== undefined) alwaysOn.checked = data.always_on;
 
+            // Hide schedule row when 24/7 mode is enabled
+            const scheduleRow = document.getElementById('schedule-time-row');
+            if (scheduleRow) scheduleRow.style.display = data.always_on ? 'none' : '';
+
             // Re-enable onchange after a short delay
             setTimeout(() => { autonomousUIUpdating = false; }, 50);
 
@@ -1549,6 +1553,10 @@
             const endHour = parseInt(document.getElementById('auto-end-hour').value);
             const alwaysOn = document.getElementById('auto-always-on').checked;
             const toggle = document.getElementById('autonomous-toggle');
+
+            // Immediately hide/show schedule row based on 24/7 mode
+            const scheduleRow = document.getElementById('schedule-time-row');
+            if (scheduleRow) scheduleRow.style.display = alwaysOn ? 'none' : '';
 
             try {
                 // Update schedule
@@ -2825,6 +2833,13 @@
 
         // Update connection status and show appropriate remote
         updateDeviceConnectionStatus();
+
+        // Show/hide Fire TV specific settings sections
+        const firetvSettingsSection = document.getElementById('firetv-settings-section');
+        const adbKeysSection = document.getElementById('adb-keys-section');
+        const isFireTV = currentDeviceType === 'fire_tv';
+        if (firetvSettingsSection) firetvSettingsSection.style.display = isFireTV ? '' : 'none';
+        if (adbKeysSection) adbKeysSection.style.display = isFireTV ? '' : 'none';
     }
 
     async function updateDeviceConnectionStatus() {
