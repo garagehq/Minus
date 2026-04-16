@@ -157,6 +157,11 @@ class AutonomousMode:
         self._last_recovery_time: Optional[float] = None
         self._RECOVERY_COOLDOWN = 60.0  # Minimum seconds between recovery attempts
 
+        # Escalating recovery - tracks failed attempts to try different strategies
+        self._recovery_attempt_count = 0
+        self._last_successful_audio_time: Optional[float] = None
+        self._RECOVERY_ESCALATION_THRESHOLD = 3  # After N failed attempts, escalate
+
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
 
@@ -1104,8 +1109,12 @@ class AutonomousMode:
             current_time = time.time()
 
             if audio_flowing:
-                # Audio is working, reset the timer
+                # Audio is working, reset the timer and recovery count
                 self._no_audio_start_time = None
+                self._last_successful_audio_time = current_time
+                if self._recovery_attempt_count > 0:
+                    logger.info(f"[AutonomousMode] Audio recovered after {self._recovery_attempt_count} attempts")
+                    self._recovery_attempt_count = 0
             else:
                 # No audio - track how long
                 if self._no_audio_start_time is None:
@@ -1118,24 +1127,19 @@ class AutonomousMode:
                                    current_time - self._last_recovery_time < self._RECOVERY_COOLDOWN)
 
                     if no_audio_duration >= self._NO_AUDIO_TIMEOUT and not in_cooldown:
-                        logger.warning(f"[AutonomousMode] No audio for {no_audio_duration:.1f}s - attempting recovery")
-                        self._log_event(f"No audio for {no_audio_duration:.0f}s - recovery attempt")
+                        self._recovery_attempt_count += 1
+                        strategy = self._get_recovery_strategy(self._recovery_attempt_count)
+                        logger.warning(f"[AutonomousMode] No audio for {no_audio_duration:.1f}s - "
+                                      f"recovery attempt #{self._recovery_attempt_count} ({strategy})")
+                        self._log_event(f"No audio {no_audio_duration:.0f}s - attempt #{self._recovery_attempt_count} ({strategy})")
 
-                        # Recovery sequence: back → wait → down → down → select
-                        self._device_controller.send_command("back")
-                        time.sleep(1.5)
-                        self._device_controller.send_command("down")
-                        time.sleep(0.5)
-                        self._device_controller.send_command("down")
-                        time.sleep(0.5)
-                        self._device_controller.send_command("select")
+                        self._execute_recovery_strategy(strategy)
 
                         # Reset timers
                         self._no_audio_start_time = None
                         self._last_recovery_time = current_time
                         self._consecutive_static = 0
-                        self.stats.videos_played += 1
-                        logger.info("[AutonomousMode] Recovery sequence completed")
+                        logger.info(f"[AutonomousMode] Recovery strategy '{strategy}' completed")
                         return
 
             # Use VLM to understand what's on screen
@@ -1238,6 +1242,95 @@ class AutonomousMode:
                     self._device_controller.send_command("wakeup")
         except Exception as e:
             logger.warning(f"[AutonomousMode] Wake device error: {e}")
+
+    def _get_recovery_strategy(self, attempt: int) -> str:
+        """Get recovery strategy based on attempt number.
+
+        Escalates through increasingly aggressive strategies:
+        1-2: Basic navigation (back + select video)
+        3-4: Play/pause attempts
+        5-6: Multiple navigation attempts
+        7+: Full relaunch YouTube
+        """
+        if attempt <= 2:
+            return "navigate_select"
+        elif attempt <= 4:
+            return "play_pause_navigate"
+        elif attempt <= 6:
+            return "deep_navigate"
+        else:
+            return "relaunch_youtube"
+
+    def _execute_recovery_strategy(self, strategy: str):
+        """Execute the specified recovery strategy."""
+        try:
+            if strategy == "navigate_select":
+                # Basic: back, navigate down, select
+                self._device_controller.send_command("back")
+                time.sleep(1.5)
+                self._device_controller.send_command("down")
+                time.sleep(0.5)
+                self._device_controller.send_command("down")
+                time.sleep(0.5)
+                self._device_controller.send_command("select")
+                self.stats.videos_played += 1
+
+            elif strategy == "play_pause_navigate":
+                # Try play_pause first, then navigate
+                self._device_controller.send_command("play_pause")
+                time.sleep(2)
+                # If still no audio, navigate to a new video
+                self._device_controller.send_command("back")
+                time.sleep(1.5)
+                for _ in range(3):
+                    self._device_controller.send_command("down")
+                    time.sleep(0.3)
+                self._device_controller.send_command("select")
+                self.stats.videos_played += 1
+
+            elif strategy == "deep_navigate":
+                # Go back multiple times and try to find content
+                for _ in range(2):
+                    self._device_controller.send_command("back")
+                    time.sleep(1)
+                # Navigate around more
+                for _ in range(4):
+                    self._device_controller.send_command("down")
+                    time.sleep(0.3)
+                self._device_controller.send_command("right")
+                time.sleep(0.3)
+                self._device_controller.send_command("select")
+                self.stats.videos_played += 1
+
+            elif strategy == "relaunch_youtube":
+                # Nuclear option: go home and relaunch YouTube
+                logger.info("[AutonomousMode] Executing full YouTube relaunch")
+                self._log_event("Full YouTube relaunch (escalation)")
+
+                if self._device_type == DEVICE_TYPE_ROKU:
+                    self._device_controller.send_command("home")
+                    time.sleep(2)
+                    self._launch_youtube()
+                    time.sleep(4)
+                else:
+                    self._device_controller.send_command("home")
+                    time.sleep(2)
+                    self._launch_youtube()
+                    time.sleep(3)
+
+                # Navigate to a video
+                for _ in range(3):
+                    self._device_controller.send_command("down")
+                    time.sleep(0.3)
+                self._device_controller.send_command("select")
+                self.stats.videos_played += 1
+
+                # Reset attempt count after relaunch
+                self._recovery_attempt_count = 0
+
+        except Exception as e:
+            logger.error(f"[AutonomousMode] Recovery strategy '{strategy}' failed: {e}")
+            self.stats.errors += 1
 
     def play_next_video(self):
         """Skip to next video in YouTube."""

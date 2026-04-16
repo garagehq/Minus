@@ -19,8 +19,8 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
-# Config file path
-CONFIG_FILE = Path.home() / '.minus_device_config.json'
+# Config file path - use fixed path for consistency across user/root contexts
+CONFIG_FILE = Path('/home/radxa/.minus_device_config.json')
 
 
 class DeviceType(Enum):

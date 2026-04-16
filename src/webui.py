@@ -759,6 +759,11 @@ class WebUI:
                     manager.set_device_ip(ip)
                     manager.set_setup_complete(True)
 
+                    # Connect autonomous mode to Roku controller
+                    if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
+                        self.minus.autonomous_mode.set_device_controller(self.minus.roku_controller, 'roku')
+                        logger.info("[API] Roku controller connected to autonomous mode")
+
                     # Show connected notification and clear setup overlay
                     try:
                         from src.overlay import RokuNotification

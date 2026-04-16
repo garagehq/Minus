@@ -993,66 +993,112 @@ class Minus:
         self.fire_tv_setup.start_setup()
 
     def _start_roku_connection(self, saved_ip: str = None):
-        """Start Roku connection with appropriate overlay notifications."""
+        """Start Roku connection with appropriate overlay notifications.
+
+        Connection flow:
+        1. Try saved IP if available
+        2. If that fails or no saved IP, scan for Roku devices
+        3. Connect to first discovered Roku
+        4. Update config with working IP for next restart
+        """
         try:
             from src.roku import RokuController
             from src.overlay import RokuNotification
+            from src.device_config import get_device_config_manager
 
             # Initialize notification overlay
             roku_notification = RokuNotification(ustreamer_port=self.config.ustreamer_port)
+            self.roku_controller = RokuController()
+            connected = False
+            connected_ip = None
 
+            # Step 1: Try saved IP first
             if saved_ip:
                 roku_notification.show_connecting(saved_ip)
                 logger.info(f"[Roku] Connecting to saved Roku at {saved_ip}...")
 
-                self.roku_controller = RokuController()
                 if self.roku_controller.connect(saved_ip):
-                    device_info = self.roku_controller.get_device_info()
-                    device_name = device_info.get('name', 'Roku') if device_info else 'Roku'
-                    model = device_info.get('model', '') if device_info else ''
-                    full_name = f"{device_name} {model}".strip()
-
-                    logger.info(f"[Roku] Connected to {full_name} at {saved_ip}")
-
-                    # Connect autonomous mode to Roku controller
-                    if self.autonomous_mode:
-                        self.autonomous_mode.set_device_controller(self.roku_controller, 'roku')
-                        logger.info("[AutonomousMode] Roku controller connected")
-
-                    # Check if Roku is in limited mode
-                    control_mode = self.roku_controller.check_control_mode()
-                    if control_mode == 'limited':
-                        logger.warning("[Roku] Roku is in Limited mode - commands won't work!")
-                        # Show brief connected message, then setup instructions
-                        roku_notification.show_connected(full_name)
-                        time.sleep(3)
-                        roku_notification.show_limited_mode()
-
-                        # Start background thread to auto-hide when mode changes
-                        def monitor_control_mode():
-                            """Poll for control mode change and hide overlay."""
-                            check_interval = 10  # Check every 10 seconds
-                            max_checks = 30  # Max 5 minutes (30 x 10s)
-                            for _ in range(max_checks):
-                                time.sleep(check_interval)
-                                if not self.roku_controller or not self.roku_controller.is_connected():
-                                    break
-                                mode = self.roku_controller.check_control_mode()
-                                if mode == 'full':
-                                    logger.info("[Roku] Control mode changed to FULL - hiding setup overlay")
-                                    roku_notification.hide()
-                                    roku_notification.show_connected(f"{full_name} - Ready!")
-                                    break
-
-                        threading.Thread(target=monitor_control_mode, daemon=True, name="Roku-ModeMonitor").start()
-                    else:
-                        roku_notification.show_connected(full_name)
+                    connected = True
+                    connected_ip = saved_ip
+                    logger.info(f"[Roku] Connected to saved IP {saved_ip}")
                 else:
-                    logger.warning(f"[Roku] Failed to connect to Roku at {saved_ip}")
-                    roku_notification.show_failed("Could not connect")
+                    logger.warning(f"[Roku] Failed to connect to saved IP {saved_ip}, will scan...")
+
+            # Step 2: If saved IP failed or not available, scan for Roku devices
+            if not connected:
+                roku_notification.show_scanning()
+                logger.info("[Roku] Scanning for Roku devices...")
+
+                devices = RokuController.discover_devices(timeout=8)
+                if devices:
+                    # Try to connect to each discovered device
+                    for device in devices:
+                        device_ip = device.get('ip')
+                        if device_ip:
+                            logger.info(f"[Roku] Found Roku at {device_ip}, attempting connection...")
+                            if self.roku_controller.connect(device_ip):
+                                connected = True
+                                connected_ip = device_ip
+                                logger.info(f"[Roku] Connected via discovery to {device_ip}")
+                                break
+                            else:
+                                logger.warning(f"[Roku] Failed to connect to discovered Roku at {device_ip}")
+
+            # Step 3: Handle connection result
+            if connected and connected_ip:
+                device_info = self.roku_controller.get_device_info()
+                device_name = device_info.get('name', 'Roku') if device_info else 'Roku'
+                model = device_info.get('model', '') if device_info else ''
+                full_name = f"{device_name} {model}".strip()
+
+                logger.info(f"[Roku] Connected to {full_name} at {connected_ip}")
+
+                # Update saved config with working IP
+                try:
+                    manager = get_device_config_manager()
+                    if manager.config.device_ip != connected_ip:
+                        manager.set_device_ip(connected_ip)
+                        manager.set_setup_complete(True)
+                        logger.info(f"[Roku] Updated saved IP to {connected_ip}")
+                except Exception as e:
+                    logger.warning(f"[Roku] Could not update config: {e}")
+
+                # Connect autonomous mode to Roku controller
+                if self.autonomous_mode:
+                    self.autonomous_mode.set_device_controller(self.roku_controller, 'roku')
+                    logger.info("[AutonomousMode] Roku controller connected")
+
+                # Check if Roku is in limited mode
+                control_mode = self.roku_controller.check_control_mode()
+                if control_mode == 'limited':
+                    logger.warning("[Roku] Roku is in Limited mode - commands won't work!")
+                    # Show brief connected message, then setup instructions
+                    roku_notification.show_connected(full_name)
+                    time.sleep(3)
+                    roku_notification.show_limited_mode()
+
+                    # Start background thread to auto-hide when mode changes
+                    def monitor_control_mode():
+                        """Poll for control mode change and hide overlay."""
+                        check_interval = 10  # Check every 10 seconds
+                        max_checks = 30  # Max 5 minutes (30 x 10s)
+                        for _ in range(max_checks):
+                            time.sleep(check_interval)
+                            if not self.roku_controller or not self.roku_controller.is_connected():
+                                break
+                            mode = self.roku_controller.check_control_mode()
+                            if mode == 'full':
+                                logger.info("[Roku] Control mode changed to FULL - hiding setup overlay")
+                                roku_notification.hide()
+                                roku_notification.show_connected(f"{full_name} - Ready!")
+                                break
+
+                    threading.Thread(target=monitor_control_mode, daemon=True, name="Roku-ModeMonitor").start()
+                else:
+                    roku_notification.show_connected(full_name)
             else:
-                logger.info("[Roku] No saved Roku IP - showing setup instructions")
-                roku_notification.show_not_configured()
+                logger.warning("[Roku] Could not connect to any Roku device")
+                roku_notification.show_failed("No Roku found")
 
         except Exception as e:
             logger.error(f"[Roku] Error starting Roku connection: {e}")
