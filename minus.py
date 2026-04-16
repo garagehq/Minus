@@ -1350,6 +1350,7 @@ class Minus:
 
         # Get FPS from ad_blocker if available
         fps = 0
+        fps_source = 'display'  # 'display' or 'capture'
         if self.ad_blocker:
             try:
                 fps = self.ad_blocker.get_fps()
@@ -1365,6 +1366,8 @@ class Minus:
                 with urllib.request.urlopen(url, timeout=1.0) as response:
                     data = json.loads(response.read().decode('utf-8'))
                     fps = data.get('result', {}).get('source', {}).get('captured_fps', 0)
+                    if fps > 0:
+                        fps_source = 'capture'
             except Exception:
                 pass
 
@@ -1393,6 +1396,7 @@ class Minus:
 
             # System status
             'fps': fps,
+            'fps_source': fps_source,  # 'display' or 'capture' (orange in UI when capture)
             'uptime': uptime,
             'uptime_str': f"{uptime // 3600}h {(uptime % 3600) // 60}m",
             'hdmi_signal': health_status.hdmi_signal if health_status else True,

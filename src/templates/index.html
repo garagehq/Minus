@@ -881,7 +881,10 @@
                 }
 
                 // Stats
-                document.getElementById('fps-value').textContent = Math.round(status.fps) || '--';
+                const fpsEl = document.getElementById('fps-value');
+                fpsEl.textContent = Math.round(status.fps) || '--';
+                // Orange color when FPS is from capture (display disconnected)
+                fpsEl.style.color = status.fps_source === 'capture' ? '#f5a623' : '';
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
 
                 // System info in settings tab
