@@ -2665,17 +2665,17 @@ input:checked + .toggle-slider:before {
     border-color: rgba(255, 0, 64, 0.4);
 }
 
-/* Fly-out animations */
+/* Fly-out animations - fast for rapid swiping */
 .review-card.fly-right {
     transform: translateX(150vw) rotate(30deg) !important;
     opacity: 0 !important;
-    transition: transform 0.4s ease-out, opacity 0.3s ease-out;
+    transition: transform 0.12s ease-out, opacity 0.08s ease-out;
     z-index: 4;
 }
 .review-card.fly-left {
     transform: translateX(-150vw) rotate(-30deg) !important;
     opacity: 0 !important;
-    transition: transform 0.4s ease-out, opacity 0.3s ease-out;
+    transition: transform 0.12s ease-out, opacity 0.08s ease-out;
     z-index: 4;
 }
 
