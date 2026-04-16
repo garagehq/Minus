@@ -905,6 +905,25 @@ class AutonomousMode:
             logger.debug(f"[AutonomousMode] Signed-out screen check failed: {e}")
             return False
 
+    def _has_accounts_visible(self) -> bool:
+        """Check if account names are visible on the signed-out screen.
+
+        When "Make YouTube your own" shows with existing accounts (e.g., @username),
+        we should navigate down to select an account instead of clicking Sign in.
+        """
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+                    # Look for @ symbols indicating account names
+                    # Also check for "add account" which appears when accounts exist
+                    if '@' in combined or 'add account' in combined or 'addaccount' in combined:
+                        return True
+            return False
+        except Exception:
+            return False
+
     def _is_survey_screen(self) -> bool:
         """Check if there's a survey dialog that should be skipped.
 
@@ -1068,14 +1087,22 @@ class AutonomousMode:
                 self._consecutive_static = 0
                 return
 
-            # Check for signed-out screen - need to click Sign in
+            # Check for signed-out screen - need to sign in or select account
             if self._is_signed_out_screen():
-                logger.info("[AutonomousMode] Signed-out screen detected - clicking Sign in")
-                self._log_event("Signed-out screen detected - clicking Sign in")
-                # Press right to move to Sign in button, then select
-                self._device_controller.send_command("right")
-                time.sleep(0.5)
-                self._device_controller.send_command("select")
+                if self._has_accounts_visible():
+                    # Accounts are visible - navigate down to select one
+                    logger.info("[AutonomousMode] Signed-out screen with accounts visible - selecting account")
+                    self._log_event("Signed-out screen with accounts - selecting account")
+                    self._device_controller.send_command("down")
+                    time.sleep(0.5)
+                    self._device_controller.send_command("select")
+                else:
+                    # No accounts visible - click Sign in button
+                    logger.info("[AutonomousMode] Signed-out screen detected - clicking Sign in")
+                    self._log_event("Signed-out screen detected - clicking Sign in")
+                    self._device_controller.send_command("right")
+                    time.sleep(0.5)
+                    self._device_controller.send_command("select")
                 self._consecutive_static = 0
                 return
 

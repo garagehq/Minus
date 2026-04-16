@@ -1356,6 +1356,18 @@ class Minus:
             except Exception:
                 pass
 
+        # Fallback to ustreamer captured_fps if display pipeline FPS is 0
+        if fps == 0:
+            try:
+                import urllib.request
+                import json
+                url = "http://localhost:9090/state"
+                with urllib.request.urlopen(url, timeout=1.0) as response:
+                    data = json.loads(response.read().decode('utf-8'))
+                    fps = data.get('result', {}).get('source', {}).get('captured_fps', 0)
+            except Exception:
+                pass
+
         uptime = int(time.time() - self.start_time)
 
         # Check if blocking is active (either via detection or test mode)
