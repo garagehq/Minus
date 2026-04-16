@@ -1348,28 +1348,29 @@ class Minus:
             except Exception:
                 pass
 
-        # Get FPS from ad_blocker if available
-        fps = 0
-        fps_source = 'display'  # 'display' or 'capture'
+        # Get FPS from ad_blocker (display pipeline) if available
+        fps_display = 0
         if self.ad_blocker:
             try:
-                fps = self.ad_blocker.get_fps()
+                fps_display = self.ad_blocker.get_fps() or 0
             except Exception:
                 pass
 
-        # Fallback to ustreamer captured_fps if display pipeline FPS is 0
-        if fps == 0:
-            try:
-                import urllib.request
-                import json
-                url = "http://localhost:9090/state"
-                with urllib.request.urlopen(url, timeout=1.0) as response:
-                    data = json.loads(response.read().decode('utf-8'))
-                    fps = data.get('result', {}).get('source', {}).get('captured_fps', 0)
-                    if fps > 0:
-                        fps_source = 'capture'
-            except Exception:
-                pass
+        # Get FPS from ustreamer (capture)
+        fps_capture = 0
+        try:
+            import urllib.request
+            import json
+            url = "http://localhost:9090/state"
+            with urllib.request.urlopen(url, timeout=1.0) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                fps_capture = data.get('result', {}).get('source', {}).get('captured_fps', 0)
+        except Exception:
+            pass
+
+        # For backwards compatibility, fps = display fps if available, else capture
+        fps = fps_display if fps_display > 0 else fps_capture
+        fps_source = 'display' if fps_display > 0 else 'capture'
 
         uptime = int(time.time() - self.start_time)
 
@@ -1396,7 +1397,9 @@ class Minus:
 
             # System status
             'fps': fps,
-            'fps_source': fps_source,  # 'display' or 'capture' (orange in UI when capture)
+            'fps_capture': fps_capture,
+            'fps_display': fps_display,
+            'fps_source': fps_source,  # 'display' or 'capture' (for backwards compat)
             'uptime': uptime,
             'uptime_str': f"{uptime // 3600}h {(uptime % 3600) // 60}m",
             'hdmi_signal': health_status.hdmi_signal if health_status else True,

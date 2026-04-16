@@ -22,6 +22,7 @@
     --purple: #a855f7;
     --red: #ff0040;
     --green: #00ff41;
+    --orange: #f5a623;
 
     /* Fonts */
     --font-display: 'VT323', monospace;
@@ -524,6 +525,53 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
 .stat:nth-child(3) .stat-value {
     color: var(--purple);
     text-shadow: 0 0 8px rgba(168, 85, 247, 0.4);
+}
+
+/* Dual FPS display (capture | display) */
+.fps-dual {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.25rem;
+}
+
+.fps-col {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 28px;
+}
+
+.fps-num {
+    font-family: var(--font-display);
+    font-size: 1.1rem;
+    line-height: 1;
+}
+
+.fps-label {
+    font-size: 0.5rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    opacity: 0.8;
+    margin-top: 2px;
+}
+
+.fps-capture .fps-num,
+.fps-capture .fps-label {
+    color: var(--orange);
+    text-shadow: 0 0 6px rgba(245, 166, 35, 0.4);
+}
+
+.fps-display .fps-num,
+.fps-display .fps-label {
+    color: var(--accent);
+    text-shadow: 0 0 6px rgba(0, 255, 65, 0.4);
+}
+
+.fps-divider {
+    color: var(--text-muted);
+    font-size: 1rem;
+    margin: 0 0.1rem;
 }
 
 /* ==================== VOCABULARY SECTION ==================== */

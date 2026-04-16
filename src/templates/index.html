@@ -98,7 +98,17 @@
                 <div class="status-details">
                     <div class="stat">
                         <span class="stat-label">FPS</span>
-                        <span id="fps-value" class="stat-value">--</span>
+                        <div class="fps-dual">
+                            <div class="fps-col fps-capture">
+                                <span id="fps-capture-value" class="fps-num">--</span>
+                                <span class="fps-label">capture</span>
+                            </div>
+                            <span class="fps-divider">|</span>
+                            <div class="fps-col fps-display">
+                                <span id="fps-display-value" class="fps-num">--</span>
+                                <span class="fps-label">display</span>
+                            </div>
+                        </div>
                     </div>
                     <div class="stat">
                         <span class="stat-label">Ads Blocked</span>
@@ -880,11 +890,11 @@
                         `Paused: ${mins}:${secs.toString().padStart(2, '0')} remaining`;
                 }
 
-                // Stats
-                const fpsEl = document.getElementById('fps-value');
-                fpsEl.textContent = Math.round(status.fps) || '--';
-                // Orange color when FPS is from capture (display disconnected)
-                fpsEl.style.color = status.fps_source === 'capture' ? '#f5a623' : '';
+                // Stats - dual FPS display (capture | display)
+                const fpsCaptureEl = document.getElementById('fps-capture-value');
+                const fpsDisplayEl = document.getElementById('fps-display-value');
+                fpsCaptureEl.textContent = status.fps_capture > 0 ? Math.round(status.fps_capture) : '--';
+                fpsDisplayEl.textContent = status.fps_display > 0 ? Math.round(status.fps_display) : '--';
                 document.getElementById('uptime-value').textContent = status.uptime_str || '--';
 
                 // System info in settings tab
