@@ -2614,6 +2614,15 @@ class Minus:
         """Start the stream processing."""
         logger.info("Starting Minus...")
 
+        # Show startup display IMMEDIATELY - user should never see a black screen
+        # Start with "NO SIGNAL" bouncing animation, will transition to "INITIALIZING" later
+        if self.ad_blocker:
+            logger.info("Starting initial display (NO SIGNAL)...")
+            if self.ad_blocker.start_no_signal_mode():
+                logger.info("Startup display showing - beginning initialization")
+            else:
+                logger.warning("Could not start startup display (DRM unavailable?)")
+
         # Start web UI early so it's accessible even when waiting for HDMI signal
         if HAS_WEBUI:
             try:
@@ -2737,10 +2746,10 @@ class Minus:
         width, height, fps = signal_info
         logger.info(f"HDMI signal: {width}x{height} @ {fps}fps")
 
-        # If ad_blocker doesn't have a loading/no-signal screen showing, start loading now
-        # This ensures we always show loading during ustreamer startup
-        if self.ad_blocker and self.ad_blocker.current_source not in ('loading', 'no_hdmi_device'):
-            logger.info("Starting loading display while initializing...")
+        # Switch to loading/initializing mode now that we have HDMI signal
+        # This transitions from startup "NO SIGNAL" screen to "INITIALIZING" screen
+        if self.ad_blocker and self.ad_blocker.current_source != 'loading':
+            logger.info("Switching to INITIALIZING display...")
             self.ad_blocker.start_loading_mode()
 
         # Start ML threads flag - set early so threads can start
