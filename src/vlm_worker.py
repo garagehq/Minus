@@ -38,30 +38,44 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
             logger.error("[VLMWorker] Failed to load model")
             return
 
-        # Warmup inference to avoid cold-start timeout on first real request
-        logger.info("[VLMWorker] Running warmup inference...")
+        # Warmup inferences to avoid cold-start timeout on first real request
+        logger.info("[VLMWorker] Running warmup inferences...")
         try:
-            # Create a small test image for warmup
             import numpy as np
             from PIL import Image
-            warmup_img = Image.fromarray(np.zeros((512, 512, 3), dtype=np.uint8))
             warmup_path = '/tmp/vlm_warmup.jpg'
-            warmup_img.save(warmup_path, quality=50)
+            # First warmup with noise image (more realistic than blank)
+            warmup_img = Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
+            warmup_img.save(warmup_path, quality=80)
             _ = vlm.detect_ad(warmup_path)
-            logger.info("[VLMWorker] Warmup complete")
+            # Second warmup to fully stabilize
+            _ = vlm.detect_ad(warmup_path)
+            logger.info("[VLMWorker] Warmup complete (2 inferences)")
         except Exception as e:
             logger.warning(f"[VLMWorker] Warmup failed (non-fatal): {e}")
 
         logger.info("[VLMWorker] Model loaded, ready for requests")
         ready_event.set()
 
-        # Process requests
+        # Process requests with keepalive to prevent NPU cold-start
+        last_inference_time = time.time()
+        KEEPALIVE_INTERVAL = 20.0  # Run keepalive if idle for 20s
+        warmup_path = '/tmp/vlm_warmup.jpg'
+
         while not shutdown_event.is_set():
             try:
-                # Wait for request with timeout so we can check shutdown
+                # Wait for request with timeout so we can check shutdown and keepalive
                 try:
                     request = request_queue.get(timeout=1.0)
                 except:
+                    # No request - check if we need keepalive
+                    if time.time() - last_inference_time > KEEPALIVE_INTERVAL:
+                        try:
+                            _ = vlm.detect_ad(warmup_path)
+                            last_inference_time = time.time()
+                            logger.debug("[VLMWorker] Keepalive inference completed")
+                        except:
+                            pass
                     continue
 
                 if request is None:  # Shutdown signal
@@ -72,6 +86,7 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
                 if request_type == 'detect_ad':
                     result = vlm.detect_ad(image_path)
                     response_queue.put(('ok', result))
+                    last_inference_time = time.time()
                 elif request_type == 'query':
                     # For query_image, request is (image_path, prompt, 'query')
                     pass
@@ -98,7 +113,7 @@ class VLMProcess:
     If inference takes longer than timeout, the process is KILLED and restarted.
     """
 
-    HARD_TIMEOUT = 2.0  # Kill VLM if it takes longer than this
+    HARD_TIMEOUT = 1.5  # Kill VLM if it takes longer than this
 
     def __init__(self):
         self.process = None

@@ -4,7 +4,7 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame)
-- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame)
+- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.7s per frame, 1.5s hard timeout)
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -77,6 +77,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
 | `src/vlm.py` | FastVLM-1.5B on Axera NPU (ad detection + custom queries) |
+| `src/vlm_worker.py` | Process-based VLM with hard timeout, warmup, and keepalive |
 | `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
 | `src/health.py` | Unified health monitor for all subsystems |
 | `src/webui.py` | Flask web UI for remote monitoring/control |
@@ -193,8 +194,8 @@ MINUS_VLM_ALONE_THRESHOLD=5      # Consecutive VLM detections needed to trigger 
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
-| VLM latency | **~0.9s per frame** (FastVLM-1.5B, smarter than 0.5B) |
-| VLM model load | **~13s** (once at startup) |
+| VLM latency | **~0.7s per frame** (FastVLM-1.5B, process-based with 1.5s hard timeout) |
+| VLM model load | **~25s** (includes 2 warmup inferences + keepalive thread) |
 | Snapshot capture | **~150ms** (4K JPEG download) |
 | OCR image size | 960x540 (downscaled from 4K for speed) |
 | ustreamer quality | 80% JPEG (MPP encoder) |
@@ -458,17 +459,24 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 **FastVLM-1.5B** on Axera LLM 8850 NPU:
 - Smarter than 0.5B with fewer false positives on streaming interfaces
-- **~0.9s** inference time for ad detection
+- **~0.7s** inference time for ad detection (process-based with 1.5s hard timeout)
 - **~1.0s** for custom queries (structured prompt)
-- **~13s** model load time (once at startup, with 3 retries)
+- **~25s** model load time (includes 2 warmup inferences)
 - Uses Python axengine + transformers tokenizer
 - Home screen detection provides additional safety net
+
+**Process-based architecture (`src/vlm_worker.py`):**
+- VLM runs in a separate process for hard timeout capability
+- If inference exceeds 1.5s, process is KILLED and restarted (not just timed out)
+- 2 warmup inferences at startup to avoid cold-start slowness
+- Keepalive thread runs dummy inference every 20s during idle to prevent NPU cold-start
+- Worker process loads model once, processes requests via Queue
 
 **Two inference modes:**
 - `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification
 - `query_image(image_path, prompt)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification)
 
-Both modes share the same model and are serialized via `threading.Lock`.
+Both modes share the same model and are serialized via the worker process queue.
 
 ```
 /home/radxa/axera_models/FastVLM-1.5B/
