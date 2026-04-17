@@ -104,7 +104,7 @@ import re
 import json
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+# Process-based OCR/VLM workers handle timeouts internally (no ThreadPoolExecutor needed)
 
 import numpy as np
 import cv2
@@ -188,7 +188,7 @@ from skip_detection import check_skip_opportunity
 
 # Import OCR module
 try:
-    from ocr import PaddleOCR
+    from ocr_worker import OCRProcess
     HAS_OCR = True
 except ImportError as e:
     logger.warning(f"OCR module not available: {e}")
@@ -482,26 +482,13 @@ class Minus:
         elif HAS_OCR:
             det_model, rec_model, dict_path = self._find_model_paths()
             if det_model:
-                for attempt in range(1, 4):
-                    try:
-                        self.ocr = PaddleOCR(
-                            det_model_path=det_model,
-                            rec_model_path=rec_model,
-                            dict_path=dict_path
-                        )
-                        if self.ocr.load_models():
-                            logger.info("OCR models loaded successfully")
-                            break
-                        else:
-                            self.ocr = None
-                            logger.warning(f"OCR load_models failed (attempt {attempt}/3)")
-                    except Exception as e:
-                        self.ocr = None
-                        logger.warning(f"OCR init failed (attempt {attempt}/3): {e}")
-                    if attempt < 3:
-                        time.sleep(2)
-                if not self.ocr:
-                    logger.error("OCR failed after 3 attempts - continuing without OCR")
+                # Use process-based OCR for hard timeout capability
+                self.ocr = OCRProcess()
+                if self.ocr.start():
+                    logger.info("OCR process started (hard 1.2s timeout with keepalive)")
+                else:
+                    self.ocr = None
+                    logger.error("OCR process failed to start - continuing without OCR")
             else:
                 logger.warning("OCR model files not found - continuing without OCR")
         else:
@@ -1405,7 +1392,7 @@ class Minus:
             'hdmi_signal': health_status.hdmi_signal if health_status else True,
             'vlm_ready': not self.vlm_disabled and (self.vlm is not None and self.vlm.is_ready if self.vlm else False),
             'vlm_disabled': self.vlm_disabled,
-            'ocr_ready': self.ocr is not None and self.ocr.initialized,
+            'ocr_ready': self.ocr is not None and self.ocr.is_ready,
             'ocr_disabled': getattr(self, 'ocr_disabled', False),
             'display_connected': self.display_connected,
             'display_error': self.display_error,
@@ -2123,9 +2110,7 @@ class Minus:
 
         logger.info(f"Using HTTP snapshot at {self.frame_capture.snapshot_url}")
 
-        # Create a single ThreadPoolExecutor for OCR timeout handling
-        # CRITICAL: Creating this inside the loop caused massive memory/FD leak!
-        ocr_executor = ThreadPoolExecutor(max_workers=1)
+        # OCRProcess handles timeout internally - no ThreadPoolExecutor needed
 
         while self.running:
             try:
@@ -2231,21 +2216,19 @@ class Minus:
 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Run OCR with timeout using pre-created executor
-                future = ocr_executor.submit(self.ocr.ocr, frame_rgb)
-                try:
-                    ocr_results = future.result(timeout=self.config.ocr_timeout)
-                except FuturesTimeoutError:
-                    logger.warning(f"OCR #{self.frame_count}: TIMEOUT ({self.config.ocr_timeout}s) - assuming no ad")
+                # Run OCR - OCRProcess has hard 1.2s timeout with process kill
+                ocr_results = self.ocr.ocr(frame_rgb)
+                ocr_time = (time.time() - start_time) * 1000 - capture_time
+
+                # Empty results could mean timeout (process was killed and restarted)
+                if not ocr_results:
                     self.ocr_no_ad_count += 1
                     self.ocr_ad_detection_count = 0
                     if self.ocr_ad_detected and self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD:
                         self.ocr_ad_detected = False
-                        logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} timeouts)")
+                        logger.info(f"OCR: ad no longer detected (after {self.OCR_STOP_THRESHOLD} no-results)")
                         self._update_blocking_state()
                     continue
-
-                ocr_time = (time.time() - start_time) * 1000 - capture_time
 
                 # Check for Fire TV ADB authorization dialog (if waiting for auth)
                 if self.fire_tv_setup and ocr_results:
@@ -2459,7 +2442,6 @@ class Minus:
             time.sleep(0.1)
 
         logger.info("OCR worker thread stopped")
-        ocr_executor.shutdown(wait=False)
 
     def vlm_worker(self):
         """VLM processing thread."""

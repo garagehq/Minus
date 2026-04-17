@@ -76,6 +76,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/ad_blocker.py` | GStreamer video pipeline, blocking API client |
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
+| `src/ocr_worker.py` | Process-based OCR with hard timeout, warmup, and keepalive |
 | `src/vlm.py` | FastVLM-1.5B on Axera NPU (ad detection + custom queries) |
 | `src/vlm_worker.py` | Process-based VLM with hard timeout, warmup, and keepalive |
 | `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
