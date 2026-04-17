@@ -38,6 +38,20 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
             logger.error("[VLMWorker] Failed to load model")
             return
 
+        # Warmup inference to avoid cold-start timeout on first real request
+        logger.info("[VLMWorker] Running warmup inference...")
+        try:
+            # Create a small test image for warmup
+            import numpy as np
+            from PIL import Image
+            warmup_img = Image.fromarray(np.zeros((512, 512, 3), dtype=np.uint8))
+            warmup_path = '/tmp/vlm_warmup.jpg'
+            warmup_img.save(warmup_path, quality=50)
+            _ = vlm.detect_ad(warmup_path)
+            logger.info("[VLMWorker] Warmup complete")
+        except Exception as e:
+            logger.warning(f"[VLMWorker] Warmup failed (non-fatal): {e}")
+
         logger.info("[VLMWorker] Model loaded, ready for requests")
         ready_event.set()
 
@@ -98,7 +112,10 @@ class VLMProcess:
     def start(self):
         """Start the VLM worker process."""
         if self.process is not None and self.process.is_alive():
-            return True
+            # Process running - check if ready
+            if self.ready_event is not None and self.ready_event.is_set():
+                self.is_ready = True
+            return self.is_ready
 
         # Create communication queues
         self.request_queue = Queue()
@@ -137,6 +154,13 @@ class VLMProcess:
         """Kill and restart the VLM worker."""
         self._restart_count += 1
         self.kill()
+        # Clear any stale responses from killed worker
+        if self.response_queue is not None:
+            while not self.response_queue.empty():
+                try:
+                    self.response_queue.get_nowait()
+                except:
+                    break
         return self.start()
 
     def detect_ad(self, image_path):
