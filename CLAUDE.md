@@ -1448,9 +1448,28 @@ ps -p 179247
 **Solution:** Enhanced `_check_audio_pipeline()` in `src/health.py` to:
 1. Read the ALSA device status from `/proc/asound/cardX/pcm0p/sub0/status`
 2. Verify the `owner_pid` corresponds to a live process (check `/proc/{pid}/` exists)
-3. If owner is dead but device shows RUNNING, trigger `audio.reset_av_sync()` to force restart
-4. This runs every health check cycle (5 seconds), so recovery happens automatically
+3. If owner is dead but device shows RUNNING, trigger full `_restart_pipeline()` (not just queue flush)
+4. 10-second cooldown after any restart before zombie detection runs again (prevents restart loops)
+5. Skip zombie detection if restart is already in progress
+6. This runs every health check cycle (5 seconds), so recovery happens automatically
 
 **Files modified:**
-- `src/health.py` - Added `_check_alsa_owner_alive()` method and zombie detection logic
+- `src/health.py` - Added `_check_alsa_zombie_state()` method with full restart and cooldown logic
+
+### OCR Ad Timestamp Pattern Fix (Fixed - Apr 2026)
+
+**Symptom:** Ad blocking would flicker on/off during ads because OCR sometimes reads "Ad 0:42" (with space) and sometimes "Ad0:42" (no space) or "Ado:55" (OCR misreads '0' as 'o').
+
+**Root Cause:** The OCR pattern used word boundaries (`\bad\b`) which required a space between "Ad" and the timestamp. When OCR dropped the space, the pattern didn't match, counting as "no ad". After 3 "no ads", blocking ended, then immediately re-triggered when a frame with space was detected.
+
+**Solution:** Updated `src/ocr.py` to match OCR variants:
+- `ad[0o]:` pattern catches "Ad0:" and "Ado:" (no space, or 'o' misread)
+- `[0-9o]:\d{2}` timestamp pattern handles 'o' misread as '0'
+- Both per-element and cross-element checks updated
+
+**Test cases now matched:**
+- `Ad 0:42` - standard format ✓
+- `Ad0:42` - no space ✓
+- `Ado:55` - OCR misread '0' as 'o' ✓
+- `0:30 | Ad` - Hulu style ✓
 

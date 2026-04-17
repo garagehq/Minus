@@ -447,20 +447,38 @@ class HealthMonitor:
             if not isinstance(status, dict):
                 return False
 
+            # Skip zombie checks if restart is already in progress
+            if status.get('restart_in_progress', False):
+                logger.debug("[HealthMonitor] Audio restart in progress, skipping zombie check")
+                return False  # Report unhealthy but don't interfere
+
             gst_playing = status.get('state') == 'playing'
 
             if gst_playing:
+                # Check cooldown - don't run zombie detection right after a restart
+                # The audio module tracks last_restart_time internally
+                last_restart = getattr(self.minus.audio, '_last_restart_time', 0)
+                if last_restart > 0 and (time.time() - last_restart) < 10.0:
+                    # Just restarted within 10 seconds, give it time to stabilize
+                    logger.debug("[HealthMonitor] Audio recently restarted, skipping zombie check")
+                    return True  # Assume healthy during stabilization
+
                 # GStreamer thinks it's playing - verify ALSA device owner is alive
                 zombie_detected = self._check_alsa_zombie_state()
                 if zombie_detected:
                     logger.warning("[HealthMonitor] Audio zombie state detected - GStreamer playing but ALSA owner dead")
-                    # Trigger audio restart via reset_av_sync (runs in background)
-                    try:
-                        self.minus.audio.reset_av_sync()
-                        logger.info("[HealthMonitor] Triggered audio pipeline restart for zombie recovery")
-                    except Exception as e:
-                        logger.error(f"[HealthMonitor] Failed to restart zombie audio: {e}")
-                    return False  # Report unhealthy to trigger proper status
+                    # Trigger a FULL audio restart (not just queue flush)
+                    # Use threading to avoid blocking the health monitor
+                    import threading
+                    def restart_audio():
+                        try:
+                            # Use _restart_pipeline directly for full restart
+                            self.minus.audio._restart_pipeline()
+                        except Exception as e:
+                            logger.error(f"[HealthMonitor] Failed to restart zombie audio: {e}")
+                    threading.Thread(target=restart_audio, daemon=True, name="ZombieAudioRestart").start()
+                    logger.info("[HealthMonitor] Triggered full audio pipeline restart for zombie recovery")
+                    return False  # Report unhealthy
 
             return gst_playing
 

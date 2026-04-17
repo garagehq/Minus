@@ -565,17 +565,21 @@ class PaddleOCR:
             if re.search(r'^ad\s*\d+$', text_lower.strip()):
                 matched.append(('ad countdown', text))
 
-            # "0:30 | Ad", "Ad | 0:30", "Ad 0:30" - Hulu-style ad with timestamp
-            # Matches "Ad" (as whole word) appearing with a timestamp like X:XX in same element
-            if re.search(r'\bad\b', text_lower) and re.search(r'\d:\d{2}', text):
+            # "0:30 | Ad", "Ad | 0:30", "Ad 0:30", "Ad0:30", "Ado:30" - ad with timestamp
+            # OCR often misreads as "Ad0:42" (no space) or "Ado:55" ('0' as 'o')
+            # Match "ad" at word boundary OR "ad" followed directly by digit/timestamp
+            # Timestamp can be X:XX or o:XX (OCR misread)
+            has_ad = re.search(r'\bad\b', text_lower) or re.search(r'ad[0o]:', text_lower)
+            has_timestamp = re.search(r'[0-9o]:\d{2}', text_lower)
+            if has_ad and has_timestamp:
                 matched.append(('ad with timestamp', text))
 
         # Cross-element check: "Ad" in one element + timestamp in another (Hulu-style)
         # Only if we haven't already matched and there are few text elements (not noisy OCR)
         if not matched and len(all_texts) <= 5:
             combined = ' '.join(all_texts).lower()
-            has_ad_word = re.search(r'\bad\b', combined)
-            has_timestamp = re.search(r'\d:\d{2}', ' '.join(all_texts))
+            has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0o]:', combined)
+            has_timestamp = re.search(r'[0-9o]:\d{2}', ' '.join(all_texts).lower())
             if has_ad_word and has_timestamp:
                 matched.append(('ad with timestamp (cross-element)', combined[:50]))
 
