@@ -202,9 +202,9 @@ except ImportError as e:
     logger.warning(f"AdBlocker module not available: {e}")
     HAS_ADBLOCKER = False
 
-# Import VLM module
+# Import VLM module (process-based for hard 2s timeout)
 try:
-    from vlm import VLMManager
+    from vlm_worker import VLMProcess
     HAS_VLM = True
 except ImportError as e:
     logger.warning(f"VLM module not available: {e}")
@@ -528,8 +528,8 @@ class Minus:
             logger.info("VLM disabled via --no-vlm flag")
         elif HAS_VLM:
             try:
-                self.vlm = VLMManager()
-                logger.info("VLM manager initialized")
+                self.vlm = VLMProcess()
+                logger.info("VLM process initialized (hard 2s timeout)")
             except Exception as e:
                 logger.warning(f"VLM init failed: {e}")
                 self.vlm = None
@@ -2481,9 +2481,7 @@ class Minus:
 
         vlm_image_path = f'/dev/shm/minus_vlm_frame_{os.getpid()}.jpg'
 
-        # Create a single ThreadPoolExecutor for VLM timeout handling
-        # CRITICAL: Creating this inside the loop would cause memory/FD leak!
-        vlm_executor = ThreadPoolExecutor(max_workers=1)
+        # VLMProcess handles hard 2s timeout internally - no ThreadPoolExecutor needed
 
         while self.running:
             try:
@@ -2515,20 +2513,17 @@ class Minus:
 
                 cv2.imwrite(vlm_image_path, frame)
 
-                # Run VLM with hard timeout using executor
-                future = vlm_executor.submit(self.vlm.detect_ad, vlm_image_path)
-                try:
-                    is_ad, response, elapsed, confidence = future.result(timeout=self.config.vlm_timeout)
-                except FuturesTimeoutError:
-                    logger.warning(f"VLM #{self.vlm_frame_count}: TIMEOUT ({self.config.vlm_timeout}s) - assuming no ad")
-                    # Don't wait for the thread - it will eventually complete and release the VLM lock
+                # Run VLM - VLMProcess has hard 2s timeout with process kill
+                is_ad, response, elapsed, confidence = self.vlm.detect_ad(vlm_image_path)
+
+                # Check if VLM was killed (response will be "KILLED")
+                if response == "KILLED":
+                    logger.warning(f"VLM #{self.vlm_frame_count}: KILLED after {elapsed:.1f}s - worker restarted")
                     self.vlm_prev_frame = frame.copy()
                     self.vlm_scene_skip_count = 0
-                    time.sleep(0.5)
                     continue
 
                 # Discard slow VLM responses - scene likely changed during inference
-                # (This is now a secondary check since the hard timeout above catches most cases)
                 VLM_MAX_RELEVANT_TIME = 2.0
                 if elapsed > VLM_MAX_RELEVANT_TIME:
                     ad_status = "AD" if is_ad else "NO-AD"
@@ -2806,7 +2801,7 @@ class Minus:
             if vlm_preloaded and self.vlm:
                 self.vlm_thread = threading.Thread(target=self.vlm_worker, daemon=True)
                 self.vlm_thread.start()
-                logger.info(f"VLM worker started with prompt: \"{self.vlm.AD_PROMPT}\"")
+                logger.info("VLM worker started (process-based with hard 2s timeout)")
 
         # Start night mode if it was enabled (persisted setting)
         if self.autonomous_mode:
