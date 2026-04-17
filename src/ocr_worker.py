@@ -130,7 +130,7 @@ class OCRProcess:
     If inference takes longer than timeout, the process is KILLED and restarted.
     """
 
-    HARD_TIMEOUT = 1.2  # Kill OCR if it takes longer than this
+    HARD_TIMEOUT = 1.0  # Kill OCR if it takes longer than this
 
     def __init__(self):
         self.process = None
