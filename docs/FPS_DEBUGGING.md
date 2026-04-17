@@ -501,6 +501,65 @@ Using the video overlay plane eliminates all CPU format conversion, achieving tr
 ## Next Steps
 
 1. ✅ **ACHIEVED 30 FPS display** - Problem solved!
-2. **Integrate into minus.py** - Use the new pipeline configuration
-3. **Create systemd service** - Auto-start without X11 for dedicated HDMI passthrough mode
+2. ✅ **Integrate into minus.py** - Use the new pipeline configuration
+3. ✅ **Create systemd service** - Auto-start without X11 for dedicated HDMI passthrough mode
 4. **Test color calibration** - Verify NV12 color accuracy vs RGB
+
+---
+
+## April 2026 Update: CPU Downscaling Bug Fix
+
+### The Problem
+FPS was dipping to 15fps intermittently despite all the optimizations above. ustreamer CPU usage was at 462%.
+
+### Root Cause
+The `--encode-scale=native` option was causing CPU-based 4K→1080p downscaling via `_downscale_nv12()` in the MPP encoder. This function iterates over 2M+ pixels per frame, causing massive CPU overhead.
+
+### The Fix
+Changed `--encode-scale=native` to `--encode-scale=passthrough`:
+
+```bash
+# Old (bad) - CPU downscaling on every frame
+ustreamer --encoder=mpp-jpeg --encode-scale=native ...
+
+# New (good) - No scaling, use source resolution directly
+ustreamer --encoder=mpp-jpeg --encode-scale=passthrough ...
+```
+
+### Encode Scale Options
+
+| Option | Behavior | CPU Impact |
+|--------|----------|------------|
+| `native` | Auto-downscale 4K NV12 to 1080p | HIGH - CPU iterates 2M+ pixels/frame |
+| `1080p` | Force 1080p output | HIGH - Same CPU downscaling |
+| `2k` | Force 2K (1440p) output | HIGH - Same CPU downscaling |
+| `passthrough` | No scaling, use source resolution | LOW - Hardware MPP only |
+
+### Results After Fix
+- FPS: Stable 30 (was dipping to 15)
+- ustreamer CPU: 188% (was 462%)
+- Memory: Stable
+
+### Current Optimal Configuration
+
+```bash
+ustreamer \
+  --device=/dev/video0 \
+  --format=NV12 \
+  --resolution=3840x2160 \
+  --persistent \
+  --port=9090 \
+  --host=0.0.0.0 \
+  --encoder=mpp-jpeg \
+  --encode-scale=passthrough \
+  --quality=80 \
+  --workers=4 \
+  --buffers=5 \
+  --tcp-nodelay
+```
+
+Key settings:
+- `--encoder=mpp-jpeg` - Use RK3588 VPU hardware encoding
+- `--encode-scale=passthrough` - No CPU scaling, use source resolution directly
+- `--workers=4` - 4 parallel MPP encoders (optimal for RK3588)
+- `--buffers=5` - Balance between latency and throughput
