@@ -68,7 +68,7 @@ $USTREAMER \
     --port=9090 \
     --host=0.0.0.0 \
     --encoder=mpp-jpeg \
-    --encode-scale=4k \
+    --encode-scale=passthrough \
     --quality=80 \
     --workers=4 \
     --buffers=5 \

@@ -249,7 +249,7 @@ Format conversions (NV24→NV12, BGR24→NV12) are done in software in the MPP e
   --port=9090 \
   --host=0.0.0.0 \
   --encoder=mpp-jpeg \
-  --encode-scale=4k \
+  --encode-scale=passthrough \
   --quality=80 \
   --workers=4 \
   --buffers=5
@@ -570,7 +570,7 @@ The blocking overlay system uses ustreamer's native MPP blocking mode (`/blockin
 **Resolution Flexibility:**
 The blocking system automatically handles resolution mismatches:
 - API calls may specify 4K dimensions (3840x2160)
-- Encoder may output at 1080p due to `--encode-scale native`
+- With `--encode-scale passthrough`, encoder uses source resolution directly
 - Preview dimensions are scaled proportionally to fit
 - Positions are clamped to valid ranges
 - All coordinates aligned to even values for NV12

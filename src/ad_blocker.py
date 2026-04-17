@@ -285,7 +285,7 @@ class DRMAdBlocker:
             # - leaky=downstream drops oldest frames if queue fills (prevents latency buildup)
             pipeline_str = (
                 f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream "
-                f"is-live=true blocksize=262144 timeout=10 retries=-1 keep-alive=true ! "
+                f"is-live=true blocksize=524288 timeout=10 retries=-1 keep-alive=true ! "
                 f"multipartdemux ! jpegparse ! mppjpegdec ! video/x-raw,format=NV12 ! "
                 f"videobalance saturation=1.0 brightness=0.0 contrast=1.0 hue=0.0 name=colorbalance ! "
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "

@@ -755,9 +755,9 @@ class Minus:
                 f'--port={port}',
                 '--host=0.0.0.0',          # Bind to all interfaces for remote access
                 '--encoder=mpp-jpeg',
-                '--encode-scale=native',
+                '--encode-scale=passthrough',  # No scaling, use source resolution directly
                 '--quality=80',
-                '--workers=4',
+                '--workers=4',              # 4 parallel MPP encoders
                 '--buffers=5',
                 '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
             ]
@@ -1891,9 +1891,9 @@ class Minus:
             f'--port={port}',
             '--host=0.0.0.0',          # Bind to all interfaces for remote access
             '--encoder=mpp-jpeg',       # Use RK3588 VPU hardware encoding
-            '--encode-scale=native',    # Native scaling (auto-downscale 4K to 1080p)
+            '--encode-scale=passthrough',  # No scaling, use source resolution directly
             '--quality=80',
-            '--workers=4',              # 4 parallel MPP encoders (optimal)
+            '--workers=4',              # 4 parallel MPP encoders
             '--buffers=5',
             '--tcp-nodelay',           # Disable Nagle's algorithm for smoother streaming
         ]
@@ -2481,6 +2481,10 @@ class Minus:
 
         vlm_image_path = f'/dev/shm/minus_vlm_frame_{os.getpid()}.jpg'
 
+        # Create a single ThreadPoolExecutor for VLM timeout handling
+        # CRITICAL: Creating this inside the loop would cause memory/FD leak!
+        vlm_executor = ThreadPoolExecutor(max_workers=1)
+
         while self.running:
             try:
                 # Pause when HDMI signal is lost to prevent memory leak from repeated timeouts
@@ -2510,9 +2514,21 @@ class Minus:
                         logger.debug(f"VLM #{self.vlm_frame_count}: Force run after {self.vlm_scene_skip_count} skips")
 
                 cv2.imwrite(vlm_image_path, frame)
-                is_ad, response, elapsed, confidence = self.vlm.detect_ad(vlm_image_path)
+
+                # Run VLM with hard timeout using executor
+                future = vlm_executor.submit(self.vlm.detect_ad, vlm_image_path)
+                try:
+                    is_ad, response, elapsed, confidence = future.result(timeout=self.config.vlm_timeout)
+                except FuturesTimeoutError:
+                    logger.warning(f"VLM #{self.vlm_frame_count}: TIMEOUT ({self.config.vlm_timeout}s) - assuming no ad")
+                    # Don't wait for the thread - it will eventually complete and release the VLM lock
+                    self.vlm_prev_frame = frame.copy()
+                    self.vlm_scene_skip_count = 0
+                    time.sleep(0.5)
+                    continue
 
                 # Discard slow VLM responses - scene likely changed during inference
+                # (This is now a secondary check since the hard timeout above catches most cases)
                 VLM_MAX_RELEVANT_TIME = 2.0
                 if elapsed > VLM_MAX_RELEVANT_TIME:
                     ad_status = "AD" if is_ad else "NO-AD"

@@ -43,6 +43,7 @@ class MinusConfig:
 
     # Timeouts and thresholds
     ocr_timeout: float = 1.5
+    vlm_timeout: float = 3.0  # Hard timeout for VLM inference (seconds)
 
     # ustreamer settings
     ustreamer_port: int = 9090
