@@ -434,17 +434,92 @@ class HealthMonitor:
             return False
 
     def _check_audio_pipeline(self) -> bool:
-        """Check if audio GStreamer pipeline is healthy."""
+        """Check if audio GStreamer pipeline is healthy.
+
+        Also verifies the ALSA device owner PID is alive to detect zombie states
+        where GStreamer thinks it's playing but the actual audio thread crashed.
+        """
         try:
             if not self.minus.audio:
                 return False
 
             status = self.minus.audio.get_status()
-            if isinstance(status, dict):
-                return status.get('state') == 'playing'
-            return False
+            if not isinstance(status, dict):
+                return False
+
+            gst_playing = status.get('state') == 'playing'
+
+            if gst_playing:
+                # GStreamer thinks it's playing - verify ALSA device owner is alive
+                zombie_detected = self._check_alsa_zombie_state()
+                if zombie_detected:
+                    logger.warning("[HealthMonitor] Audio zombie state detected - GStreamer playing but ALSA owner dead")
+                    # Trigger audio restart via reset_av_sync (runs in background)
+                    try:
+                        self.minus.audio.reset_av_sync()
+                        logger.info("[HealthMonitor] Triggered audio pipeline restart for zombie recovery")
+                    except Exception as e:
+                        logger.error(f"[HealthMonitor] Failed to restart zombie audio: {e}")
+                    return False  # Report unhealthy to trigger proper status
+
+            return gst_playing
 
         except Exception:
+            return False
+
+    def _check_alsa_zombie_state(self) -> bool:
+        """Check if ALSA playback device is in zombie state (owned by dead process).
+
+        Returns:
+            True if zombie state detected (device RUNNING but owner PID dead)
+            False if healthy or unable to determine
+        """
+        try:
+            if not self.minus.audio:
+                return False
+
+            # Get playback device from audio module (e.g., "hw:1,0")
+            playback_device = getattr(self.minus.audio, 'playback_device', 'hw:0,0')
+            if not playback_device.startswith('hw:'):
+                return False
+
+            # Parse card number from "hw:X,Y"
+            parts = playback_device[3:].split(',')
+            if not parts:
+                return False
+            card_num = parts[0]
+
+            # Read ALSA status
+            status_path = f'/proc/asound/card{card_num}/pcm0p/sub0/status'
+            try:
+                with open(status_path, 'r') as f:
+                    content = f.read()
+            except FileNotFoundError:
+                return False  # Device doesn't exist, not a zombie
+
+            # Parse state and owner_pid
+            state = None
+            owner_pid = None
+            for line in content.split('\n'):
+                if line.startswith('state:'):
+                    state = line.split(':')[1].strip()
+                elif line.startswith('owner_pid'):
+                    try:
+                        owner_pid = int(line.split(':')[1].strip())
+                    except (ValueError, IndexError):
+                        pass
+
+            # If state is RUNNING but owner PID doesn't exist, it's a zombie
+            if state == 'RUNNING' and owner_pid:
+                # Check if owner PID exists
+                if not os.path.exists(f'/proc/{owner_pid}'):
+                    logger.debug(f"[HealthMonitor] ALSA zombie: card{card_num} state=RUNNING but owner_pid={owner_pid} is dead")
+                    return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[HealthMonitor] ALSA zombie check error: {e}")
             return False
 
     def _get_memory_percent(self) -> float:

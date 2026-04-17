@@ -1414,3 +1414,34 @@ if self.bus:
 ```
 
 Fixed in `src/ad_blocker.py`: `start_no_signal_mode()` and `start_loading_mode()` failure paths and exception handlers.
+
+### Audio Pipeline Zombie State After Sleep/Wake (Fixed - Apr 2026)
+
+**Symptom:** After TV/display sleeps for several hours and wakes up, there is no audio output even though the health monitor reports `audio=OK` and the ALSA device shows `state: RUNNING`.
+
+**Root Cause:** The GStreamer audio pipeline runs in a separate thread. When the display sleeps, this thread can crash or die (e.g., due to ALSA device disconnection), but:
+1. The Python `AudioPassthrough` object retains a stale reference to the dead pipeline
+2. The ALSA device shows `owner_pid` pointing to the dead thread's PID
+3. The health check only queries the Python GStreamer state, not the actual ALSA device ownership
+4. Result: Health reports `audio=OK` while no actual audio is flowing
+
+**Detection:** Check if the ALSA playback device's `owner_pid` corresponds to a live process:
+```bash
+# Get owner PID
+cat /proc/asound/card1/pcm0p/sub0/status | grep owner_pid
+# owner_pid   : 179247
+
+# Check if process exists
+ps -p 179247
+# Returns empty = zombie audio state!
+```
+
+**Solution:** Enhanced `_check_audio_pipeline()` in `src/health.py` to:
+1. Read the ALSA device status from `/proc/asound/cardX/pcm0p/sub0/status`
+2. Verify the `owner_pid` corresponds to a live process (check `/proc/{pid}/` exists)
+3. If owner is dead but device shows RUNNING, trigger `audio.reset_av_sync()` to force restart
+4. This runs every health check cycle (5 seconds), so recovery happens automatically
+
+**Files modified:**
+- `src/health.py` - Added `_check_alsa_owner_alive()` method and zombie detection logic
+
