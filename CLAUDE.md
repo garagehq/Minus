@@ -100,6 +100,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
 | `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
+| `tests/test_ocr_ad_detection.py` | OCR ad pattern detection tests (143+ cases) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
 | `install.sh` | Install as systemd service |
@@ -328,9 +329,10 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 **OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
-- Stops blocking after 3 consecutive no-ads (`OCR_STOP_THRESHOLD`)
+- Stops blocking after 4 consecutive no-ads (`OCR_STOP_THRESHOLD`)
 - **Authoritative for stopping** when OCR triggered the block
 - Tracks `last_ocr_ad_time` for VLM context
+- Handles common OCR misreads in ad timestamps (see below)
 
 **VLM (Secondary - Anti-Waffle Protected):**
 - Uses sliding window of last 45 seconds of VLM decisions (`vlm_history_window`)
@@ -362,7 +364,7 @@ When blocking is active, black/solid-color frames are detected as transitions be
 4. Home screen detection suppresses both OCR and VLM blocking on streaming interfaces
 
 **Stopping Blocking:**
-1. **If OCR triggered** (source=ocr or both): OCR says stop (3 no-ads) → ends immediately (~2-3s)
+1. **If OCR triggered** (source=ocr or both): OCR says stop (4 no-ads) → ends immediately (~2-3s)
 2. **If VLM triggered alone** (source=vlm): VLM says stop (2 no-ads) → ends (~4s after ad ends)
 3. VLM history cleared on stop → prevents immediate re-trigger
 4. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
@@ -385,6 +387,21 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - When video resumes, 0.5s cooldown (`DYNAMIC_COOLDOWN`) before re-enabling blocking
 - Detection state (OCR/VLM) cleared on cooldown complete to prevent false positives
 - Static ad screenshots saved to `screenshots/static/` for analysis
+
+**OCR Timestamp Pattern Handling:**
+OCR frequently misreads characters in ad timestamps. The detection handles these common confusions:
+
+| Intended | OCR Misreads | Example |
+|----------|--------------|---------|
+| `0` (zero) | `o`, `O` | "Ad0:30" → "Ado:30", "AdO:30" |
+| `1` (one) | `l`, `L`, `I`, `i` | "Ad1:30" → "Adl:30", "AdI:30" |
+| `:` (colon) | `;`, `.` | "Ad0:30" → "Ad0;30", "Ad0.30" |
+
+Combined misreads are also handled (e.g., "Adl;lo" for "Ad1:10"). The timestamp pattern matches:
+- Standard: `Ad 0:30`, `Ad0:30`, `Ad1:45`
+- Zero misreads: `Ado:30`, `Ad0:3o`, `Ado:oo`
+- One misreads: `Adl:30`, `Ad1:l5`, `Adl:lo`
+- Separator misreads: `Ad0;30`, `Ad0.30`, `Ado;3o`
 
 ## Blocking Overlay
 
