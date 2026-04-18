@@ -566,11 +566,15 @@ class PaddleOCR:
                 matched.append(('ad countdown', text))
 
             # "0:30 | Ad", "Ad | 0:30", "Ad 0:30", "Ad0:30", "Ad1:20", "Ado:30" - ad with timestamp
-            # OCR often misreads as "Ad0:42" (no space) or "Ado:55" ('0' as 'o')
-            # Match "ad" at word boundary OR "ad" followed directly by any digit or 'o'
-            # Timestamp can be X:XX, o:XX, X:oX, or o:oX (OCR misreads 0 as o)
-            has_ad = re.search(r'\bad\b', text_lower) or re.search(r'ad[0-9o]:', text_lower)
-            has_timestamp = re.search(r'[0-9o]:[0-9o][0-9o]', text_lower)
+            # OCR common misreads:
+            #   0 ↔ o ↔ O (zero vs letter o)
+            #   1 ↔ l ↔ I ↔ i (one vs lowercase L vs uppercase i)
+            #   : ↔ ; ↔ . (colon vs semicolon vs period)
+            # Match "ad" at word boundary OR "ad" followed by digit-like char + separator
+            # Digit-like: 0-9, o, O, l, I, i (common OCR confusions)
+            # Separator: : ; . (colon misreads)
+            has_ad = re.search(r'\bad\b', text_lower) or re.search(r'ad[0-9oOlIi][:;.]', text_lower)
+            has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', text_lower)
             if has_ad and has_timestamp:
                 matched.append(('ad with timestamp', text))
 
@@ -578,8 +582,8 @@ class PaddleOCR:
         # Only if we haven't already matched and there are few text elements (not noisy OCR)
         if not matched and len(all_texts) <= 5:
             combined = ' '.join(all_texts).lower()
-            has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0-9o]:', combined)
-            has_timestamp = re.search(r'[0-9o]:[0-9o][0-9o]', combined)
+            has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0-9oOlIi][:;.]', combined)
+            has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', combined)
             if has_ad_word and has_timestamp:
                 matched.append(('ad with timestamp (cross-element)', combined[:50]))
 
