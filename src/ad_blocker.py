@@ -756,11 +756,15 @@ class DRMAdBlocker:
             'i2c_errors_per_second': round(errors_per_sec, 1),
         }
 
-    def start_no_signal_mode(self):
+    def start_no_signal_mode(self, skip_dpms=False):
         """Start a standalone display for 'No Signal' message with DVD-style bouncing.
 
         This creates a simple pipeline using videotestsrc that doesn't depend on ustreamer.
         The text bounces around the screen like the classic DVD screensaver.
+
+        Args:
+            skip_dpms: Skip DPMS cycle on initial cold boot (default: False)
+                      DPMS cycle is only needed after TV restart/hotplug, not on cold boot.
         """
         try:
             logger.debug("[DRMAdBlocker] Starting no-signal mode...")
@@ -788,18 +792,21 @@ class DRMAdBlocker:
 
             # Force HDMI PHY reinitialization via DPMS cycle
             # This is needed after TV restart/hotplug to ensure HDMI output works
-            self._force_hdmi_reinit()
+            # Skip on initial cold boot for faster startup
+            if not skip_dpms:
+                self._force_hdmi_reinit()
 
-            # Dynamically re-probe DRM to find currently connected HDMI output
-            # This handles cases where TV was connected after service started
-            drm_info = probe_drm_output()
-            if drm_info.get('connector_id'):
-                if drm_info['connector_id'] != self.connector_id:
-                    logger.info(f"[DRMAdBlocker] Updating DRM output: connector {self.connector_id} -> {drm_info['connector_id']}")
-                    self.connector_id = drm_info['connector_id']
-                    self.plane_id = drm_info.get('plane_id', self.plane_id)
-            else:
-                logger.warning("[DRMAdBlocker] No connected HDMI output found for no-signal display")
+                # Dynamically re-probe DRM to find currently connected HDMI output
+                # This handles cases where TV was connected after service started
+                # Skip on cold boot since we already have the info from __init__
+                drm_info = probe_drm_output()
+                if drm_info.get('connector_id'):
+                    if drm_info['connector_id'] != self.connector_id:
+                        logger.info(f"[DRMAdBlocker] Updating DRM output: connector {self.connector_id} -> {drm_info['connector_id']}")
+                        self.connector_id = drm_info['connector_id']
+                        self.plane_id = drm_info.get('plane_id', self.plane_id)
+                else:
+                    logger.warning("[DRMAdBlocker] No connected HDMI output found for no-signal display")
 
             # Create a standalone pipeline for no-signal display with positioned text
             # Uses valignment=position and halignment=position to enable xpos/ypos control

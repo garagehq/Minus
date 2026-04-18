@@ -2681,13 +2681,31 @@ class Minus:
             self.health_monitor.start()
             logger.info("Health monitor started")
 
-        # Preload VLM at startup if enabled (so it's ready when HDMI arrives)
+        # FAST STARTUP: Show visual feedback immediately (within 5 seconds of launch)
+        # Check HDMI signal first, then show appropriate display before loading ML models
+        signal_info = self.check_hdmi_signal()
+        if not signal_info:
+            # No HDMI input - show NO SIGNAL immediately
+            # Skip DPMS cycle on cold boot for faster startup (DPMS only needed after TV restart)
+            logger.info("No HDMI signal - showing NO SIGNAL display immediately")
+            if self.ad_blocker:
+                if self.ad_blocker.start_no_signal_mode(skip_dpms=True):
+                    logger.info("NO SIGNAL display started (early startup)")
+                else:
+                    logger.warning("Failed to start early NO SIGNAL display")
+        else:
+            # HDMI input present - show LOADING while we initialize
+            logger.info("HDMI signal detected - showing LOADING display")
+            if self.ad_blocker:
+                self.ad_blocker.start_loading_mode()
+
+        # Now preload VLM in background (this takes 25-30 seconds)
         vlm_preloaded = False
         if self.vlm_preload and self.vlm:
             logger.info("Preloading VLM model at startup (vlm_preload=True)...")
             vlm_preloaded = self._load_vlm_model()
 
-        # Check signal
+        # Re-check signal (may have changed during VLM load)
         signal_info = self.check_hdmi_signal()
         if not signal_info:
             logger.warning("No HDMI signal detected - starting in no-signal mode")
