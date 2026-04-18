@@ -377,7 +377,7 @@ class Minus:
         self.OCR_TRUST_WINDOW = 5.0
         self.VLM_ALONE_THRESHOLD = self.config.vlm_alone_threshold
         self.MIN_BLOCKING_DURATION = 3.0
-        self.OCR_STOP_THRESHOLD = 3
+        self.OCR_STOP_THRESHOLD = 5  # Increased from 3 for more robust ad end detection
         self.VLM_STOP_THRESHOLD = 2
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
