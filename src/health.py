@@ -74,6 +74,12 @@ class HealthMonitor:
         self._hdmi_lost_time = 0
         self._hdmi_fps_zero_since = 0  # When captured_fps first dropped to 0
         self._hdmi_signal_loss_threshold = 5.0  # Seconds of 0 FPS before signal is considered lost
+        self._last_no_signal_trigger = 0  # When we last triggered NO SIGNAL mode
+        self._no_signal_retry_interval = 3.0  # Retry interval for NO SIGNAL mode if it failed
+
+        # HDMI-TX output tracking (for TV disconnect/reconnect detection)
+        self._last_hdmi_output_connected = None  # Track output connector status
+        self._hdmi_output_reconnect_time = 0  # When output was last reconnected
 
         # Format/resolution tracking for adaptive restart
         self._last_hdmi_format = None  # Last detected V4L2 format (NV12, NV24, etc.)
@@ -182,6 +188,7 @@ class HealthMonitor:
             if not status.hdmi_signal and self._last_hdmi_signal:
                 # Signal just lost
                 self._hdmi_lost_time = time.time()
+                self._last_no_signal_trigger = time.time()  # Track when we triggered
                 logger.warning("[HealthMonitor] HDMI signal LOST")
                 if self._on_hdmi_lost:
                     self._on_hdmi_lost()
@@ -201,6 +208,56 @@ class HealthMonitor:
                 logger.debug(f"[HealthMonitor] Initial HDMI signal state: {status.hdmi_signal}")
 
         self._last_hdmi_signal = status.hdmi_signal
+
+        # Continuous NO SIGNAL mode enforcement
+        # Even if we already triggered _on_hdmi_lost, the display might have failed or crashed
+        # Check if signal is lost but NO SIGNAL mode isn't active, and re-trigger if needed
+        if not status.hdmi_signal and uptime > self.startup_grace_period:
+            now = time.time()
+            no_signal_active = self._is_no_signal_mode_active()
+
+            if not no_signal_active:
+                # NO SIGNAL mode is not active but should be
+                time_since_last_trigger = now - self._last_no_signal_trigger
+                if time_since_last_trigger >= self._no_signal_retry_interval:
+                    logger.warning(f"[HealthMonitor] Signal lost but NO SIGNAL mode not active - re-triggering")
+                    self._last_no_signal_trigger = now
+                    if self._on_hdmi_lost:
+                        self._on_hdmi_lost()
+
+        # HDMI-TX output monitoring (detect TV disconnect/reconnect)
+        # When TV restarts, the kmssink pipeline loses its DRM connection but keeps "running"
+        # We need to detect output reconnection and restart the no-signal pipeline
+        if uptime > self.startup_grace_period:
+            output_connected = self._check_hdmi_output_connected()
+
+            if self._last_hdmi_output_connected is not None:
+                if output_connected and not self._last_hdmi_output_connected:
+                    # Output just reconnected (TV turned on/restarted)
+                    self._hdmi_output_reconnect_time = time.time()
+                    logger.info("[HealthMonitor] HDMI output reconnected (TV turned on)")
+
+                    # If we're in no-signal mode, restart the pipeline for the new output
+                    if self._is_no_signal_mode_active():
+                        # Give HDMI link time to fully establish before restarting
+                        # The TV needs time to complete HDCP handshake and EDID negotiation
+                        logger.warning("[HealthMonitor] Waiting 2s for HDMI link to stabilize...")
+                        time.sleep(2.0)
+
+                        # Force HDMI reinit via DPMS cycle - the kernel hotplug doesn't
+                        # always fully reinitialize the HDMI PHY after TV restart
+                        self._force_hdmi_reinit()
+
+                        logger.warning("[HealthMonitor] Restarting NO SIGNAL display for reconnected output")
+                        self._last_no_signal_trigger = time.time()
+                        if self._on_hdmi_lost:
+                            self._on_hdmi_lost()
+
+                elif not output_connected and self._last_hdmi_output_connected:
+                    # Output just disconnected (TV turned off)
+                    logger.info("[HealthMonitor] HDMI output disconnected (TV turned off)")
+
+            self._last_hdmi_output_connected = output_connected
 
         # Format/resolution change detection (for adaptive device switching)
         # This allows seamless switching between FireTV, Roku, AppleTV, etc.
@@ -309,6 +366,75 @@ class HealthMonitor:
             f"mem={status.memory_percent:.0f}% "
             f"disk={status.disk_free_mb:.0f}MB"
         )
+
+    def _is_no_signal_mode_active(self) -> bool:
+        """Check if the NO SIGNAL display mode is currently active.
+
+        Returns True if ad_blocker is in 'no_hdmi_device' mode.
+        """
+        try:
+            if not self.minus.ad_blocker:
+                return False
+
+            current_source = getattr(self.minus.ad_blocker, 'current_source', None)
+            return current_source == 'no_hdmi_device'
+        except Exception:
+            return False
+
+    def _check_hdmi_output_connected(self) -> bool:
+        """Check if any HDMI-TX output is connected via sysfs.
+
+        This is a fast check (no subprocess) that reads /sys/class/drm/card0-HDMI-A-*/status.
+        Returns True if at least one HDMI output shows 'connected'.
+        """
+        try:
+            from pathlib import Path
+            drm_path = Path('/sys/class/drm')
+
+            for connector in drm_path.glob('card0-HDMI-A-*'):
+                status_file = connector / 'status'
+                if status_file.exists():
+                    status = status_file.read_text().strip()
+                    if status == 'connected':
+                        return True
+
+            return False
+        except Exception:
+            return False
+
+    def _force_hdmi_reinit(self):
+        """Force HDMI PHY reinitialization via DPMS cycle.
+
+        The kernel hotplug detection doesn't always fully reinitialize the HDMI
+        link after TV restart. Cycling DPMS (power management) forces a full
+        reinit of the HDMI PHY, similar to physically unplugging/replugging.
+        """
+        try:
+            from drm import probe_drm_output
+
+            # Get current connector ID
+            drm_info = probe_drm_output()
+            connector_id = drm_info.get('connector_id')
+            if not connector_id:
+                logger.warning("[HealthMonitor] No connector found for DPMS cycle")
+                return
+
+            logger.info(f"[HealthMonitor] Forcing HDMI reinit via DPMS cycle on connector {connector_id}")
+
+            # DPMS Off (value 3) then On (value 0)
+            subprocess.run(
+                ['modetest', '-M', 'rockchip', '-w', f'{connector_id}:DPMS:3'],
+                capture_output=True, timeout=5
+            )
+            time.sleep(0.5)
+            subprocess.run(
+                ['modetest', '-M', 'rockchip', '-w', f'{connector_id}:DPMS:0'],
+                capture_output=True, timeout=5
+            )
+
+            logger.info("[HealthMonitor] DPMS cycle complete")
+        except Exception as e:
+            logger.warning(f"[HealthMonitor] DPMS cycle failed: {e}")
 
     def _get_v4l2_format(self) -> str:
         """Get current V4L2 device format and resolution.

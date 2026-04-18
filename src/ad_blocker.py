@@ -25,6 +25,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import json
+import subprocess
 from collections import deque
 from pathlib import Path
 
@@ -40,7 +41,8 @@ from vocabulary import SPANISH_VOCABULARY
 from config import MinusConfig
 from drm import (
     get_color_format, set_color_format, is_connector_connected,
-    check_hdmi_i2c_errors, COLOR_FORMAT_YCBCR420, COLOR_FORMAT_NAMES
+    check_hdmi_i2c_errors, COLOR_FORMAT_YCBCR420, COLOR_FORMAT_NAMES,
+    probe_drm_output
 )
 
 # Set up logging
@@ -494,6 +496,58 @@ class DRMAdBlocker:
             self._watchdog_thread.join(timeout=2.0)
             self._watchdog_thread = None
 
+    def _force_hdmi_reinit(self):
+        """Force HDMI PHY reinitialization via DPMS cycle.
+
+        After TV restart/hotplug, the HDMI PHY may not reinitialize properly,
+        causing the TV to show "No Signal" even though GStreamer reports success.
+        A DPMS Off->On cycle forces the HDMI transmitter to reinitialize.
+
+        This must be called AFTER the old pipeline is stopped (so DRM is free)
+        but BEFORE the new pipeline is created.
+        """
+        try:
+            # Get current connector ID
+            drm_info = probe_drm_output()
+            connector_id = drm_info.get('connector_id')
+            if not connector_id:
+                logger.debug("[DRMAdBlocker] No connector found for DPMS cycle, skipping")
+                return
+
+            logger.info(f"[DRMAdBlocker] Forcing HDMI reinit via DPMS cycle on connector {connector_id}")
+
+            # DPMS Off (value 3)
+            result = subprocess.run(
+                ['modetest', '-M', 'rockchip', '-w', f'{connector_id}:DPMS:3'],
+                capture_output=True, timeout=5
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode() if result.stderr else ''
+                if 'Permission denied' in stderr:
+                    logger.debug("[DRMAdBlocker] DPMS cycle skipped - DRM in use (expected on first start)")
+                    return
+                logger.warning(f"[DRMAdBlocker] DPMS Off failed: {stderr}")
+                return
+
+            time.sleep(0.3)
+
+            # DPMS On (value 0)
+            result = subprocess.run(
+                ['modetest', '-M', 'rockchip', '-w', f'{connector_id}:DPMS:0'],
+                capture_output=True, timeout=5
+            )
+            if result.returncode != 0:
+                logger.warning(f"[DRMAdBlocker] DPMS On failed: {result.stderr.decode() if result.stderr else ''}")
+                return
+
+            time.sleep(0.3)
+            logger.info("[DRMAdBlocker] DPMS cycle complete - HDMI PHY reinitialized")
+
+        except subprocess.TimeoutExpired:
+            logger.warning("[DRMAdBlocker] DPMS cycle timed out")
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] DPMS cycle failed: {e}")
+
     def _watchdog_loop(self):
         while not self._stop_watchdog.is_set():
             self._stop_watchdog.wait(self._watchdog_interval)
@@ -732,6 +786,21 @@ class DRMAdBlocker:
                 # Give DRM time to release resources
                 time.sleep(0.3)
 
+            # Force HDMI PHY reinitialization via DPMS cycle
+            # This is needed after TV restart/hotplug to ensure HDMI output works
+            self._force_hdmi_reinit()
+
+            # Dynamically re-probe DRM to find currently connected HDMI output
+            # This handles cases where TV was connected after service started
+            drm_info = probe_drm_output()
+            if drm_info.get('connector_id'):
+                if drm_info['connector_id'] != self.connector_id:
+                    logger.info(f"[DRMAdBlocker] Updating DRM output: connector {self.connector_id} -> {drm_info['connector_id']}")
+                    self.connector_id = drm_info['connector_id']
+                    self.plane_id = drm_info.get('plane_id', self.plane_id)
+            else:
+                logger.warning("[DRMAdBlocker] No connected HDMI output found for no-signal display")
+
             # Create a standalone pipeline for no-signal display with positioned text
             # Uses valignment=position and halignment=position to enable xpos/ypos control
             no_signal_pipeline = (
@@ -909,6 +978,14 @@ class DRMAdBlocker:
                 except Exception as e:
                     logger.debug(f"[DRMAdBlocker] Error during pipeline cleanup: {e}")
                 self.pipeline = None
+
+            # Dynamically re-probe DRM to find currently connected HDMI output
+            drm_info = probe_drm_output()
+            if drm_info.get('connector_id'):
+                if drm_info['connector_id'] != self.connector_id:
+                    logger.info(f"[DRMAdBlocker] Updating DRM output: connector {self.connector_id} -> {drm_info['connector_id']}")
+                    self.connector_id = drm_info['connector_id']
+                    self.plane_id = drm_info.get('plane_id', self.plane_id)
 
             # Create a standalone pipeline for loading display
             # Uses videotestsrc with named textoverlay for animation

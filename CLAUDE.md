@@ -1490,3 +1490,30 @@ ps -p 179247
 - `Ado:55` - OCR misread '0' as 'o' ✓
 - `0:30 | Ad` - Hulu style ✓
 
+### HDMI PHY Not Reinitializing After TV Restart (Fixed - Apr 2026)
+
+**Symptom:** After TV restart/power cycle, the GStreamer pipeline reports "No-signal display started successfully" but the TV shows its own "HDMI 1 No Signal" message (meaning no video signal from RK3588).
+
+**Root Cause:** When the TV restarts, the HDMI hotplug event is detected and the sysfs status changes from "disconnected" to "connected", but the HDMI PHY (physical layer) doesn't properly reinitialize. The DRM connector shows as connected, but no actual video signal is being transmitted.
+
+**Discovery:** Physically unplugging and replugging the HDMI cable made the display work, indicating the HDMI PHY needed reinitialization that wasn't happening on TV restart.
+
+**Solution:** Force HDMI PHY reinitialization via DPMS (Display Power Management Signaling) cycle:
+1. When TV reconnects, health monitor detects status change and waits 2s for link stabilization
+2. DPMS Off (value 3) sent via `modetest -M rockchip -w {connector}:DPMS:3`
+3. Wait 300ms
+4. DPMS On (value 0) sent via `modetest -M rockchip -w {connector}:DPMS:0`
+5. This forces the HDMI transmitter to reinitialize, equivalent to cable replug
+
+**Implementation:**
+- `src/health.py` - Health monitor calls `_force_hdmi_reinit()` on TV reconnection before restarting display
+- `src/ad_blocker.py` - Added `_force_hdmi_reinit()` method in `start_no_signal_mode()` as backup
+
+**Key heuristics for detecting working vs broken state:**
+| Heuristic | Working | Broken (needs DPMS) |
+|-----------|---------|---------------------|
+| sysfs status | connected | connected |
+| sysfs dpms | On | On |
+| Video output | Visible | TV shows "No Signal" |
+
+Note: All sysfs values look identical in both states - the only difference is whether video is actually being transmitted. The DPMS cycle is applied preemptively on every TV reconnection.
