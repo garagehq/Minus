@@ -156,6 +156,15 @@ class VLMProcess:
     HARD_TIMEOUT = 5.0   # Only kill if inference takes longer than this
     RESTART_THRESHOLD = 3  # Restart after this many consecutive soft timeouts
 
+    # Latency-based auto-recovery: Axera NPU can drift into a degraded state
+    # (not thermal — observed at same ~70°C temps) where inference runs ~15-18s
+    # instead of ~0.7s, producing descriptive responses to short-answer prompts.
+    # Detect this by tracking rolling inference times and triggering recovery.
+    LATENCY_WINDOW = 10          # Rolling sample size for trend detection
+    LATENCY_P95_TRIGGER = 3.0    # P95 latency (s) that triggers auto-recovery
+    RECOVERY_COOLDOWN = 60.0     # Min seconds between auto-recoveries
+    DEEP_RESTART_BACKOFF = 8.0   # Longer NPU-release delay when simple restart didn't help
+
     def __init__(self):
         self.process = None
         self.request_queue = None
@@ -167,6 +176,10 @@ class VLMProcess:
         self._last_restart_time = 0
         self._consecutive_timeouts = 0
         self._pending_response = False  # True if we're waiting for a slow response
+        # Rolling latencies of successful inferences for auto-recovery detection
+        from collections import deque
+        self._recent_latencies = deque(maxlen=self.LATENCY_WINDOW)
+        self._last_auto_recovery_time = 0.0
 
     def start(self):
         """Start the VLM worker process."""
@@ -255,6 +268,82 @@ class VLMProcess:
         self._last_restart_time = time.time()
         return self.start()
 
+    def _record_latency(self, elapsed_s):
+        """Record a successful inference latency for trend analysis."""
+        try:
+            self._recent_latencies.append(float(elapsed_s))
+        except (TypeError, ValueError):
+            pass
+
+    def _maybe_auto_recover(self):
+        """If recent inference latencies show degraded performance, restart the worker.
+
+        Triggered when P95 of the rolling window exceeds LATENCY_P95_TRIGGER.
+        Subject to RECOVERY_COOLDOWN to avoid thrashing.
+
+        If a recovery fired recently (within cooldown) and we're still slow, escalate
+        to a "deep" restart with a longer NPU-release backoff.
+        """
+        if len(self._recent_latencies) < self.LATENCY_WINDOW:
+            return
+        samples = sorted(self._recent_latencies)
+        p95_idx = max(0, int(len(samples) * 0.95) - 1)
+        p95 = samples[p95_idx]
+        if p95 <= self.LATENCY_P95_TRIGGER:
+            return
+        now = time.time()
+        since_last = now - self._last_auto_recovery_time
+        if since_last < self.RECOVERY_COOLDOWN:
+            return
+        import logging
+        logger = logging.getLogger('Minus.VLM')
+        # If our previous recovery was recent-ish (<3 min) and we're degraded
+        # again, the simple restart isn't clearing NPU state — use deep restart.
+        deep = since_last < 180.0 and self._last_auto_recovery_time > 0
+        if deep:
+            logger.warning(
+                f"[VLMProcess] Auto-recovery: P95={p95:.1f}s over last "
+                f"{len(samples)} queries; previous restart at {since_last:.0f}s "
+                f"ago didn't help — DEEP restart (backoff={self.DEEP_RESTART_BACKOFF}s)"
+            )
+            self.kill()
+            if self.response_queue is not None:
+                while not self.response_queue.empty():
+                    try:
+                        self.response_queue.get_nowait()
+                    except Exception:
+                        break
+            self._consecutive_timeouts = 0
+            time.sleep(self.DEEP_RESTART_BACKOFF)
+            self._restart_count += 1
+            self._last_restart_time = time.time()
+            self.start()
+        else:
+            logger.warning(
+                f"[VLMProcess] Auto-recovery: P95={p95:.1f}s over last "
+                f"{len(samples)} queries exceeds {self.LATENCY_P95_TRIGGER}s — restarting worker"
+            )
+            self.restart()
+        self._last_auto_recovery_time = time.time()
+        self._recent_latencies.clear()
+
+    def get_latency_stats(self):
+        """Return recent inference latency stats for observability."""
+        if not self._recent_latencies:
+            return {'samples': 0}
+        samples = sorted(self._recent_latencies)
+        n = len(samples)
+        p50 = samples[n // 2]
+        p95_idx = max(0, int(n * 0.95) - 1)
+        p95 = samples[p95_idx]
+        return {
+            'samples': n,
+            'p50_s': round(p50, 3),
+            'p95_s': round(p95, 3),
+            'max_s': round(samples[-1], 3),
+            'auto_recoveries_last_time': self._last_auto_recovery_time,
+        }
+
     def detect_ad(self, image_path):
         """
         Run ad detection with soft/hard timeout.
@@ -305,6 +394,22 @@ class VLMProcess:
                 # Reset consecutive timeout counter on success
                 self._consecutive_timeouts = 0
                 self._pending_response = False
+                # Record inference latency for degradation detection. Use the
+                # elapsed time the worker reported if present (4-tuple or 2-tuple),
+                # else our wall-clock elapsed.
+                latency = elapsed
+                if isinstance(result, tuple):
+                    if len(result) >= 3:  # detect_ad: (is_ad, text, elapsed, conf)
+                        latency = result[2]
+                    elif len(result) == 2:  # query: (text, elapsed)
+                        latency = result[1]
+                self._record_latency(latency)
+                self._maybe_auto_recover()
+                # Guard: detect_ad returns 4-tuple; if we got a 2-tuple (stale query
+                # response leaked through), synthesize a 4-tuple.
+                if isinstance(result, tuple) and len(result) == 2:
+                    response_text, r_elapsed = result
+                    return False, response_text, r_elapsed, 0.0
                 return result
             else:
                 return False, f"Error: {result}", elapsed, 0.0
@@ -386,6 +491,19 @@ class VLMProcess:
             if status == 'ok':
                 self._consecutive_timeouts = 0
                 self._pending_response = False
+                latency = elapsed
+                if isinstance(result, tuple):
+                    if len(result) >= 3:
+                        latency = result[2]
+                    elif len(result) == 2:
+                        latency = result[1]
+                self._record_latency(latency)
+                self._maybe_auto_recover()
+                # Guard: query returns 2-tuple; if we got a 4-tuple (stale detect_ad
+                # response leaked through), unpack and keep only the text.
+                if isinstance(result, tuple) and len(result) == 4:
+                    _is_ad, response_text, r_elapsed, _conf = result
+                    return response_text, r_elapsed
                 return result
             else:
                 return f"Error: {result}", elapsed

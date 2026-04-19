@@ -318,7 +318,11 @@ class OCRProcess:
 
         # Ad keyword lists (from PaddleOCR)
         AD_KEYWORDS_EXACT = [
-            'skip ad', 'skip ads', 'skip in', 'ad in', 'video will play after ad',
+            'skip ad', 'skip ads', 'skip in', 'video will play after ad',
+            # 'ad in' removed: normalizes to 'adin' which matches inside 'loading'
+            # (lo-ADIN-g), 'reading' (re-AD-IN-g), etc. The specific patterns
+            # for "Ad N of M", "Ad N" countdown, and "ad with timestamp" catch
+            # legitimate cases.
             'shop now', 'learn more', 'sponsored', 'advertisement',
             'download now', 'install now', 'get the app', 'free download',
             'limited time', 'offer ends', 'dont miss', "don't miss",

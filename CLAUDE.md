@@ -519,6 +519,26 @@ Both modes share the same model and are serialized via the worker process queue.
 | Intelligence | Basic | **Much smarter** |
 | Parameters | 0.5B | **1.5B** |
 
+### Latency-based auto-recovery
+
+The Axera NPU can drift into a degraded state (observed: ~15–18s inference with descriptive responses instead of the structured short answer) that outlasts simple worker restarts. This is **not thermal** — temps are similar (~70°C) when healthy and when slow. Most likely accumulated NPU memory or axengine context state.
+
+`VLMProcess` keeps a rolling window of the last 10 successful inference latencies. After each success it computes P95 and triggers recovery if `P95 > 3.0s`:
+
+| Step | Trigger | Action |
+|------|---------|--------|
+| 1 | P95 > 3.0s, no recovery in last 60s | `restart()` — kill worker + 2s NPU-release + start |
+| 2 | Still degraded within 180s of step 1 | **Deep restart** — kill + 8s release + start |
+
+60s cooldown prevents thrashing. Latency window and recoveries surface on `/api/health` at `subsystems.vlm.latency` and as Prometheus gauge `minus_axera_temperature_celsius` / `minus_axera_npu_usage_percent` / `minus_axera_cmm_used_kib`.
+
+Query axcl directly for live telemetry:
+```bash
+axcl-smi info --temp   # milli-°C, divide by 1000
+axcl-smi info --npu    # utilization %
+axcl-smi info --cmm    # CMM memory used / total
+```
+
 ## Dependencies
 
 ```bash
@@ -1555,3 +1575,44 @@ This prevents false zombie detection when the audio thread is actually alive and
 **Files modified:**
 - `src/ocr.py` - Added Minus overlay exclusions
 - `src/ocr_worker.py` - Added Minus overlay exclusions
+
+### Autonomous Mode False-Pause When Display Disconnected (Fixed - Apr 2026)
+
+**Symptom:** Running autonomous mode with HDMI-TX disconnected, music videos with static album art were being paused by autonomous mode every 20 seconds, interrupting legitimate playback.
+
+**Root Cause:** With display disconnected, the audio pipeline's alsasink can't open HDMI-TX, so the pipeline never receives buffers (`last_buffer_age == -1`). `_is_audio_flowing()` returned False. On music videos with static art (hamming≈0), the pause detector concluded "static frames + no audio = PAUSED" and sent `play_pause`, actually pausing content that was playing.
+
+**Solution:** Added `_is_audio_pipeline_available()` in `src/autonomous_mode.py`. When the audio pipeline has never received a buffer or its state is stopped, treat audio as "unknown" rather than "not flowing". `_is_screen_static()` returns False in that case so autonomous mode does not assume paused. VLM's direct `PAUSED` verdict still triggers play.
+
+### Autonomous Mode Navigation During Ads (Fixed - Apr 2026)
+
+**Symptom:** During real ads on YouTube, autonomous mode would fire `down` + `select` commands thinking it was on the home screen, navigating through the ad UI and occasionally switching to a different video.
+
+**Root Cause:** `HOME_SCREEN_KEYWORDS` in `src/autonomous_mode.py` contained `'sponsored'` and `'views'`. "Sponsored · Visit advertiser" on YouTube pre-roll ads and "347M views" in any video's info panel both matched, triggering the home-screen action path.
+
+**Solution:**
+- Removed `'sponsored'` and `'views'` from `HOME_SCREEN_KEYWORDS`.
+- Added `AD_ONLY_KEYWORDS` (`'visit advertiser'`, `'send to phone'`, `'skip in'`, `'skip ad'`) — if any are present, skip home-screen detection.
+- Added `ad_blocker.is_visible` guard — if blocking is active, never classify as home screen.
+- In `minus.py`, added a secondary audio-aware guard: if the OCR match is only `'sponsored'` **and** HDMI-IN `audio_present=0`, suppress the block. Real video ads transmit audio; home-screen sponsored tiles usually don't. Uses new `_hdmi_audio_present()` helper reading v4l2-ctl directly so it works even when our playback pipeline is down.
+
+### OCR 'ad in' Keyword Matching Inside Words (Fixed - Apr 2026)
+
+**Symptom:** False ad blocks triggered when OCR read `"LOADING"` or `"reading"` on screen.
+
+**Root Cause:** `AD_KEYWORDS_EXACT` in `src/ocr_worker.py` contained `'ad in'`. The alphanumeric-normalized form is `'adin'` (4 chars), which appears as a substring in `'loading'` (lo**adin**g), `'reading'` (re**adin**g), and similar words.
+
+**Solution:** Removed `'ad in'` from exact keywords. The specific patterns for `"Ad N of M"`, `"Ad N"` countdown, and `"ad with timestamp"` (in both `ocr.py` and `ocr_worker.py`) already cover legitimate ad timestamps.
+
+### VLM Degraded State Auto-Recovery (Added - Apr 2026)
+
+**Symptom:** After several hours of runtime, VLM inference degrades from ~0.7s to ~15–18s per query and returns descriptive responses to short-answer prompts. Each DISCARDED (>2s) entry makes the system effectively OCR-only. Not thermal — temperatures stayed around 70°C both when healthy and when slow.
+
+**Solution:** Added rolling latency window + auto-recovery in `src/vlm_worker.py`:
+- `_record_latency()` / `_maybe_auto_recover()` called after each successful inference.
+- If P95 over the last 10 queries exceeds 3.0s, trigger a worker restart.
+- If a prior recovery happened within the last 3 minutes and we're degraded again, escalate to a **deep restart** with 8s NPU-release backoff (the simple 2s backoff did not always clear the bad state).
+- 60s cooldown prevents thrash.
+- `get_latency_stats()` exposes samples/P50/P95/max via `/api/health` under `subsystems.vlm.latency`.
+
+Axera telemetry (`axcl-smi info --temp / --npu / --cmm`) is also wired into `/api/health` at `subsystems.vlm.axera` and exposed as Prometheus gauges `minus_axera_*` for alerting on temperature or memory pressure.

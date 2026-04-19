@@ -30,6 +30,56 @@ from pathlib import Path
 from flask import Flask, jsonify, request, Response, send_from_directory, redirect
 import requests
 
+
+AXCL_SMI_PATH = '/usr/bin/axcl/axcl-smi'
+_axera_metrics_cache = {'ts': 0.0, 'data': None}
+_AXERA_METRICS_TTL = 5.0
+
+
+def get_axera_metrics():
+    """Query axcl-smi for Axera NPU telemetry.
+
+    Returns dict with temperature_c, npu_usage_pct, cmm_used_kib, cmm_total_kib,
+    or None if axcl-smi is unavailable or returns an error.
+
+    Cached for 5s — subprocess latency is ~100ms per call and these metrics
+    don't change meaningfully faster than that.
+    """
+    now = time.time()
+    if (_axera_metrics_cache['data'] is not None and
+            now - _axera_metrics_cache['ts'] < _AXERA_METRICS_TTL):
+        return _axera_metrics_cache['data']
+    if not os.path.exists(AXCL_SMI_PATH):
+        return None
+    metrics = {}
+    try:
+        r = subprocess.run([AXCL_SMI_PATH, 'info', '--temp'],
+                           capture_output=True, text=True, timeout=1.0)
+        m = re.search(r'temperature\s*:\s*(\d+)', r.stdout)
+        if m:
+            # axcl-smi returns temperature in milli-degrees Celsius
+            metrics['temperature_c'] = int(m.group(1)) / 1000.0
+        r = subprocess.run([AXCL_SMI_PATH, 'info', '--npu'],
+                           capture_output=True, text=True, timeout=1.0)
+        m = re.search(r':\s*(\d+)%', r.stdout)
+        if m:
+            metrics['npu_usage_pct'] = int(m.group(1))
+        r = subprocess.run([AXCL_SMI_PATH, 'info', '--cmm'],
+                           capture_output=True, text=True, timeout=1.0)
+        mt = re.search(r'CMM Total\s*:\s*(\d+)', r.stdout)
+        mu = re.search(r'CMM Used\s*:\s*(\d+)', r.stdout)
+        if mt:
+            metrics['cmm_total_kib'] = int(mt.group(1))
+        if mu:
+            metrics['cmm_used_kib'] = int(mu.group(1))
+    except Exception:
+        return None
+    if not metrics:
+        return None
+    _axera_metrics_cache['data'] = metrics
+    _axera_metrics_cache['ts'] = now
+    return metrics
+
 from src.wifi_manager import get_wifi_manager
 
 # Reviewed screenshots tracking
@@ -1722,6 +1772,18 @@ class WebUI:
                         vlm_status = {'status': 'ok'}
                     else:
                         vlm_status = {'status': 'loading'}
+                    # Inference latency stats (for detecting NPU degraded state)
+                    if hasattr(self.minus.vlm, 'get_latency_stats'):
+                        try:
+                            vlm_status['latency'] = self.minus.vlm.get_latency_stats()
+                        except Exception:
+                            pass
+                    if hasattr(self.minus.vlm, '_restart_count'):
+                        vlm_status['restart_count'] = self.minus.vlm._restart_count
+                # Axera NPU telemetry (same card the VLM runs on)
+                axera = get_axera_metrics()
+                if axera:
+                    vlm_status['axera'] = axera
                 health['subsystems']['vlm'] = vlm_status
 
                 # OCR subsystem
@@ -1830,6 +1892,22 @@ class WebUI:
                     time_saved = getattr(self.minus.ad_blocker, '_total_time_saved', 0)
                     if isinstance(time_saved, (int, float)):
                         add_metric('minus_time_saved_seconds', time_saved, 'Total time saved by blocking ads', 'counter')
+
+                # Axera NPU telemetry
+                axera = get_axera_metrics()
+                if axera:
+                    if 'temperature_c' in axera:
+                        add_metric('minus_axera_temperature_celsius', axera['temperature_c'],
+                                   'Axera AX650N SoC temperature')
+                    if 'npu_usage_pct' in axera:
+                        add_metric('minus_axera_npu_usage_percent', axera['npu_usage_pct'],
+                                   'Axera NPU utilization')
+                    if 'cmm_used_kib' in axera:
+                        add_metric('minus_axera_cmm_used_kib', axera['cmm_used_kib'],
+                                   'Axera CMM memory in use')
+                    if 'cmm_total_kib' in axera:
+                        add_metric('minus_axera_cmm_total_kib', axera['cmm_total_kib'],
+                                   'Axera CMM memory total')
 
                 response = '\n'.join(lines) + '\n'
                 return response, 200, {'Content-Type': 'text/plain; charset=utf-8'}

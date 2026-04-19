@@ -369,6 +369,10 @@ class Minus:
         self.video_interface_detected = False  # True if video player interface detected
         self.video_interface_detect_time = 0   # When video interface was last detected
 
+        # HDMI-IN audio_present cache (v4l2-ctl subprocess is expensive)
+        self._hdmi_audio_present_cache = None
+        self._hdmi_audio_present_cache_time = 0.0
+
         # Combined ad detection state
         self.ad_detected = False
         self.frame_count = 0
@@ -1737,6 +1741,34 @@ class Minus:
 
         return vlm_loaded
 
+    def _hdmi_audio_present(self) -> bool:
+        """Check if HDMI-IN is currently receiving audio from the source device.
+
+        Uses v4l2-ctl on the capture device, which reports the HDMI audio island
+        state independently of our playback pipeline — so it works even when the
+        display is disconnected and our alsasink can't open.
+
+        Cached for 2s because the subprocess call adds latency.
+
+        Returns True if audio is present on the HDMI input, False otherwise.
+        Defaults to True on error (fail-open: don't suppress real ads).
+        """
+        now = time.time()
+        if (self._hdmi_audio_present_cache is not None and
+                now - self._hdmi_audio_present_cache_time < 2.0):
+            return self._hdmi_audio_present_cache
+        try:
+            result = subprocess.run(
+                ['v4l2-ctl', '-d', self.device, '--get-ctrl', 'audio_present'],
+                capture_output=True, text=True, timeout=0.5
+            )
+            present = 'audio_present: 1' in result.stdout
+        except Exception:
+            present = True
+        self._hdmi_audio_present_cache = present
+        self._hdmi_audio_present_cache_time = now
+        return present
+
     def check_hdmi_signal(self):
         """Check HDMI signal and return resolution."""
         try:
@@ -2395,11 +2427,20 @@ class Minus:
                         self.ad_blocker.set_skip_status(False, None)
 
                 if ad_detected and not is_terminal:
+                    keywords_found = [kw for kw, txt in matched_keywords]
+                    # "Sponsored" alone without HDMI audio is almost always a home-screen
+                    # tile (Fire TV recommendations row, YouTube home sponsored thumbnail).
+                    # Real video ads transmit audio. We check HDMI-IN audio_present
+                    # directly so this works even when our playback pipeline is down
+                    # (e.g. display disconnected).
+                    sponsored_only = (len(matched_keywords) > 0 and
+                                      all(kw == 'sponsored' for kw, _ in matched_keywords))
                     # Suppress OCR ad detection if home screen is detected
                     # (e.g., "Sponsored" content rows on Fire TV home are not video ads)
                     if self.home_screen_detected:
-                        keywords_found = [kw for kw, txt in matched_keywords]
                         logger.info(f"OCR suppressed - home screen detected. Keywords would have been: {keywords_found}")
+                    elif sponsored_only and not self._hdmi_audio_present():
+                        logger.info(f"OCR suppressed - 'sponsored' without HDMI audio = likely home tile. Texts: {all_texts[:3]}")
                     else:
                         self.ocr_ad_detection_count += 1
                         self.ocr_no_ad_count = 0
@@ -2407,7 +2448,6 @@ class Minus:
 
                         if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
                             self.ocr_ad_detected = True
-                        keywords_found = [kw for kw, txt in matched_keywords]
                         logger.info(f"OCR detected ad keywords: {keywords_found}")
                         self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
                         self.add_detection('OCR', all_texts, matched_keywords)

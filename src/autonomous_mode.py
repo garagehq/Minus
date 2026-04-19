@@ -755,6 +755,33 @@ class AutonomousMode:
         diff = gray[:, 1:] > gray[:, :-1]
         return int(np.packbits(diff.flatten())[:8].view(np.uint64)[0])
 
+    def _is_audio_pipeline_available(self) -> bool:
+        """Check if the audio pipeline is actually functional.
+
+        When HDMI-TX is disconnected, the alsasink can't open and the pipeline
+        never receives buffers. In that case audio-based pause detection is
+        unreliable — treat as unavailable rather than "not flowing".
+        """
+        if self._ad_blocker and hasattr(self._ad_blocker, 'audio') and self._ad_blocker.audio:
+            try:
+                status = self._ad_blocker.audio.get_status()
+                buffer_age = status.get('last_buffer_age', -1)
+                state = status.get('state', 'stopped')
+                # Pipeline is available if it's playing AND has received a buffer
+                # buffer_age == -1 means no buffer ever received → pipeline broken
+                if buffer_age < 0 or state in ('stopped', 'unknown'):
+                    return False
+                return True
+            except Exception:
+                return False
+        # Fallback: check ALSA capture; if it's not open at all, pipeline isn't up
+        try:
+            with open("/proc/asound/card4/pcm0c/sub0/status", 'r') as f:
+                content = f.read().strip()
+            return content != 'closed'
+        except Exception:
+            return False
+
     def _is_audio_flowing(self) -> bool:
         """Check if audio is currently flowing (music/sound playing).
 
@@ -853,12 +880,23 @@ class AutonomousMode:
         'trending',
         'subscriptions',
         'library',
-        'sponsored',         # Sponsored ads on home screen
-        'views',             # "3.3M views" indicates video thumbnails
+        # 'views' removed: too common (any playing video info panel shows "347M views")
         'year ago',
         'month ago',
         'day ago',
         'hour ago',
+    ]
+
+    # Keywords that strongly indicate a playing AD (not home screen).
+    # When these are present, skip home-screen detection — "Sponsored" tiles
+    # on YouTube home will coexist with the keywords above, but during an ad
+    # these appear alone alongside "Sponsored".
+    AD_ONLY_KEYWORDS = [
+        'visit advertiser',
+        'send to phone',
+        'sendtophone',
+        'skip in',
+        'skip ad',
     ]
 
     def _is_youtube_login_screen(self) -> bool:
@@ -907,10 +945,20 @@ class AutonomousMode:
         instead of sending play_pause.
         """
         try:
+            # Don't treat as home screen if ad blocker is actively blocking
+            # (we know it's an ad, not home screen).
+            if self._ad_blocker and getattr(self._ad_blocker, 'is_visible', False):
+                return False
+
             if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
                 texts = self._ad_blocker.last_ocr_texts
                 if texts:
                     combined = ' '.join(str(t) for t in texts).lower()
+
+                    # If ad-specific keywords are present, this is an ad, not home
+                    for ad_kw in self.AD_ONLY_KEYWORDS:
+                        if ad_kw in combined:
+                            return False
 
                     for keyword in self.HOME_SCREEN_KEYWORDS:
                         if keyword in combined:
@@ -1177,6 +1225,15 @@ class AutonomousMode:
                 return False
 
             # Frames are static - check if audio is still playing
+            # If the audio pipeline itself is unavailable (e.g. display disconnected
+            # so alsasink can't open), the "no audio" signal is meaningless and we
+            # must not treat static frames as paused — that would pause a live
+            # music stream with static album art.
+            if not self._is_audio_pipeline_available():
+                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
+                           f"frames static but audio pipeline unavailable — not treating as paused")
+                return False
+
             audio_flowing = self._is_audio_flowing()
 
             if audio_flowing:
