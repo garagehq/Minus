@@ -189,10 +189,12 @@ from skip_detection import check_skip_opportunity
 # Import OCR module
 try:
     from ocr_worker import OCRProcess
+    from ocr import PaddleOCR
     HAS_OCR = True
 except ImportError as e:
     logger.warning(f"OCR module not available: {e}")
     HAS_OCR = False
+    PaddleOCR = None
 
 # Import AdBlocker module
 try:
@@ -2681,31 +2683,13 @@ class Minus:
             self.health_monitor.start()
             logger.info("Health monitor started")
 
-        # FAST STARTUP: Show visual feedback immediately (within 5 seconds of launch)
-        # Check HDMI signal first, then show appropriate display before loading ML models
-        signal_info = self.check_hdmi_signal()
-        if not signal_info:
-            # No HDMI input - show NO SIGNAL immediately
-            # Skip DPMS cycle on cold boot for faster startup (DPMS only needed after TV restart)
-            logger.info("No HDMI signal - showing NO SIGNAL display immediately")
-            if self.ad_blocker:
-                if self.ad_blocker.start_no_signal_mode(skip_dpms=True):
-                    logger.info("NO SIGNAL display started (early startup)")
-                else:
-                    logger.warning("Failed to start early NO SIGNAL display")
-        else:
-            # HDMI input present - show LOADING while we initialize
-            logger.info("HDMI signal detected - showing LOADING display")
-            if self.ad_blocker:
-                self.ad_blocker.start_loading_mode()
-
-        # Now preload VLM in background (this takes 25-30 seconds)
+        # Preload VLM at startup if enabled (so it's ready when HDMI arrives)
         vlm_preloaded = False
         if self.vlm_preload and self.vlm:
             logger.info("Preloading VLM model at startup (vlm_preload=True)...")
             vlm_preloaded = self._load_vlm_model()
 
-        # Re-check signal (may have changed during VLM load)
+        # Check signal
         signal_info = self.check_hdmi_signal()
         if not signal_info:
             logger.warning("No HDMI signal detected - starting in no-signal mode")
@@ -2774,14 +2758,23 @@ class Minus:
         else:
             self.display_connected = True
             self.display_error = None
+            # Reset signal lost flag - display is running so signal is present
+            # This fixes race condition where health monitor may have triggered
+            # signal lost callback during startup before ustreamer was ready
+            self._hdmi_signal_lost = False
+            # Resume audio watchdog if it was paused during startup
+            if self.audio:
+                self.audio.resume_watchdog()
+                self.audio.unmute()
             logger.info("Display running at 30 FPS with instant ad blocking")
 
         if self.ocr:
             self.ml_thread = threading.Thread(target=self.ml_worker, daemon=True)
             self.ml_thread.start()
 
-            all_keywords = PaddleOCR.AD_KEYWORDS_EXACT + PaddleOCR.AD_KEYWORDS_WORD
-            logger.info(f"OCR watching for ad keywords: {all_keywords}")
+            if PaddleOCR:
+                all_keywords = PaddleOCR.AD_KEYWORDS_EXACT + PaddleOCR.AD_KEYWORDS_WORD
+                logger.info(f"OCR watching for ad keywords: {all_keywords}")
 
         # Note: Health monitor and Web UI already started at beginning of run()
 

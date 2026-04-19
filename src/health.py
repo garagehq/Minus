@@ -88,6 +88,11 @@ class HealthMonitor:
         self._format_stable_since = 0  # Time when format became stable (debounce)
         self._format_change_debounce = 2.0  # Wait 2s before triggering restart on format change
 
+        # V4L2 format cache (to avoid probing on every status call)
+        self._v4l2_format_cache = ""
+        self._v4l2_format_cache_time = 0
+        self._v4l2_format_cache_ttl = 10.0  # Cache for 10 seconds
+
         # Recovery callbacks
         self._on_hdmi_lost: Optional[Callable] = None
         self._on_hdmi_restored: Optional[Callable] = None
@@ -440,17 +445,28 @@ class HealthMonitor:
         """Get current V4L2 device format and resolution.
 
         Returns format string like 'NV24@1280x720' for change detection.
+        Uses caching to avoid excessive v4l2-ctl calls from frequent API polls.
         """
+        # Return cached value if still valid
+        now = time.time()
+        if self._v4l2_format_cache and (now - self._v4l2_format_cache_time) < self._v4l2_format_cache_ttl:
+            return self._v4l2_format_cache
+
         try:
             device = getattr(self.minus, 'device', '/dev/video0')
             info = probe_v4l2_device(device)
             fmt = info.get('ustreamer_format') or info.get('format') or 'unknown'
             width = info.get('width', 0)
             height = info.get('height', 0)
-            return f"{fmt}@{width}x{height}"
+            result = f"{fmt}@{width}x{height}"
+
+            # Update cache
+            self._v4l2_format_cache = result
+            self._v4l2_format_cache_time = now
+            return result
         except Exception as e:
             logger.debug(f"[HealthMonitor] Error getting V4L2 format: {e}")
-            return ""
+            return self._v4l2_format_cache or ""
 
     def _check_hdmi_signal(self) -> tuple[bool, str]:
         """Check if HDMI signal is present using ustreamer's HTTP API.

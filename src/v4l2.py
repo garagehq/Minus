@@ -69,7 +69,7 @@ def probe_v4l2_device(device: str) -> dict:
             }
             result['ustreamer_format'] = format_map.get(v4l2_format, v4l2_format)
 
-        logger.info(f"Probed {device}: {result['width']}x{result['height']} format={result['format']} -> {result['ustreamer_format']}")
+        logger.debug(f"Probed {device}: {result['width']}x{result['height']} format={result['format']} -> {result['ustreamer_format']}")
 
     except subprocess.TimeoutExpired:
         logger.warning(f"Timeout probing {device}")
