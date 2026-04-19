@@ -1522,3 +1522,18 @@ ps -p 179247
 | Video output | Visible | TV shows "No Signal" |
 
 Note: All sysfs values look identical in both states - the only difference is whether video is actually being transmitted. The DPMS cycle is applied preemptively on every TV reconnection.
+
+### Minus Overlay Text Triggering False Positive Ad Detection (Fixed - Apr 2026)
+
+**Symptom:** Screen stuck on "Initializing..." for 20+ minutes. GStreamer pipeline in restart loop (37+ attempts). ustreamer is capturing video correctly but display pipeline fails.
+
+**Root Cause:** The Fire TV notification overlay shows "Ad skipping enabled." which contains the word "ad". When OCR read this overlay text, it triggered false positive ad detection. This activated the blocking mode, which caused MPP pipeline errors (`mpp_buffer: check buffer found NULL pointer`).
+
+**Why overlay is visible to OCR:** The notification overlay is composited at the ustreamer encoder level BEFORE the snapshot, so `/snapshot/raw` includes overlay text. This is by design for the preview window in blocking mode, but it means OCR sees everything on screen including our overlays.
+
+**Solution:** Added our overlay messages to the OCR exclusion lists:
+- `'ad skipping enabled'`, `'ad skipping'`, `'adskipping'` added to `AD_EXCLUSIONS` in both `src/ocr.py` and `src/ocr_worker.py`
+
+**Files modified:**
+- `src/ocr.py` - Added Minus overlay exclusions
+- `src/ocr_worker.py` - Added Minus overlay exclusions
