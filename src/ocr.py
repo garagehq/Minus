@@ -191,8 +191,13 @@ class PaddleOCR:
         'skip recap', 'skiprecap',  # Netflix "Skip Recap" button
         'skip intro', 'skipintro',  # Streaming "Skip Intro" button
         'saltar intro', 'saltarintro',  # Spanish "Skip Intro"
-        # Minus overlay messages (Fire TV notifications)
+        # Minus overlay messages (prevent self-triggering)
         'ad skipping enabled', 'ad skipping', 'adskipping',
+        'ad detection active', 'ad detection actiue',  # Status overlay (OCR misreads V as U)
+        'addetection', 'detection active', 'detection actiue',
+        'vlm ready', 'vlmready', 'ulmready',  # VLM status (OCR misreads V as U)
+        'ocr ready', 'ocrready',  # OCR status
+        'ready',  # Generic status word (too common to be an ad indicator)
     ]
 
     def __init__(self, det_model_path, rec_model_path, dict_path,
@@ -518,6 +523,13 @@ class PaddleOCR:
             text_lower = text.lower()
             text_clean = ''.join(c for c in text_lower if c.isalnum())
 
+            # Check exclusions FIRST - skip ALL ad detection for excluded phrases
+            # This prevents Minus overlay text from triggering false positives
+            is_excluded = any(excl in text_lower or excl.replace(' ', '') in text_clean
+                              for excl in self.AD_EXCLUSIONS)
+            if is_excluded:
+                continue  # Skip all pattern matching for this text element
+
             # Check exact phrase keywords (can appear anywhere)
             for keyword in self.AD_KEYWORDS_EXACT:
                 keyword_clean = ''.join(c for c in keyword if c.isalnum())
@@ -526,17 +538,12 @@ class PaddleOCR:
                     break
 
             # Check word-boundary keywords (must be whole word)
-            # But first check if text matches any exclusion patterns (e.g., "Skip Recap")
-            is_excluded = any(excl in text_lower or excl.replace(' ', '') in text_clean
-                              for excl in self.AD_EXCLUSIONS)
-
-            if not is_excluded:
-                for keyword in self.AD_KEYWORDS_WORD:
-                    # Use word boundary regex
-                    pattern = r'\b' + re.escape(keyword) + r'\b'
-                    if re.search(pattern, text_lower):
-                        matched.append((keyword, text))
-                        break
+            for keyword in self.AD_KEYWORDS_WORD:
+                # Use word boundary regex
+                pattern = r'\b' + re.escape(keyword) + r'\b'
+                if re.search(pattern, text_lower):
+                    matched.append((keyword, text))
+                    break
 
             # Fuzzy matches for common OCR misreads of "Skip Ad"
             if 'skipad' in text_clean or 'skipads' in text_clean:
@@ -584,10 +591,15 @@ class PaddleOCR:
         # Only if we haven't already matched and there are few text elements (not noisy OCR)
         if not matched and len(all_texts) <= 5:
             combined = ' '.join(all_texts).lower()
-            has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0-9oOlIi][:;.]', combined)
-            has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', combined)
-            if has_ad_word and has_timestamp:
-                matched.append(('ad with timestamp (cross-element)', combined[:50]))
+            combined_clean = ''.join(c for c in combined if c.isalnum())
+            # Check exclusions for combined text too
+            is_combined_excluded = any(excl in combined or excl.replace(' ', '') in combined_clean
+                                       for excl in self.AD_EXCLUSIONS)
+            if not is_combined_excluded:
+                has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0-9oOlIi][:;.]', combined)
+                has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', combined)
+                if has_ad_word and has_timestamp:
+                    matched.append(('ad with timestamp (cross-element)', combined[:50]))
 
         # Check if this appears to be terminal content
         is_terminal = self.is_terminal_content(all_texts)
