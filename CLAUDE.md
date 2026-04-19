@@ -3,8 +3,8 @@
 ## Overview
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
-- **PaddleOCR** on RK3588 NPU (~400ms per frame)
-- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.7s per frame, 1.5s hard timeout)
+- **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
+- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame, 1.5s soft timeout / 5s hard timeout)
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -196,8 +196,8 @@ MINUS_VLM_ALONE_THRESHOLD=5      # Consecutive VLM detections needed to trigger 
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
-| VLM latency | **~0.7s per frame** (FastVLM-1.5B, process-based with 1.5s hard timeout) |
-| VLM model load | **~25s** (includes 2 warmup inferences + keepalive thread) |
+| VLM latency | **~0.9-1.1s per frame** (FastVLM-1.5B, process-based with soft/hard timeout) |
+| VLM model load | **~30s** (includes 4 warmup inferences + keepalive thread) |
 | Snapshot capture | **~150ms** (4K JPEG download) |
 | OCR image size | 960x540 (downscaled from 4K for speed) |
 | ustreamer quality | 80% JPEG (MPP encoder) |
@@ -485,10 +485,15 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 **Process-based architecture (`src/vlm_worker.py`):**
 - VLM runs in a separate process for hard timeout capability
-- If inference exceeds 1.5s, process is KILLED and restarted (not just timed out)
-- 2 warmup inferences at startup to avoid cold-start slowness
+- Uses 'spawn' multiprocessing method to avoid "can only join a child process" errors from axengine
+- **Soft/Hard timeout strategy** to avoid unnecessary restarts:
+  - Soft timeout (1.5s): Returns immediately with "TIMEOUT", but worker keeps running
+  - Hard timeout (5.0s): Only kills worker if inference is truly stuck
+  - Restart threshold: 3 consecutive soft timeouts trigger a hard kill
+  - Late responses are drained on next request and counters reset
+- 4 warmup inferences at startup with varied content (noise, gradients, edges, mixed)
 - Keepalive thread runs dummy inference every 20s during idle to prevent NPU cold-start
-- Worker process loads model once, processes requests via Queue
+- Worker process loads model once (~27s), processes requests via Queue
 
 **Two inference modes:**
 - `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification

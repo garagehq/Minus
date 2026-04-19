@@ -10,6 +10,13 @@ import time
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Event
 
+# Use 'spawn' start method to avoid inherited file descriptors and process state issues
+# This prevents "can only join a child process" errors from RKNN runtime
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
 
 def _ocr_worker_main(request_queue, response_queue, ready_event, shutdown_event):
     """
@@ -49,15 +56,37 @@ def _ocr_worker_main(request_queue, response_queue, ready_event, shutdown_event)
             logger.error("[OCRWorker] Failed to load models")
             return
 
-        # Warmup inferences to avoid cold-start
-        logger.info("[OCRWorker] Running warmup inferences...")
+        # Extended warmup to ensure RKNN NPU is fully ready for real frames
+        # 4 inferences with varying content to warm all code paths
+        load_start = time.time()
         try:
             import numpy as np
-            # Create test images with varying content
-            for i in range(2):
-                warmup_img = np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8)
+            for i in range(4):
+                # Create varied warmup images (noise, gradients, edges, text-like)
+                if i == 0:
+                    # Pure noise
+                    warmup_img = np.random.randint(0, 255, (540, 960, 3), dtype=np.uint8)
+                elif i == 1:
+                    # Gradient (simulates video content)
+                    arr = np.zeros((540, 960, 3), dtype=np.uint8)
+                    arr[:, :, 0] = np.linspace(0, 255, 960).reshape(1, -1).astype(np.uint8)
+                    arr[:, :, 1] = np.linspace(255, 0, 540).reshape(-1, 1).astype(np.uint8)
+                    warmup_img = arr
+                elif i == 2:
+                    # High contrast edges (simulates text/UI elements)
+                    arr = np.zeros((540, 960, 3), dtype=np.uint8)
+                    arr[::2, :, :] = 255
+                    warmup_img = arr
+                else:
+                    # Mixed content
+                    warmup_img = np.random.randint(50, 200, (540, 960, 3), dtype=np.uint8)
+
+                start_w = time.time()
                 _ = ocr.ocr(warmup_img)
-            logger.info("[OCRWorker] Warmup complete (2 inferences)")
+                logger.debug(f"[OCRWorker] Warmup {i+1}/4: {time.time() - start_w:.2f}s")
+
+            total_time = time.time() - load_start
+            logger.info(f"[OCRWorker] Warmup complete (4 inferences in {total_time:.1f}s)")
         except Exception as e:
             logger.warning(f"[OCRWorker] Warmup failed (non-fatal): {e}")
 
@@ -140,6 +169,7 @@ class OCRProcess:
         self.shutdown_event = None
         self.is_ready = False
         self._restart_count = 0
+        self._consecutive_timeouts = 0
 
     def start(self):
         """Start the OCR worker process."""
@@ -175,17 +205,39 @@ class OCRProcess:
         """Kill the OCR worker process."""
         if self.process is not None:
             self.shutdown_event.set()
+            # Try graceful shutdown first
             self.process.terminate()
-            self.process.join(timeout=2.0)
+            self.process.join(timeout=3.0)
             if self.process.is_alive():
+                # Force kill if still running
                 self.process.kill()
+                self.process.join(timeout=1.0)
             self.process = None
         self.is_ready = False
 
     def restart(self):
-        """Kill and restart the OCR worker."""
+        """Kill and restart the OCR worker.
+
+        Uses exponential backoff if restarting frequently (prevents restart loops).
+        """
+        import logging
+        logger = logging.getLogger('Minus.OCR')
+
         self._restart_count += 1
+        self._consecutive_timeouts += 1
+
+        # Calculate backoff based on consecutive timeouts
+        # 1st timeout: 1s, 2nd: 2s, 3rd+: 4s max
+        if self._consecutive_timeouts >= 3:
+            backoff = 4.0
+            logger.warning(f"[OCRProcess] Multiple timeouts ({self._consecutive_timeouts}), using {backoff}s backoff")
+        elif self._consecutive_timeouts >= 2:
+            backoff = 2.0
+        else:
+            backoff = 1.0
+
         self.kill()
+
         # Clear any stale responses
         if self.response_queue is not None:
             while not self.response_queue.empty():
@@ -193,6 +245,10 @@ class OCRProcess:
                     self.response_queue.get_nowait()
                 except:
                     break
+
+        # Wait for NPU resources to be released
+        time.sleep(backoff)
+
         return self.start()
 
     def ocr(self, frame_rgb):
@@ -213,9 +269,10 @@ class OCRProcess:
         # Wait for response with hard timeout
         try:
             status, result = self.response_queue.get(timeout=self.HARD_TIMEOUT)
-            elapsed = time.time() - start_time
 
             if status == 'ok':
+                # Reset consecutive timeout counter on success
+                self._consecutive_timeouts = 0
                 return result
             else:
                 return []
@@ -225,44 +282,10 @@ class OCRProcess:
             elapsed = time.time() - start_time
             import logging
             logging.getLogger('Minus.OCR').warning(
-                f"[OCRProcess] HARD KILL after {elapsed:.1f}s - restarting worker"
+                f"[OCRProcess] HARD KILL after {elapsed:.1f}s (timeout #{self._consecutive_timeouts + 1}) - restarting worker"
             )
             self.restart()
             return []
-
-    def check_ad_keywords(self, frame_rgb):
-        """
-        Run OCR and check for ad keywords with hard timeout.
-
-        Returns: (is_ad, keywords, ocr_results) or (False, [], []) on timeout
-        """
-        if not self.is_ready or self.process is None or not self.process.is_alive():
-            if not self.start():
-                return False, [], []
-
-        start_time = time.time()
-
-        # Send request
-        self.request_queue.put((frame_rgb, 'check_ad'))
-
-        # Wait for response with hard timeout
-        try:
-            status, result = self.response_queue.get(timeout=self.HARD_TIMEOUT)
-
-            if status == 'ok':
-                return result
-            else:
-                return False, [], []
-
-        except:
-            # TIMEOUT - kill the process
-            elapsed = time.time() - start_time
-            import logging
-            logging.getLogger('Minus.OCR').warning(
-                f"[OCRProcess] HARD KILL after {elapsed:.1f}s - restarting worker"
-            )
-            self.restart()
-            return False, [], []
 
     def release(self):
         """Release the OCR worker process."""

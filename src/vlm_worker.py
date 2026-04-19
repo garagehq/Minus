@@ -147,7 +147,9 @@ class VLMProcess:
     If inference takes longer than timeout, the process is KILLED and restarted.
     """
 
-    HARD_TIMEOUT = 1.5  # Kill VLM if it takes longer than this
+    SOFT_TIMEOUT = 1.5   # Return "timeout" after this, but don't kill
+    HARD_TIMEOUT = 5.0   # Only kill if inference takes longer than this
+    RESTART_THRESHOLD = 3  # Restart after this many consecutive soft timeouts
 
     def __init__(self):
         self.process = None
@@ -159,6 +161,7 @@ class VLMProcess:
         self._restart_count = 0
         self._last_restart_time = 0
         self._consecutive_timeouts = 0
+        self._pending_response = False  # True if we're waiting for a slow response
 
     def start(self):
         """Start the VLM worker process."""
@@ -219,25 +222,14 @@ class VLMProcess:
         Includes delay to allow NPU resources to be released properly.
         The Axera NPU can get into a bad state if we restart too quickly
         after killing a process that was using NPU resources.
-
-        Uses exponential backoff if restarting frequently (prevents restart loops).
         """
         import logging
         logger = logging.getLogger('Minus.VLM')
 
         self._restart_count += 1
-        self._consecutive_timeouts += 1
-        now = time.time()
 
-        # Calculate backoff based on consecutive timeouts
-        # 1st timeout: 2s, 2nd: 4s, 3rd+: 8s max
-        if self._consecutive_timeouts >= 3:
-            backoff = 8.0
-            logger.warning(f"[VLMProcess] Multiple timeouts ({self._consecutive_timeouts}), using {backoff}s backoff")
-        elif self._consecutive_timeouts >= 2:
-            backoff = 4.0
-        else:
-            backoff = 2.0
+        # Fixed 2 second delay for NPU recovery
+        backoff = 2.0
 
         self.kill()
 
@@ -249,7 +241,10 @@ class VLMProcess:
                 except:
                     break
 
-        # Wait for NPU resources to be released with backoff
+        # Reset timeout counter after restart
+        self._consecutive_timeouts = 0
+
+        # Wait for NPU resources to be released
         time.sleep(backoff)
 
         self._last_restart_time = time.time()
@@ -257,41 +252,94 @@ class VLMProcess:
 
     def detect_ad(self, image_path):
         """
-        Run ad detection with hard timeout.
+        Run ad detection with soft/hard timeout.
+
+        Soft timeout (1.5s): Returns immediately but doesn't kill worker
+        Hard timeout (5.0s): Kills and restarts worker
 
         Returns: (is_ad, response, elapsed, confidence)
-        If timeout: returns (False, "KILLED", timeout, 0.0)
+        If soft timeout: returns (False, "TIMEOUT", timeout, 0.0)
+        If hard timeout: returns (False, "KILLED", timeout, 0.0)
         """
+        import logging
+        logger = logging.getLogger('Minus.VLM')
+
         if not self.is_ready or self.process is None or not self.process.is_alive():
             if not self.start():
                 return False, "VLM not ready", 0, 0.0
+
+        # If we have a pending slow response, try to drain it first
+        if self._pending_response:
+            try:
+                # Quick check if previous response arrived
+                status, result = self.response_queue.get(timeout=0.1)
+                self._pending_response = False
+                self._consecutive_timeouts = 0
+                logger.debug("[VLMProcess] Drained late response from previous request")
+            except:
+                # Still no response, check if we should restart
+                if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
+                    logger.warning(
+                        f"[VLMProcess] {self._consecutive_timeouts} consecutive timeouts, restarting worker"
+                    )
+                    self.restart()
+                    self._pending_response = False
+                    return False, "KILLED", 0, 0.0
 
         start_time = time.time()
 
         # Send request
         self.request_queue.put((image_path, 'detect_ad'))
 
-        # Wait for response with hard timeout
+        # Wait for response with soft timeout first
         try:
-            status, result = self.response_queue.get(timeout=self.HARD_TIMEOUT)
+            status, result = self.response_queue.get(timeout=self.SOFT_TIMEOUT)
             elapsed = time.time() - start_time
 
             if status == 'ok':
                 # Reset consecutive timeout counter on success
                 self._consecutive_timeouts = 0
+                self._pending_response = False
                 return result
             else:
                 return False, f"Error: {result}", elapsed, 0.0
 
         except:
-            # TIMEOUT - kill the process
+            # SOFT TIMEOUT - don't kill yet, just skip this frame
             elapsed = time.time() - start_time
-            import logging
-            logging.getLogger('Minus.VLM').warning(
-                f"[VLMProcess] HARD KILL after {elapsed:.1f}s (timeout #{self._consecutive_timeouts + 1}) - restarting worker"
-            )
-            self.restart()
-            return False, "KILLED", elapsed, 0.0
+            self._consecutive_timeouts += 1
+            self._pending_response = True
+
+            # Check if we should do hard kill (only after many consecutive timeouts)
+            if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
+                # Try waiting a bit longer for hard timeout before killing
+                try:
+                    remaining = self.HARD_TIMEOUT - elapsed
+                    if remaining > 0:
+                        status, result = self.response_queue.get(timeout=remaining)
+                        # Got a response, reset counters
+                        self._consecutive_timeouts = 0
+                        self._pending_response = False
+                        if status == 'ok':
+                            elapsed = time.time() - start_time
+                            logger.info(f"[VLMProcess] Slow response arrived after {elapsed:.1f}s")
+                            return result
+                except:
+                    pass
+
+                # Still no response after hard timeout, restart
+                elapsed = time.time() - start_time
+                logger.warning(
+                    f"[VLMProcess] HARD KILL after {elapsed:.1f}s ({self._consecutive_timeouts} timeouts) - restarting worker"
+                )
+                self.restart()
+                self._pending_response = False
+                return False, "KILLED", elapsed, 0.0
+            else:
+                logger.debug(
+                    f"[VLMProcess] Soft timeout after {elapsed:.1f}s (#{self._consecutive_timeouts}) - skipping frame"
+                )
+                return False, "TIMEOUT", elapsed, 0.0
 
     def release(self):
         """Release the VLM worker process."""
