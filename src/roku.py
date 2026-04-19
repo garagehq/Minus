@@ -337,20 +337,30 @@ class RokuController:
             logger.warning("[Roku] Not connected")
             return False
 
-        try:
-            url = f'http://{self._ip_address}:{ROKU_PORT}/keypress/{key}'
-            response = requests.post(url, timeout=2)
-            # Roku returns 200 or 204 for successful key presses
-            if response.status_code in (200, 204):
-                logger.debug(f"[Roku] Sent key: {key}")
-                return True
-            else:
-                logger.error(f"[Roku] Key press failed: HTTP {response.status_code}")
+        url = f'http://{self._ip_address}:{ROKU_PORT}/keypress/{key}'
+
+        # Retry up to 2 times on timeout
+        for attempt in range(2):
+            try:
+                response = requests.post(url, timeout=5)
+                # Roku returns 200 or 204 for successful key presses
+                if response.status_code in (200, 204):
+                    logger.debug(f"[Roku] Sent key: {key}")
+                    return True
+                else:
+                    logger.error(f"[Roku] Key press failed: HTTP {response.status_code}")
+                    return False
+            except requests.exceptions.Timeout:
+                if attempt == 0:
+                    logger.warning(f"[Roku] Key press timeout, retrying...")
+                    continue
+                logger.error(f"[Roku] Key press timeout after retry")
                 return False
-        except Exception as e:
-            logger.error(f"[Roku] Key press error: {e}")
-            self._connected = False
-            return False
+            except Exception as e:
+                logger.error(f"[Roku] Key press error: {e}")
+                self._connected = False
+                return False
+        return False
 
     def send_keys(self, *commands: str, delay: float = 0.1) -> bool:
         """Send multiple commands in sequence."""

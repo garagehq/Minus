@@ -24,6 +24,13 @@ def _ocr_worker_main(request_queue, response_queue, ready_event, shutdown_event)
 
     Loads models once, then processes requests until shutdown.
     """
+    # Reset inherited signal handlers so SIGTERM from parent just exits cleanly
+    # instead of running minus.stop() (inherited via fork), which deadlocks
+    # and corrupts RKNN runtime state across subsequent worker respawns.
+    import signal
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
     import logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
     logger = logging.getLogger('OCRWorker')

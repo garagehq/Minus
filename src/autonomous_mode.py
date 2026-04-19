@@ -43,9 +43,10 @@ DEVICE_TYPE_FIRE_TV = 'fire_tv'
 DEVICE_TYPE_ROKU = 'roku'
 DEVICE_TYPE_GOOGLE_TV = 'google_tv'
 
-# Timing constants
-CHECK_INTERVAL = 60.0          # Check every minute
-KEEPALIVE_INTERVAL = 120.0     # Check screen state every 2 minutes (VLM-guided, only acts if needed)
+# Timing constants - adaptive based on state
+CHECK_INTERVAL = 15.0              # Base check interval
+KEEPALIVE_INTERVAL_PLAYING = 20.0  # When video is playing, check every 20s (catches unexpected exits)
+KEEPALIVE_INTERVAL_NAV = 10.0      # On navigation screens (home/login), check every 10s
 
 
 class AutonomousModeStats:
@@ -161,6 +162,13 @@ class AutonomousMode:
         self._recovery_attempt_count = 0
         self._last_successful_audio_time: Optional[float] = None
         self._RECOVERY_ESCALATION_THRESHOLD = 3  # After N failed attempts, escalate
+
+        # Stuck detection - state machine for detecting and escaping stuck states
+        self._last_screen_state: Optional[str] = None  # Track last detected screen type
+        self._stuck_count: int = 0                     # Consecutive times we've seen same stuck state
+        self._STUCK_THRESHOLD = 3                      # After N stuck detections, reset with Home
+        self._last_action_time: Optional[float] = None # Track when we last took an action
+        self._ACTION_TIMEOUT = 45.0                    # If no progress in N seconds, consider stuck
 
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
@@ -480,6 +488,7 @@ class AutonomousMode:
         logger.info("[AutonomousMode] Monitoring thread started")
 
         last_keepalive = 0
+        on_nav_screen = True  # Start assuming we need fast checks
 
         while self._running and not self._stop_event.is_set():
             try:
@@ -493,11 +502,17 @@ class AutonomousMode:
                     self._deactivate()
 
                 if self._active:
+                    # Adaptive keepalive: shorter on nav screens, longer when playing
+                    keepalive_interval = KEEPALIVE_INTERVAL_NAV if on_nav_screen else KEEPALIVE_INTERVAL_PLAYING
+
                     # Keep YouTube running
                     now = time.time()
-                    if now - last_keepalive > KEEPALIVE_INTERVAL:
-                        self._ensure_youtube_playing()
+                    if now - last_keepalive > keepalive_interval:
+                        took_action = self._ensure_youtube_playing()
                         last_keepalive = now
+                        # If we took an action, we're probably on a nav screen - use fast checks
+                        # If no action needed, video is playing - use slower checks
+                        on_nav_screen = took_action
 
                 # Update stats
                 if self._active:
@@ -802,6 +817,33 @@ class AutonomousMode:
         'submit answers',
     ]
 
+    # Keywords that indicate we're on the Roku home screen (not YouTube)
+    # These are app names and UI elements only visible on Roku home
+    ROKU_HOME_KEYWORDS = [
+        'rokuchannel',
+        'roku channel',
+        'ad-free tv',
+        'frndly',            # Frndly TV app on Roku
+        'watchnow',
+        'press for more',    # Roku UI prompt
+    ]
+
+    # Keywords that indicate we're on a keyboard/sign-in screen (STUCK - need to escape)
+    # These screens require manual input we can't provide - press Back to escape
+    KEYBOARD_STUCK_KEYWORDS = [
+        '12#',               # Keyboard symbol toggle
+        'qwerty',            # Keyboard layout
+        'enter email',
+        'enter password',
+        'phone number',
+        'verification code',
+        'yt.be/activate',    # YouTube sign-in with code screen
+        'enter the code',    # Sign-in code entry
+        'scan qr code',      # QR code sign-in
+        'sign in with your phone',  # Mobile sign-in prompt
+        'add your google',   # Google account addition
+    ]
+
     # Keywords that indicate YouTube home/browse screen (need to select a video)
     # NOTE: "subscribe" and "description" removed - they appear on paused videos too
     HOME_SCREEN_KEYWORDS = [
@@ -881,6 +923,39 @@ class AutonomousMode:
             logger.debug(f"[AutonomousMode] Home screen check failed: {e}")
             return False
 
+    def _is_youtube_shorts(self) -> bool:
+        """Check if we're watching YouTube Shorts (short-form video).
+
+        Shorts have a distinctive UI:
+        - "@username" handle visible
+        - "Subscribe" button visible
+        - Hashtags like "#topic"
+        - No progress bar or video duration
+
+        We want to exit Shorts and find full-length videos.
+        """
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    # Shorts UI pattern: has "@handle" and "subscribe" but no duration/progress indicators
+                    has_handle = '@' in combined
+                    has_subscribe = 'subscribe' in combined
+                    # Full videos have duration like "10:23" or progress indicators
+                    has_duration = any(c.isdigit() and ':' in combined for c in combined)
+
+                    if has_handle and has_subscribe and not has_duration:
+                        logger.debug("[AutonomousMode] Shorts pattern detected: @handle + subscribe, no duration")
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Shorts check failed: {e}")
+            return False
+
     def _is_signed_out_screen(self) -> bool:
         """Check if we're on the signed-out "Make YouTube your own" screen.
 
@@ -946,6 +1021,119 @@ class AutonomousMode:
         except Exception as e:
             logger.debug(f"[AutonomousMode] Survey screen check failed: {e}")
             return False
+
+    def _is_roku_home_screen(self) -> bool:
+        """Check if we're on the Roku home screen (not YouTube) using OCR.
+
+        The Roku home screen shows app tiles like "Roku Channel", "Frndly TV", "hulu"
+        that are never visible inside YouTube. This serves as a fallback when the
+        ECP active-app query doesn't work or is slow.
+        """
+        if self._device_type != DEVICE_TYPE_ROKU:
+            return False  # Only for Roku
+
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    for keyword in self.ROKU_HOME_KEYWORDS:
+                        if keyword in combined:
+                            logger.info(f"[AutonomousMode] Roku home screen detected via OCR: '{keyword}'")
+                            return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Roku home screen check failed: {e}")
+            return False
+
+    def _is_keyboard_stuck_screen(self) -> bool:
+        """Check if we're on a keyboard/sign-in screen that requires manual input.
+
+        These screens (email entry, password, verification code) can't be automated.
+        We need to press Back to escape and try a different path.
+        """
+        try:
+            if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                texts = self._ad_blocker.last_ocr_texts
+                if texts:
+                    combined = ' '.join(str(t) for t in texts).lower()
+
+                    for keyword in self.KEYBOARD_STUCK_KEYWORDS:
+                        if keyword in combined:
+                            logger.info(f"[AutonomousMode] Keyboard/stuck screen detected: '{keyword}'")
+                            return True
+
+                    # Also detect if OCR only shows single characters (keyboard keys)
+                    # If most texts are 1-2 chars and include numbers, it's likely a keyboard
+                    if len(texts) >= 4:
+                        short_texts = [t for t in texts if len(str(t)) <= 2]
+                        if len(short_texts) >= len(texts) * 0.6:  # 60%+ are short
+                            has_numbers = any(c.isdigit() for t in texts for c in str(t))
+                            if has_numbers:
+                                logger.info("[AutonomousMode] Keyboard detected via character pattern")
+                                return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Keyboard screen check failed: {e}")
+            return False
+
+    def _escape_stuck_state(self) -> bool:
+        """Attempt to escape a stuck state by pressing Back and navigating.
+
+        Returns True if escape was attempted, False if not needed.
+        """
+        if not self._device_controller or not self._device_controller.is_connected():
+            return False
+
+        logger.info("[AutonomousMode] Attempting to escape stuck state with Back + navigation")
+        self._log_event("Escaping stuck state - Back + navigate")
+
+        # Press Back multiple times to exit dialogs/keyboards/sign-in flows
+        for _ in range(4):
+            self._device_controller.send_command("back")
+            time.sleep(0.4)
+
+        # After escaping, try to navigate to content
+        # Press Down and Right to navigate away from sign-in options
+        time.sleep(0.5)
+        for _ in range(2):
+            self._device_controller.send_command("down")
+            time.sleep(0.3)
+        self._device_controller.send_command("select")
+
+        return True
+
+    def _full_reset_to_youtube(self) -> bool:
+        """Full reset: go to Home and relaunch YouTube from scratch.
+
+        This is the nuclear option when we're completely stuck.
+        """
+        if not self._device_controller or not self._device_controller.is_connected():
+            return False
+
+        logger.warning("[AutonomousMode] Full reset - going Home and relaunching YouTube")
+        self._log_event("FULL RESET - Home + relaunch YouTube")
+
+        # Go to home screen
+        self._device_controller.send_command("home")
+        time.sleep(2)
+
+        # Launch YouTube
+        self._launch_youtube()
+        time.sleep(3)
+
+        # Reset stuck counters - let normal OCR/VLM detection handle the rest
+        self._stuck_count = 0
+        self._last_screen_state = None
+        self._recovery_attempt_count = 0
+        self._consecutive_static = 0
+
+        return True
 
     def _is_screen_static(self) -> bool:
         """Check if screen is truly paused by combining frame analysis with audio state.
@@ -1060,9 +1248,12 @@ class AutonomousMode:
         Includes frame-change verification: if VLM says PLAYING but the screen
         is actually static (not changing), the video is likely paused. VLM is
         unreliable at distinguishing paused from playing states.
+        Returns:
+            True if an action was taken (we're on a navigation screen)
+            False if no action needed (video is playing)
         """
         if not self._device_controller or not self._device_controller.is_connected():
-            return
+            return False
 
         try:
             # For Roku: check active app via ECP before VLM
@@ -1071,7 +1262,31 @@ class AutonomousMode:
             if not self._check_roku_active_app():
                 self._launch_youtube()
                 self._consecutive_static = 0
-                return
+                return True
+
+            # OCR-based Roku home screen fallback (if ECP missed it)
+            if self._is_roku_home_screen():
+                logger.info("[AutonomousMode] Roku home detected via OCR - launching YouTube")
+                self._log_event("Roku home (OCR fallback) - launching YouTube")
+                self._launch_youtube()
+                self._consecutive_static = 0
+                self._stuck_count = 0
+                return True
+
+            # STUCK DETECTION: Check for keyboard/sign-in screens we can't automate
+            # This must come BEFORE other checks to escape stuck states quickly
+            if self._is_keyboard_stuck_screen():
+                self._stuck_count += 1
+                logger.warning(f"[AutonomousMode] Keyboard/stuck screen detected ({self._stuck_count}/{self._STUCK_THRESHOLD})")
+
+                if self._stuck_count >= self._STUCK_THRESHOLD:
+                    # We've been stuck too long - full reset
+                    self._full_reset_to_youtube()
+                    return True
+                else:
+                    # Try to escape with Back presses
+                    self._escape_stuck_state()
+                    return True
 
             # OCR-based screen detection (VLM often misclassifies static screens as PLAYING)
 
@@ -1085,89 +1300,138 @@ class AutonomousMode:
                     time.sleep(0.3)
                 self._device_controller.send_command("select")
                 self._consecutive_static = 0
-                return
+                return True
 
-            # Check for signed-out screen - need to sign in or select account
-            if self._is_signed_out_screen():
-                if self._has_accounts_visible():
-                    # Accounts are visible - navigate down to select one
-                    logger.info("[AutonomousMode] Signed-out screen with accounts visible - selecting account")
-                    self._log_event("Signed-out screen with accounts - selecting account")
-                    self._device_controller.send_command("down")
-                    time.sleep(0.5)
-                    self._device_controller.send_command("select")
+            # Check for signed-out screen OR login screen - need to select account or watch as guest
+            is_signed_out = self._is_signed_out_screen()
+            is_login = self._is_youtube_login_screen()
+
+            if is_signed_out or is_login:
+                # Track consecutive auth screen detections
+                if self._last_screen_state in ('signed_out', 'login'):
+                    self._stuck_count += 1
                 else:
-                    # No accounts visible - click Sign in button
-                    logger.info("[AutonomousMode] Signed-out screen detected - clicking Sign in")
-                    self._log_event("Signed-out screen detected - clicking Sign in")
-                    self._device_controller.send_command("right")
-                    time.sleep(0.5)
-                    self._device_controller.send_command("select")
-                self._consecutive_static = 0
-                return
+                    self._stuck_count = 0
+                    self._last_screen_state = 'signed_out' if is_signed_out else 'login'
 
-            # Check for YouTube account selection / login screen
-            if self._is_youtube_login_screen():
-                logger.info("[AutonomousMode] YouTube login screen detected via OCR - selecting account")
-                self._log_event("YouTube login screen detected - selecting account")
-                # Navigate down to highlight an account and select it
-                self._device_controller.send_command("down")
-                time.sleep(0.5)
+                if self._stuck_count >= self._STUCK_THRESHOLD:
+                    logger.warning(f"[AutonomousMode] Stuck on auth screen ({self._stuck_count}x) - full reset")
+                    self._full_reset_to_youtube()
+                    return True
+
+                # Get OCR text to understand the screen layout
+                combined = ''
+                if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                    texts = self._ad_blocker.last_ocr_texts
+                    if texts:
+                        combined = ' '.join(str(t) for t in texts).lower()
+
+                # Count accounts visible (@ symbols indicate account names)
+                account_count = combined.count('@')
+                logger.info(f"[AutonomousMode] Auth screen - {account_count} accounts visible, navigating to guest option")
+                self._log_event(f"Auth screen - {account_count} accounts, selecting guest")
+
+                # Navigate DOWN past all accounts to reach "Watch as guest" / guest mode option
+                # Layout: [Sign in] → [Add account] → [Account 1] → [Account 2] → [Guest] → [Sign in bottom]
+                # Need to go past accounts (2-3) plus header items (1-2), so 5-6 downs should reach guest
+                down_count = max(4, account_count + 3)  # At least 4, more if many accounts
+                for _ in range(down_count):
+                    self._device_controller.send_command("down")
+                    time.sleep(0.2)
+
+                # Now go UP once in case we overshot past guest to "Add account" or "Sign in" at bottom
+                self._device_controller.send_command("up")
+                time.sleep(0.2)
                 self._device_controller.send_command("select")
+
                 self._consecutive_static = 0
-                return
+                return True
+
+            # Check if we're stuck in YouTube Shorts - exit back to home
+            if self._is_youtube_shorts():
+                logger.info("[AutonomousMode] YouTube Shorts detected - exiting to find full video")
+                self._log_event("YouTube Shorts detected - pressing Back")
+                self._device_controller.send_command("back")
+                time.sleep(0.5)
+                return True
 
             # Check for YouTube home screen - need to select a video
             if self._is_youtube_home_screen():
+                # Reaching home screen is progress - reset stuck counters
+                self._stuck_count = 0
+                self._last_screen_state = 'home'
+
                 logger.info("[AutonomousMode] YouTube home screen detected via OCR - selecting a video")
                 self._log_event("YouTube home screen detected - selecting a video")
-                # Navigate down past any sponsored content and select a video
-                for _ in range(3):
+
+                # Vary navigation to find different videos (some require sign-in)
+                import random
+                down_count = random.randint(3, 6)  # Randomize how far down we go
+                right_first = random.choice([True, False])  # Sometimes skip the right press
+
+                if right_first:
+                    self._device_controller.send_command("right")
+                    time.sleep(0.3)
+                for _ in range(down_count):
                     self._device_controller.send_command("down")
                     time.sleep(0.3)
                 self._device_controller.send_command("select")
                 self.stats.videos_played += 1
                 self._consecutive_static = 0
-                return
+                return True
 
             # 30-second no-audio timeout recovery
             # If we've been without audio for 30+ seconds, something is stuck
-            audio_flowing = self._is_audio_flowing()
-            current_time = time.time()
+            # BUT skip this check if display is disconnected (audio pipeline isn't running)
+            display_ok = True
+            if self._ad_blocker and hasattr(self._ad_blocker, 'display_connected'):
+                display_ok = self._ad_blocker.display_connected
+            elif self._ad_blocker and hasattr(self._ad_blocker, 'video_ok'):
+                display_ok = self._ad_blocker.video_ok
 
-            if audio_flowing:
-                # Audio is working, reset the timer and recovery count
+            if not display_ok:
+                # Display disconnected - audio pipeline isn't running, skip audio recovery
+                logger.debug("[AutonomousMode] Display disconnected - skipping audio recovery check")
                 self._no_audio_start_time = None
-                self._last_successful_audio_time = current_time
-                if self._recovery_attempt_count > 0:
-                    logger.info(f"[AutonomousMode] Audio recovered after {self._recovery_attempt_count} attempts")
-                    self._recovery_attempt_count = 0
+                self._recovery_attempt_count = 0
+                # Still do VLM check below for screen state
             else:
-                # No audio - track how long
-                if self._no_audio_start_time is None:
-                    self._no_audio_start_time = current_time
-                    logger.debug("[AutonomousMode] No audio detected, starting timer")
+                audio_flowing = self._is_audio_flowing()
+                current_time = time.time()
+
+                if audio_flowing:
+                    # Audio is working, reset the timer and recovery count
+                    self._no_audio_start_time = None
+                    self._last_successful_audio_time = current_time
+                    if self._recovery_attempt_count > 0:
+                        logger.info(f"[AutonomousMode] Audio recovered after {self._recovery_attempt_count} attempts")
+                        self._recovery_attempt_count = 0
                 else:
-                    no_audio_duration = current_time - self._no_audio_start_time
-                    # Check if we've exceeded the timeout and not in cooldown
-                    in_cooldown = (self._last_recovery_time is not None and
-                                   current_time - self._last_recovery_time < self._RECOVERY_COOLDOWN)
+                    # No audio - track how long
+                    if self._no_audio_start_time is None:
+                        self._no_audio_start_time = current_time
+                        logger.debug("[AutonomousMode] No audio detected, starting timer")
+                    else:
+                        no_audio_duration = current_time - self._no_audio_start_time
+                        # Check if we've exceeded the timeout and not in cooldown
+                        in_cooldown = (self._last_recovery_time is not None and
+                                       current_time - self._last_recovery_time < self._RECOVERY_COOLDOWN)
 
-                    if no_audio_duration >= self._NO_AUDIO_TIMEOUT and not in_cooldown:
-                        self._recovery_attempt_count += 1
-                        strategy = self._get_recovery_strategy(self._recovery_attempt_count)
-                        logger.warning(f"[AutonomousMode] No audio for {no_audio_duration:.1f}s - "
-                                      f"recovery attempt #{self._recovery_attempt_count} ({strategy})")
-                        self._log_event(f"No audio {no_audio_duration:.0f}s - attempt #{self._recovery_attempt_count} ({strategy})")
+                        if no_audio_duration >= self._NO_AUDIO_TIMEOUT and not in_cooldown:
+                            self._recovery_attempt_count += 1
+                            strategy = self._get_recovery_strategy(self._recovery_attempt_count)
+                            logger.warning(f"[AutonomousMode] No audio for {no_audio_duration:.1f}s - "
+                                          f"recovery attempt #{self._recovery_attempt_count} ({strategy})")
+                            self._log_event(f"No audio {no_audio_duration:.0f}s - attempt #{self._recovery_attempt_count} ({strategy})")
 
-                        self._execute_recovery_strategy(strategy)
+                            self._execute_recovery_strategy(strategy)
 
-                        # Reset timers
-                        self._no_audio_start_time = None
-                        self._last_recovery_time = current_time
-                        self._consecutive_static = 0
-                        logger.info(f"[AutonomousMode] Recovery strategy '{strategy}' completed")
-                        return
+                            # Reset timers
+                            self._no_audio_start_time = None
+                            self._last_recovery_time = current_time
+                            self._consecutive_static = 0
+                            logger.info(f"[AutonomousMode] Recovery strategy '{strategy}' completed")
+                            return True
 
             # Use VLM to understand what's on screen
             screen_desc = self._query_screen()
@@ -1197,11 +1461,16 @@ class AutonomousMode:
                         self._log_event("Escalated: selected video (play_pause failed)")
                         self.stats.videos_played += 1
                         self._consecutive_static = 0
+
+                    # Action taken due to static screen
+                    return True
                 else:
-                    # Screen is changing - truly playing
+                    # Screen is changing - truly playing! Reset all stuck counters.
                     self._consecutive_static = 0
+                    self._stuck_count = 0
+                    self._last_screen_state = 'playing'
                     logger.debug("[AutonomousMode] Screen looks good, video is playing")
-                return
+                    return False
 
             # Taking an action - reset static counter
             self._consecutive_static = 0
@@ -1249,9 +1518,13 @@ class AutonomousMode:
                 time.sleep(1)
                 self._device_controller.send_command("play")
 
+            # VLM action taken - we're on a navigation screen
+            return True
+
         except Exception as e:
             logger.error(f"[AutonomousMode] Error in ensure_youtube_playing: {e}")
             self.stats.errors += 1
+            return True  # Error occurred, assume we need fast checks
 
     def _wake_device(self):
         """Wake up the device from screensaver/sleep."""

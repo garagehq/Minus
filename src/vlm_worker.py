@@ -115,15 +115,20 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
                 if request is None:  # Shutdown signal
                     break
 
-                image_path, request_type = request
+                # detect_ad: (image_path, 'detect_ad')
+                # query:     (image_path, prompt, 'query')
+                request_type = request[-1]
 
                 if request_type == 'detect_ad':
+                    image_path = request[0]
                     result = vlm.detect_ad(image_path)
                     response_queue.put(('ok', result))
                     last_inference_time = time.time()
                 elif request_type == 'query':
-                    # For query_image, request is (image_path, prompt, 'query')
-                    pass
+                    image_path, prompt, _ = request
+                    result = vlm.query_image(image_path, prompt)
+                    response_queue.put(('ok', result))
+                    last_inference_time = time.time()
                 else:
                     response_queue.put(('error', 'Unknown request type'))
 
@@ -340,6 +345,82 @@ class VLMProcess:
                     f"[VLMProcess] Soft timeout after {elapsed:.1f}s (#{self._consecutive_timeouts}) - skipping frame"
                 )
                 return False, "TIMEOUT", elapsed, 0.0
+
+    def query_image(self, image_path, prompt):
+        """
+        Run a custom prompt against an image (e.g. autonomous mode screen classification).
+
+        Returns: (response_text, elapsed)
+        On soft timeout: ("TIMEOUT", elapsed)
+        On hard timeout/error: ("KILLED", elapsed)
+        """
+        import logging
+        logger = logging.getLogger('Minus.VLM')
+
+        if not self.is_ready or self.process is None or not self.process.is_alive():
+            if not self.start():
+                return "VLM not ready", 0.0
+
+        if self._pending_response:
+            try:
+                status, result = self.response_queue.get(timeout=0.1)
+                self._pending_response = False
+                self._consecutive_timeouts = 0
+                logger.debug("[VLMProcess] Drained late response from previous request")
+            except:
+                if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
+                    logger.warning(
+                        f"[VLMProcess] {self._consecutive_timeouts} consecutive timeouts, restarting worker"
+                    )
+                    self.restart()
+                    self._pending_response = False
+                    return "KILLED", 0.0
+
+        start_time = time.time()
+        self.request_queue.put((image_path, prompt, 'query'))
+
+        try:
+            status, result = self.response_queue.get(timeout=self.SOFT_TIMEOUT)
+            elapsed = time.time() - start_time
+
+            if status == 'ok':
+                self._consecutive_timeouts = 0
+                self._pending_response = False
+                return result
+            else:
+                return f"Error: {result}", elapsed
+
+        except:
+            elapsed = time.time() - start_time
+            self._consecutive_timeouts += 1
+            self._pending_response = True
+
+            if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
+                try:
+                    remaining = self.HARD_TIMEOUT - elapsed
+                    if remaining > 0:
+                        status, result = self.response_queue.get(timeout=remaining)
+                        self._consecutive_timeouts = 0
+                        self._pending_response = False
+                        if status == 'ok':
+                            elapsed = time.time() - start_time
+                            logger.info(f"[VLMProcess] Slow query response arrived after {elapsed:.1f}s")
+                            return result
+                except:
+                    pass
+
+                elapsed = time.time() - start_time
+                logger.warning(
+                    f"[VLMProcess] HARD KILL after {elapsed:.1f}s ({self._consecutive_timeouts} timeouts) - restarting worker"
+                )
+                self.restart()
+                self._pending_response = False
+                return "KILLED", elapsed
+            else:
+                logger.debug(
+                    f"[VLMProcess] Soft timeout after {elapsed:.1f}s (#{self._consecutive_timeouts}) - skipping query"
+                )
+                return "TIMEOUT", elapsed
 
     def release(self):
         """Release the VLM worker process."""
