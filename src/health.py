@@ -247,23 +247,23 @@ class HealthMonitor:
                     logger.info("[HealthMonitor] Waiting 2s for HDMI link to stabilize...")
                     time.sleep(2.0)
 
-                    # Force HDMI reinit via DPMS cycle - the kernel hotplug doesn't
-                    # always fully reinitialize the HDMI PHY after TV restart
-                    self._force_hdmi_reinit()
-
-                    # Restart the appropriate display mode
+                    # Restart the appropriate display mode with HDMI reconnect flag
+                    # This triggers DPMS cycle and DRM re-probe in the restart method
                     if self._is_no_signal_mode_active():
                         logger.info("[HealthMonitor] Restarting NO SIGNAL display for reconnected output")
+                        # For no-signal mode, DPMS cycle is done in start_no_signal_mode()
+                        self._force_hdmi_reinit()
                         self._last_no_signal_trigger = time.time()
                         if self._on_hdmi_lost:
                             self._on_hdmi_lost()
                     else:
                         # We have HDMI input but output reconnected - restart display pipeline
-                        logger.info("[HealthMonitor] Restarting display pipeline for reconnected output")
+                        # with hdmi_reconnect=True to trigger DPMS cycle and DRM re-probe
+                        logger.info("[HealthMonitor] Restarting display pipeline for reconnected output (with HDMI reinit)")
                         if self.minus and self.minus.ad_blocker:
                             try:
-                                self.minus.ad_blocker.restart()
-                                logger.info("[HealthMonitor] Display pipeline restart requested")
+                                self.minus.ad_blocker.restart(hdmi_reconnect=True)
+                                logger.info("[HealthMonitor] Display pipeline restart with HDMI reinit requested")
                             except Exception as e:
                                 logger.error(f"[HealthMonitor] Failed to restart display pipeline: {e}")
 
@@ -680,8 +680,20 @@ class HealthMonitor:
 
             # If state is RUNNING but owner PID doesn't exist, it's a zombie
             if state == 'RUNNING' and owner_pid:
-                # Check if owner PID exists
-                if not os.path.exists(f'/proc/{owner_pid}'):
+                # Check if owner PID/TID exists
+                # Note: ALSA owner_pid can be a thread ID (TID), not just a process ID (PID)
+                # Threads appear under /proc/{main_pid}/task/{tid}, not /proc/{tid}
+                # So we need to check both locations
+                pid_exists = os.path.exists(f'/proc/{owner_pid}')
+
+                # Also check if it's a thread of the main minus process
+                if not pid_exists and self.minus:
+                    main_pid = os.getpid()
+                    tid_exists = os.path.exists(f'/proc/{main_pid}/task/{owner_pid}')
+                    if tid_exists:
+                        pid_exists = True  # It's a valid thread of our process
+
+                if not pid_exists:
                     logger.debug(f"[HealthMonitor] ALSA zombie: card{card_num} state=RUNNING but owner_pid={owner_pid} is dead")
                     return True
 

@@ -616,7 +616,7 @@ class DRMAdBlocker:
                 except Exception as e:
                     logger.debug(f"[DRMAdBlocker] Error checking pipeline state: {e}")
 
-    def _restart_pipeline(self):
+    def _restart_pipeline(self, hdmi_reconnect=False):
         with self._restart_lock:
             if self._pipeline_restarting:
                 return
@@ -628,7 +628,7 @@ class DRMAdBlocker:
             # Cap exponent at 10 to prevent overflow (2^10 = 1024, way past max_restart_delay anyway)
             exponent = min(self._consecutive_failures - 1, 10)
             delay = min(self._base_restart_delay * (2 ** exponent), self._max_restart_delay)
-            logger.warning(f"[DRMAdBlocker] Restarting pipeline (attempt {self._restart_count}, delay {delay:.1f}s)")
+            logger.warning(f"[DRMAdBlocker] Restarting pipeline (attempt {self._restart_count}, delay {delay:.1f}s, hdmi_reconnect={hdmi_reconnect})")
 
             if self.pipeline:
                 try:
@@ -651,6 +651,28 @@ class DRMAdBlocker:
                 except Exception as e:
                     logger.debug(f"[DRMAdBlocker] Error killing ustreamer: {e}")
 
+            # For HDMI reconnect (TV power cycle), do DPMS cycle and re-probe DRM
+            if hdmi_reconnect:
+                time.sleep(0.3)  # Give DRM time to release
+                self._force_hdmi_reinit()
+
+                # Re-probe DRM to find currently connected HDMI output
+                drm_info = probe_drm_output()
+                if drm_info.get('connector_id'):
+                    if drm_info['connector_id'] != self.connector_id:
+                        logger.info(f"[DRMAdBlocker] Updating DRM output: connector {self.connector_id} -> {drm_info['connector_id']}")
+                        self.connector_id = drm_info['connector_id']
+                        self.plane_id = drm_info.get('plane_id', self.plane_id)
+
+                    # Always restart audio on HDMI reconnect - TV power cycle disrupts audio
+                    # even when the device doesn't change
+                    if hasattr(self, 'audio') and self.audio:
+                        audio_device = drm_info.get('audio_device', self.audio.playback_device)
+                        logger.info(f"[DRMAdBlocker] Restarting audio for HDMI reconnect (device: {audio_device})")
+                        self.audio.stop()
+                        self.audio.playback_device = audio_device
+                        self.audio.start()
+
             time.sleep(delay)
             self._init_pipeline()
 
@@ -666,9 +688,9 @@ class DRMAdBlocker:
         finally:
             self._pipeline_restarting = False
 
-    def restart(self):
-        logger.info("[DRMAdBlocker] External restart requested")
-        threading.Thread(target=self._restart_pipeline, daemon=True).start()
+    def restart(self, hdmi_reconnect=False):
+        logger.info(f"[DRMAdBlocker] External restart requested (hdmi_reconnect={hdmi_reconnect})")
+        threading.Thread(target=self._restart_pipeline, args=(hdmi_reconnect,), daemon=True).start()
 
     def _attempt_bandwidth_fallback(self) -> bool:
         """

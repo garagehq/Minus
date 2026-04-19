@@ -1511,8 +1511,14 @@ ps -p 179247
 5. This forces the HDMI transmitter to reinitialize, equivalent to cable replug
 
 **Implementation:**
-- `src/health.py` - Health monitor calls `_force_hdmi_reinit()` on TV reconnection before restarting display
-- `src/ad_blocker.py` - Added `_force_hdmi_reinit()` method in `start_no_signal_mode()` as backup
+- `src/health.py` - Health monitor detects TV reconnection and calls `ad_blocker.restart(hdmi_reconnect=True)`
+- `src/ad_blocker.py` - `_restart_pipeline(hdmi_reconnect=True)` does:
+  1. Stop existing pipeline
+  2. DPMS cycle via `_force_hdmi_reinit()`
+  3. Re-probe DRM to detect connector/plane changes
+  4. Restart audio pipeline (required after TV power cycle)
+  5. Start new video pipeline
+- For no-signal mode, DPMS cycle is done in `start_no_signal_mode()` directly
 
 **Key heuristics for detecting working vs broken state:**
 | Heuristic | Working | Broken (needs DPMS) |
@@ -1522,6 +1528,18 @@ ps -p 179247
 | Video output | Visible | TV shows "No Signal" |
 
 Note: All sysfs values look identical in both states - the only difference is whether video is actually being transmitted. The DPMS cycle is applied preemptively on every TV reconnection.
+
+### ALSA Zombie Detection False Positives (Fixed - Apr 2026)
+
+**Symptom:** Audio cuts out every ~15 seconds with logs showing "Audio zombie state detected - GStreamer playing but ALSA owner dead" followed by constant pipeline restarts.
+
+**Root Cause:** The ALSA `owner_pid` in `/proc/asound/cardX/pcm0p/sub0/status` is actually a **thread ID (TID)**, not a process ID (PID). The zombie detection code was checking `/proc/{owner_pid}` which doesn't exist for threads - threads are listed under `/proc/{main_pid}/task/{tid}` instead.
+
+**Solution:** Updated `_check_alsa_zombie_state()` in `src/health.py` to check both locations:
+1. First check `/proc/{owner_pid}` (works if it's a PID)
+2. If not found, check `/proc/{main_pid}/task/{owner_pid}` (works if it's a TID)
+
+This prevents false zombie detection when the audio thread is actually alive and healthy.
 
 ### Minus Overlay Text Triggering False Positive Ad Detection (Fixed - Apr 2026)
 
