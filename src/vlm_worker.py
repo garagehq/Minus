@@ -116,7 +116,7 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
                     break
 
                 # detect_ad: (image_path, 'detect_ad')
-                # query:     (image_path, prompt, 'query')
+                # query:     (image_path, prompt, max_new_tokens, 'query')
                 request_type = request[-1]
 
                 if request_type == 'detect_ad':
@@ -125,8 +125,8 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
                     response_queue.put(('ok', result))
                     last_inference_time = time.time()
                 elif request_type == 'query':
-                    image_path, prompt, _ = request
-                    result = vlm.query_image(image_path, prompt)
+                    image_path, prompt, mnt, _ = request
+                    result = vlm.query_image(image_path, prompt, max_new_tokens=mnt)
                     response_queue.put(('ok', result))
                     last_inference_time = time.time()
                 else:
@@ -462,18 +462,22 @@ class VLMProcess:
                 )
                 return False, "TIMEOUT", elapsed, 0.0
 
-    def query_image(self, image_path, prompt):
+    def query_image(self, image_path, prompt, max_new_tokens=8):
         """
         Run a custom prompt against an image (e.g. autonomous mode screen classification).
+
+        max_new_tokens defaults to 8 (fits the autonomous-mode multi-choice
+        prompt). Raise explicitly for open-ended questions, knowing the
+        end-to-end latency rises ~0.23s per allowed token.
 
         Returns: (response_text, elapsed)
         On soft timeout: ("TIMEOUT", elapsed)
         On hard timeout/error: ("KILLED", elapsed)
         """
         with self._call_lock:
-            return self._query_image_locked(image_path, prompt)
+            return self._query_image_locked(image_path, prompt, max_new_tokens)
 
-    def _query_image_locked(self, image_path, prompt):
+    def _query_image_locked(self, image_path, prompt, max_new_tokens):
         import logging
         logger = logging.getLogger('Minus.VLM')
 
@@ -497,7 +501,7 @@ class VLMProcess:
                     return "KILLED", 0.0
 
         start_time = time.time()
-        self.request_queue.put((image_path, prompt, 'query'))
+        self.request_queue.put((image_path, prompt, max_new_tokens, 'query'))
 
         try:
             status, result = self.response_queue.get(timeout=self.SOFT_TIMEOUT)

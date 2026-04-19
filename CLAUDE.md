@@ -18,6 +18,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/DEBUG_GLITCHES.md](docs/DEBUG_GLITCHES.md) | Video glitch debugging notes |
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
+| [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
 
 ## Visual Design
 
@@ -496,10 +497,12 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 - Worker process loads model once (~27s), processes requests via Queue
 
 **Two inference modes:**
-- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification
-- `query_image(image_path, prompt)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification)
+- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification. Internally hard-caps the model at `max_new_tokens=5`.
+- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification). The `max_new_tokens` default of 8 fits the autonomous-mode multi-choice prompt (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`); raise it explicitly for open-ended prompts knowing latency rises ~0.23 s per allowed token.
 
 Both modes share the same model. Concurrent callers (detection loop calling `detect_ad`, autonomous mode calling `query_image`) are serialized by `VLMProcess._call_lock` so they cannot cross responses on the shared queue or race on the timeout / latency state. See *VLMProcess Cross-Thread Race* under Known Issues for the full rationale.
+
+The `max_new_tokens` cap is the load-bearing reason VLM never enters a sustained "restart cycle" anymore. Without it, certain images (visually busy / ambiguous) make the model emit a 30–60 token descriptive paragraph instead of `"Yes."` / `"No."`, taking 10–15 s and tripping every downstream timeout. See `docs/VLM_NPU_DEGRADATION.md` for the investigation that ruled out NPU/firmware/driver causes and isolated the fix.
 
 ```
 /home/radxa/axera_models/FastVLM-1.5B/
@@ -1604,18 +1607,25 @@ This prevents false zombie detection when the audio thread is actually alive and
 
 **Solution:** Removed `'ad in'` from exact keywords. The specific patterns for `"Ad N of M"`, `"Ad N"` countdown, and `"ad with timestamp"` (in both `ocr.py` and `ocr_worker.py`) already cover legitimate ad timestamps.
 
-### VLM Degraded State Auto-Recovery (Added - Apr 2026)
+### VLM Degraded State Auto-Recovery (Added - Apr 2026, ROOT CAUSE CORRECTED)
 
 **Symptom:** After several hours of runtime, VLM inference degrades from ~0.7s to ~15–18s per query and returns descriptive responses to short-answer prompts. Each DISCARDED (>2s) entry makes the system effectively OCR-only. Not thermal — temperatures stayed around 70°C both when healthy and when slow.
 
-**Solution:** Added rolling latency window + auto-recovery in `src/vlm_worker.py`:
+**Original solution (kept as defense-in-depth):** Rolling latency window + auto-recovery in `src/vlm_worker.py`:
 - `_record_latency()` / `_maybe_auto_recover()` called after each successful inference.
 - If P95 over the last 10 queries exceeds 3.0s, trigger a worker restart.
-- If a prior recovery happened within the last 3 minutes and we're degraded again, escalate to a **deep restart** with 8s NPU-release backoff (the simple 2s backoff did not always clear the bad state).
+- If a prior recovery happened within the last 3 minutes and we're degraded again, escalate to a **deep restart** with 8s NPU-release backoff.
 - 60s cooldown prevents thrash.
 - `get_latency_stats()` exposes samples/P50/P95/max via `/api/health` under `subsystems.vlm.latency`.
 
-Axera telemetry (`axcl-smi info --temp / --npu / --cmm`) is also wired into `/api/health` at `subsystems.vlm.axera` and exposed as Prometheus gauges `minus_axera_*` for alerting on temperature or memory pressure.
+Axera telemetry (`axcl-smi info --temp / --npu / --cmm`) is wired into `/api/health` at `subsystems.vlm.axera` and exposed as Prometheus gauges `minus_axera_*` for alerting on temperature or memory pressure.
+
+**⚠️ Correction (Apr 2026):** The "NPU drift to degraded state" framing turned out to be wrong. Controlled experiments (`docs/VLM_NPU_DEGRADATION.md`) confirmed:
+- Latency is **deterministically image-dependent**, not a state that drifts in over time.
+- Per-token decode rate is constant (~0.23 s/tok); the slow inferences are slow because the model generates 30–60 tokens of descriptive response instead of 1–3 tokens of `Yes.`/`No.`.
+- The NPU, axcl driver, and Axera firmware are all healthy throughout. `axcl-smi reboot` and `rmmod` + `modprobe` of the host modules do **not** change behavior on the same image.
+
+**Real fix:** Cap `max_new_tokens` at the model layer (5 for `detect_ad`, 8 for `query_image`). With the cap, worst-case latency drops from ~12 s to ~1.3 s and the entire restart-cycle pathology goes away. The auto-recovery logic above stays in as defense-in-depth for any genuine NPU pathology, but in normal operation it should never fire.
 
 ### VLMProcess Cross-Thread Race (Fixed - Apr 2026)
 

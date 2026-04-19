@@ -220,13 +220,18 @@ class VLMManager:
         vit_output = self.vision_session.run(None, {"images": input_image})[0]
         return vit_output
 
-    def query_image(self, image_path, prompt):
+    def query_image(self, image_path, prompt, max_new_tokens=8):
         """
         Run a custom prompt on an image.
 
         Args:
             image_path: Path to image file (JPEG/PNG)
             prompt: Custom question to ask about the image
+            max_new_tokens: Cap on generated tokens. Default 8 fits the
+                autonomous-mode multi-choice prompt (PLAYING / PAUSED /
+                DIALOG / MENU / SCREENSAVER, each ~1-3 tokens). Raise
+                explicitly for open-ended prompts; see
+                docs/VLM_NPU_DEGRADATION.md for why a cap matters.
 
         Returns:
             tuple: (response_text, elapsed_time)
@@ -270,7 +275,8 @@ class VLMManager:
                 )
                 response = self.imer.decode(
                     self.tokenizer, token_ids, self.embeds,
-                    slice_len=slice_len, eos_token_id=eos_token_id, stream=False
+                    slice_len=slice_len, eos_token_id=eos_token_id, stream=False,
+                    max_new_tokens=max_new_tokens,
                 )
 
                 elapsed = time.time() - start_time
@@ -352,18 +358,31 @@ class VLMManager:
                     self.embeds,
                     slice_len=slice_len,
                     eos_token_id=eos_token_id,
-                    stream=False
+                    stream=False,
+                    # Cap generation. detect_ad only needs the first word
+                    # ("Yes" / "No") plus a token of slack for parsing.
+                    # Without this, certain images make the model emit a
+                    # 30-60-token descriptive paragraph (~10s at ~0.23s/tok)
+                    # instead of the requested short answer. See
+                    # docs/VLM_NPU_DEGRADATION.md for the investigation.
+                    max_new_tokens=5,
                 )
 
                 elapsed = time.time() - start_time
 
-                # Timeout-based rejection: if response took too long, model is uncertain
-                # Return False with low confidence to avoid blocking (conservative)
-                if elapsed > self.RESPONSE_TIMEOUT:
-                    logger.debug(f"VLM response timeout ({elapsed:.2f}s > {self.RESPONSE_TIMEOUT}s), treating as uncertain")
-                    return False, response, elapsed, 0.2
-
+                # Always parse the response — even if it ran long. With
+                # max_new_tokens=5 the worst case is ~1.34s, so a slow
+                # answer still tells us what the model decided. We just
+                # halve the parsed confidence as a soft penalty for
+                # the model going descriptive instead of giving the
+                # one-word answer the prompt asked for.
                 is_ad, confidence = self._is_ad_response(response)
+                if elapsed > self.RESPONSE_TIMEOUT:
+                    logger.debug(
+                        f"VLM response slow ({elapsed:.2f}s > {self.RESPONSE_TIMEOUT}s), "
+                        f"keeping verdict but halving confidence"
+                    )
+                    confidence = confidence * 0.5
 
                 return is_ad, response, elapsed, confidence
 
