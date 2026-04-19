@@ -639,7 +639,7 @@ class SystemNotification(NotificationOverlay):
 
     def show_vlm_ready(self):
         """Show VLM ready notification (auto-hides)."""
-        text = "[ VLM READY ]\n\nAD DETECTION ACTIVE"
+        text = "[ VLM READY ]\n\nDETECTION ACTIVE"
         self.show(text, duration=5.0)
 
     def show_vlm_failed(self):
