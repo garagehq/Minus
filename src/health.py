@@ -615,21 +615,32 @@ class HealthMonitor:
                     return True  # Assume healthy during stabilization
 
                 # GStreamer thinks it's playing - verify ALSA device owner is alive
+                # BUT only trigger restart if audio buffers are ALSO stale
+                # (ALSA owner_pid can be stale even when audio is working fine)
                 zombie_detected = self._check_alsa_zombie_state()
                 if zombie_detected:
-                    logger.warning("[HealthMonitor] Audio zombie state detected - GStreamer playing but ALSA owner dead")
-                    # Trigger a FULL audio restart (not just queue flush)
-                    # Use threading to avoid blocking the health monitor
-                    import threading
-                    def restart_audio():
-                        try:
-                            # Use _restart_pipeline directly for full restart
-                            self.minus.audio._restart_pipeline()
-                        except Exception as e:
-                            logger.error(f"[HealthMonitor] Failed to restart zombie audio: {e}")
-                    threading.Thread(target=restart_audio, daemon=True, name="ZombieAudioRestart").start()
-                    logger.info("[HealthMonitor] Triggered full audio pipeline restart for zombie recovery")
-                    return False  # Report unhealthy
+                    # Check if audio buffers are actually flowing
+                    last_buffer = getattr(self.minus.audio, '_last_buffer_time', 0)
+                    buffer_age = time.time() - last_buffer if last_buffer > 0 else -1
+
+                    # Only restart if buffers are stale (> 5 seconds old)
+                    # If buffers are flowing, ALSA owner_pid is just stale metadata
+                    if buffer_age < 0 or buffer_age > 5.0:
+                        logger.warning(f"[HealthMonitor] Audio zombie: ALSA owner dead AND buffer stale ({buffer_age:.1f}s)")
+                        # Trigger a FULL audio restart (not just queue flush)
+                        # Use threading to avoid blocking the health monitor
+                        import threading
+                        def restart_audio():
+                            try:
+                                # Use _restart_pipeline directly for full restart
+                                self.minus.audio._restart_pipeline()
+                            except Exception as e:
+                                logger.error(f"[HealthMonitor] Failed to restart zombie audio: {e}")
+                        threading.Thread(target=restart_audio, daemon=True, name="ZombieAudioRestart").start()
+                        logger.info("[HealthMonitor] Triggered full audio pipeline restart for zombie recovery")
+                        return False  # Report unhealthy
+                    else:
+                        logger.debug(f"[HealthMonitor] ALSA owner stale but audio flowing ({buffer_age:.1f}s), ignoring")
 
             return gst_playing
 
