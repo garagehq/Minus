@@ -1972,6 +1972,24 @@ class Minus:
         if not self.start_ustreamer():
             return False
 
+        # Wait for ustreamer to actually be capturing frames (not just responding)
+        # This minimizes the black screen gap when transitioning from loading to live
+        port = self.config.ustreamer_port
+        for attempt in range(20):  # Up to 6 seconds (20 * 0.3s)
+            try:
+                import urllib.request
+                import json
+                resp = urllib.request.urlopen(f'http://localhost:{port}/state', timeout=1)
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode())
+                    captured_fps = data.get('result', {}).get('source', {}).get('captured_fps', 0)
+                    if captured_fps > 0:
+                        logger.info(f"ustreamer capturing {captured_fps} fps after {attempt + 1} checks")
+                        break
+            except Exception:
+                pass
+            time.sleep(0.3)
+
         # Then start display pipeline (may fail if HDMI-TX disconnected)
         return self.start_display_pipeline()
 
@@ -2630,6 +2648,16 @@ class Minus:
                 logger.warning(f"Failed to start Web UI: {e}")
                 self.webui = None
 
+        # Check HDMI signal IMMEDIATELY - we want to show display ASAP (within 3-5s)
+        # This is done BEFORE WiFi manager (which takes ~5s) to minimize startup delay
+        signal_info = self.check_hdmi_signal()
+
+        # If HDMI signal present, show loading display IMMEDIATELY
+        # The loading mode uses videotestsrc (no ustreamer needed) so it starts instantly
+        if signal_info and self.ad_blocker:
+            logger.info("HDMI signal detected - showing loading display while initializing...")
+            self.ad_blocker.start_loading_mode()
+
         # Start WiFi manager and monitor thread
         # If no WiFi, it will auto-start AP mode after 30 seconds
         if HAS_WIFI_MANAGER:
@@ -2683,14 +2711,26 @@ class Minus:
             self.health_monitor.start()
             logger.info("Health monitor started")
 
-        # Preload VLM at startup if enabled (so it's ready when HDMI arrives)
-        vlm_preloaded = False
-        if self.vlm_preload and self.vlm:
-            logger.info("Preloading VLM model at startup (vlm_preload=True)...")
-            vlm_preloaded = self._load_vlm_model()
+        # Note: HDMI check and start_loading_mode() already done above (before WiFi manager)
+        # signal_info variable is already set from that earlier check
 
-        # Check signal
-        signal_info = self.check_hdmi_signal()
+        # Start VLM preload in a background thread (non-blocking)
+        # This runs while the loading display is showing and main startup continues
+        vlm_preloaded = False
+        vlm_preload_thread = None
+        if self.vlm_preload and self.vlm:
+            def _preload_vlm():
+                nonlocal vlm_preloaded
+                logger.info("Preloading VLM model in background thread...")
+                vlm_preloaded = self._load_vlm_model()
+                if vlm_preloaded:
+                    logger.info("VLM preload complete - model ready")
+
+            vlm_preload_thread = threading.Thread(target=_preload_vlm, daemon=True)
+            vlm_preload_thread.start()
+            logger.info("VLM preload started in background")
+
+        # If no HDMI signal, handle the no-signal case
         if not signal_info:
             logger.warning("No HDMI signal detected - starting in no-signal mode")
             # Start display in no-signal mode to show "NO HDMI INPUT"
@@ -2783,15 +2823,21 @@ class Minus:
         self._start_device_setup_delayed(delay_seconds=5.0)
 
         # Load VLM model and start worker thread
-        # If vlm_preload=True, model was already loaded above. Otherwise load now.
+        # If vlm_preload=True, wait for background preload to finish. Otherwise load now.
         if self.vlm:
-            if not vlm_preloaded:
+            if vlm_preload_thread and vlm_preload_thread.is_alive():
+                # Wait for background preload to complete (should be nearly done by now)
+                logger.info("Waiting for VLM preload to complete...")
+                vlm_preload_thread.join(timeout=60)  # Max 60s wait
+                if vlm_preload_thread.is_alive():
+                    logger.warning("VLM preload still running after 60s, continuing anyway")
+            elif not vlm_preloaded and not self.vlm_preload:
                 # Load VLM now (vlm_preload=False means wait for HDMI)
                 logger.info("Loading VLM model after HDMI detected (vlm_preload=False)...")
                 vlm_preloaded = self._load_vlm_model()
 
-            # Start VLM worker thread if model is loaded
-            if vlm_preloaded and self.vlm:
+            # Start VLM worker thread if model is loaded (check vlm.is_ready)
+            if self.vlm.is_ready:
                 self.vlm_thread = threading.Thread(target=self.vlm_worker, daemon=True)
                 self.vlm_thread.start()
                 logger.info("VLM worker started (process-based with hard 2s timeout)")
