@@ -180,6 +180,13 @@ class VLMProcess:
         from collections import deque
         self._recent_latencies = deque(maxlen=self.LATENCY_WINDOW)
         self._last_auto_recovery_time = 0.0
+        # Serializes detect_ad and query_image calls from different threads
+        # (detection loop vs. autonomous mode). Upstream's tuple-shape guards
+        # already tolerate stale cross-pollinated responses, but the lock
+        # also protects shared mutable state (_consecutive_timeouts,
+        # _pending_response, _recent_latencies) from concurrent mutation.
+        import threading
+        self._call_lock = threading.Lock()
 
     def start(self):
         """Start the VLM worker process."""
@@ -355,6 +362,10 @@ class VLMProcess:
         If soft timeout: returns (False, "TIMEOUT", timeout, 0.0)
         If hard timeout: returns (False, "KILLED", timeout, 0.0)
         """
+        with self._call_lock:
+            return self._detect_ad_locked(image_path)
+
+    def _detect_ad_locked(self, image_path):
         import logging
         logger = logging.getLogger('Minus.VLM')
 
@@ -459,6 +470,10 @@ class VLMProcess:
         On soft timeout: ("TIMEOUT", elapsed)
         On hard timeout/error: ("KILLED", elapsed)
         """
+        with self._call_lock:
+            return self._query_image_locked(image_path, prompt)
+
+    def _query_image_locked(self, image_path, prompt):
         import logging
         logger = logging.getLogger('Minus.VLM')
 
