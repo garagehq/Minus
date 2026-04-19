@@ -324,6 +324,8 @@ class OCRProcess:
             'skip recap', 'skip intro', 'skip credits', 'skip opening',
             'add to', 'add it', 'already added', 'address', 'add new',
             'additionally', 'adaptive', 'advanced', 'advantage',
+            # Minus overlay messages (Fire TV notifications)
+            'ad skipping enabled', 'ad skipping', 'adskipping',
         ]
         TERMINAL_PATTERNS = [
             r'^\$\s*',

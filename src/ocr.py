@@ -191,6 +191,8 @@ class PaddleOCR:
         'skip recap', 'skiprecap',  # Netflix "Skip Recap" button
         'skip intro', 'skipintro',  # Streaming "Skip Intro" button
         'saltar intro', 'saltarintro',  # Spanish "Skip Intro"
+        # Minus overlay messages (Fire TV notifications)
+        'ad skipping enabled', 'ad skipping', 'adskipping',
     ]
 
     def __init__(self, det_model_path, rec_model_path, dict_path,
