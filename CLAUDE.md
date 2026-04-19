@@ -499,7 +499,7 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 - `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification
 - `query_image(image_path, prompt)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification)
 
-Both modes share the same model and are serialized via the worker process queue.
+Both modes share the same model. Concurrent callers (detection loop calling `detect_ad`, autonomous mode calling `query_image`) are serialized by `VLMProcess._call_lock` so they cannot cross responses on the shared queue or race on the timeout / latency state. See *VLMProcess Cross-Thread Race* under Known Issues for the full rationale.
 
 ```
 /home/radxa/axera_models/FastVLM-1.5B/
@@ -1616,3 +1616,24 @@ This prevents false zombie detection when the audio thread is actually alive and
 - `get_latency_stats()` exposes samples/P50/P95/max via `/api/health` under `subsystems.vlm.latency`.
 
 Axera telemetry (`axcl-smi info --temp / --npu / --cmm`) is also wired into `/api/health` at `subsystems.vlm.axera` and exposed as Prometheus gauges `minus_axera_*` for alerting on temperature or memory pressure.
+
+### VLMProcess Cross-Thread Race (Fixed - Apr 2026)
+
+**Symptom:** Intermittent `too many values to unpack (expected 2)` from `[AutonomousMode] VLM screen query failed`, plus a sustained worker restart cycle (~15–40 hard kills per 15 min) that the soft/hard timeout logic could not damp on its own.
+
+**Root Cause:** `VLMProcess.detect_ad` (called from the detection-loop thread) and `VLMProcess.query_image` (called from the autonomous-mode thread) shared the same request/response `multiprocessing.Queue` with no request-to-response correlation and no lock around the queue or the shared state (`_consecutive_timeouts`, `_pending_response`, `_recent_latencies`). When both threads called concurrently:
+
+1. A `detect_ad` 4-tuple response could be `get()`-ed by the `query_image` caller (which expected a 2-tuple) — and vice versa — producing the unpack error.
+2. Concurrent mutation of `_consecutive_timeouts` and `_pending_response` produced spurious threshold trips, triggering hard kills the system did not actually need. Each hard kill cost ~25s of model reload, during which more queued requests timed out, perpetuating the cycle.
+
+**Solution:**
+- Added `self._call_lock = threading.Lock()` to `VLMProcess.__init__`.
+- Refactored `detect_ad` and `query_image` into thin wrappers that acquire the lock, then delegate to `_detect_ad_locked` / `_query_image_locked` with the original logic.
+- This serializes the two callers across the entire request → response cycle, so cross-pollinated responses cannot happen and the shared timeout state stays consistent.
+
+Upstream's tuple-shape defensive guards (introduced in commit `7c42e80`) are kept as belt-and-suspenders — they tolerate a stale leaked response if one ever does slip through. The lock prevents the leak; the guards handle it if prevention fails.
+
+**Why a lock and not separate queues / request IDs:** simplest correct fix that is local to `VLMProcess`. Detection-loop calls are ~4 Hz and complete in ~0.7s; autonomous-mode calls are once per 2 minutes and complete in ~1.0s. The lock contention is negligible in practice. A dedicated request-ID protocol would be cleaner but invasive to both worker and callers.
+
+**Files modified:**
+- `src/vlm_worker.py` — `_call_lock`, `_detect_ad_locked`, `_query_image_locked`
