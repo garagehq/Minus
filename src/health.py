@@ -242,21 +242,30 @@ class HealthMonitor:
                     self._hdmi_output_reconnect_time = time.time()
                     logger.info("[HealthMonitor] HDMI output reconnected (TV turned on)")
 
-                    # If we're in no-signal mode, restart the pipeline for the new output
+                    # Give HDMI link time to fully establish before restarting
+                    # The TV needs time to complete HDCP handshake and EDID negotiation
+                    logger.info("[HealthMonitor] Waiting 2s for HDMI link to stabilize...")
+                    time.sleep(2.0)
+
+                    # Force HDMI reinit via DPMS cycle - the kernel hotplug doesn't
+                    # always fully reinitialize the HDMI PHY after TV restart
+                    self._force_hdmi_reinit()
+
+                    # Restart the appropriate display mode
                     if self._is_no_signal_mode_active():
-                        # Give HDMI link time to fully establish before restarting
-                        # The TV needs time to complete HDCP handshake and EDID negotiation
-                        logger.warning("[HealthMonitor] Waiting 2s for HDMI link to stabilize...")
-                        time.sleep(2.0)
-
-                        # Force HDMI reinit via DPMS cycle - the kernel hotplug doesn't
-                        # always fully reinitialize the HDMI PHY after TV restart
-                        self._force_hdmi_reinit()
-
-                        logger.warning("[HealthMonitor] Restarting NO SIGNAL display for reconnected output")
+                        logger.info("[HealthMonitor] Restarting NO SIGNAL display for reconnected output")
                         self._last_no_signal_trigger = time.time()
                         if self._on_hdmi_lost:
                             self._on_hdmi_lost()
+                    else:
+                        # We have HDMI input but output reconnected - restart display pipeline
+                        logger.info("[HealthMonitor] Restarting display pipeline for reconnected output")
+                        if self.minus and self.minus.ad_blocker:
+                            try:
+                                self.minus.ad_blocker.restart()
+                                logger.info("[HealthMonitor] Display pipeline restart requested")
+                            except Exception as e:
+                                logger.error(f"[HealthMonitor] Failed to restart display pipeline: {e}")
 
                 elif not output_connected and self._last_hdmi_output_connected:
                     # Output just disconnected (TV turned off)
