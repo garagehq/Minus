@@ -10,6 +10,14 @@ import time
 import multiprocessing as mp
 from multiprocessing import Process, Queue, Event
 
+# Use 'spawn' start method to avoid inherited file descriptors and process state issues
+# This is especially important when the parent process uses multiprocessing internally
+# (like axengine's NPU runtime), as 'fork' can cause "can only join a child process" errors
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
+
 # Set environment before any imports
 os.environ['PYTORCH_MATCHER_LOGLEVEL'] = 'WARNING'
 os.environ['TORCH_LOGS'] = '-all'
@@ -27,6 +35,8 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
     logger = logging.getLogger('VLMWorker')
 
     try:
+        load_start = time.time()
+
         # Import VLM manager
         sys.path.insert(0, '/home/radxa/Minus/src')
         from vlm import VLMManager
@@ -38,19 +48,43 @@ def _vlm_worker_main(request_queue, response_queue, ready_event, shutdown_event)
             logger.error("[VLMWorker] Failed to load model")
             return
 
-        # Warmup inferences to avoid cold-start timeout on first real request
-        logger.info("[VLMWorker] Running warmup inferences...")
+        model_load_time = time.time() - load_start
+        logger.info(f"[VLMWorker] Model loaded in {model_load_time:.1f}s, running warmup...")
+
+        # Extended warmup to ensure NPU is fully ready for real frames
+        # 4 inferences with varying content to warm all code paths
         try:
             import numpy as np
             from PIL import Image
             warmup_path = '/tmp/vlm_warmup.jpg'
-            # First warmup with noise image (more realistic than blank)
-            warmup_img = Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
-            warmup_img.save(warmup_path, quality=80)
-            _ = vlm.detect_ad(warmup_path)
-            # Second warmup to fully stabilize
-            _ = vlm.detect_ad(warmup_path)
-            logger.info("[VLMWorker] Warmup complete (2 inferences)")
+
+            for i in range(4):
+                # Create varied warmup images (noise, gradients, edges)
+                if i == 0:
+                    # Pure noise
+                    warmup_img = Image.fromarray(np.random.randint(0, 255, (512, 512, 3), dtype=np.uint8))
+                elif i == 1:
+                    # Gradient (simulates video content)
+                    arr = np.zeros((512, 512, 3), dtype=np.uint8)
+                    arr[:, :, 0] = np.linspace(0, 255, 512).reshape(1, -1).astype(np.uint8)
+                    arr[:, :, 1] = np.linspace(255, 0, 512).reshape(-1, 1).astype(np.uint8)
+                    warmup_img = Image.fromarray(arr)
+                elif i == 2:
+                    # High contrast edges (simulates text/UI)
+                    arr = np.zeros((512, 512, 3), dtype=np.uint8)
+                    arr[::2, :, :] = 255
+                    warmup_img = Image.fromarray(arr)
+                else:
+                    # Mixed content
+                    warmup_img = Image.fromarray(np.random.randint(50, 200, (512, 512, 3), dtype=np.uint8))
+
+                warmup_img.save(warmup_path, quality=80)
+                start_w = time.time()
+                _ = vlm.detect_ad(warmup_path)
+                logger.debug(f"[VLMWorker] Warmup {i+1}/4: {time.time() - start_w:.2f}s")
+
+            total_time = time.time() - load_start
+            logger.info(f"[VLMWorker] Warmup complete (4 inferences), total startup: {total_time:.1f}s")
         except Exception as e:
             logger.warning(f"[VLMWorker] Warmup failed (non-fatal): {e}")
 
@@ -123,6 +157,8 @@ class VLMProcess:
         self.shutdown_event = None
         self.is_ready = False
         self._restart_count = 0
+        self._last_restart_time = 0
+        self._consecutive_timeouts = 0
 
     def start(self):
         """Start the VLM worker process."""
@@ -146,11 +182,20 @@ class VLMProcess:
         )
         self.process.start()
 
-        # Wait for model to load (up to 30s)
-        if self.ready_event.wait(timeout=30.0):
+        import logging
+        logger = logging.getLogger('Minus.VLM')
+        start_time = time.time()
+        logger.info(f"[VLMProcess] Waiting for model to load (PID {self.process.pid})...")
+
+        # Wait for model to load (up to 60s - model + warmup can take 40s under load)
+        if self.ready_event.wait(timeout=60.0):
+            elapsed = time.time() - start_time
+            logger.info(f"[VLMProcess] Worker ready after {elapsed:.1f}s")
             self.is_ready = True
             return True
         else:
+            elapsed = time.time() - start_time
+            logger.error(f"[VLMProcess] Worker failed to become ready after {elapsed:.1f}s - killing")
             self.kill()
             return False
 
@@ -158,17 +203,44 @@ class VLMProcess:
         """Kill the VLM worker process."""
         if self.process is not None:
             self.shutdown_event.set()
+            # Try graceful shutdown first
             self.process.terminate()
-            self.process.join(timeout=2.0)
+            self.process.join(timeout=3.0)
             if self.process.is_alive():
+                # Force kill if still running
                 self.process.kill()
+                self.process.join(timeout=1.0)
             self.process = None
         self.is_ready = False
 
     def restart(self):
-        """Kill and restart the VLM worker."""
+        """Kill and restart the VLM worker.
+
+        Includes delay to allow NPU resources to be released properly.
+        The Axera NPU can get into a bad state if we restart too quickly
+        after killing a process that was using NPU resources.
+
+        Uses exponential backoff if restarting frequently (prevents restart loops).
+        """
+        import logging
+        logger = logging.getLogger('Minus.VLM')
+
         self._restart_count += 1
+        self._consecutive_timeouts += 1
+        now = time.time()
+
+        # Calculate backoff based on consecutive timeouts
+        # 1st timeout: 2s, 2nd: 4s, 3rd+: 8s max
+        if self._consecutive_timeouts >= 3:
+            backoff = 8.0
+            logger.warning(f"[VLMProcess] Multiple timeouts ({self._consecutive_timeouts}), using {backoff}s backoff")
+        elif self._consecutive_timeouts >= 2:
+            backoff = 4.0
+        else:
+            backoff = 2.0
+
         self.kill()
+
         # Clear any stale responses from killed worker
         if self.response_queue is not None:
             while not self.response_queue.empty():
@@ -176,6 +248,11 @@ class VLMProcess:
                     self.response_queue.get_nowait()
                 except:
                     break
+
+        # Wait for NPU resources to be released with backoff
+        time.sleep(backoff)
+
+        self._last_restart_time = time.time()
         return self.start()
 
     def detect_ad(self, image_path):
@@ -200,6 +277,8 @@ class VLMProcess:
             elapsed = time.time() - start_time
 
             if status == 'ok':
+                # Reset consecutive timeout counter on success
+                self._consecutive_timeouts = 0
                 return result
             else:
                 return False, f"Error: {result}", elapsed, 0.0
@@ -209,7 +288,7 @@ class VLMProcess:
             elapsed = time.time() - start_time
             import logging
             logging.getLogger('Minus.VLM').warning(
-                f"[VLMProcess] HARD KILL after {elapsed:.1f}s - restarting worker"
+                f"[VLMProcess] HARD KILL after {elapsed:.1f}s (timeout #{self._consecutive_timeouts + 1}) - restarting worker"
             )
             self.restart()
             return False, "KILLED", elapsed, 0.0
