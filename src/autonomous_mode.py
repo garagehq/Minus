@@ -11,7 +11,6 @@ Device-agnostic design supports any streaming device with remote control capabil
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import threading
 import time
@@ -756,39 +755,6 @@ class AutonomousMode:
         diff = gray[:, 1:] > gray[:, :-1]
         return int(np.packbits(diff.flatten())[:8].view(np.uint64)[0])
 
-    def _hdmi_audio_present(self) -> Optional[bool]:
-        """Whether the HDMI-RX source is currently transmitting audio.
-
-        Reads the v4l2 `audio_present` control on /dev/video0 (the HDMI-RX
-        capture device). This is independent of our output pipeline, so it
-        works even when HDMI-TX is disconnected and alsasink can't open.
-
-        Returns True if source has audio, False if silent, None if the v4l2
-        call fails (treat as unknown).
-        """
-        now = time.time()
-        cache = getattr(self, '_hdmi_audio_present_cache', None)
-        cache_t = getattr(self, '_hdmi_audio_present_cache_t', 0.0)
-        if cache is not None and now - cache_t < 2.0:
-            return cache
-        try:
-            r = subprocess.run(
-                ['v4l2-ctl', '-d', '/dev/video0', '--get-ctrl', 'audio_present'],
-                capture_output=True, text=True, timeout=1.0,
-            )
-            if r.returncode != 0:
-                self._hdmi_audio_present_cache = None
-                self._hdmi_audio_present_cache_t = now
-                return None
-            present = 'audio_present: 1' in r.stdout
-            self._hdmi_audio_present_cache = present
-            self._hdmi_audio_present_cache_t = now
-            return present
-        except Exception:
-            self._hdmi_audio_present_cache = None
-            self._hdmi_audio_present_cache_t = now
-            return None
-
     def _is_audio_pipeline_available(self) -> bool:
         """Check if the audio pipeline is actually functional.
 
@@ -919,6 +885,12 @@ class AutonomousMode:
         'month ago',
         'day ago',
         'hour ago',
+        # New YouTube TV browse layout (observed Apr 2026): top-of-page nav
+        # row reads "Search" + "Shorts", with category rows like
+        # "Food processing and more". A playing video's info panel does not
+        # show these terms, so they're safe home-screen markers.
+        'shorts',
+        'search',
     ]
 
     # Keywords that strongly indicate a playing AD (not home screen).
@@ -1258,30 +1230,17 @@ class AutonomousMode:
                 logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, video is changing")
                 return False
 
-            # Frames are static - check if audio is still playing.
-            # Prefer the HDMI-RX `audio_present` signal: it tells us whether
-            # the source device is sending audio, independent of whether our
-            # output pipeline can play it (so it works when HDMI-TX is off).
-            hdmi_audio = self._hdmi_audio_present()
-            if hdmi_audio is True:
-                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
-                           f"frames static but HDMI-RX audio present (music stream, not paused)")
-                return False
-            if hdmi_audio is False:
-                # Source is silent and frames are static — truly paused.
-                # Skip the output-pipeline / ALSA-flow checks below; HDMI-RX
-                # is the authoritative signal.
-                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
-                           f"frames static and HDMI-RX silent — treating as PAUSED")
-                return True
-
-            # HDMI-RX read failed (None). Fall back to the original audio-pipeline
-            # logic. If the output pipeline isn't even functional, abstain rather
-            # than risk pausing a live music stream.
+            # Frames are static - check if audio is still playing
+            # If the audio pipeline itself is unavailable (e.g. display disconnected
+            # so alsasink can't open), the "no audio" signal is meaningless and we
+            # must not treat static frames as paused — that would pause a live
+            # music stream with static album art.
+            # NOTE: HDMI-RX `audio_present` was tried as a workaround but proved
+            # unreliable on Roku/YouTube — the source sends a continuous 48kHz
+            # silence stream even when paused, so audio_present is always 1.
             if not self._is_audio_pipeline_available():
                 logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
-                           f"frames static, HDMI-RX audio unknown and output pipeline "
-                           f"unavailable — abstaining (not treating as paused)")
+                           f"frames static but audio pipeline unavailable — not treating as paused")
                 return False
 
             audio_flowing = self._is_audio_flowing()
@@ -1591,12 +1550,17 @@ class AutonomousMode:
                 logger.info("[AutonomousMode] Sent play_pause command (video was paused)")
 
             elif action == "dismiss":
-                # Dialog like "Are you still watching?" - press select to dismiss
-                self._device_controller.send_command("select")
-                time.sleep(1.5)
-                # After dismissing, send play_pause to ensure playback resumes
-                self._device_controller.send_command("play_pause")
-                logger.info("[AutonomousMode] Dismissed dialog and sent play_pause")
+                # Dismiss overlays/banners (e.g. YouTube's persistent
+                # "Sign in to subscribe" banner that overlays the player).
+                # Use BACK rather than select+play_pause: select can confirm
+                # an unwanted button (e.g. the Sign in button itself), and
+                # play_pause toggles the player — which previously paused
+                # any video that happened to be playing under the banner.
+                # If the dialog actually paused the video (e.g. "Are you
+                # still watching?"), the next pause-detection cycle will
+                # send play_pause via the "play" action.
+                self._device_controller.send_command("back")
+                logger.info("[AutonomousMode] Dismissed dialog with back")
 
             elif action == "select":
                 # On home/menu screen - navigate to a video
