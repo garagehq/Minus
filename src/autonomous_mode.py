@@ -103,6 +103,16 @@ class AutonomousMode:
     DEFAULT_START_HOUR = 0   # Midnight
     DEFAULT_END_HOUR = 8     # 8 AM
 
+    # When the audio pipeline is unavailable (display off / alsasink can't
+    # open), we normally abstain from pause detection to avoid false positives
+    # on music streams with static album art. But a genuinely-frozen video
+    # (e.g. a live stream that froze on the source side) will show hamming=0
+    # indefinitely and the user gets stuck. If we see that many consecutive
+    # hamming=0 observations in a row, we escalate to "stuck" regardless of
+    # audio state. At ~22s per _is_screen_static() call, 15 observations =
+    # ~5.5 min of a truly-static screen before we act.
+    PERSISTENT_STATIC_LIMIT = 15
+
     def __init__(self, device_controller=None, ad_blocker=None, vlm=None, frame_capture=None,
                  fire_tv_controller=None):
         """
@@ -151,6 +161,12 @@ class AutonomousMode:
         self._prev_frame_hash: Optional[int] = None
         self._consecutive_static: int = 0
         self._STATIC_PAUSE_THRESHOLD = 2  # Consecutive static checks before forcing play
+
+        # Persistent-static tracking for the audio-pipeline-unavailable case:
+        # if hamming=0 keeps recurring for PERSISTENT_STATIC_LIMIT checks in a
+        # row we escalate from "abstain" to "genuinely stuck". See
+        # _is_screen_static() and PERSISTENT_STATIC_LIMIT.
+        self._persistent_static_count: int = 0
 
         # No-audio timeout for stuck state recovery
         self._no_audio_start_time: Optional[float] = None
@@ -1186,6 +1202,7 @@ class AutonomousMode:
         self._last_screen_state = None
         self._recovery_attempt_count = 0
         self._consecutive_static = 0
+        self._persistent_static_count = 0
 
         return True
 
@@ -1227,6 +1244,8 @@ class AutonomousMode:
             frames_static = hamming < 3  # Only truly frozen screens
 
             if not frames_static:
+                # Video is moving — reset the persistent-static counter.
+                self._persistent_static_count = 0
                 logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, video is changing")
                 return False
 
@@ -1239,19 +1258,39 @@ class AutonomousMode:
             # unreliable on Roku/YouTube — the source sends a continuous 48kHz
             # silence stream even when paused, so audio_present is always 1.
             if not self._is_audio_pipeline_available():
-                logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
-                           f"frames static but audio pipeline unavailable — not treating as paused")
+                self._persistent_static_count += 1
+                if self._persistent_static_count >= self.PERSISTENT_STATIC_LIMIT:
+                    # Frames have been truly frozen for ~5-7 minutes with no
+                    # signal from the output audio pipeline. This is past the
+                    # point where a real music stream would have updated *any*
+                    # pixels (album-art fades, equalizer animations, etc.), so
+                    # we treat it as stuck and let the caller take action.
+                    logger.warning(
+                        f"[AutonomousMode] Frame change check: hamming={hamming}, "
+                        f"persistently static for {self._persistent_static_count} checks "
+                        f"({self._persistent_static_count * 22}s approx) — escalating to STUCK"
+                    )
+                    self._persistent_static_count = 0
+                    return True
+                logger.info(
+                    f"[AutonomousMode] Frame change check: hamming={hamming}, "
+                    f"frames static but audio pipeline unavailable "
+                    f"(persistent-static {self._persistent_static_count}/"
+                    f"{self.PERSISTENT_STATIC_LIMIT}) — not treating as paused"
+                )
                 return False
 
             audio_flowing = self._is_audio_flowing()
 
             if audio_flowing:
                 # Static image but audio playing = music stream (lo-fi, etc.) - NOT paused
+                self._persistent_static_count = 0
                 logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
                            f"frames static but audio flowing (music stream, not paused)")
                 return False
             else:
                 # Static image AND no audio = truly paused
+                self._persistent_static_count = 0
                 logger.info(f"[AutonomousMode] Frame change check: hamming={hamming}, "
                            f"frames static + no audio = PAUSED")
                 return True
