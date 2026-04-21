@@ -828,7 +828,14 @@ class DRMAdBlocker:
                         self.connector_id = drm_info['connector_id']
                         self.plane_id = drm_info.get('plane_id', self.plane_id)
                 else:
-                    logger.warning("[DRMAdBlocker] No connected HDMI output found for no-signal display")
+                    # Early-return: attempting to build the pipeline without a
+                    # connected DRM output is guaranteed to fail in kmssink, and
+                    # each failure leaks ~0-1 FDs from bus signal watch teardown
+                    # race. Health monitor retries this every 3-5s when HDMI-TX
+                    # is disconnected, so the leaks compound. Bail before
+                    # allocating any GStreamer objects.
+                    logger.warning("[DRMAdBlocker] No connected HDMI output found for no-signal display — skipping pipeline creation")
+                    return False
 
             # Create a standalone pipeline for no-signal display with positioned text
             # Uses valignment=position and halignment=position to enable xpos/ypos control
