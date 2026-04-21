@@ -712,18 +712,18 @@ class TestStateManagement(unittest.TestCase):
         self.assertFalse(result["enabled"])
 
     def test_disable_stops_active_session(self):
-        """disable() calls _deactivate() if _active is True.
+        """disable() deactivates the session when _active is True.
 
-        Note: disable() and _deactivate() both acquire self._lock which is a
-        non-reentrant threading.Lock. To avoid the deadlock in tests we mock
-        _deactivate and verify it was called.
+        Since the API-deadlock fix, `disable()` calls `_deactivate_unlocked()`
+        directly (it already holds `self._lock`), not the public `_deactivate()`
+        wrapper. We mock the unlocked variant and assert it runs.
         """
         with patch("autonomous_mode.SETTINGS_FILE", Path(self.mode._test_settings_path)):
             with patch.object(self.mode, "_start_thread"):
                 self.mode.enable()
             self.mode._active = True
             self.mode.stats.session_start = datetime.now(ET)
-            with patch.object(self.mode, "_deactivate") as mock_deact, \
+            with patch.object(self.mode, "_deactivate_unlocked", return_value=True) as mock_deact, \
                  patch.object(self.mode, "_stop_thread"):
                 self.mode.disable()
             mock_deact.assert_called_once()
