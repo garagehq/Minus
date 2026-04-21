@@ -408,6 +408,7 @@ class AutonomousMode:
 
     def disable(self) -> dict:
         """Disable autonomous mode."""
+        did_deactivate = False
         with self._lock:
             if not self._enabled:
                 return self.get_status()
@@ -420,12 +421,16 @@ class AutonomousMode:
 
             # Stop if running (use unlocked version since we hold the lock)
             if self._active:
-                self._deactivate_unlocked()
+                did_deactivate = self._deactivate_unlocked()
 
             self._stop_thread()
 
             logger.info("[AutonomousMode] Disabled")
             self._log_event("Autonomous mode DISABLED")
+
+        # Notify status change OUTSIDE lock (mirrors _activate; get_status may be slow)
+        if did_deactivate and self._on_status_change:
+            self._on_status_change(self.get_status())
 
         # Return status OUTSIDE lock (get_status may be slow due to device checks)
         return self.get_status()
@@ -567,12 +572,21 @@ class AutonomousMode:
     def _deactivate(self):
         """Deactivate autonomous mode session (acquires lock)."""
         with self._lock:
-            self._deactivate_unlocked()
+            did_deactivate = self._deactivate_unlocked()
+
+        # Notify status change OUTSIDE lock (mirrors _activate; get_status may be slow)
+        if did_deactivate and self._on_status_change:
+            self._on_status_change(self.get_status())
 
     def _deactivate_unlocked(self):
-        """Deactivate autonomous mode session (caller must hold lock)."""
+        """Deactivate autonomous mode session (caller must hold lock).
+
+        Returns True if a session was actually ended, False if it was already inactive.
+        Callers holding the lock must fire the status callback themselves outside the lock;
+        see `_deactivate` for the standalone path.
+        """
         if not self._active:
-            return
+            return False
 
         self._active = False
         self.stats.session_end = datetime.now(ET)
@@ -580,6 +594,7 @@ class AutonomousMode:
         duration = self.stats._get_duration_minutes()
         logger.info(f"[AutonomousMode] Session ENDED after {duration} minutes")
         self._log_event(f"Session ENDED - Duration: {duration}min, Videos: {self.stats.videos_played}, Ads: {self.stats.ads_detected}")
+        return True
 
     def _is_youtube_app(self, app_name: str) -> bool:
         """Check if the app name matches any known YouTube package."""
