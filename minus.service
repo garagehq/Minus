@@ -60,6 +60,11 @@ StandardError=journal
 Nice=-5
 IOSchedulingClass=realtime
 IOSchedulingPriority=0
+# Raise file descriptor limit — default systemd 1024 exhausted in ~34h of runtime
+# (see /api/health `fds` gauge). The service does many subprocess + HTTP/urllib
+# calls per second; occasional cleanup misses accumulate slowly. Investigation
+# of the specific leak is ongoing; this buys months of headroom.
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target

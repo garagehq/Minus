@@ -2011,13 +2011,13 @@ class Minus:
             try:
                 import urllib.request
                 import json
-                resp = urllib.request.urlopen(f'http://localhost:{port}/state', timeout=1)
-                if resp.status == 200:
-                    data = json.loads(resp.read().decode())
-                    captured_fps = data.get('result', {}).get('source', {}).get('captured_fps', 0)
-                    if captured_fps > 0:
-                        logger.info(f"ustreamer capturing {captured_fps} fps after {attempt + 1} checks")
-                        break
+                with urllib.request.urlopen(f'http://localhost:{port}/state', timeout=1) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode())
+                        captured_fps = data.get('result', {}).get('source', {}).get('captured_fps', 0)
+                        if captured_fps > 0:
+                            logger.info(f"ustreamer capturing {captured_fps} fps after {attempt + 1} checks")
+                            break
             except Exception:
                 pass
             time.sleep(0.3)

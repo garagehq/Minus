@@ -117,7 +117,8 @@ def _set_persistent(text: str, params: dict, duration: float, api_base: str):
                             query = urllib.parse.urlencode(params)
                             url = f"{api_base}?{query}"
                             req2 = urllib.request.Request(url)
-                            urllib.request.urlopen(req2, timeout=2.0)
+                            with urllib.request.urlopen(req2, timeout=2.0):
+                                pass
 
                 except Exception as e:
                     logger.debug(f"[OverlayManager] Monitor check error: {e}")

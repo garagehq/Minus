@@ -418,9 +418,15 @@ class WebUI:
                 req = requests.get(url, stream=True, timeout=10)
 
                 def generate():
-                    for chunk in req.iter_content(chunk_size=8192):
-                        if chunk:
-                            yield chunk
+                    try:
+                        for chunk in req.iter_content(chunk_size=8192):
+                            if chunk:
+                                yield chunk
+                    finally:
+                        # Ensure the upstream socket is closed when the client
+                        # disconnects; otherwise we leak sockets on every page
+                        # refresh / stream reconnect.
+                        req.close()
 
                 # Pass through the Content-Type from ustreamer (includes correct boundary)
                 content_type = req.headers.get('Content-Type', 'multipart/x-mixed-replace;boundary=boundarydonotcross')
@@ -1808,6 +1814,25 @@ class WebUI:
                     health['hdmi_resolution'] = hm_status.hdmi_resolution
                     health['uptime_seconds'] = hm_status.uptime_seconds
 
+                # File descriptor usage — we've had FD leaks cause 500 errors
+                # once the soft limit was hit. Surface fd count + limit for
+                # monitoring.
+                try:
+                    import resource
+                    pid = os.getpid()
+                    fd_count = len(os.listdir(f'/proc/{pid}/fd'))
+                    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+                    health['fds'] = {
+                        'open': fd_count,
+                        'soft_limit': soft,
+                        'hard_limit': hard,
+                        'usage_pct': round(100.0 * fd_count / soft, 1) if soft > 0 else 0.0,
+                    }
+                    if soft > 0 and fd_count > soft * 0.8:
+                        issues.append('fd_limit_near_exhaustion')
+                except Exception:
+                    pass
+
                 # Overall status
                 if issues:
                     health['status'] = 'degraded'
@@ -1892,6 +1917,17 @@ class WebUI:
                     time_saved = getattr(self.minus.ad_blocker, '_total_time_saved', 0)
                     if isinstance(time_saved, (int, float)):
                         add_metric('minus_time_saved_seconds', time_saved, 'Total time saved by blocking ads', 'counter')
+
+                # File descriptor usage
+                try:
+                    import resource
+                    pid = os.getpid()
+                    fd_count = len(os.listdir(f'/proc/{pid}/fd'))
+                    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+                    add_metric('minus_open_fds', fd_count, 'Open file descriptors')
+                    add_metric('minus_fd_soft_limit', soft, 'Soft limit on open FDs')
+                except Exception:
+                    pass
 
                 # Axera NPU telemetry
                 axera = get_axera_metrics()
