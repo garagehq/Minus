@@ -26,15 +26,21 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 **When ads are detected:**
 - Full-screen blocking overlay at 60fps
 - Pixelated background from pre-ad content (optional)
-- Live preview window showing blocked content
+- Live preview window showing blocked content — **desaturated** (greyscale chroma) by default so the Spanish overlay is more eye-catching than the ad
 - Spanish vocabulary practice during blocks
 - Debug dashboard with stats
 
 **Overlay Features:**
 - Smooth animations (0.3s start, 0.25s end)
-- Multi-color text rendering via FreeType
+- Multi-color text rendering via FreeType — Spanish word cycles through a 10-color YUV palette (purple / magenta / cyan / lime / amber / pink / mint / sky / coral / teal) each rotation so the overlay doesn't feel static
 - Hardware-accelerated compositing in ustreamer MPP encoder
-- Configurable preview window and debug overlay
+- Configurable preview window, debug overlay, and greyscale-preview flag (all toggleable in the web UI Settings tab)
+
+**Block-duration falloff:**
+Minimum block time starts at 3.0s for the first ad in a sequence and shrinks by 0.5s on each consecutive ad (3.0 → 2.5 → 2.0 → 1.5 → 1.0s). Floor is 1.5s when OCR+VLM both agree, 1.0s when OCR is alone. Counter resets after 30s without a block. The goal: unblock as soon as the ad actually ends instead of holding a fixed 3-4s every time. Can be disabled from Settings → Blocking Optimizations.
+
+**HDMI reconnect grace period:**
+For 90 seconds after the TV reconnects (detected by the health monitor), ad blocking is suppressed so the user can navigate menus without overlays jumping in. Toggleable from Settings → Blocking Optimizations.
 
 ### Audio Passthrough
 

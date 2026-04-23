@@ -37,7 +37,7 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 # Import vocabulary from extracted module
-from vocabulary import SPANISH_VOCABULARY
+from vocabulary import SPANISH_VOCABULARY, VOCABULARY_COMBINED
 from config import MinusConfig
 from drm import (
     get_color_format, set_color_format, is_connector_connected,
@@ -117,6 +117,10 @@ class DRMAdBlocker:
 
         # Preview settings - use actual capture resolution for positioning
         self._preview_enabled = True
+        # When True, the corner preview is desaturated during blocking so the
+        # ad looks less appealing than the Spanish overlay. Toggled via the
+        # web UI (`greyscale_preview` in ~/.minus_system_settings.json).
+        self._preview_grayscale = True
 
         # Pixelated background - disabled to test if it causes remaining glitches
         self._pixelated_background_enabled = False  # DISABLED for glitch testing
@@ -1163,16 +1167,22 @@ class DRMAdBlocker:
             header = "[ BLOCKING // OCR+VLM ]"
         else:
             header = "[ BLOCKING ]"
-        vocab = random.choice(SPANISH_VOCABULARY)
-        spanish, pronunciation, english, example = vocab
+        vocab = random.choice(VOCABULARY_COMBINED)
         self._current_vocab = vocab  # Track current word for API
+        # Entries come in two shapes:
+        #   4-tuple: (spanish, pronunciation, english, example)
+        #   5-tuple: (spanish, pronunciation, english, example1, example2)
+        # Render whichever examples exist, each on its own quoted line.
+        spanish, pronunciation, english = vocab[0], vocab[1], vocab[2]
+        examples = [ex for ex in vocab[3:] if ex]
+        example_block = "\n".join(f'"{ex}"' for ex in examples)
         # Layout matching web UI vocabulary card:
         # - Header (small)
         # - Spanish word (prominent)
         # - (pronunciation) in parentheses
         # - = translation
-        # - "Example sentence" in quotes
-        return f"{header}\n\n{spanish}\n({pronunciation})\n\n= {english}\n\n\"{example}\""
+        # - "Example sentences" in quotes, newline-separated
+        return f"{header}\n\n{spanish}\n({pronunciation})\n\n= {english}\n\n{example_block}"
 
     def _get_debug_text(self):
         uptime_str = "N/A"
@@ -1207,8 +1217,42 @@ class DRMAdBlocker:
             debug_text += f"\n> {self._skip_text}"
         return debug_text
 
+    # Palette of Spanish-word colors in YUV (Y=luma, U=blue chroma, V=red
+    # chroma). Picked to stay legible on the dark blocking background and to
+    # read as distinct hues after the ustreamer MPP encoder maps back to
+    # RGB-ish display. Each entry is (name, y, u, v).
+    WORD_COLOR_PALETTE = (
+        ("purple",    140, 175, 145),   # original accent
+        ("magenta",   150, 160, 180),
+        ("cyan",      180, 170, 100),
+        ("lime",      200, 100, 120),
+        ("amber",     200, 100, 160),
+        ("pink",      190, 150, 175),
+        ("mint",      210, 120, 115),
+        ("sky",       175, 180, 115),
+        ("coral",     185, 110, 175),
+        ("teal",      165, 155, 110),
+    )
+
+    def _randomize_word_color(self):
+        """Pick a new Spanish-word color and push it to ustreamer.
+
+        Runs before each vocab rotation so the word cycles through the
+        palette rather than sitting on a single hue. Failures are harmless —
+        the previous color sticks.
+        """
+        try:
+            _name, y, u, v = random.choice(self.WORD_COLOR_PALETTE)
+            self._blocking_api_call(
+                '/blocking/set',
+                {'word_y': str(y), 'word_u': str(u), 'word_v': str(v)},
+            )
+        except Exception as e:
+            logger.debug(f"[DRMAdBlocker] word color randomize skipped: {e}")
+
     def _rotation_loop(self, source):
         while not self._stop_rotation.is_set():
+            self._randomize_word_color()
             text = self._get_blocking_text(source)
             self._blocking_api_call('/blocking/set', {'text_vocab': text})
             self._stop_rotation.wait(random.uniform(11.0, 15.0))
@@ -1428,6 +1472,16 @@ class DRMAdBlocker:
         if self.is_visible:
             self._blocking_api_call('/blocking/set', {'preview_enabled': 'true' if enabled else 'false'})
 
+    def is_preview_grayscale(self):
+        return self._preview_grayscale
+
+    def set_preview_grayscale(self, enabled):
+        """Enable/disable greyscale on the ad preview window (live updates)."""
+        self._preview_grayscale = enabled
+        logger.info(f"[DRMAdBlocker] Preview greyscale {'enabled' if enabled else 'disabled'}")
+        if self.is_visible:
+            self._blocking_api_call('/blocking/set', {'preview_grayscale': 'true' if enabled else 'false'})
+
     def is_debug_overlay_enabled(self):
         return self._debug_overlay_enabled
 
@@ -1529,6 +1583,7 @@ class DRMAdBlocker:
                 'preview_x': '0', 'preview_y': '0',
                 'preview_w': str(self._frame_width), 'preview_h': str(self._frame_height),
                 'preview_enabled': 'true' if self._preview_enabled else 'false',
+                'preview_grayscale': 'true' if self._preview_grayscale else 'false',
                 'text_vocab': '', 'text_stats': '',
                 'text_vocab_scale': str(vocab_scale),
                 'text_stats_scale': str(stats_scale),

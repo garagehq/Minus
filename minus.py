@@ -382,7 +382,18 @@ class Minus:
         # Weighted detection parameters
         self.OCR_TRUST_WINDOW = 5.0
         self.VLM_ALONE_THRESHOLD = self.config.vlm_alone_threshold
-        self.MIN_BLOCKING_DURATION = 4.0
+        # MIN_BLOCKING_DURATION has a falloff. Each consecutive ad (second ad
+        # that starts shortly after the previous one ended) shortens the
+        # minimum block duration: 3.0 -> 2.5 -> 2.0 -> 1.5 -> 1.0 s.
+        # Floor is 1.0s for OCR-only, 1.5s when OCR+VLM both agree (the extra
+        # stagger lets VLM's slower cycle catch up before we unblock). Counter
+        # resets after MIN_DURATION_RESET_GAP seconds without any block.
+        self.MIN_BLOCKING_DURATION_BASE = 3.0
+        self.MIN_BLOCKING_DURATION_STEP = 0.5
+        self.MIN_BLOCKING_DURATION_FLOOR_OCR = 1.0
+        self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
+        self.MIN_DURATION_RESET_GAP = 30.0  # seconds
+        self.consecutive_ad_count = 0  # 0 = first ad, 1 = second, ...
         self.OCR_STOP_THRESHOLD = 4  # Increased from 3 for more robust ad end detection
         self.VLM_STOP_THRESHOLD = 2
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
@@ -421,6 +432,14 @@ class Minus:
         self.webui = None
         self.start_time = time.time()
         self.blocking_paused_until = 0  # Timestamp when pause expires
+        # HDMI reconnect grace period: when the TV reconnects, blocking is
+        # suppressed for HDMI_RECONNECT_GRACE_SECONDS so the user can grab the
+        # remote and navigate without an overlay jumping in. The health monitor
+        # sets hdmi_reconnect_time on reconnect; we compare against it each
+        # cycle instead of persisting a "paused_until" to keep the two
+        # suppression mechanisms independent.
+        self.HDMI_RECONNECT_GRACE_SECONDS = 90.0
+        self.hdmi_reconnect_time = 0.0
         from collections import deque
         self.detection_history = deque(maxlen=50)  # Recent detections for web UI
 
@@ -512,6 +531,9 @@ class Minus:
                     output_width=config.output_width,
                     output_height=config.output_height
                 )
+                # Apply persisted greyscale-preview setting from disk
+                if hasattr(self.ad_blocker, 'set_preview_grayscale'):
+                    self.ad_blocker.set_preview_grayscale(self.greyscale_preview_enabled)
                 logger.info("AdBlocker initialized (instant input-selector switching)")
             except Exception as e:
                 logger.exception(f"AdBlocker init failed: {e}")
@@ -1320,6 +1342,29 @@ class Minus:
         remaining = self.blocking_paused_until - time.time()
         return max(0, int(remaining))
 
+    def notify_hdmi_reconnect(self):
+        """Called by the health monitor when the TV output reconnects."""
+        self.hdmi_reconnect_time = time.time()
+        logger.info(
+            f"[Minus] HDMI reconnect recorded; ad blocking suppressed for "
+            f"{self.HDMI_RECONNECT_GRACE_SECONDS:.0f}s"
+        )
+
+    def is_in_hdmi_reconnect_grace(self) -> bool:
+        """True if we're within the post-reconnect grace window."""
+        if not self.hdmi_reconnect_grace_enabled:
+            return False
+        if self.hdmi_reconnect_time <= 0:
+            return False
+        return (time.time() - self.hdmi_reconnect_time) < self.HDMI_RECONNECT_GRACE_SECONDS
+
+    def get_hdmi_reconnect_grace_remaining(self) -> int:
+        """Seconds left in the HDMI reconnect grace window (0 if inactive)."""
+        if not self.is_in_hdmi_reconnect_grace():
+            return 0
+        remaining = self.HDMI_RECONNECT_GRACE_SECONDS - (time.time() - self.hdmi_reconnect_time)
+        return max(0, int(remaining))
+
     def add_detection(self, source: str, texts: list, matched_keywords: list = None):
         """Add a detection to history for web UI display."""
         from datetime import datetime
@@ -1379,6 +1424,8 @@ class Minus:
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
+            'hdmi_reconnect_grace': self.is_in_hdmi_reconnect_grace(),
+            'hdmi_reconnect_grace_remaining': self.get_hdmi_reconnect_grace_remaining(),
             'static_suppressed': self.static_blocking_suppressed,
 
             # Detection counts
@@ -1551,6 +1598,28 @@ class Minus:
             logger.debug(f"Transition detection error: {e}")
             return False, None
 
+    def _current_min_blocking_duration(self) -> float:
+        """Compute the dynamic minimum blocking duration for the current ad.
+
+        Consecutive ads shorten the floor so we don't hold the block longer than
+        the ad itself. Index 0 is the first ad of a sequence, index N is the
+        (N+1)th consecutive ad. Floor depends on whether OCR+VLM both agree
+        (slightly longer — 1.5s — because VLM's cycle is slower and we don't
+        want to unblock before it confirms) or OCR alone (1.0s).
+
+        When falloff is disabled via the settings toggle, the base 3.0s is held
+        regardless of how many ads fired in a row.
+        """
+        if not self.block_falloff_enabled:
+            return self.MIN_BLOCKING_DURATION_BASE
+        floor = (
+            self.MIN_BLOCKING_DURATION_FLOOR_BOTH
+            if self.blocking_source == "both"
+            else self.MIN_BLOCKING_DURATION_FLOOR_OCR
+        )
+        duration = self.MIN_BLOCKING_DURATION_BASE - self.consecutive_ad_count * self.MIN_BLOCKING_DURATION_STEP
+        return max(duration, floor)
+
     def _get_vlm_agreement(self) -> tuple:
         """
         Calculate VLM agreement percentage from sliding window using confidence-weighted votes.
@@ -1653,7 +1722,10 @@ class Minus:
     def _load_system_settings(self) -> dict:
         """Load system settings from disk."""
         defaults = {
-            'vlm_preload': True,  # Load VLM at startup (vs wait for HDMI)
+            'vlm_preload': True,          # Load VLM at startup (vs wait for HDMI)
+            'block_falloff': True,        # Shorten min-block duration on consecutive ads
+            'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
+            'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
         }
         try:
             if SYSTEM_SETTINGS_FILE.exists():
@@ -1663,7 +1735,12 @@ class Minus:
                     for key in defaults:
                         if key in saved:
                             defaults[key] = saved[key]
-                    logger.info(f"Loaded system settings: vlm_preload={defaults['vlm_preload']}")
+                    logger.info(
+                        f"Loaded system settings: vlm_preload={defaults['vlm_preload']}, "
+                        f"block_falloff={defaults['block_falloff']}, "
+                        f"hdmi_reconnect_grace={defaults['hdmi_reconnect_grace']}, "
+                        f"greyscale_preview={defaults['greyscale_preview']}"
+                    )
         except Exception as e:
             logger.warning(f"Could not load system settings: {e}")
         return defaults
@@ -1698,6 +1775,30 @@ class Minus:
     def vlm_preload(self) -> bool:
         """Whether to preload VLM at startup."""
         return self._system_settings.get('vlm_preload', True)
+
+    @property
+    def block_falloff_enabled(self) -> bool:
+        """Whether consecutive-ad min-duration falloff is active."""
+        return self._system_settings.get('block_falloff', True)
+
+    @property
+    def hdmi_reconnect_grace_enabled(self) -> bool:
+        """Whether ad blocking is suppressed for 90s after HDMI reconnect."""
+        return self._system_settings.get('hdmi_reconnect_grace', True)
+
+    @property
+    def greyscale_preview_enabled(self) -> bool:
+        """Whether the ad preview window is desaturated in blocking mode."""
+        return self._system_settings.get('greyscale_preview', True)
+
+    def set_optimization_setting(self, key: str, enabled: bool) -> dict:
+        """Update one of the optimization toggles and persist."""
+        allowed = {'block_falloff', 'hdmi_reconnect_grace', 'greyscale_preview'}
+        if key not in allowed:
+            return {'success': False, 'error': f'unknown setting {key}'}
+        self._system_settings[key] = bool(enabled)
+        self._save_system_settings()
+        return {'success': True, key: bool(enabled)}
 
     def _load_vlm_model(self) -> bool:
         """Load VLM model with retry logic.
@@ -2060,10 +2161,25 @@ class Minus:
                         ad_ratio, _, total = self._get_vlm_agreement()
                         logger.info(f"VLM triggered alone (agreement: {ad_ratio*100:.0f}% of {total} decisions)")
 
+                if should_start and self.is_in_hdmi_reconnect_grace():
+                    remaining = self.get_hdmi_reconnect_grace_remaining()
+                    logger.info(
+                        f"Blocking suppressed - HDMI reconnect grace period "
+                        f"({remaining}s remaining)"
+                    )
+                    should_start = False
+
                 if should_start:
                     self.ad_detected = True
                     self.blocking_start_time = now
                     self.blocking_source = source
+                    # Falloff counter: if the last block ended recently (within the
+                    # reset gap), this is a consecutive ad — bump the counter. If
+                    # it's been a while, this is a fresh ad sequence — reset.
+                    if self.blocking_end_time > 0 and (now - self.blocking_end_time) <= self.MIN_DURATION_RESET_GAP:
+                        self.consecutive_ad_count += 1
+                    else:
+                        self.consecutive_ad_count = 0
                     # Reset skip and pause detection for new ad
                     self.accidental_pause_detected = False
                     self.skip_attempted_this_ad = False
@@ -2082,7 +2198,8 @@ class Minus:
                 blocking_elapsed = now - self.blocking_start_time
                 should_stop = False
 
-                if blocking_elapsed >= self.MIN_BLOCKING_DURATION:
+                min_duration = self._current_min_blocking_duration()
+                if blocking_elapsed >= min_duration:
                     ocr_says_stop = (self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD)
                     # For VLM stopping, use consecutive no-ad count (not sliding window)
                     # This ensures responsive stopping after ad ends

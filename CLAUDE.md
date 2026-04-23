@@ -89,7 +89,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
 | `src/wifi_manager.py` | WiFi captive portal and AP mode management |
 | `src/overlay.py` | Notification overlay via ustreamer API |
-| `src/vocabulary.py` | Spanish vocabulary list (120+ words) |
+| `src/vocabulary.py` | Spanish vocabulary — original `SPANISH_VOCABULARY` (~550 entries, 4-tuples) plus `SPANISH_VOCABULARY_EXTENDED` (~200 entries, 5-tuples with two example sentences). `VOCABULARY_COMBINED` is the unified list the ad overlay iterates. |
 | `src/console.py` | Console blanking/restore functions |
 | `src/drm.py` | DRM output probing, adaptive bandwidth fallback |
 | `src/v4l2.py` | V4L2 device probing (format, resolution) |
@@ -378,9 +378,10 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - VLM stopping uses simple consecutive count (not sliding window) for responsiveness
 
 **Anti-flicker:**
-- Minimum 3s blocking duration (`MIN_BLOCKING_DURATION`)
+- Minimum blocking duration starts at 3.0s (`MIN_BLOCKING_DURATION_BASE`) and falls off by `MIN_BLOCKING_DURATION_STEP` (0.5s) on each consecutive ad: 3.0 → 2.5 → 2.0 → 1.5 → 1.0s. Floor is 1.0s for OCR-only, 1.5s for OCR+VLM both agreeing. Counter resets after `MIN_DURATION_RESET_GAP` (30s) without a block. Toggleable via Settings → Blocking Optimizations → *Block-duration Falloff*.
 - VLM history cleared on stop prevents false re-triggers
 - Transition frame detection holds blocking through black screens between ads
+- After TV reconnect, ad blocking is suppressed for `HDMI_RECONNECT_GRACE_SECONDS` (90s) so the user can navigate without overlays jumping in. The health monitor calls `Minus.notify_hdmi_reconnect()` when it sees the HDMI-TX link return. Toggleable via Settings → Blocking Optimizations → *HDMI Reconnect Grace*.
 
 **Static Screen Suppression:**
 - Prevents blocking on paused video screens (Netflix/YouTube show ads when paused)
@@ -671,7 +672,7 @@ curl "http://localhost:9090/overlay/set?clear=true"
 
 **Blocking Mode Endpoints:**
 - `GET /blocking` - Get current config (enabled, preview, colors, etc.)
-- `GET /blocking/set?enabled=true&text_vocab=...&preview_enabled=true` - Configure
+- `GET /blocking/set?enabled=true&text_vocab=...&preview_enabled=true&preview_grayscale=true&word_y=140&word_u=175&word_v=145` - Configure (includes `preview_grayscale` flag to desaturate the corner preview, plus `word_y/word_u/word_v` for cycling the Spanish word color per rotation)
 - `POST /blocking/background` - Upload pixelated NV12 background (width*height*1.5 bytes)
 
 **Multi-color text auto-detection:** Lines starting with `[` → white (header), `(` → gray (pronunciation), `=` → white (translation), `"` → gray (example), other → purple (Spanish word)
@@ -958,6 +959,7 @@ VLM preload loads the model at startup before HDMI signal arrives (configurable 
 - `POST /api/autonomous/schedule` - Set hours and always_on flag
 - `GET /api/autonomous/logs` - Recent log entries
 - `GET/POST /api/settings/vlm-preload` - VLM preload toggle
+- `GET/POST /api/settings/optimization` - Toggle block-duration falloff, HDMI reconnect grace, and greyscale preview. POST body: `{"key": "block_falloff"|"hdmi_reconnect_grace"|"greyscale_preview", "enabled": true|false}`. Persisted to `~/.minus_system_settings.json`. Setting `greyscale_preview` here propagates to the running ad_blocker immediately via `/blocking/set?preview_grayscale=...` so the current block updates on the fly.
 
 **Web UI:** Toggle button, schedule time selectors, 24/7 checkbox (auto-enables mode), stats display in Settings tab, VLM preload toggle.
 

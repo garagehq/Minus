@@ -538,6 +538,37 @@
                 <p class="help-text">When enabled, VLM loads immediately at startup (even without HDMI signal). When disabled, VLM waits for HDMI signal before loading. Takes effect on next restart.</p>
             </section>
 
+            <!-- Blocking Optimizations -->
+            <section class="settings-section">
+                <h2>Blocking Optimizations</h2>
+                <div class="setting-item">
+                    <span class="setting-label">Block-duration Falloff</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="block-falloff-toggle" checked onchange="toggleOptimization('block_falloff', this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text">Minimum blocking time shrinks 3.0s &rarr; 1.0s as consecutive ads fire (floor 1.5s when OCR+VLM both agree). Lets the block end right as the ad does instead of holding for a full 3s every time.</p>
+
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">HDMI Reconnect Grace (90s)</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="hdmi-grace-toggle" checked onchange="toggleOptimization('hdmi_reconnect_grace', this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text">After the TV reconnects, suppress ad blocking for 90 seconds so you can navigate menus without overlays jumping in.</p>
+
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">Greyscale Ad Preview</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="greyscale-preview-toggle" checked onchange="toggleOptimization('greyscale_preview', this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text">Desaturates the corner preview of the blocked ad so the Spanish overlay (bright, colorful) is more appealing than the ad.</p>
+            </section>
+
             <!-- Autonomous Mode Settings -->
             <section class="settings-section">
                 <h2>Autonomous Mode</h2>
@@ -1395,6 +1426,42 @@
                 document.getElementById('vlm-preload-toggle').checked = data.vlm_preload;
             } catch (error) {
                 console.error('Failed to load VLM preload setting:', error);
+            }
+        }
+
+        async function toggleOptimization(key, enabled) {
+            const toggleIds = {
+                block_falloff: 'block-falloff-toggle',
+                hdmi_reconnect_grace: 'hdmi-grace-toggle',
+                greyscale_preview: 'greyscale-preview-toggle',
+            };
+            const toggleId = toggleIds[key];
+            try {
+                const response = await fetch('/api/settings/optimization', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key: key, enabled: enabled })
+                });
+                const data = await response.json();
+                if (!data.success && toggleId) {
+                    document.getElementById(toggleId).checked = !enabled;
+                    console.error('Optimization toggle failed:', data.error);
+                }
+            } catch (error) {
+                console.error('Optimization toggle error:', error);
+                if (toggleId) document.getElementById(toggleId).checked = !enabled;
+            }
+        }
+
+        async function loadOptimizationSettings() {
+            try {
+                const response = await fetch('/api/settings/optimization');
+                const data = await response.json();
+                document.getElementById('block-falloff-toggle').checked = !!data.block_falloff;
+                document.getElementById('hdmi-grace-toggle').checked = !!data.hdmi_reconnect_grace;
+                document.getElementById('greyscale-preview-toggle').checked = !!data.greyscale_preview;
+            } catch (error) {
+                console.error('Failed to load optimization settings:', error);
             }
         }
 
@@ -2497,6 +2564,7 @@
         updateFireTVStatus();
         updateVLMStatus();
         loadVLMPreloadSetting();
+        loadOptimizationSettings();
         updateAutonomousModeStatus();
 
         setInterval(updateStatus, 1000);

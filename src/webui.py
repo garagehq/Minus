@@ -2280,6 +2280,42 @@ class WebUI:
                 logger.error(f"Error with VLM preload setting: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
+        @self.app.route('/api/settings/optimization', methods=['GET', 'POST'])
+        def api_optimization_settings():
+            """Get or set the three optimization toggles.
+
+            Keys: ``block_falloff``, ``hdmi_reconnect_grace``, ``greyscale_preview``.
+            POST body: ``{"key": "block_falloff", "enabled": true}``.
+            """
+            try:
+                if request.method == 'GET':
+                    return jsonify({
+                        'block_falloff': self.minus.block_falloff_enabled,
+                        'hdmi_reconnect_grace': self.minus.hdmi_reconnect_grace_enabled,
+                        'greyscale_preview': self.minus.greyscale_preview_enabled,
+                    })
+
+                data = request.get_json() or {}
+                key = data.get('key')
+                enabled = data.get('enabled')
+                if key is None or enabled is None:
+                    return jsonify({'success': False, 'error': 'key and enabled required'}), 400
+                result = self.minus.set_optimization_setting(key, bool(enabled))
+                if not result.get('success'):
+                    return jsonify(result), 400
+
+                # Greyscale needs to flow to ad_blocker immediately so the
+                # current (and future) blocking uses the new setting.
+                if key == 'greyscale_preview' and self.minus.ad_blocker:
+                    try:
+                        self.minus.ad_blocker.set_preview_grayscale(bool(enabled))
+                    except Exception as e:
+                        logger.warning(f"[WebUI] set_preview_grayscale failed: {e}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error with optimization setting: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
         # =========================================================================
         # Blocking Control
         # =========================================================================

@@ -569,5 +569,204 @@ class TestWebUIDeviceAgnosticSkip(unittest.TestCase):
             self.assertFalse(r.get_json()['success'])
 
 
+# =============================================================================
+# various-optimizations branch — falloff, grace period, vocabulary, toggles
+# =============================================================================
+
+
+class _MinStub:
+    """Minimal stand-in for a Minus instance. Binds real helper methods so we
+    exercise production code without running Minus.__init__ (which touches
+    hardware)."""
+
+    def __init__(self):
+        import threading
+        self.MIN_BLOCKING_DURATION_BASE = 3.0
+        self.MIN_BLOCKING_DURATION_STEP = 0.5
+        self.MIN_BLOCKING_DURATION_FLOOR_OCR = 1.0
+        self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
+        self.consecutive_ad_count = 0
+        self.blocking_source = "ocr"
+        self.HDMI_RECONNECT_GRACE_SECONDS = 90.0
+        self.hdmi_reconnect_time = 0.0
+        self._falloff_enabled = True
+        self._grace_enabled = True
+        self._state_lock = threading.Lock()
+
+    @property
+    def block_falloff_enabled(self):
+        return self._falloff_enabled
+
+    @property
+    def hdmi_reconnect_grace_enabled(self):
+        return self._grace_enabled
+
+
+def _make_min_stub():
+    """Factory that binds the real Minus helpers onto a stub instance."""
+    import types
+    # minus.py lives at the project root, not in src/ — add it to path so
+    # the Minus helper methods can be imported without running __init__.
+    project_root = str(Path(__file__).parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    import minus as _minus_mod
+
+    stub = _MinStub()
+    stub._current_min_blocking_duration = types.MethodType(
+        _minus_mod.Minus._current_min_blocking_duration, stub)
+    stub.notify_hdmi_reconnect = types.MethodType(
+        _minus_mod.Minus.notify_hdmi_reconnect, stub)
+    stub.is_in_hdmi_reconnect_grace = types.MethodType(
+        _minus_mod.Minus.is_in_hdmi_reconnect_grace, stub)
+    stub.get_hdmi_reconnect_grace_remaining = types.MethodType(
+        _minus_mod.Minus.get_hdmi_reconnect_grace_remaining, stub)
+    return stub
+
+
+class TestBlockingDurationFalloff(unittest.TestCase):
+    """3.0 -> 2.5 -> 2.0 -> 1.5 -> 1.0 on consecutive ads, 1.5s floor for OCR+VLM."""
+
+    def setUp(self):
+        self.m = _make_min_stub()
+
+    def test_first_ad_is_3_seconds(self):
+        self.m.consecutive_ad_count = 0
+        self.assertAlmostEqual(self.m._current_min_blocking_duration(), 3.0, places=2)
+
+    def test_falloff_steps_ocr(self):
+        self.m.blocking_source = "ocr"
+        expected = [3.0, 2.5, 2.0, 1.5, 1.0, 1.0, 1.0]
+        for i, want in enumerate(expected):
+            self.m.consecutive_ad_count = i
+            self.assertAlmostEqual(
+                self.m._current_min_blocking_duration(), want, places=2,
+                msg=f"ocr falloff at i={i} expected {want}")
+
+    def test_falloff_floor_for_both_is_1_5(self):
+        self.m.blocking_source = "both"
+        expected = [3.0, 2.5, 2.0, 1.5, 1.5, 1.5]
+        for i, want in enumerate(expected):
+            self.m.consecutive_ad_count = i
+            self.assertAlmostEqual(
+                self.m._current_min_blocking_duration(), want, places=2,
+                msg=f"both-floor at i={i} expected {want}")
+
+    def test_disabling_falloff_pins_to_base(self):
+        self.m._falloff_enabled = False
+        for i in range(0, 10):
+            self.m.consecutive_ad_count = i
+            self.assertAlmostEqual(
+                self.m._current_min_blocking_duration(), 3.0, places=2)
+
+
+class TestHDMIReconnectGrace(unittest.TestCase):
+    """notify_hdmi_reconnect sets the timestamp; the grace helpers read it."""
+
+    def setUp(self):
+        self.m = _make_min_stub()
+
+    def test_no_grace_before_reconnect(self):
+        self.assertFalse(self.m.is_in_hdmi_reconnect_grace())
+        self.assertEqual(self.m.get_hdmi_reconnect_grace_remaining(), 0)
+
+    def test_grace_active_after_notify(self):
+        self.m.notify_hdmi_reconnect()
+        self.assertTrue(self.m.is_in_hdmi_reconnect_grace())
+        remaining = self.m.get_hdmi_reconnect_grace_remaining()
+        self.assertGreater(remaining, 85)
+        self.assertLessEqual(remaining, 90)
+
+    def test_grace_expires(self):
+        self.m.hdmi_reconnect_time = time.time() - 100
+        self.assertFalse(self.m.is_in_hdmi_reconnect_grace())
+        self.assertEqual(self.m.get_hdmi_reconnect_grace_remaining(), 0)
+
+    def test_disabled_setting_skips_grace(self):
+        self.m.notify_hdmi_reconnect()
+        self.m._grace_enabled = False
+        self.assertFalse(self.m.is_in_hdmi_reconnect_grace())
+
+
+class TestVocabularyExtended(unittest.TestCase):
+    """Extended vocabulary supplies dual example sentences."""
+
+    def test_combined_list_is_larger_than_base(self):
+        from vocabulary import (
+            SPANISH_VOCABULARY,
+            SPANISH_VOCABULARY_EXTENDED,
+            VOCABULARY_COMBINED,
+        )
+        self.assertEqual(
+            len(VOCABULARY_COMBINED),
+            len(SPANISH_VOCABULARY) + len(SPANISH_VOCABULARY_EXTENDED))
+        self.assertGreater(len(SPANISH_VOCABULARY_EXTENDED), 150)
+
+    def test_extended_entries_are_5_tuples(self):
+        from vocabulary import SPANISH_VOCABULARY_EXTENDED
+        for entry in SPANISH_VOCABULARY_EXTENDED:
+            self.assertEqual(
+                len(entry), 5,
+                f"extended entry must be 5-tuple: {entry[:1]}")
+            for field in entry:
+                self.assertIsInstance(field, str)
+                self.assertTrue(
+                    field.strip(),
+                    f"empty field in extended entry {entry[:1]}")
+
+
+class TestOptimizationSettingsAPI(unittest.TestCase):
+    """POST /api/settings/optimization flips the persisted toggle."""
+
+    def test_get_returns_all_three_flags(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.block_falloff_enabled = True
+        minus.hdmi_reconnect_grace_enabled = False
+        minus.greyscale_preview_enabled = True
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            r = client.get('/api/settings/optimization')
+            self.assertEqual(r.status_code, 200)
+            data = r.get_json()
+            self.assertTrue(data['block_falloff'])
+            self.assertFalse(data['hdmi_reconnect_grace'])
+            self.assertTrue(data['greyscale_preview'])
+
+    def test_post_invalid_key_returns_400(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_optimization_setting.return_value = {
+            'success': False, 'error': 'unknown setting bogus'}
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            r = client.post('/api/settings/optimization',
+                            json={'key': 'bogus', 'enabled': True})
+            self.assertEqual(r.status_code, 400)
+
+    def test_post_greyscale_propagates_to_ad_blocker(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_optimization_setting.return_value = {
+            'success': True, 'greyscale_preview': False}
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            r = client.post('/api/settings/optimization',
+                            json={'key': 'greyscale_preview', 'enabled': False})
+            self.assertEqual(r.status_code, 200)
+            minus.ad_blocker.set_preview_grayscale.assert_called_once_with(False)
+
+    def test_post_falloff_does_not_touch_ad_blocker(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_optimization_setting.return_value = {
+            'success': True, 'block_falloff': True}
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            client.post('/api/settings/optimization',
+                        json={'key': 'block_falloff', 'enabled': True})
+            minus.ad_blocker.set_preview_grayscale.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
