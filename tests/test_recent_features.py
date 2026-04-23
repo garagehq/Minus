@@ -768,5 +768,416 @@ class TestOptimizationSettingsAPI(unittest.TestCase):
             minus.ad_blocker.set_preview_grayscale.assert_not_called()
 
 
+# =============================================================================
+# various-optimizations follow-up: countdown bar, content rotation, audio bars,
+# photo library, replacement modes. Heavy emphasis on memory bounds + offline.
+# =============================================================================
+
+
+class TestAdCountdownExtraction(unittest.TestCase):
+    """OCR ad-timer parser: seconds remaining from 'Ad N:MM', 'Ad N', etc."""
+
+    def test_returns_none_when_no_timer(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertIsNone(extract_ad_seconds_remaining([]))
+        self.assertIsNone(extract_ad_seconds_remaining(['hello', 'world']))
+
+    def test_parses_minute_seconds(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 0:30']), 30)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 1:05']), 65)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad0:45']), 45)
+
+    def test_parses_ocr_misreads(self):
+        from skip_detection import extract_ad_seconds_remaining
+        # 0 -> o, 1 -> l, : -> ;
+        self.assertEqual(extract_ad_seconds_remaining(['Ado:30']), 30)
+        self.assertEqual(extract_ad_seconds_remaining(['Adl:05']), 65)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad0;45']), 45)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad0.30']), 30)
+
+    def test_parses_standalone_countdown(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 10']), 10)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 5']), 5)
+
+    def test_hulu_pipe_style(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertEqual(extract_ad_seconds_remaining(['0:30 | Ad']), 30)
+
+    def test_rejects_nonsense(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertIsNone(extract_ad_seconds_remaining(['email@ad.com']))
+        # "99:99" — out of range minutes/seconds rejected
+        self.assertIsNone(extract_ad_seconds_remaining(['Ad 99:99']))
+
+
+class TestAdBlockerCountdownBar(unittest.TestCase):
+    """The visual progress bar rendered from ad_seconds_remaining."""
+
+    def _make(self):
+        from ad_blocker import DRMAdBlocker
+        stub = MagicMock()
+        stub._ad_seconds_remaining = None
+        stub._ad_seconds_peak = None
+        stub._ad_seconds_anchor = 0.0
+        stub._ad_countdown_bar = types.MethodType(DRMAdBlocker._ad_countdown_bar, stub)
+        stub.set_ad_seconds_remaining = types.MethodType(
+            DRMAdBlocker.set_ad_seconds_remaining, stub)
+        stub._clear_ad_countdown = types.MethodType(
+            DRMAdBlocker._clear_ad_countdown, stub)
+        return stub
+
+    def test_empty_when_no_data(self):
+        bar = self._make()._ad_countdown_bar()
+        self.assertEqual(bar, '')
+
+    def test_bar_full_at_start(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(30)
+        # Re-anchor to 'now' so wall-clock drift between set and render
+        # doesn't shave a second off the display.
+        stub._ad_seconds_anchor = time.time() + 0.1
+        bar = stub._ad_countdown_bar(width=10)
+        # All 10 slots should be filled (#) since current >= peak
+        self.assertIn('##########', bar)
+        # Seconds should be within one of the value we set
+        self.assertTrue(
+            any(s in bar for s in ('29s', '30s', '31s')),
+            f"expected ~30s in bar, got: {bar!r}")
+
+    def test_bar_half_drained(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(30)
+        stub._ad_seconds_remaining = 15  # simulate OCR re-read at half
+        bar = stub._ad_countdown_bar(width=10)
+        self.assertEqual(bar.count('#'), 5)
+
+    def test_clear_wipes_bar(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(10)
+        stub._clear_ad_countdown()
+        self.assertEqual(stub._ad_countdown_bar(), '')
+
+    def test_rejects_negative_seconds(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(-5)
+        self.assertIsNone(stub._ad_seconds_remaining)
+
+    def test_rejects_non_int(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining("abc")
+        self.assertIsNone(stub._ad_seconds_remaining)
+
+
+import types  # placed here so the helper above can reference it
+
+
+class TestContentRotationModes(unittest.TestCase):
+    """Vocab/fact/haiku rotation with per-block lock-in."""
+
+    def _make(self):
+        from ad_blocker import DRMAdBlocker
+        stub = MagicMock()
+        stub._CONTENT_KINDS = DRMAdBlocker._CONTENT_KINDS
+        stub._CONTENT_KIND_WEIGHTS = DRMAdBlocker._CONTENT_KIND_WEIGHTS
+        stub._PHOTO_MODE_CHANCE = DRMAdBlocker._PHOTO_MODE_CHANCE
+        stub._locked_content_kind = None
+        stub._content_kind_lock_until = 0.0
+        stub.CONTENT_KIND_COOLDOWN_SECONDS = 30.0
+        stub.minus = None
+        stub._current_vocab = None
+        stub._pick_content_kind = types.MethodType(
+            DRMAdBlocker._pick_content_kind, stub)
+        stub._get_enabled_replacement_modes = types.MethodType(
+            DRMAdBlocker._get_enabled_replacement_modes, stub)
+        stub._roll_replacement_mode = types.MethodType(
+            DRMAdBlocker._roll_replacement_mode, stub)
+        stub._render_vocab = types.MethodType(DRMAdBlocker._render_vocab, stub)
+        stub._render_fact = types.MethodType(DRMAdBlocker._render_fact, stub)
+        stub._render_haiku = types.MethodType(DRMAdBlocker._render_haiku, stub)
+        stub._get_blocking_text = types.MethodType(
+            DRMAdBlocker._get_blocking_text, stub)
+        return stub
+
+    def test_lock_forces_fixed_kind(self):
+        stub = self._make()
+        stub._locked_content_kind = 'haiku'
+        for _ in range(30):
+            self.assertEqual(stub._pick_content_kind(), 'haiku')
+
+    def test_all_kinds_appear_without_lock(self):
+        stub = self._make()
+        seen = set()
+        for _ in range(400):
+            seen.add(stub._pick_content_kind())
+        self.assertEqual(seen, {'vocab', 'fact', 'haiku'})
+
+    def test_disabled_text_kinds_excluded_from_roll(self):
+        stub = self._make()
+        # Only vocab allowed — never roll fact/haiku/photos
+        mock_minus = MagicMock()
+        mock_minus.get_replacement_modes.return_value = ['vocab']
+        stub.minus = mock_minus
+        for _ in range(50):
+            self.assertEqual(stub._roll_replacement_mode(), 'vocab')
+
+    def test_photos_skipped_when_library_empty(self):
+        stub = self._make()
+        mock_minus = MagicMock()
+        mock_minus.get_replacement_modes.return_value = ['vocab', 'photos']
+        stub.minus = mock_minus
+        # Patch photo_library to report empty
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = None
+            kinds = {stub._roll_replacement_mode() for _ in range(30)}
+        self.assertEqual(kinds, {'vocab'})
+
+    def test_blocking_text_fact_and_haiku_render(self):
+        stub = self._make()
+        # Fact path
+        stub._locked_content_kind = 'fact'
+        text = stub._get_blocking_text(source='ocr')
+        self.assertIn('DID YOU KNOW', text)
+        # Haiku path
+        stub._locked_content_kind = 'haiku'
+        text = stub._get_blocking_text(source='ocr')
+        self.assertIn('HAIKU', text)
+
+
+class TestFactsAndHaikusOffline(unittest.TestCase):
+    """Content libraries should be pure data — no network, no import surprises."""
+
+    def test_facts_module_has_content(self):
+        from facts import DID_YOU_KNOW
+        self.assertGreater(len(DID_YOU_KNOW), 50)
+        for title, body in DID_YOU_KNOW:
+            self.assertIsInstance(title, str)
+            self.assertIsInstance(body, str)
+            self.assertTrue(title.strip())
+            self.assertTrue(body.strip())
+
+    def test_haiku_module_has_content(self):
+        from haiku import HAIKUS
+        self.assertGreaterEqual(len(HAIKUS), 20)
+        for lines, attrib in HAIKUS:
+            self.assertEqual(len(lines), 3)
+            for line in lines:
+                self.assertIsInstance(line, str)
+                self.assertTrue(line.strip())
+            self.assertIsInstance(attrib, str)
+
+    def test_modules_have_no_imports_of_net_libs(self):
+        """We run offline — content modules should have no network imports."""
+        import pathlib
+        src_dir = pathlib.Path(__file__).parent.parent / 'src'
+        for name in ('facts.py', 'haiku.py'):
+            txt = (src_dir / name).read_text()
+            for forbidden in ('import requests', 'from requests',
+                              'urllib.request', 'urlopen', 'socket.connect'):
+                self.assertNotIn(
+                    forbidden, txt,
+                    f"{name} references {forbidden!r} — breaks offline mode")
+
+
+class TestAudioLevelBars(unittest.TestCase):
+    """Audio-reactive bar renderer uses a bounded deque + pure math."""
+
+    def _make(self):
+        from audio import AudioPassthrough
+        # Avoid running __init__ (which touches GStreamer) — just pull the
+        # deque and render function onto a naked object.
+        from collections import deque
+        stub = type('S', (), {})()
+        stub._level_history = deque(maxlen=16)
+        stub.get_level_bars = types.MethodType(AudioPassthrough.get_level_bars, stub)
+        return stub
+
+    def test_empty_history_returns_empty(self):
+        stub = self._make()
+        self.assertEqual(stub.get_level_bars(), '')
+
+    def test_bars_respond_to_levels(self):
+        stub = self._make()
+        for v in [0.0, 0.0, 0.5, 0.5, 1.0, 1.0]:
+            stub._level_history.append(v)
+        bars = stub.get_level_bars(width=6)
+        self.assertEqual(len(bars), 6)
+        # Left end should be quietest character
+        self.assertEqual(bars[0], ' ')
+        # Right end should be the loudest char from the ramp
+        self.assertEqual(bars[-1], '@')
+
+    def test_memory_bound_of_level_history(self):
+        """24h run: appending a million samples still bounds memory to maxlen."""
+        stub = self._make()
+        for i in range(1_000_000):
+            stub._level_history.append((i % 7) / 7.0)
+        self.assertLessEqual(len(stub._level_history), 16)
+
+
+class TestPhotoLibrary(unittest.TestCase):
+    """Photo upload / list / delete with caps enforced."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        from photo_library import PhotoLibrary
+        self.lib = PhotoLibrary(base_dir=self._tmpdir.name)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _tiny_jpeg(self, color=(128, 64, 32)):
+        from PIL import Image
+        import io as _io
+        img = Image.new('RGB', (64, 64), color)
+        buf = _io.BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        return buf.getvalue()
+
+    def test_add_and_list_photo(self):
+        self.assertEqual(self.lib.count(), 0)
+        meta = self.lib.add_photo(self._tiny_jpeg(), original_name='cat.jpg')
+        self.assertEqual(self.lib.count(), 1)
+        self.assertIn(meta['id'], {p['id'] for p in self.lib.list_photos()})
+
+    def test_rejects_empty_upload(self):
+        with self.assertRaises(ValueError):
+            self.lib.add_photo(b'', original_name='x')
+
+    def test_rejects_garbage(self):
+        with self.assertRaises(ValueError):
+            self.lib.add_photo(b'not a real image payload', original_name='x')
+
+    def test_delete_photo(self):
+        meta = self.lib.add_photo(self._tiny_jpeg(), original_name='x.jpg')
+        self.assertTrue(self.lib.remove_photo(meta['id']))
+        self.assertEqual(self.lib.count(), 0)
+
+    def test_random_photo_id_returns_none_when_empty(self):
+        self.assertIsNone(self.lib.random_photo_id())
+
+    def test_name_sanitization_rejects_traversal(self):
+        meta = self.lib.add_photo(self._tiny_jpeg(), original_name='../../etc/passwd')
+        self.assertNotIn('/', meta['name'])
+        self.assertNotIn('..', meta['name'])
+
+    def test_delete_sanitizes_id(self):
+        """Path traversal / non-hex id can't escape the library dir."""
+        self.lib.add_photo(self._tiny_jpeg(), original_name='a.jpg')
+        # Attempt path-traversal delete: should sanitize and NOT remove anything
+        self.assertFalse(self.lib.remove_photo('../../../etc/passwd'))
+        self.assertEqual(self.lib.count(), 1)
+
+    def test_count_cap_eviction(self):
+        """More than PHOTO_MAX_COUNT adds evict the oldest."""
+        import photo_library as pl
+        original = pl.PHOTO_MAX_COUNT
+        pl.PHOTO_MAX_COUNT = 3
+        try:
+            for i in range(5):
+                # Each call gets a different color so its hash differs
+                self.lib.add_photo(self._tiny_jpeg(color=(i * 40, 0, 0)),
+                                    original_name=f'p{i}.jpg')
+            self.assertLessEqual(self.lib.count(), 3)
+        finally:
+            pl.PHOTO_MAX_COUNT = original
+
+    def test_memory_footprint_stable_under_churn(self):
+        """Repeated add/delete should not leak filesystem entries."""
+        for i in range(20):
+            meta = self.lib.add_photo(self._tiny_jpeg(color=(i * 12, 0, 0)))
+            self.lib.remove_photo(meta['id'])
+        # No residue after churn
+        self.assertEqual(self.lib.count(), 0)
+        # total_bytes should be 0 too
+        self.assertEqual(self.lib.total_bytes(), 0)
+
+
+class TestReplacementModesAPI(unittest.TestCase):
+    """Web UI can GET/POST the enabled replacement kinds."""
+
+    def test_get_returns_minus_list(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.get_replacement_modes.return_value = ['vocab', 'fact']
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.get('/api/settings/replacement-modes')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['replacement_modes'], ['vocab', 'fact'])
+
+    def test_post_rejects_non_list(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/settings/replacement-modes',
+                       json={'modes': 'vocab'})
+            self.assertEqual(r.status_code, 400)
+
+    def test_post_persists(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_replacement_modes.return_value = {
+            'success': True, 'replacement_modes': ['vocab', 'photos']}
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/settings/replacement-modes',
+                       json={'modes': ['vocab', 'photos']})
+            self.assertEqual(r.status_code, 200)
+            minus.set_replacement_modes.assert_called_once_with(['vocab', 'photos'])
+
+
+class TestMinusReplacementModesLogic(unittest.TestCase):
+    """Minus.set_replacement_modes enforces a text-kind floor."""
+
+    def _make(self):
+        import types as _t
+        import minus as _m
+        stub = type('S', (), {})()
+        stub._system_settings = {'replacement_modes': ['vocab', 'fact', 'haiku']}
+        stub._save_system_settings = lambda self=None: None
+        stub.get_replacement_modes = _t.MethodType(
+            _m.Minus.get_replacement_modes, stub)
+        stub.set_replacement_modes = _t.MethodType(
+            _m.Minus.set_replacement_modes, stub)
+        return stub
+
+    def test_empty_modes_force_vocab(self):
+        """Disabling every kind should force vocab back on."""
+        stub = self._make()
+        result = stub.set_replacement_modes([])
+        self.assertIn('vocab', result['replacement_modes'])
+
+    def test_photos_only_still_gets_vocab(self):
+        """User picks only photos → vocab is added as the text fallback."""
+        stub = self._make()
+        result = stub.set_replacement_modes(['photos'])
+        self.assertIn('vocab', result['replacement_modes'])
+        self.assertIn('photos', result['replacement_modes'])
+
+    def test_unknown_kinds_stripped(self):
+        stub = self._make()
+        result = stub.set_replacement_modes(['vocab', 'bogus', 'fact'])
+        self.assertNotIn('bogus', result['replacement_modes'])
+
+
+class TestOfflineImportHygiene(unittest.TestCase):
+    """None of the new modules should require network access at import time."""
+
+    def test_new_modules_import_without_network(self):
+        # We can't easily sandbox network here; instead assert the modules
+        # don't mention common net libraries in their top-level imports.
+        import pathlib
+        src_dir = pathlib.Path(__file__).parent.parent / 'src'
+        for name in ('facts.py', 'haiku.py', 'photo_library.py'):
+            txt = (src_dir / name).read_text()
+            for forbidden in ('import requests', 'from requests',
+                              'urllib.request', 'urlopen', 'socket.connect'):
+                self.assertNotIn(forbidden, txt,
+                                 f"{name} references {forbidden!r} — breaks offline mode")
+
+
 if __name__ == '__main__':
     unittest.main()

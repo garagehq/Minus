@@ -132,6 +132,16 @@ class AudioPassthrough:
         # Flushing every 45 minutes resets the sync queue with minimal audio dropout (~300ms)
         self._sync_interval = 45 * 60  # 45 minutes between sync resets
         self._last_sync_reset = 0
+
+        # Rolling audio level history for the blocking-overlay visualizer.
+        # Stores normalized RMS (0.0-1.0) samples of the mixer output. Kept
+        # as a bounded deque so memory is O(1) over a 24h run.
+        from collections import deque
+        self._level_history = deque(maxlen=16)
+        self._last_level_sample_time = 0.0
+        # Only sample RMS every N seconds — full-rate would thrash the CPU
+        # and we only need ~10 Hz updates for the bar visualizer.
+        self._level_sample_interval = 0.1
         self._sync_reset_enabled = True
 
         # Initialize GStreamer (may already be initialized by video pipeline)
@@ -251,9 +261,24 @@ class AudioPassthrough:
             self.pipeline = None
 
     def _buffer_probe(self, pad, info, user_data):
-        """Probe callback to track buffer flow for stall detection."""
+        """Probe callback to track buffer flow for stall detection.
+
+        Also samples the buffer's RMS at `_level_sample_interval` so the
+        blocking overlay can render an audio-reactive bar visualization.
+        Skips the RMS math on most buffers to keep CPU overhead negligible.
+        """
         now = time.time()
         self._last_buffer_time = now
+
+        # Sample audio level for the visualizer (throttled)
+        if now - self._last_level_sample_time >= self._level_sample_interval:
+            self._last_level_sample_time = now
+            try:
+                buf = info.get_buffer()
+                if buf is not None:
+                    self._sample_rms(buf)
+            except Exception as e:
+                logger.debug(f"[AudioPassthrough] RMS sample skipped: {e}")
 
         # Reset backoff counter after sustained buffer flow (5+ seconds)
         if self._consecutive_failures > 0:
@@ -264,6 +289,69 @@ class AudioPassthrough:
                 logger.debug("[AudioPassthrough] Backoff reset - sustained buffer flow")
 
         return Gst.PadProbeReturn.OK
+
+    def _sample_rms(self, buf):
+        """Compute RMS from an S16LE audio buffer, append to history.
+
+        Format is locked to S16LE stereo at 48 kHz elsewhere in the pipeline
+        so we can treat the buffer as signed 16-bit little-endian samples.
+        """
+        success, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return
+        try:
+            import struct
+            data = bytes(mapinfo.data)
+            # Down-sample — we don't need every one of ~1000 samples per 50ms
+            # buffer. Stride picks one sample every ~0.5 ms, plenty for bar
+            # heights.
+            n = len(data) // 2  # S16 = 2 bytes
+            if n == 0:
+                return
+            stride = max(1, n // 64)
+            samples = struct.unpack_from(f'<{n}h', data)
+            total = 0
+            count = 0
+            peak = 0
+            for i in range(0, n, stride):
+                s = samples[i]
+                total += s * s
+                if abs(s) > peak:
+                    peak = abs(s)
+                count += 1
+            if count == 0:
+                return
+            import math
+            rms = math.sqrt(total / count) / 32767.0
+            # Nudge the perceived range — quiet speech is ~0.02 RMS, peaks
+            # are ~0.3. A sqrt curve makes the bars feel more responsive.
+            visual = min(1.0, math.sqrt(rms))
+            self._level_history.append(visual)
+        finally:
+            buf.unmap(mapinfo)
+
+    def get_level_bars(self, width=16):
+        """Render the current audio history as a unicode block bar string.
+
+        Returns a `width`-character string like `.,;ozIMI;,.` that rises and
+        falls with audio energy. Designed for the blocking overlay stats
+        area (monospace). Returns empty string if no history yet.
+        """
+        if not self._level_history:
+            return ''
+        # ASCII-only bar ramp so it renders reliably through the MPP text pass
+        # no matter what font the encoder picked.
+        ramp = ' .,-;+ox*#@'
+        levels = list(self._level_history)[-width:]
+        # Pad with zeros on the left if history is shorter than width
+        if len(levels) < width:
+            levels = [0.0] * (width - len(levels)) + levels
+        chars = []
+        for lv in levels:
+            idx = int(round(lv * (len(ramp) - 1)))
+            idx = max(0, min(len(ramp) - 1, idx))
+            chars.append(ramp[idx])
+        return ''.join(chars)
 
     def _on_error(self, bus, message):
         """Handle GStreamer error messages."""

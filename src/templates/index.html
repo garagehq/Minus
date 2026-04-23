@@ -569,6 +569,56 @@
                 <p class="help-text">Desaturates the corner preview of the blocked ad so the Spanish overlay (bright, colorful) is more appealing than the ad.</p>
             </section>
 
+            <!-- Replacement content -->
+            <section class="settings-section">
+                <h2>Replace</h2>
+                <p class="help-text">What shows in place of the ad. One kind is rolled per ad break and sticks for that break (30s cooldown before a new roll).</p>
+
+                <div class="setting-item">
+                    <span class="setting-label">Spanish Vocabulary</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-vocab" checked onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="setting-item">
+                    <span class="setting-label">Did You Know? facts</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-fact" checked onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="setting-item">
+                    <span class="setting-label">Haikus</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-haiku" checked onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="setting-item">
+                    <span class="setting-label">Photo Screensaver</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-photos" onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text">Cycles your uploaded photos every 5 seconds during an ad block. Needs at least one photo uploaded below to take effect.</p>
+
+                <div class="photo-library">
+                    <h3 style="margin-top: 1.5rem;">Photos</h3>
+                    <div id="photo-list" class="photo-grid"></div>
+                    <form id="photo-upload-form" style="margin-top: 0.75rem;" onsubmit="return uploadPhoto(event)">
+                        <input type="file" id="photo-upload-input" accept="image/*" />
+                        <button type="submit">Upload</button>
+                        <span id="photo-upload-status" class="help-text" style="margin-left: 0.75rem;"></span>
+                    </form>
+                    <p class="help-text" id="photo-library-stats"></p>
+                </div>
+            </section>
+
             <!-- Autonomous Mode Settings -->
             <section class="settings-section">
                 <h2>Autonomous Mode</h2>
@@ -1450,6 +1500,108 @@
             } catch (error) {
                 console.error('Optimization toggle error:', error);
                 if (toggleId) document.getElementById(toggleId).checked = !enabled;
+            }
+        }
+
+        async function loadReplacementModes() {
+            try {
+                const r = await fetch('/api/settings/replacement-modes');
+                const data = await r.json();
+                const modes = new Set(data.replacement_modes || []);
+                document.getElementById('replace-mode-vocab').checked = modes.has('vocab');
+                document.getElementById('replace-mode-fact').checked = modes.has('fact');
+                document.getElementById('replace-mode-haiku').checked = modes.has('haiku');
+                document.getElementById('replace-mode-photos').checked = modes.has('photos');
+            } catch (e) {
+                console.error('Failed to load replacement modes:', e);
+            }
+        }
+
+        async function saveReplacementModes() {
+            const modes = [];
+            ['vocab','fact','haiku','photos'].forEach(k => {
+                if (document.getElementById('replace-mode-' + k).checked) modes.push(k);
+            });
+            try {
+                const r = await fetch('/api/settings/replacement-modes', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ modes })
+                });
+                const data = await r.json();
+                if (!data.success) console.error('replacement modes save failed', data.error);
+                // Server may have forced vocab back on; reflect the real state
+                loadReplacementModes();
+            } catch (e) {
+                console.error('replacement modes save error', e);
+            }
+        }
+
+        async function loadPhotoLibrary() {
+            try {
+                const r = await fetch('/api/media/photos');
+                const data = await r.json();
+                const grid = document.getElementById('photo-list');
+                grid.innerHTML = '';
+                (data.photos || []).forEach(p => {
+                    const cell = document.createElement('div');
+                    cell.className = 'photo-cell';
+                    const img = document.createElement('img');
+                    img.src = '/api/media/photos/' + p.id;
+                    img.alt = p.name;
+                    img.loading = 'lazy';
+                    const del = document.createElement('button');
+                    del.textContent = '✕';
+                    del.title = 'Delete ' + p.name;
+                    del.onclick = () => deletePhoto(p.id);
+                    cell.appendChild(img);
+                    cell.appendChild(del);
+                    grid.appendChild(cell);
+                });
+                const stats = document.getElementById('photo-library-stats');
+                if (stats) {
+                    const mb = ((data.total_bytes || 0) / (1024 * 1024)).toFixed(1);
+                    stats.textContent = `${data.count || 0} photos, ${mb} MB total`;
+                }
+            } catch (e) {
+                console.error('load photos failed', e);
+            }
+        }
+
+        async function uploadPhoto(ev) {
+            ev.preventDefault();
+            const input = document.getElementById('photo-upload-input');
+            const status = document.getElementById('photo-upload-status');
+            if (!input.files || !input.files[0]) {
+                status.textContent = 'pick a file first';
+                return false;
+            }
+            const form = new FormData();
+            form.append('file', input.files[0]);
+            status.textContent = 'uploading...';
+            try {
+                const r = await fetch('/api/media/photos', { method: 'POST', body: form });
+                const data = await r.json();
+                if (data.success) {
+                    status.textContent = 'uploaded';
+                    input.value = '';
+                    loadPhotoLibrary();
+                } else {
+                    status.textContent = 'error: ' + (data.error || 'unknown');
+                }
+            } catch (e) {
+                status.textContent = 'error: ' + e.message;
+            }
+            return false;
+        }
+
+        async function deletePhoto(id) {
+            if (!confirm('Delete this photo?')) return;
+            try {
+                await fetch('/api/media/photos/' + encodeURIComponent(id), { method: 'DELETE' });
+                loadPhotoLibrary();
+            } catch (e) {
+                console.error('delete failed', e);
             }
         }
 
@@ -2565,6 +2717,8 @@
         updateVLMStatus();
         loadVLMPreloadSetting();
         loadOptimizationSettings();
+        loadReplacementModes();
+        loadPhotoLibrary();
         updateAutonomousModeStatus();
 
         setInterval(updateStatus, 1000);

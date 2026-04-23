@@ -184,7 +184,7 @@ from v4l2 import probe_v4l2_device
 from config import MinusConfig, USTREAMER_PATH, OCR_MODEL_DIR
 from capture import UstreamerCapture
 from screenshots import ScreenshotManager
-from skip_detection import check_skip_opportunity
+from skip_detection import check_skip_opportunity, extract_ad_seconds_remaining
 
 # Import OCR module
 try:
@@ -440,6 +440,11 @@ class Minus:
         # suppression mechanisms independent.
         self.HDMI_RECONNECT_GRACE_SECONDS = 90.0
         self.hdmi_reconnect_time = 0.0
+        # Ad's own countdown (seconds remaining) extracted from OCR, plus the
+        # wall-clock time of the last update so the overlay can decay the bar
+        # smoothly between OCR samples.
+        self.ad_seconds_remaining = None
+        self.ad_seconds_remaining_at = 0.0
         from collections import deque
         self.detection_history = deque(maxlen=50)  # Recent detections for web UI
 
@@ -1726,6 +1731,10 @@ class Minus:
             'block_falloff': True,        # Shorten min-block duration on consecutive ads
             'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
             'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
+            # Which replacement-mode kinds are allowed during ad blocks. A
+            # list rather than a dict so the web UI can just toggle checkboxes.
+            # Valid kinds: 'vocab', 'fact', 'haiku', 'photos'.
+            'replacement_modes': ['vocab', 'fact', 'haiku'],
         }
         try:
             if SYSTEM_SETTINGS_FILE.exists():
@@ -1799,6 +1808,29 @@ class Minus:
         self._system_settings[key] = bool(enabled)
         self._save_system_settings()
         return {'success': True, key: bool(enabled)}
+
+    def get_replacement_modes(self) -> list:
+        """Which replacement-mode kinds the overlay may roll into."""
+        modes = self._system_settings.get(
+            'replacement_modes', ['vocab', 'fact', 'haiku'])
+        allowed = {'vocab', 'fact', 'haiku', 'photos'}
+        return [m for m in modes if m in allowed]
+
+    def set_replacement_modes(self, modes: list) -> dict:
+        """Persist the user's replacement-mode selection.
+
+        At least one text kind must remain enabled; if the caller tried to
+        disable every text option we force ``vocab`` back on so the overlay
+        has *something* to show when photos run out or aren't enabled.
+        """
+        allowed = {'vocab', 'fact', 'haiku', 'photos'}
+        cleaned = [m for m in (modes or []) if m in allowed]
+        text_kinds = {'vocab', 'fact', 'haiku'}
+        if not any(m in text_kinds for m in cleaned):
+            cleaned.append('vocab')
+        self._system_settings['replacement_modes'] = sorted(set(cleaned))
+        self._save_system_settings()
+        return {'success': True, 'replacement_modes': self._system_settings['replacement_modes']}
 
     def _load_vlm_model(self) -> bool:
         """Load VLM model with retry logic.
@@ -2432,6 +2464,16 @@ class Minus:
                 # Check for skip opportunity (for Fire TV ad skipping)
                 # CONSERVATIVE APPROACH: Only try to skip ONCE per ad to avoid accidental pauses
                 is_skippable, skip_text, countdown = check_skip_opportunity(all_texts)
+
+                # Extract the ad's *own* countdown (Ad 0:30 etc.) — distinct
+                # from the skip-button countdown above. Feeds a progress bar
+                # in the blocking overlay so the user sees how long is left.
+                ad_seconds_left = extract_ad_seconds_remaining(all_texts)
+                if ad_seconds_left is not None:
+                    self.ad_seconds_remaining = ad_seconds_left
+                    self.ad_seconds_remaining_at = time.time()
+                    if self.ad_blocker and hasattr(self.ad_blocker, 'set_ad_seconds_remaining'):
+                        self.ad_blocker.set_ad_seconds_remaining(ad_seconds_left)
 
                 # Calculate time since ad blocking started
                 time_since_blocking = 0

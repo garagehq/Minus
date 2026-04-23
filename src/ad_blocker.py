@@ -38,6 +38,8 @@ from gi.repository import Gst
 
 # Import vocabulary from extracted module
 from vocabulary import SPANISH_VOCABULARY, VOCABULARY_COMBINED
+from facts import DID_YOU_KNOW
+from haiku import HAIKUS
 from config import MinusConfig
 from drm import (
     get_color_format, set_color_format, is_connector_connected,
@@ -122,8 +124,27 @@ class DRMAdBlocker:
         # web UI (`greyscale_preview` in ~/.minus_system_settings.json).
         self._preview_grayscale = True
 
-        # Pixelated background - disabled to test if it causes remaining glitches
-        self._pixelated_background_enabled = False  # DISABLED for glitch testing
+        # Ad-remaining countdown state for the stats progress bar. Set from
+        # minus.py when OCR reads an "Ad 0:NN" timer. Decays client-side
+        # between OCR samples so the bar moves even at sub-second resolution.
+        self._ad_seconds_remaining = None
+        self._ad_seconds_anchor = 0.0  # time.time() when we received the value
+        self._ad_seconds_peak = None   # Largest value seen this ad (for bar %)
+
+        # Replacement-mode lock-in: at the start of each ad block we roll once
+        # for a content kind (vocab / fact / haiku) and stick with it for the
+        # whole break, plus a cooldown afterwards. Prevents flip-flopping
+        # between styles mid-ad, which felt visually chaotic in testing.
+        self._locked_content_kind = None
+        self._content_kind_lock_until = 0.0
+        self.CONTENT_KIND_COOLDOWN_SECONDS = 30.0
+
+        # Pixelated pre-ad background — heavy pixelation (20x downscale) plus
+        # 60% darken so the previous content reads as "where I was" without
+        # competing with the Spanish overlay for attention. Kept fully offline
+        # — JPEG comes from the local ustreamer /snapshot poll, not any remote
+        # source. Can be turned off if glitches resurface.
+        self._pixelated_background_enabled = True
         self._frame_width, self._frame_height = self._detect_frame_resolution()
         self._preview_w = int(self._frame_width * 0.20)
         self._preview_h = int(self._frame_height * 0.20)
@@ -1154,6 +1175,83 @@ class DRMAdBlocker:
             'last_error': self._last_error_time
         }
 
+    # Content-kind rotation weights. Vocab is the default workhorse but we
+    # sprinkle haiku/facts in to keep the overlay from feeling monotonous.
+    # When _locked_content_kind is set (per-ad-break lock-in), we bypass this.
+    _CONTENT_KINDS = ('vocab', 'fact', 'haiku')
+    _CONTENT_KIND_WEIGHTS = (0.6, 0.25, 0.15)
+    # When the user has enabled 'photos' replacement mode AND uploaded at
+    # least one photo, each ad block has a one-in-N chance of rolling into
+    # photo-cycling mode instead of a text rotation. Lock-in applies the
+    # same way so we don't flip-flop mid-break.
+    _PHOTO_MODE_CHANCE = 0.5
+
+    def _pick_content_kind(self):
+        """Choose which kind of content to show next.
+
+        If a per-block lock is active, return it. Otherwise weighted-random.
+        """
+        if getattr(self, '_locked_content_kind', None):
+            return self._locked_content_kind
+        return random.choices(self._CONTENT_KINDS, weights=self._CONTENT_KIND_WEIGHTS, k=1)[0]
+
+    def _roll_replacement_mode(self):
+        """Pick a content kind at the start of an ad break.
+
+        Honours the user's preferences from ``minus.replacement_modes``:
+          - If only 'vocab' is enabled → always vocab
+          - If 'photos' is enabled AND at least one photo is uploaded, there
+            is a :attr:`_PHOTO_MODE_CHANCE` chance of photo-cycling
+          - Otherwise weighted-random over the currently-enabled text kinds
+        """
+        modes_enabled = self._get_enabled_replacement_modes()
+        # If photos enabled and we have photos on disk, roll the dice.
+        if 'photos' in modes_enabled:
+            try:
+                from photo_library import get_photo_library
+                if get_photo_library().random_photo_id() is not None:
+                    if random.random() < self._PHOTO_MODE_CHANCE or modes_enabled == {'photos'}:
+                        return 'photos'
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] photo pool check failed: {e}")
+        # Filter text kinds to what's enabled; fall back to vocab.
+        text_kinds = tuple(k for k in self._CONTENT_KINDS if k in modes_enabled)
+        if not text_kinds:
+            return 'vocab'
+        weights = tuple(
+            w for k, w in zip(self._CONTENT_KINDS, self._CONTENT_KIND_WEIGHTS) if k in modes_enabled)
+        return random.choices(text_kinds, weights=weights, k=1)[0]
+
+    def _get_enabled_replacement_modes(self):
+        """Read ``replacement_modes`` preferences from the Minus instance.
+
+        Defaults to {'vocab', 'fact', 'haiku'} (text kinds on, photos off).
+        """
+        if self.minus and hasattr(self.minus, 'get_replacement_modes'):
+            try:
+                return set(self.minus.get_replacement_modes())
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] get_replacement_modes failed: {e}")
+        return {'vocab', 'fact', 'haiku'}
+
+    def _render_vocab(self, header):
+        vocab = random.choice(VOCABULARY_COMBINED)
+        self._current_vocab = vocab
+        # 4-tuple -> single example; 5-tuple -> two examples on own lines
+        spanish, pronunciation, english = vocab[0], vocab[1], vocab[2]
+        examples = [ex for ex in vocab[3:] if ex]
+        example_block = "\n".join(f'"{ex}"' for ex in examples)
+        return f"{header}\n\n{spanish}\n({pronunciation})\n\n= {english}\n\n{example_block}"
+
+    def _render_fact(self, header):
+        title, body = random.choice(DID_YOU_KNOW)
+        return f"{header}\n\nDID YOU KNOW?\n{title}\n\n{body}"
+
+    def _render_haiku(self, header):
+        lines, attribution = random.choice(HAIKUS)
+        body = "\n".join(lines)
+        return f"{header}\n\nHAIKU\n\n{body}\n\n— {attribution}"
+
     def _get_blocking_text(self, source='default'):
         if source == 'hdmi_lost':
             return "[ NO SIGNAL ]\n\nHDMI DISCONNECTED\n\nWaiting for signal..."
@@ -1167,22 +1265,13 @@ class DRMAdBlocker:
             header = "[ BLOCKING // OCR+VLM ]"
         else:
             header = "[ BLOCKING ]"
-        vocab = random.choice(VOCABULARY_COMBINED)
-        self._current_vocab = vocab  # Track current word for API
-        # Entries come in two shapes:
-        #   4-tuple: (spanish, pronunciation, english, example)
-        #   5-tuple: (spanish, pronunciation, english, example1, example2)
-        # Render whichever examples exist, each on its own quoted line.
-        spanish, pronunciation, english = vocab[0], vocab[1], vocab[2]
-        examples = [ex for ex in vocab[3:] if ex]
-        example_block = "\n".join(f'"{ex}"' for ex in examples)
-        # Layout matching web UI vocabulary card:
-        # - Header (small)
-        # - Spanish word (prominent)
-        # - (pronunciation) in parentheses
-        # - = translation
-        # - "Example sentences" in quotes, newline-separated
-        return f"{header}\n\n{spanish}\n({pronunciation})\n\n= {english}\n\n{example_block}"
+
+        kind = self._pick_content_kind()
+        if kind == 'fact':
+            return self._render_fact(header)
+        if kind == 'haiku':
+            return self._render_haiku(header)
+        return self._render_vocab(header)
 
     def _get_debug_text(self):
         uptime_str = "N/A"
@@ -1213,6 +1302,19 @@ class DRMAdBlocker:
             time_saved_str = f"{saved_secs}s"
 
         debug_text = f"UPTIME    {uptime_str}\nBLOCKED   {self._total_ads_blocked}\nBLK TIME  {block_time_str}\nSAVED     {time_saved_str}"
+        # Ad countdown bar (YouTube/Netflix "Ad 0:30" -> drains to 0)
+        countdown_bar = self._ad_countdown_bar()
+        if countdown_bar:
+            debug_text += f"\n{countdown_bar}"
+        # Audio-reactive bar (falls silent when we're muted, which is the
+        # whole point — the Spanish overlay steals attention from the ad)
+        if self.audio and hasattr(self.audio, 'get_level_bars'):
+            try:
+                bars = self.audio.get_level_bars(width=12)
+                if bars:
+                    debug_text += f"\nAUDIO     {bars}"
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] audio bars skipped: {e}")
         if self._skip_text:
             debug_text += f"\n> {self._skip_text}"
         return debug_text
@@ -1252,10 +1354,41 @@ class DRMAdBlocker:
 
     def _rotation_loop(self, source):
         while not self._stop_rotation.is_set():
-            self._randomize_word_color()
-            text = self._get_blocking_text(source)
-            self._blocking_api_call('/blocking/set', {'text_vocab': text})
-            self._stop_rotation.wait(random.uniform(11.0, 15.0))
+            kind = self._pick_content_kind()
+            if kind == 'photos':
+                # Photo-cycling replacement mode: swap the background image
+                # every ~5s, hide the large text so the photo reads as a
+                # screensaver. Stats + countdown bar stay on top.
+                self._push_photo_background()
+                self._blocking_api_call('/blocking/set', {'text_vocab': ''})
+                self._stop_rotation.wait(5.0)
+            else:
+                self._randomize_word_color()
+                text = self._get_blocking_text(source)
+                self._blocking_api_call('/blocking/set', {'text_vocab': text})
+                self._stop_rotation.wait(random.uniform(11.0, 15.0))
+
+    def _push_photo_background(self):
+        """Send a random library photo to ustreamer as the blocking bg.
+
+        The photo is already a re-encoded JPEG on disk so we just read and
+        forward its bytes. No re-encoding here — hot path.
+        """
+        try:
+            from photo_library import get_photo_library
+            lib = get_photo_library()
+            photo_id = lib.random_photo_id()
+            if not photo_id:
+                return False
+            data = lib.get_photo_bytes(photo_id)
+            if not data:
+                return False
+            result = self._blocking_api_call(
+                '/blocking/background', data=data, method='POST', timeout=0.8)
+            return bool(result and result.get('ok', False))
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] photo background push failed: {e}")
+            return False
 
     def _start_rotation(self, source):
         self._stop_rotation.clear()
@@ -1314,12 +1447,50 @@ class DRMAdBlocker:
                     logger.debug(f"[DRMAdBlocker] Snapshot buffer fetch failed ({consecutive_failures}x): {e}")
             self._stop_snapshot_buffer.wait(self._snapshot_interval)
 
+    def _generate_fallback_background(self):
+        """Build a dark radial-gradient JPEG for blocks that start before the
+        snapshot buffer has content (e.g. ad in the first ~6s after restart).
+
+        Pure-Python/OpenCV, zero network. Returns JPEG bytes or None.
+        """
+        try:
+            import cv2
+            import numpy as np
+            w, h = 960, 540  # small is fine — ustreamer scales to output
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            cx, cy = w / 2.0, h / 2.0
+            dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+            dist /= dist.max()
+            # Dark matrix-green radial gradient matching the AESTHETICS palette
+            img = np.zeros((h, w, 3), dtype=np.uint8)
+            img[..., 0] = (25 * (1 - dist)).astype(np.uint8)   # B
+            img[..., 1] = (50 * (1 - dist)).astype(np.uint8)   # G
+            img[..., 2] = (20 * (1 - dist)).astype(np.uint8)   # R
+            _, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            return enc.tobytes()
+        except Exception as e:
+            logger.debug(f"[DRMAdBlocker] Fallback gradient generation failed: {e}")
+            return None
+
     def _upload_background(self):
         """Upload pixelated background. Thread-safe for async execution."""
         try:
             # Thread-safe: copy snapshot data atomically to avoid race conditions
             try:
                 if not self._snapshot_buffer:
+                    # Buffer empty (early boot / post-restart). Upload a cheap
+                    # radial gradient as fallback so the overlay isn't flat
+                    # black while we wait for the first capture.
+                    fallback = self._generate_fallback_background()
+                    if fallback:
+                        self._blocking_api_call(
+                            '/blocking/background', data=fallback,
+                            method='POST', timeout=0.5)
+                        logger.info(
+                            "[DRMAdBlocker] Uploaded fallback gradient "
+                            "(snapshot buffer empty)"
+                        )
+                        return True
                     logger.warning("[DRMAdBlocker] No snapshots in buffer for background")
                     return False
                 # Copy data immediately to avoid race with buffer updates
@@ -1472,6 +1643,44 @@ class DRMAdBlocker:
         if self.is_visible:
             self._blocking_api_call('/blocking/set', {'preview_enabled': 'true' if enabled else 'false'})
 
+    def set_ad_seconds_remaining(self, seconds):
+        """Called from the OCR loop when an "Ad N:MM" timer is spotted."""
+        if seconds is None:
+            return
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            return
+        if seconds < 0:
+            return
+        self._ad_seconds_remaining = seconds
+        self._ad_seconds_anchor = time.time()
+        # Peak resets when value goes UP (new ad started or OCR misread low)
+        if self._ad_seconds_peak is None or seconds > self._ad_seconds_peak:
+            self._ad_seconds_peak = seconds
+
+    def _clear_ad_countdown(self):
+        self._ad_seconds_remaining = None
+        self._ad_seconds_anchor = 0.0
+        self._ad_seconds_peak = None
+
+    def _ad_countdown_bar(self, width=10):
+        """Return a `[▓▓▓░░░] 12s` style bar, or '' if no timer known.
+
+        Uses the peak value seen this ad as 100% so the bar drains instead
+        of snapping around. Decays between OCR samples using wall-clock.
+        """
+        if self._ad_seconds_remaining is None or self._ad_seconds_peak is None:
+            return ''
+        if self._ad_seconds_peak <= 0:
+            return ''
+        elapsed = max(0.0, time.time() - self._ad_seconds_anchor)
+        current = max(0.0, self._ad_seconds_remaining - elapsed)
+        frac = max(0.0, min(1.0, current / self._ad_seconds_peak))
+        filled = int(round(frac * width))
+        bar = ('#' * filled) + ('.' * (width - filled))
+        return f"AD LEFT   [{bar}] {int(current):>2d}s"
+
     def is_preview_grayscale(self):
         return self._preview_grayscale
 
@@ -1565,6 +1774,14 @@ class DRMAdBlocker:
                 logger.info(f"[DRMAdBlocker] Reversing end animation ({source})")
                 self._stop_animation_thread()
 
+            # Lock a replacement-mode choice for this ad break (unless a
+            # prior lock is still within the cooldown window, in which case
+            # we reuse it — avoids flip-flopping between styles during an
+            # ad cluster). If the user has enabled 'photos' mode and uploaded
+            # at least one photo, we may roll into photo-cycling instead.
+            now = time.time()
+            if not self._locked_content_kind or now > self._content_kind_lock_until:
+                self._locked_content_kind = self._roll_replacement_mode()
             logger.info(f"[DRMAdBlocker] Starting blocking ({source})")
 
             # Mute audio immediately
@@ -1643,6 +1860,10 @@ class DRMAdBlocker:
 
             self._stop_rotation_thread()
             self._stop_debug_thread()
+            self._clear_ad_countdown()
+            # Keep the locked content kind valid for the cooldown window so
+            # a fresh ad shortly after this one reuses the same style.
+            self._content_kind_lock_until = time.time() + self.CONTENT_KIND_COOLDOWN_SECONDS
 
             if self._current_block_start:
                 self._total_blocking_time += time.time() - self._current_block_start

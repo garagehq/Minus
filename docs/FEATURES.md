@@ -42,6 +42,19 @@ Minimum block time starts at 3.0s for the first ad in a sequence and shrinks by 
 **HDMI reconnect grace period:**
 For 90 seconds after the TV reconnects (detected by the health monitor), ad blocking is suppressed so the user can navigate menus without overlays jumping in. Toggleable from Settings → Blocking Optimizations.
 
+**Replacement modes (Settings → Replace):**
+The blocking overlay rolls a single *replacement mode* at the start of each ad break and sticks with it for the whole break (plus a 30-second cooldown so back-to-back ads reuse the same style). Available kinds:
+- **Vocabulary** — Spanish words with 1-2 example sentences (default)
+- **Did You Know?** — short trivia cards (`src/facts.py`)
+- **Haikus** — classical + modern short poems (`src/haiku.py`)
+- **Photo Screensaver** — cycles user-uploaded photos as the blocking background every 5 seconds. Photos are uploaded via the web UI Settings → Replace tab, stored under `~/.minus_media/photos/` (re-encoded to 1920px max, JPEG quality 85, capped at 200 photos / 200 MB).
+
+The overlay also gets:
+- **Pixelated pre-ad background** — heavy pixelation + 60% darken of the screen as it looked ~6s before the ad. Gives context without competing for attention. Falls back to a dark radial gradient when the snapshot buffer is empty (e.g. within the first seconds after a restart).
+- **Ad countdown bar** — when OCR reads "Ad 0:30" or "Ad 10", a `[###...] 12s` bar drains in real time so the user sees how long is left.
+- **Audio-reactive visualizer** — a short ASCII ramp bar (`' .,-;+ox*#@'`) driven by RMS of the alsasrc capture in `src/audio.py`. Bounded 16-sample deque — no memory growth over a 24h run.
+- **Rotating Spanish word color** — 10-color YUV palette cycled per rotation.
+
 ### Audio Passthrough
 
 **Features:**

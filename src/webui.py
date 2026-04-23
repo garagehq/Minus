@@ -2280,6 +2280,84 @@ class WebUI:
                 logger.error(f"Error with VLM preload setting: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
+        @self.app.route('/api/settings/replacement-modes', methods=['GET', 'POST'])
+        def api_replacement_modes():
+            """Get or set which replacement-mode kinds are enabled.
+
+            GET returns the list; POST takes ``{"modes": ["vocab","photos"]}``
+            and persists it via Minus.set_replacement_modes (which enforces
+            at least one text kind).
+            """
+            try:
+                if request.method == 'GET':
+                    return jsonify({
+                        'replacement_modes': self.minus.get_replacement_modes()
+                    })
+                data = request.get_json() or {}
+                modes = data.get('modes', [])
+                if not isinstance(modes, list):
+                    return jsonify({'success': False, 'error': 'modes must be a list'}), 400
+                return jsonify(self.minus.set_replacement_modes(modes))
+            except Exception as e:
+                logger.error(f"Error with replacement-modes setting: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Photo library (for 'photos' replacement mode)
+        # =========================================================================
+
+        @self.app.route('/api/media/photos', methods=['GET', 'POST'])
+        def api_media_photos():
+            """List photos (GET) or upload a new one (POST multipart).
+
+            POST accepts ``multipart/form-data`` with a single ``file`` field.
+            Server re-encodes to JPEG, caps dimensions/size, and stores under
+            ``~/.minus_media/photos/``. See src/photo_library.py.
+            """
+            from photo_library import get_photo_library
+            lib = get_photo_library()
+            try:
+                if request.method == 'GET':
+                    return jsonify({
+                        'photos': lib.list_photos(),
+                        'total_bytes': lib.total_bytes(),
+                        'count': lib.count(),
+                    })
+                # POST upload
+                if 'file' not in request.files:
+                    return jsonify({'success': False, 'error': 'missing file field'}), 400
+                f = request.files['file']
+                data = f.read()
+                if not data:
+                    return jsonify({'success': False, 'error': 'empty upload'}), 400
+                try:
+                    meta = lib.add_photo(data, original_name=f.filename or 'photo')
+                    return jsonify({'success': True, 'photo': meta})
+                except ValueError as ve:
+                    return jsonify({'success': False, 'error': str(ve)}), 400
+            except Exception as e:
+                logger.error(f"Error in photo library: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/media/photos/<photo_id>', methods=['GET', 'DELETE'])
+        def api_media_photo_detail(photo_id):
+            """Download (GET) or delete (DELETE) one photo by id."""
+            from photo_library import get_photo_library
+            lib = get_photo_library()
+            try:
+                if request.method == 'DELETE':
+                    removed = lib.remove_photo(photo_id)
+                    return jsonify({'success': removed})
+                # GET — return JPEG bytes inline
+                data = lib.get_photo_bytes(photo_id)
+                if data is None:
+                    return jsonify({'error': 'not found'}), 404
+                from flask import Response
+                return Response(data, mimetype='image/jpeg')
+            except Exception as e:
+                logger.error(f"Error in photo detail {photo_id}: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
         @self.app.route('/api/settings/optimization', methods=['GET', 'POST'])
         def api_optimization_settings():
             """Get or set the three optimization toggles.
