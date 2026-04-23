@@ -1733,8 +1733,8 @@ class Minus:
             'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
             # Which replacement-mode kinds are allowed during ad blocks. A
             # list rather than a dict so the web UI can just toggle checkboxes.
-            # Valid kinds: 'vocab', 'fact', 'haiku', 'photos'.
-            'replacement_modes': ['vocab', 'fact', 'haiku'],
+            # Valid kinds: 'vocab', 'fact', 'photos'.
+            'replacement_modes': ['vocab', 'fact'],
         }
         try:
             if SYSTEM_SETTINGS_FILE.exists():
@@ -1812,8 +1812,9 @@ class Minus:
     def get_replacement_modes(self) -> list:
         """Which replacement-mode kinds the overlay may roll into."""
         modes = self._system_settings.get(
-            'replacement_modes', ['vocab', 'fact', 'haiku'])
-        allowed = {'vocab', 'fact', 'haiku', 'photos'}
+            'replacement_modes', ['vocab', 'fact'])
+        allowed = {'vocab', 'fact', 'photos'}
+        # Strip any legacy 'haiku' entries silently (kind was removed)
         return [m for m in modes if m in allowed]
 
     def set_replacement_modes(self, modes: list) -> dict:
@@ -1823,9 +1824,9 @@ class Minus:
         disable every text option we force ``vocab`` back on so the overlay
         has *something* to show when photos run out or aren't enabled.
         """
-        allowed = {'vocab', 'fact', 'haiku', 'photos'}
+        allowed = {'vocab', 'fact', 'photos'}
         cleaned = [m for m in (modes or []) if m in allowed]
-        text_kinds = {'vocab', 'fact', 'haiku'}
+        text_kinds = {'vocab', 'fact'}
         if not any(m in text_kinds for m in cleaned):
             cleaned.append('vocab')
         self._system_settings['replacement_modes'] = sorted(set(cleaned))

@@ -39,7 +39,6 @@ from gi.repository import Gst
 # Import vocabulary from extracted module
 from vocabulary import SPANISH_VOCABULARY, VOCABULARY_COMBINED
 from facts import DID_YOU_KNOW
-from haiku import HAIKUS
 from config import MinusConfig
 from drm import (
     get_color_format, set_color_format, is_connector_connected,
@@ -1176,10 +1175,10 @@ class DRMAdBlocker:
         }
 
     # Content-kind rotation weights. Vocab is the default workhorse but we
-    # sprinkle haiku/facts in to keep the overlay from feeling monotonous.
+    # sprinkle facts in to keep the overlay from feeling monotonous.
     # When _locked_content_kind is set (per-ad-break lock-in), we bypass this.
-    _CONTENT_KINDS = ('vocab', 'fact', 'haiku')
-    _CONTENT_KIND_WEIGHTS = (0.6, 0.25, 0.15)
+    _CONTENT_KINDS = ('vocab', 'fact')
+    _CONTENT_KIND_WEIGHTS = (0.7, 0.3)
     # When the user has enabled 'photos' replacement mode AND uploaded at
     # least one photo, each ad block has a one-in-N chance of rolling into
     # photo-cycling mode instead of a text rotation. Lock-in applies the
@@ -1247,11 +1246,6 @@ class DRMAdBlocker:
         title, body = random.choice(DID_YOU_KNOW)
         return f"{header}\n\nDID YOU KNOW?\n{title}\n\n{body}"
 
-    def _render_haiku(self, header):
-        lines, attribution = random.choice(HAIKUS)
-        body = "\n".join(lines)
-        return f"{header}\n\nHAIKU\n\n{body}\n\n— {attribution}"
-
     def _get_blocking_text(self, source='default'):
         if source == 'hdmi_lost':
             return "[ NO SIGNAL ]\n\nHDMI DISCONNECTED\n\nWaiting for signal..."
@@ -1269,8 +1263,6 @@ class DRMAdBlocker:
         kind = self._pick_content_kind()
         if kind == 'fact':
             return self._render_fact(header)
-        if kind == 'haiku':
-            return self._render_haiku(header)
         return self._render_vocab(header)
 
     def _get_debug_text(self):
@@ -1355,17 +1347,28 @@ class DRMAdBlocker:
     def _rotation_loop(self, source):
         while not self._stop_rotation.is_set():
             kind = self._pick_content_kind()
+            # Every rotation re-asserts preview_enabled + preview_grayscale
+            # regardless of mode so no path can accidentally drop the corner
+            # preview. Cheap (one /blocking/set), and makes the UI promise
+            # unconditional: "ad is always visible, desaturated, in the
+            # corner — during facts, vocab, photos, whatever."
+            preview_state = {
+                'preview_enabled': 'true' if self._preview_enabled else 'false',
+                'preview_grayscale': 'true' if self._preview_grayscale else 'false',
+            }
             if kind == 'photos':
                 # Photo-cycling replacement mode: swap the background image
                 # every ~5s, hide the large text so the photo reads as a
-                # screensaver. Stats + countdown bar stay on top.
+                # screensaver. Stats + countdown bar stay on top. Preview
+                # window stays (greyscaled) so the user can still peek at
+                # the ad.
                 self._push_photo_background()
-                self._blocking_api_call('/blocking/set', {'text_vocab': ''})
+                self._blocking_api_call('/blocking/set', {'text_vocab': '', **preview_state})
                 self._stop_rotation.wait(5.0)
             else:
                 self._randomize_word_color()
                 text = self._get_blocking_text(source)
-                self._blocking_api_call('/blocking/set', {'text_vocab': text})
+                self._blocking_api_call('/blocking/set', {'text_vocab': text, **preview_state})
                 self._stop_rotation.wait(random.uniform(11.0, 15.0))
 
     def _push_photo_background(self):

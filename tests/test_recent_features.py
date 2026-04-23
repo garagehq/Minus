@@ -895,23 +895,22 @@ class TestContentRotationModes(unittest.TestCase):
             DRMAdBlocker._roll_replacement_mode, stub)
         stub._render_vocab = types.MethodType(DRMAdBlocker._render_vocab, stub)
         stub._render_fact = types.MethodType(DRMAdBlocker._render_fact, stub)
-        stub._render_haiku = types.MethodType(DRMAdBlocker._render_haiku, stub)
         stub._get_blocking_text = types.MethodType(
             DRMAdBlocker._get_blocking_text, stub)
         return stub
 
     def test_lock_forces_fixed_kind(self):
         stub = self._make()
-        stub._locked_content_kind = 'haiku'
+        stub._locked_content_kind = 'fact'
         for _ in range(30):
-            self.assertEqual(stub._pick_content_kind(), 'haiku')
+            self.assertEqual(stub._pick_content_kind(), 'fact')
 
     def test_all_kinds_appear_without_lock(self):
         stub = self._make()
         seen = set()
         for _ in range(400):
             seen.add(stub._pick_content_kind())
-        self.assertEqual(seen, {'vocab', 'fact', 'haiku'})
+        self.assertEqual(seen, {'vocab', 'fact'})
 
     def test_disabled_text_kinds_excluded_from_roll(self):
         stub = self._make()
@@ -933,20 +932,24 @@ class TestContentRotationModes(unittest.TestCase):
             kinds = {stub._roll_replacement_mode() for _ in range(30)}
         self.assertEqual(kinds, {'vocab'})
 
-    def test_blocking_text_fact_and_haiku_render(self):
+    def test_blocking_text_fact_renders(self):
         stub = self._make()
-        # Fact path
         stub._locked_content_kind = 'fact'
         text = stub._get_blocking_text(source='ocr')
         self.assertIn('DID YOU KNOW', text)
-        # Haiku path
-        stub._locked_content_kind = 'haiku'
+
+    def test_blocking_text_vocab_renders(self):
+        stub = self._make()
+        stub._locked_content_kind = 'vocab'
         text = stub._get_blocking_text(source='ocr')
-        self.assertIn('HAIKU', text)
+        # Header always present
+        self.assertIn('BLOCKING', text)
+        # Should include the '=' translation marker from _render_vocab
+        self.assertIn('=', text)
 
 
-class TestFactsAndHaikusOffline(unittest.TestCase):
-    """Content libraries should be pure data — no network, no import surprises."""
+class TestFactsOffline(unittest.TestCase):
+    """Content library is pure data — no network, no import surprises."""
 
     def test_facts_module_has_content(self):
         from facts import DID_YOU_KNOW
@@ -957,27 +960,22 @@ class TestFactsAndHaikusOffline(unittest.TestCase):
             self.assertTrue(title.strip())
             self.assertTrue(body.strip())
 
-    def test_haiku_module_has_content(self):
-        from haiku import HAIKUS
-        self.assertGreaterEqual(len(HAIKUS), 20)
-        for lines, attrib in HAIKUS:
-            self.assertEqual(len(lines), 3)
-            for line in lines:
-                self.assertIsInstance(line, str)
-                self.assertTrue(line.strip())
-            self.assertIsInstance(attrib, str)
-
-    def test_modules_have_no_imports_of_net_libs(self):
-        """We run offline — content modules should have no network imports."""
+    def test_haiku_module_is_gone(self):
+        """Haikus were removed per user preference — the module must not exist."""
         import pathlib
         src_dir = pathlib.Path(__file__).parent.parent / 'src'
-        for name in ('facts.py', 'haiku.py'):
-            txt = (src_dir / name).read_text()
-            for forbidden in ('import requests', 'from requests',
-                              'urllib.request', 'urlopen', 'socket.connect'):
-                self.assertNotIn(
-                    forbidden, txt,
-                    f"{name} references {forbidden!r} — breaks offline mode")
+        self.assertFalse((src_dir / 'haiku.py').exists())
+
+    def test_modules_have_no_imports_of_net_libs(self):
+        """We run offline — content module should have no network imports."""
+        import pathlib
+        src_dir = pathlib.Path(__file__).parent.parent / 'src'
+        txt = (src_dir / 'facts.py').read_text()
+        for forbidden in ('import requests', 'from requests',
+                          'urllib.request', 'urlopen', 'socket.connect'):
+            self.assertNotIn(
+                forbidden, txt,
+                f"facts.py references {forbidden!r} — breaks offline mode")
 
 
 class TestAudioLevelBars(unittest.TestCase):
@@ -1093,6 +1091,80 @@ class TestPhotoLibrary(unittest.TestCase):
         # total_bytes should be 0 too
         self.assertEqual(self.lib.total_bytes(), 0)
 
+    # ---- auto-conversion: any format Pillow can open becomes JPEG ----
+
+    def _make_png_rgba(self, size=(128, 96)):
+        """PNG with alpha — should get flattened against black."""
+        from PIL import Image
+        import io as _io
+        img = Image.new('RGBA', size, (180, 50, 50, 128))
+        buf = _io.BytesIO()
+        img.save(buf, format='PNG')
+        return buf.getvalue()
+
+    def _make_palette_gif(self, size=(80, 80)):
+        from PIL import Image
+        import io as _io
+        img = Image.new('P', size, 7)  # palette mode
+        img.putpalette([i % 256 for i in range(768)])
+        buf = _io.BytesIO()
+        img.save(buf, format='GIF')
+        return buf.getvalue()
+
+    def _make_huge_jpeg(self, size=(4000, 3000)):
+        from PIL import Image
+        import io as _io
+        img = Image.new('RGB', size, (30, 180, 30))
+        buf = _io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        return buf.getvalue()
+
+    def test_accepts_png_with_alpha(self):
+        """RGBA PNG should be accepted and normalized (alpha flattened)."""
+        meta = self.lib.add_photo(self._make_png_rgba(), original_name='pic.png')
+        self.assertGreater(meta['bytes'], 0)
+        # Stored file is a JPEG, not a PNG (normalized on disk)
+        data = self.lib.get_photo_bytes(meta['id'])
+        self.assertEqual(data[:3], b'\xff\xd8\xff', "stored file should be JPEG")
+
+    def test_accepts_palette_gif(self):
+        """Palette-mode GIFs should be accepted and converted to JPEG."""
+        meta = self.lib.add_photo(self._make_palette_gif(), original_name='x.gif')
+        data = self.lib.get_photo_bytes(meta['id'])
+        self.assertEqual(data[:3], b'\xff\xd8\xff')
+
+    def test_downsizes_huge_image(self):
+        """Source bigger than PHOTO_MAX_DIM is thumbnailed."""
+        import photo_library as pl
+        meta = self.lib.add_photo(self._make_huge_jpeg(), original_name='big.jpg')
+        self.assertLessEqual(max(meta['dim']), pl.PHOTO_MAX_DIM)
+
+    def test_exif_orientation_applied(self):
+        """EXIF Orientation=6 (90deg) should be honored — image is rotated
+        before storage so the saved dimensions reflect the visual
+        orientation, not the raw pixel grid."""
+        from PIL import Image
+        import io as _io
+        # Build a portrait-oriented 'wide' image whose EXIF claims orientation=6
+        # (rotate 90 CW for display). After load, visual size is (H, W).
+        img = Image.new('RGB', (300, 100), (50, 50, 200))
+        buf = _io.BytesIO()
+        # Minimal EXIF blob with orientation=6. We use PIL's own hook since
+        # synthesising raw EXIF is fiddly.
+        exif = img.getexif()
+        exif[0x0112] = 6  # Orientation tag
+        img.save(buf, format='JPEG', exif=exif.tobytes())
+        meta = self.lib.add_photo(buf.getvalue(), original_name='portrait.jpg')
+        # After exif_transpose, dims should be swapped: was 300x100 → 100x300
+        self.assertEqual(meta['dim'][0], 100)
+        self.assertEqual(meta['dim'][1], 300)
+
+    def test_rejects_truly_unopenable(self):
+        """Garbage that isn't any known image format is still rejected."""
+        with self.assertRaises(ValueError):
+            self.lib.add_photo(b"this is just text, not an image",
+                                original_name='fake.jpg')
+
 
 class TestReplacementModesAPI(unittest.TestCase):
     """Web UI can GET/POST the enabled replacement kinds."""
@@ -1136,7 +1208,7 @@ class TestMinusReplacementModesLogic(unittest.TestCase):
         import types as _t
         import minus as _m
         stub = type('S', (), {})()
-        stub._system_settings = {'replacement_modes': ['vocab', 'fact', 'haiku']}
+        stub._system_settings = {'replacement_modes': ['vocab', 'fact']}
         stub._save_system_settings = lambda self=None: None
         stub.get_replacement_modes = _t.MethodType(
             _m.Minus.get_replacement_modes, stub)
@@ -1171,7 +1243,7 @@ class TestOfflineImportHygiene(unittest.TestCase):
         # don't mention common net libraries in their top-level imports.
         import pathlib
         src_dir = pathlib.Path(__file__).parent.parent / 'src'
-        for name in ('facts.py', 'haiku.py', 'photo_library.py'):
+        for name in ('facts.py', 'photo_library.py'):
             txt = (src_dir / name).read_text()
             for forbidden in ('import requests', 'from requests',
                               'urllib.request', 'urlopen', 'socket.connect'):

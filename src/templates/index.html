@@ -24,6 +24,7 @@
             <button class="tab-nav-btn active" onclick="showTab('home')">Home</button>
             <button class="tab-nav-btn" onclick="showTab('remote')">Remote</button>
             <button class="tab-nav-btn" onclick="showTab('screenshots')">Screenshots</button>
+            <button class="tab-nav-btn" onclick="showTab('replace')">Replace</button>
             <button class="tab-nav-btn" onclick="showTab('settings')">Settings</button>
         </nav>
 
@@ -428,6 +429,51 @@
             </section>
         </div>
 
+        <!-- ===== REPLACE TAB ===== -->
+        <div id="tab-replace" class="tab-content">
+            <section class="settings-section">
+                <h2>Replace</h2>
+                <p class="help-text">What shows in place of the ad. One kind is rolled per ad break and sticks for that break (30s cooldown before a new roll). The greyscaled preview of the ad stays in the bottom-right corner for every mode.</p>
+
+                <div class="setting-item">
+                    <span class="setting-label">Spanish Vocabulary</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-vocab" checked onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="setting-item">
+                    <span class="setting-label">Did You Know? facts</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-fact" checked onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div class="setting-item">
+                    <span class="setting-label">Photo Screensaver</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="replace-mode-photos" onchange="saveReplacementModes()">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text">Cycles your uploaded photos every 5 seconds during an ad block. Needs at least one photo uploaded below to take effect.</p>
+            </section>
+
+            <section class="settings-section">
+                <h2>Photos</h2>
+                <p class="help-text">Uploads are auto-converted to JPEG at up to 1920px (long edge). EXIF orientation is honoured, transparency flattened, any format Pillow can open (HEIC/PNG/WebP/GIF/...) is accepted. Cap: 200 photos / 200 MB (oldest evicted when full).</p>
+                <div id="photo-list" class="photo-grid"></div>
+                <form id="photo-upload-form" style="margin-top: 0.75rem;" onsubmit="return uploadPhoto(event)">
+                    <input type="file" id="photo-upload-input" accept="image/*" />
+                    <button type="submit">Upload</button>
+                    <span id="photo-upload-status" class="help-text" style="margin-left: 0.75rem;"></span>
+                </form>
+                <p class="help-text" id="photo-library-stats"></p>
+            </section>
+        </div>
+
         <!-- ===== SETTINGS TAB ===== -->
         <div id="tab-settings" class="tab-content">
             <!-- Display Settings -->
@@ -567,56 +613,6 @@
                     </label>
                 </div>
                 <p class="help-text">Desaturates the corner preview of the blocked ad so the Spanish overlay (bright, colorful) is more appealing than the ad.</p>
-            </section>
-
-            <!-- Replacement content -->
-            <section class="settings-section">
-                <h2>Replace</h2>
-                <p class="help-text">What shows in place of the ad. One kind is rolled per ad break and sticks for that break (30s cooldown before a new roll).</p>
-
-                <div class="setting-item">
-                    <span class="setting-label">Spanish Vocabulary</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="replace-mode-vocab" checked onchange="saveReplacementModes()">
-                        <span class="toggle-slider"></span>
-                    </label>
-                </div>
-
-                <div class="setting-item">
-                    <span class="setting-label">Did You Know? facts</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="replace-mode-fact" checked onchange="saveReplacementModes()">
-                        <span class="toggle-slider"></span>
-                    </label>
-                </div>
-
-                <div class="setting-item">
-                    <span class="setting-label">Haikus</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="replace-mode-haiku" checked onchange="saveReplacementModes()">
-                        <span class="toggle-slider"></span>
-                    </label>
-                </div>
-
-                <div class="setting-item">
-                    <span class="setting-label">Photo Screensaver</span>
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="replace-mode-photos" onchange="saveReplacementModes()">
-                        <span class="toggle-slider"></span>
-                    </label>
-                </div>
-                <p class="help-text">Cycles your uploaded photos every 5 seconds during an ad block. Needs at least one photo uploaded below to take effect.</p>
-
-                <div class="photo-library">
-                    <h3 style="margin-top: 1.5rem;">Photos</h3>
-                    <div id="photo-list" class="photo-grid"></div>
-                    <form id="photo-upload-form" style="margin-top: 0.75rem;" onsubmit="return uploadPhoto(event)">
-                        <input type="file" id="photo-upload-input" accept="image/*" />
-                        <button type="submit">Upload</button>
-                        <span id="photo-upload-status" class="help-text" style="margin-left: 0.75rem;"></span>
-                    </form>
-                    <p class="help-text" id="photo-library-stats"></p>
-                </div>
             </section>
 
             <!-- Autonomous Mode Settings -->
@@ -1510,7 +1506,6 @@
                 const modes = new Set(data.replacement_modes || []);
                 document.getElementById('replace-mode-vocab').checked = modes.has('vocab');
                 document.getElementById('replace-mode-fact').checked = modes.has('fact');
-                document.getElementById('replace-mode-haiku').checked = modes.has('haiku');
                 document.getElementById('replace-mode-photos').checked = modes.has('photos');
             } catch (e) {
                 console.error('Failed to load replacement modes:', e);
@@ -1519,7 +1514,7 @@
 
         async function saveReplacementModes() {
             const modes = [];
-            ['vocab','fact','haiku','photos'].forEach(k => {
+            ['vocab','fact','photos'].forEach(k => {
                 if (document.getElementById('replace-mode-' + k).checked) modes.push(k);
             });
             try {

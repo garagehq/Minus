@@ -126,7 +126,15 @@ class PhotoLibrary:
     def add_photo(self, data: bytes, original_name: str = "photo") -> dict:
         """Normalize + persist `data`. Returns the stored photo's metadata.
 
-        Raises ValueError on unusable input (bad format, too big, etc.).
+        Accepts **anything Pillow can open**: JPEG, PNG, WebP, GIF (first
+        frame), BMP, TIFF, HEIC (if pillow-heif is installed), RGBA, paletted
+        P mode, CMYK, grayscale, L/LA, etc. Everything is normalized to:
+          - EXIF orientation applied (portrait phones won't be sideways)
+          - RGB mode (alpha composited against black, palette resolved)
+          - long edge <= PHOTO_MAX_DIM (1920)
+          - JPEG at quality 85, metadata stripped
+
+        Raises ValueError only when the payload is truly unopenable.
         """
         if not data:
             raise ValueError("empty upload")
@@ -134,23 +142,60 @@ class PhotoLibrary:
             raise ValueError("upload too large (50 MB max before encode)")
 
         try:
-            from PIL import Image
+            from PIL import Image, ImageOps, ImageFile
         except ImportError as e:
             raise RuntimeError("Pillow not available for photo encoding") from e
 
+        # Tolerate truncated-but-decodable payloads (common with half-finished
+        # mobile uploads). Disabled locally after we finish so we don't affect
+        # other Pillow users.
+        prev_truncated = ImageFile.LOAD_TRUNCATED_IMAGES
+        ImageFile.LOAD_TRUNCATED_IMAGES = True
         try:
-            img = Image.open(io.BytesIO(data))
-            img.load()  # force decode — raises on bad payloads
-        except Exception as e:
-            raise ValueError(f"not a valid image: {e}")
+            try:
+                img = Image.open(io.BytesIO(data))
+                img.load()  # force decode — raises on bad payloads
+            except Exception as e:
+                raise ValueError(f"not a valid image: {e}")
 
-        # Re-encode to JPEG, cap long edge at PHOTO_MAX_DIM.
-        if img.mode not in ("RGB", "L"):
-            img = img.convert("RGB")
-        img.thumbnail((PHOTO_MAX_DIM, PHOTO_MAX_DIM), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=PHOTO_JPEG_QUALITY, optimize=True)
-        payload = buf.getvalue()
+            # Honor EXIF Orientation so portrait phone photos aren't sideways.
+            # exif_transpose is a no-op when there's no EXIF tag.
+            try:
+                img = ImageOps.exif_transpose(img)
+            except Exception as e:
+                logger.debug(f"[PhotoLibrary] exif_transpose skipped: {e}")
+
+            # Normalise colour mode. Transparency is flattened against black
+            # (matches the dark blocking background so edges don't ghost).
+            if img.mode == 'RGBA' or img.mode == 'LA':
+                bg = Image.new('RGB', img.size, (0, 0, 0))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            elif img.mode == 'P':
+                img = img.convert('RGBA') if 'transparency' in img.info else img.convert('RGB')
+                if img.mode == 'RGBA':
+                    bg = Image.new('RGB', img.size, (0, 0, 0))
+                    bg.paste(img, mask=img.split()[-1])
+                    img = bg
+            elif img.mode != 'RGB':
+                # CMYK, L, 1, I, F, YCbCr — Pillow's convert handles all of
+                # these. Force RGB so JPEG save doesn't refuse.
+                img = img.convert('RGB')
+
+            # Cap the long edge. `thumbnail` is in-place and skips work if
+            # the image is already smaller than the cap.
+            img.thumbnail((PHOTO_MAX_DIM, PHOTO_MAX_DIM), Image.LANCZOS)
+            buf = io.BytesIO()
+            # progressive JPEG + 4:2:0 chroma subsampling — smaller files
+            # and better fit for decoding on the ustreamer side.
+            img.save(
+                buf, format='JPEG',
+                quality=PHOTO_JPEG_QUALITY, optimize=True,
+                progressive=True, subsampling=2,
+            )
+            payload = buf.getvalue()
+        finally:
+            ImageFile.LOAD_TRUNCATED_IMAGES = prev_truncated
 
         photo_id = hashlib.sha256(payload).hexdigest()[:16]
         jpeg_path = self._dir / f"{photo_id}.jpg"
