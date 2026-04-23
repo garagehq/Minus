@@ -9,14 +9,16 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 ### Ad Detection
 
 **Dual-NPU ML Pipeline:**
-- **PaddleOCR** on RK3588 NPU (~400ms per frame) - Detects text-based ad indicators
-- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame) - Visual content analysis
+- **PaddleOCR** on RK3588 NPU (~400ms per frame) — detects text-based ad indicators
+- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame) — visual content analysis
+- Both workers run in dedicated **subprocesses** (`src/ocr_worker.py`, `src/vlm_worker.py`) with hard timeouts so a stuck NPU inference can never freeze the detection loop. The worker processes ship with warmup inferences, keepalive pings, and soft/hard timeout escalation.
 
 **Detection Methods:**
-- OCR keyword matching (Skip, Ad, Advertisement, etc.)
-- VLM scene understanding with confidence scoring
+- OCR keyword matching (Skip, Ad, Advertisement, timestamp patterns, etc.)
+- OCR self-overlay exclusions: Minus' own on-screen notifications (e.g. "Ad skipping enabled") are excluded from ad detection so the system does not self-trigger
+- VLM scene understanding with confidence scoring, `max_new_tokens` cap to keep short-answer prompts short (the root cause of long inference latency was descriptive responses, not NPU pathology — see `docs/VLM_NPU_DEGRADATION.md`)
 - Weighted voting with anti-waffle protection
-- Home screen detection to prevent false positives
+- Home screen detection to prevent false positives (with `AD_ONLY_KEYWORDS` guard to avoid home-screen triggers during ads that also contain "Shorts"/"Search" text)
 - Transition frame detection for smoother blocking
 
 ### Blocking Overlay
@@ -43,30 +45,47 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 - Silent keepalive to prevent pipeline stalls
 - Exponential backoff restart on failures
 
-### Fire TV Integration
+### Streaming Device Remote Control
 
-**Remote Control:**
-- Auto-discovery of Fire TV devices on network
-- ADB remote control for ad skipping
-- Auto-reconnect on connection drops
+**Supported devices:**
+- **Fire TV / Amazon** — ADB over Wi-Fi (`src/fire_tv.py`)
+- **Roku** — ECP over HTTP (`src/roku.py`)
+- **Google TV / Android TV** — ADB Wireless debugging (port is dynamic; users paste the `IP:PORT` printed on the TV)
+- **Generic / No remote** — ad blocking still works, only skip-automation is disabled
+
+**Common behavior:**
+- Discovery (network scan) where the protocol supports it
+- Persistent device config at `~/.minus_device_config.json`
+- Auto-reconnect on drops
 - Skip button detection via OCR
 - Guided setup flow with overlay notifications
 
+**Web UI skip** (`POST /api/blocking/skip`) is device-agnostic: the handler calls `minus.try_skip_ad()` which dispatches to whichever controller is connected. There is no Fire TV-only path.
+
 ### Autonomous Mode
 
-**VLM-Guided YouTube Playback:**
-- Configurable schedule (start/end hours, or 24/7 mode)
-- VLM screen state classification every 2 minutes (PLAYING/PAUSED/DIALOG/MENU/SCREENSAVER)
-- Smart actions: only intervenes when needed (play, dismiss dialog, select video, wake device)
-- Stats tracking: videos played, ads detected, ads skipped, session duration
-- Settings persist across restarts (`/home/radxa/.minus_autonomous_mode.json`)
-- Web UI controls: toggle, schedule time selectors, 24/7 checkbox
+**VLM-guided YouTube playback** — keeps content rolling overnight so OCR/VLM keep generating training data.
 
-**Commands:**
+- Device-agnostic: runs against any of the streaming controllers above
+- Configurable schedule (start/end hours, or 24/7 mode)
+- VLM screen-state classification every 2 minutes (`PLAYING` / `PAUSED` / `DIALOG` / `MENU` / `SCREENSAVER`)
+- OCR screen-state pre-check before VLM: explicit keyword lists for login screens, home/browse rows, ad banners (`AD_ONLY_KEYWORDS`), and a "signed-out" fallback. OCR is cheaper and more accurate on static UI chrome than VLM.
+- Roku-specific active-app query via ECP — more reliable than VLM for "YouTube closed" or "Roku City screensaver on top of YouTube"
+- Pause detection combines dHash frame comparison with audio state:
+  - Static frames + audio flowing = music stream, NOT paused (no action)
+  - Static frames + no audio + pipeline healthy = truly paused (send play)
+  - Static frames + audio pipeline unavailable (e.g. display disconnected) = suspicious; increments a `PERSISTENT_STATIC_LIMIT` counter. Escalates to STUCK only after ~5–7 minutes of unchanged frames, which prevents misfiring on live streams whose output path is temporarily down.
+- Dismiss action sends a single `back` (previously `select + play_pause`, which could confirm unwanted buttons and toggle the player)
+- Stats tracking: videos played, ads detected, ads skipped, session duration
+- Settings persist at `~/.minus_autonomous_mode.json`
+- Web UI controls: enable/disable, schedule time selectors, 24/7 checkbox, "start now" manual override
+
+**Commands (all controllers):**
 - Navigation: up, down, left, right, select, back, home
 - Media: play, pause, fast_forward, rewind
 - Volume: volume_up, volume_down, mute
 - Power: power, wakeup, sleep
+- Google Assistant (Google TV only): `assistant`
 
 ### Web UI
 
@@ -93,11 +112,15 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 
 **Automatic Recovery:**
 - HDMI signal detection and recovery
+- HDMI PHY reinit via DPMS cycle on TV reconnect (works around silent PHY stalls after TV power cycles)
+- Adaptive HDMI bandwidth fallback: when 4K@60Hz RGB/4:4:4 fails, we fall back to 4:2:0 (half bandwidth) automatically. See `docs/ARCHITECTURE.md` and `src/drm.py`.
 - ustreamer health checks with restart
+- After 3+ consecutive video pipeline failures we also kill ustreamer to force a clean MPP decoder state (fixes the "stuck after brief HDMI drop" class of bugs)
 - Video pipeline watchdog
-- Audio pipeline watchdog
+- Audio pipeline watchdog with **ALSA zombie detection**: if the GStreamer audio pipeline thread dies but the ALSA device still reports RUNNING, we detect via `/proc/asound` owner-TID check and restart. The detector understands that `owner_pid` is a thread ID, not a process ID.
 - Memory monitoring with cleanup
-- VLM degradation to OCR-only mode
+- VLM rolling P95 latency check: if P95 of the last 10 inferences exceeds 3s, we restart the worker. If a second trigger follows quickly, we escalate to a deep restart with a longer NPU-release backoff.
+- VLM degradation to OCR-only mode after consecutive hard timeouts
 
 **Graceful Degradation:**
 - OCR init: 3 retries with 2s delay, continues without OCR if all fail

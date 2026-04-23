@@ -55,9 +55,11 @@
 | Main | `minus.py` | Entry point, orchestration |
 | Ad Blocker | `src/ad_blocker.py` | GStreamer pipeline, blocking API |
 | Audio | `src/audio.py` | Audio passthrough, mute control |
-| OCR | `src/ocr.py` | PaddleOCR on RKNN NPU |
-| VLM | `src/vlm.py` | FastVLM-1.5B on Axera NPU |
-| Health | `src/health.py` | Health monitoring, recovery |
+| OCR Client | `src/ocr.py` | PaddleOCR model + `AD_EXCLUSIONS`, keyword scan |
+| OCR Worker | `src/ocr_worker.py` | Process-based OCR with hard 1.0s timeout, warmup, keepalive |
+| VLM Client | `src/vlm.py` | FastVLM-1.5B inference wrapper with `max_new_tokens` cap |
+| VLM Worker | `src/vlm_worker.py` | Process-based VLM with soft/hard timeout, P95 latency auto-recovery, `_call_lock` serializing detect_ad and query_image |
+| Health | `src/health.py` | Health monitoring, recovery, ALSA zombie detection, HDMI DPMS reinit |
 | Web UI | `src/webui.py` | Flask web interface |
 
 ### Support Modules
@@ -66,16 +68,40 @@
 |--------|------|---------|
 | Fire TV | `src/fire_tv.py` | ADB remote control |
 | Fire TV Setup | `src/fire_tv_setup.py` | Auto-setup flow |
+| Roku | `src/roku.py` | ECP (External Control Protocol) remote control |
+| Device Config | `src/device_config.py` | Device type selection + persistence (Fire TV / Roku / Google TV / generic) |
+| WiFi Manager | `src/wifi_manager.py` | Captive portal and AP-mode fallback |
 | Overlay | `src/overlay.py` | Notification overlays |
 | Vocabulary | `src/vocabulary.py` | Spanish vocabulary list |
 | Screenshots | `src/screenshots.py` | Training data with dHash dedup |
-| Autonomous Mode | `src/autonomous_mode.py` | VLM-guided YouTube playback |
+| Autonomous Mode | `src/autonomous_mode.py` | Device-agnostic VLM-guided playback |
 | Skip Detection | `src/skip_detection.py` | Skip button detection |
 | Config | `src/config.py` | Configuration dataclass |
 | Capture | `src/capture.py` | Snapshot capture |
 | Console | `src/console.py` | Console blanking |
-| DRM | `src/drm.py` | DRM output probing |
+| DRM | `src/drm.py` | DRM output probing, adaptive 4K bandwidth fallback |
 | V4L2 | `src/v4l2.py` | V4L2 device probing |
+
+### Detection Loop Execution Model
+
+OCR and VLM do *not* run on pooled threads inside the main loop. Each is
+a long-lived child process:
+
+- `OCRProcess` (`src/ocr_worker.py`) loads the RKNN model once, processes
+  requests via a `multiprocessing.Queue`, and has a **hard 1.0s timeout**
+  backed by worker-process kill-and-restart with exponential backoff.
+- `VLMProcess` (`src/vlm_worker.py`) loads FastVLM-1.5B once, and uses a
+  **soft/hard timeout** split: soft (1.5s) returns `"TIMEOUT"` to the
+  caller while letting the worker keep finishing; hard (5.0s) kills the
+  worker. In parallel, a rolling 10-sample P95 latency check triggers an
+  auto-recovery restart when variance creeps above 3.0s. If a recent
+  restart did not clear the state, the next trigger escalates to a *deep*
+  restart with a longer NPU-release backoff.
+- Both processes run warmup inferences at start and a periodic keepalive
+  to avoid NPU cold-start penalties on the first real frame.
+- `VLMProcess._call_lock` serializes `detect_ad` and `query_image` so the
+  autonomous-mode thread and the main detection-loop thread cannot race
+  on the shared request/response queue.
 
 ## Data Flow
 
@@ -115,8 +141,8 @@ audiotestsrc ───────┘
 
 | Thread | Purpose | Interval |
 |--------|---------|----------|
-| OCR Worker | Run OCR detection | ~500ms |
-| VLM Worker | Run VLM detection | ~1s |
+| OCR Dispatcher | Send snapshots to `OCRProcess` and collect results | ~500ms |
+| VLM Dispatcher | Send snapshots to `VLMProcess` and collect results | ~1s |
 | Health Monitor | Check subsystem health | 5s |
 | Vocabulary Rotation | Rotate displayed word | 11-15s |
 | Debug Update | Update debug overlay | 2s |
