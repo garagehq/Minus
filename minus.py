@@ -320,9 +320,10 @@ class Minus:
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
         self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
         self.vlm_min_decisions = 4          # Need at least 4 decisions to act
-        self.vlm_start_agreement = 0.80     # Need 80% ad agreement to START blocking
+        self.vlm_start_agreement = 0.90     # Need 90% ad agreement to START blocking (solo; OCR-corroborated uses immediate shortcut at ~line 2778). Raised from 0.80 to tighten VLM-alone triggers.
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
         self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
+        self.vlm_start_threshold_cap = 0.95 # Cap on effective start threshold so hysteresis can't push it beyond what real-world noise allows
 
         # State change rate limiting
         self.vlm_last_state_change = 0      # When VLM state last changed
@@ -1686,11 +1687,16 @@ class Minus:
             if time_since_change < self.vlm_min_state_duration:
                 return False  # Still in cooldown
 
-        # Need strong ad agreement to start
+        # Need strong ad agreement to start. Caller only reaches this function
+        # when VLM is acting alone — the OCR-corroborated path at ~line 2778
+        # takes an immediate shortcut and bypasses the sliding window entirely.
         threshold = self.vlm_start_agreement
         if not self.vlm_ad_detected:
             # Not currently detecting - need even stronger evidence to start
             threshold += self.vlm_hysteresis_boost
+        # Cap so hysteresis + raised base can't push us past what real-world
+        # noise allows (a few spurious "no" responses would block triggering forever).
+        threshold = min(threshold, self.vlm_start_threshold_cap)
 
         return ad_ratio >= threshold
 
