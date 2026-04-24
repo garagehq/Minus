@@ -5,6 +5,7 @@ Detects text in frames and checks for ad-related keywords.
 """
 
 import os
+import re
 import time
 import numpy as np
 import cv2
@@ -171,6 +172,7 @@ class PaddleOCR:
         'sponsored', 'advertisement', 'ad break',
         'shop now', 'buy now',
         'promoted',  # Twitter/social media promoted ads
+        'visit advertiser', 'visitadvertiser',  # YouTube pre-roll CTA
         # Note: 'promo' removed - too broad, matches 'Promote' button
         # Spanish keywords
         'patrocinado', 'anuncio', 'publicidad',
@@ -199,6 +201,11 @@ class PaddleOCR:
         'ocr ready', 'ocrready',  # OCR status
         'ready',  # Generic status word (too common to be an ad indicator)
     ]
+    # Fuzzy match for "Skip Intro" with OCR character swaps. Covers
+    # "Skip Intro", "Sk1p Intro", "Skip 1ntro", "Sk1p 1ntro", "Sk1p1ntro",
+    # etc. Defined as a compiled regex rather than enumerating every
+    # permutation in AD_EXCLUSIONS.
+    SKIP_INTRO_FUZZY_RE = re.compile(r's[kK][i1lI]p\s*[i1lI]ntro', re.IGNORECASE)
 
     def __init__(self, det_model_path, rec_model_path, dict_path,
                  cls_model_path=None):
@@ -525,8 +532,11 @@ class PaddleOCR:
 
             # Check exclusions FIRST - skip ALL ad detection for excluded phrases
             # This prevents Minus overlay text from triggering false positives
-            is_excluded = any(excl in text_lower or excl.replace(' ', '') in text_clean
-                              for excl in self.AD_EXCLUSIONS)
+            is_excluded = (
+                any(excl in text_lower or excl.replace(' ', '') in text_clean
+                    for excl in self.AD_EXCLUSIONS)
+                or self.SKIP_INTRO_FUZZY_RE.search(text_lower) is not None
+            )
             if is_excluded:
                 continue  # Skip all pattern matching for this text element
 
@@ -593,8 +603,11 @@ class PaddleOCR:
             combined = ' '.join(all_texts).lower()
             combined_clean = ''.join(c for c in combined if c.isalnum())
             # Check exclusions for combined text too
-            is_combined_excluded = any(excl in combined or excl.replace(' ', '') in combined_clean
-                                       for excl in self.AD_EXCLUSIONS)
+            is_combined_excluded = (
+                any(excl in combined or excl.replace(' ', '') in combined_clean
+                    for excl in self.AD_EXCLUSIONS)
+                or self.SKIP_INTRO_FUZZY_RE.search(combined) is not None
+            )
             if not is_combined_excluded:
                 has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0-9oOlIi][:;.]', combined)
                 has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', combined)

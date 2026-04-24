@@ -20,16 +20,35 @@ def check_ad_keywords_standalone(texts: List[str]) -> Tuple[bool, List[str]]:
     AD_KEYWORDS_EXACT = [
         'skip ad', 'skip ads', 'skip in', 'visit site', 'learn more',
         'shop now', 'sponsored', 'advertisement', 'ad 1 of', 'ad 2 of',
-        'next ad in', 'video will play', 'primevideo.com', 'will start in'
+        'next ad in', 'video will play', 'primevideo.com', 'will start in',
+        'visit advertiser',  # YouTube pre-roll ad CTA button
     ]
     AD_KEYWORDS_WORD = ['ad', 'ads']
     AD_EXCLUSIONS = ['skip recap', 'skip intro', 'add to']
+    # Fuzzy "Skip Intro" — tolerates OCR swapping i<->1<->l<->I anywhere in
+    # the word. Matches "Skip Intro", "Sk1p Intro", "Skip 1ntro", "Sk1p 1ntro",
+    # "Sk1p1ntro", etc. Must come BEFORE keyword checks so "skip in" in
+    # AD_KEYWORDS_EXACT doesn't match "Skip Intro" first.
+    SKIP_INTRO_FUZZY = re.compile(r's[kK][i1lI]p\s*[i1lI]ntro', re.IGNORECASE)
 
     matched = []
 
     for text in texts:
         text_lower = text.lower()
         text_clean = ''.join(c for c in text_lower if c.isalnum())
+
+        # Exclusion gate FIRST — skip all downstream matching for excluded phrases.
+        # Previously the exclusion check sat between exact-keyword matching and
+        # word-boundary matching, which meant "Skip Intro" was matched by
+        # `skip in` (substring of AD_KEYWORDS_EXACT) before we ever checked
+        # exclusions. Moving the gate up fixes that class of false positive.
+        is_excluded = (
+            any(excl in text_lower or excl.replace(' ', '') in text_clean
+                for excl in AD_EXCLUSIONS)
+            or SKIP_INTRO_FUZZY.search(text_lower) is not None
+        )
+        if is_excluded:
+            continue
 
         # Check exact phrase keywords
         for keyword in AD_KEYWORDS_EXACT:
@@ -39,14 +58,11 @@ def check_ad_keywords_standalone(texts: List[str]) -> Tuple[bool, List[str]]:
                 break
 
         # Check word-boundary keywords
-        is_excluded = any(excl in text_lower or excl.replace(' ', '') in text_clean
-                         for excl in AD_EXCLUSIONS)
-        if not is_excluded:
-            for keyword in AD_KEYWORDS_WORD:
-                pattern = r'\b' + re.escape(keyword) + r'\b'
-                if re.search(pattern, text_lower):
-                    matched.append(f'word:{keyword}')
-                    break
+        for keyword in AD_KEYWORDS_WORD:
+            pattern = r'\b' + re.escape(keyword) + r'\b'
+            if re.search(pattern, text_lower):
+                matched.append(f'word:{keyword}')
+                break
 
         # Fuzzy matches for "Skip Ad"
         if 'skipad' in text_clean or 'skipads' in text_clean:
@@ -75,9 +91,11 @@ def check_ad_keywords_standalone(texts: List[str]) -> Tuple[bool, List[str]]:
         if re.search(r'^ad\s*\d+$', text_lower.strip()):
             matched.append('pattern:ad_countdown')
 
-        # Ad with timestamp: "Ad 0:30", "Ad0:42", "Ado:55", "Ad1:20"
+        # Ad with timestamp: "Ad 0:30", "Ad0:42", "Ado:55", "Ad1:20", "Ado:o5"
+        # OCR commonly misreads 0 as o/O in both minute and seconds positions,
+        # so both sides of the colon accept digit-or-'o' characters.
         has_ad = re.search(r'\bad\b', text_lower) or re.search(r'ad[0-9o]:', text_lower)
-        has_timestamp = re.search(r'[0-9o]:\d{2}', text_lower)
+        has_timestamp = re.search(r'[0-9o]:[0-9o]{2}', text_lower)
         if has_ad and has_timestamp:
             matched.append('pattern:ad_timestamp')
 
@@ -85,7 +103,7 @@ def check_ad_keywords_standalone(texts: List[str]) -> Tuple[bool, List[str]]:
     if not matched and len(texts) <= 5:
         combined = ' '.join(texts).lower()
         has_ad_word = re.search(r'\bad\b', combined) or re.search(r'ad[0-9o]:', combined)
-        has_timestamp = re.search(r'[0-9o]:\d{2}', combined)
+        has_timestamp = re.search(r'[0-9o]:[0-9o]{2}', combined)
         if has_ad_word and has_timestamp:
             matched.append('pattern:ad_timestamp_cross')
 
@@ -138,7 +156,7 @@ def test_ad_timestamps():
         # Edge cases that should NOT match
         (['Add 0:30'], False, 'Add not Ad'),
         (['Adobe 0:30'], False, 'Adobe not Ad'),
-        (['Ads'], False, 'Just Ads no timestamp'),
+        (['Ads'], True, 'Ads alone triggers'),
         (['0:30'], False, 'Just timestamp'),
         (['Loading...'], False, 'Unrelated text'),
         (['read more'], False, 'No ad indicator'),
@@ -180,13 +198,19 @@ def test_skip_ad_patterns():
         (['[Skip Ad]'], True, 'Bracketed'),
 
         # OCR artifacts
-        (['Sk1p Ad'], False, 'Number in Skip - edge case'),
+        (['Sk1p Ad'], True, 'Sk1p misread but Ad still triggers'),
         (['Skip Ad5'], True, 'Should match skip ad'),
         (['SPad'], True, 'Fuzzy spad'),
 
         # Should NOT match
         (['Skip Recap'], False, 'Skip Recap excluded'),
         (['Skip Intro'], False, 'Skip Intro excluded'),
+        (['Sk1p Intro'], False, 'Sk1p Intro - OCR misread on Skip'),
+        (['Skip 1ntro'], False, 'Skip 1ntro - OCR misread I as 1'),
+        (['Sk1p 1ntro'], False, 'Sk1p 1ntro - both words misread'),
+        (['Sk1p1ntro'], False, 'Sk1p1ntro - no space, both misread'),
+        (['Skip1ntro'], False, 'Skip1ntro - no space, I as 1'),
+        (['SKIP INTRO'], False, 'SKIP INTRO uppercase'),
         (['Add to list'], False, 'Add to excluded'),
         (['Skip ahead'], False, 'Different skip'),
     ]
@@ -258,9 +282,10 @@ def test_netflix_countdown():
         (['Ad10'], True, 'No space'),
         (['Ad 05'], True, 'Leading zero'),
 
-        # Should NOT match
-        (['Ad 10 more'], False, 'Has suffix'),
-        (['Show Ad 10'], False, 'Has prefix'),
+        # "Ad" word appearing anywhere should trigger — user policy
+        (['Ad 10 more'], True, 'word:ad triggers even with suffix'),
+        (['Show Ad 10'], True, 'word:ad triggers even with prefix'),
+        # Should NOT match — substring of a longer word
         (['Adobe 10'], False, 'Adobe not Ad'),
     ]
 

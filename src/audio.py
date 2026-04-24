@@ -130,7 +130,7 @@ class AudioPassthrough:
         # A/V sync watchdog - periodic queue flush to prevent drift
         # The sync queue adds fixed delay but clock drift over time could cause issues
         # Flushing every 45 minutes resets the sync queue with minimal audio dropout (~300ms)
-        self._sync_interval = 45 * 60  # 45 minutes between sync resets
+        self._sync_interval = 45 * 60  # 45 minutes between sync resets (currently disabled — see _sync_reset_enabled)
         self._last_sync_reset = 0
 
         # Rolling audio level history for the blocking-overlay visualizer.
@@ -142,64 +142,79 @@ class AudioPassthrough:
         # Only sample RMS every N seconds — full-rate would thrash the CPU
         # and we only need ~10 Hz updates for the bar visualizer.
         self._level_sample_interval = 0.1
-        self._sync_reset_enabled = True
+        # Disabled: the sync-queue flush cannot cleanly recover the pipeline —
+        # alsasink closes the PCM device when the pipeline goes to PAUSED mid-
+        # flush, and with min-threshold-time on the upstream queue, nothing
+        # short of a full pipeline restart wakes it back up. The flush has
+        # therefore always triggered a full restart every fire (~ once per
+        # 45min of uptime), which is the exact "spurious restart" we set out
+        # to eliminate. Drift isn't a real concern here (provide-clock=false,
+        # sync=false) and 48h+ runs without a working flush showed no A/V
+        # sync issues. Set to True only if a proper drift-recovery mechanism
+        # is added.
+        self._sync_reset_enabled = False
 
         # Initialize GStreamer (may already be initialized by video pipeline)
         Gst.init(None)
 
     def _is_alsa_device_running(self) -> bool:
-        """Check if our ALSA playback device is actually running with our PID.
+        """Check if our ALSA playback device is actually producing audio.
 
-        This checks /proc/asound/cardX/pcmYp/sub0/status to see if the device
-        is in RUNNING state and owned by our process. This is more reliable
-        than GStreamer state queries when PipeWire/WirePlumber is involved.
+        Uses /proc/asound/.../status as the source of truth: ALSA state must
+        be RUNNING AND hw_ptr must advance between two samples. If hw_ptr moves,
+        audio is definitively flowing — regardless of what GStreamer's state
+        machine or owner_pid reports.
 
-        Returns:
-            True if device is RUNNING and owned by us, False otherwise
+        Historical note: the old implementation compared ALSA's owner_pid to
+        self._our_pid (main PID), but owner_pid is actually a thread TID — and
+        often a stale one from the thread that originally opened the device.
+        That made this check return False in healthy states and the watchdog
+        fired a spurious full restart every time GStreamer transiently reported
+        PAUSED (e.g. post-flush). Sampling hw_ptr sidesteps all that.
         """
         try:
-            # Parse playback device from self.playback_device (e.g., "hw:1,0")
-            # Format: hw:card,device
             if not self.playback_device.startswith("hw:"):
                 return False
 
             parts = self.playback_device[3:].split(",")
             if len(parts) != 2:
                 return False
-
             card = parts[0]
             device = parts[1]
 
-            # Check status file: /proc/asound/cardX/pcmYp/sub0/status
-            # 'p' suffix means playback (vs 'c' for capture)
             status_path = f"/proc/asound/card{card}/pcm{device}p/sub0/status"
-
             if not os.path.exists(status_path):
                 return False
 
-            with open(status_path, 'r') as f:
-                status_content = f.read()
+            def _read():
+                with open(status_path, 'r') as f:
+                    content = f.read()
+                state_running = False
+                hw_ptr = None
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line.startswith('state:'):
+                        state_running = 'RUNNING' in line
+                    elif line.startswith('hw_ptr'):
+                        try:
+                            hw_ptr = int(line.split(':', 1)[1].strip())
+                        except (IndexError, ValueError):
+                            pass
+                return state_running, hw_ptr
 
-            # Parse status - looking for:
-            # state: RUNNING
-            # owner_pid: <our_pid>
-            state_running = False
-            owner_is_us = False
+            state1, ptr1 = _read()
+            if not state1 or ptr1 is None:
+                return False
 
-            for line in status_content.split('\n'):
-                line = line.strip()
-                if line.startswith('state:'):
-                    state_running = 'RUNNING' in line
-                elif line.startswith('owner_pid'):
-                    # Format: "owner_pid   : 12345"
-                    try:
-                        pid_str = line.split(':')[1].strip()
-                        owner_pid = int(pid_str)
-                        owner_is_us = (owner_pid == self._our_pid)
-                    except (IndexError, ValueError):
-                        pass
+            # 50ms at 48kHz ≈ 2400 frames — any real playback will advance
+            # well beyond any noise. Costs ~50ms on the watchdog thread,
+            # which runs every 3s.
+            time.sleep(0.05)
+            state2, ptr2 = _read()
+            if not state2 or ptr2 is None:
+                return False
 
-            return state_running and owner_is_us
+            return ptr2 > ptr1
 
         except Exception as e:
             logger.debug(f"[AudioPassthrough] Error checking ALSA status: {e}")

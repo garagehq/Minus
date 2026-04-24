@@ -401,9 +401,18 @@ OCR frequently misreads characters in ad timestamps. The detection handles these
 
 Combined misreads are also handled (e.g., "Adl;lo" for "Ad1:10"). The timestamp pattern matches:
 - Standard: `Ad 0:30`, `Ad0:30`, `Ad1:45`
-- Zero misreads: `Ado:30`, `Ad0:3o`, `Ado:oo`
+- Zero misreads: `Ado:30`, `Ad0:3o`, `Ado:oo`, `Ado:o5` (zeros misread on both sides of the colon)
 - One misreads: `Adl:30`, `Ad1:l5`, `Adl:lo`
 - Separator misreads: `Ad0;30`, `Ad0.30`, `Ado;3o`
+
+**Ad-keyword policy:**
+- Bare `Ad` / `Ads` at a word boundary triggers blocking. Past false positives from words like `Loading`, `reading`, `Adobe` are handled via the word-boundary regex (`\bad\b` / `\bads\b`) and the `AD_EXCLUSIONS` list — bare `Ad` inside a longer word will not match.
+- `Visit advertiser` (YouTube pre-roll CTA) is treated as an exact ad keyword.
+
+**Fuzzy "Skip Intro" exclusion:**
+Streaming UIs render a `Skip Intro` button that OCR sometimes reads as `Sk1p Intro`, `Skip 1ntro`, `Sk1p 1ntro`, `Sk1p1ntro`, etc. (`i` ↔ `1` ↔ `l` ↔ `I` swaps). A compiled regex `s[kK][i1lI]p\s*[i1lI]ntro` (in `src/ocr.py` as `SKIP_INTRO_FUZZY_RE` and mirrored in `src/ocr_worker.py`) covers all permutations. It's applied as part of the exclusion gate at the top of the per-text and cross-element matching paths, before either exact-keyword or word-boundary detection runs — important because `skip in` (inside `AD_KEYWORDS_EXACT`) is a substring of `skip intro` and would otherwise match first.
+
+`Skip Ad` is **not** excluded — it still triggers ad detection (via the `skip ad` exact keyword) and is independently recognized as a skip button by `src/skip_detection.py`, so Minus will press it to dismiss the ad.
 
 ## Blocking Overlay
 
@@ -1652,3 +1661,35 @@ Upstream's tuple-shape defensive guards (introduced in commit `7c42e80`) are kep
 
 **Files modified:**
 - `src/vlm_worker.py` — `_call_lock`, `_detect_ad_locked`, `_query_image_locked`
+
+### A/V Sync Flush Disabled (Apr 2026)
+
+**Symptom:** Every 45 minutes of uptime, the `AudioPassthrough` watchdog ran its periodic sync-queue flush; `Sync queue flushed` was always followed ~12s later by `Pipeline issue detected: not in PLAYING state (paused)` and a full `Restarting pipeline (attempt N)`. Cumulative effect: ~32 spurious audio restarts per day, each a brief dropout. The feature that was supposed to *prevent* restarts was *causing* them.
+
+**Root cause (investigated in 4 failed fix iterations):** the flush itself is unrecoverable without a full pipeline rebuild on this pipeline configuration.
+1. `flush-start` event puts the sync queue and downstream into flushing mode.
+2. `flush-stop` should resume streaming, but `syncqueue` has `min-threshold-time=300ms` that blocks downstream reads until the queue has refilled past the threshold.
+3. While the queue is blocking, `alsasink` — having no data to consume — closes its PCM device. ALSA `state` transitions out of `RUNNING`, `hw_ptr` goes to 0.
+4. `set_state(PLAYING)` on the pipeline cannot bring `alsasink` back up because the upstream queue is still blocked. The pipeline gets stuck in `PAUSED` for 10+ seconds until the watchdog gives up and restarts the whole pipeline.
+
+Attempts that did **not** work:
+- Same-iteration `continue` after flush (commit `3b4e0d0`) — subsequent iterations still trip on the lingering `PAUSED`.
+- 10-second post-flush "grace window" — flush recovery takes longer than that.
+- Explicit `pipeline.set_state(PLAYING)` with bounded 2s wait — `get_state` returns `PAUSED` regardless.
+- Temporarily zeroing `syncqueue.min-threshold-time` across the flush + 400ms refill sleep — `alsasink` had already dropped the PCM by then.
+
+**Solution:** flip `self._sync_reset_enabled = False` in `AudioPassthrough.__init__` (see `src/audio.py:151`). The periodic flush never runs, so it can never cascade. Drift isn't a real concern in this pipeline (`provide-clock=false` on alsasrc, `sync=false` on alsasink) and 48+ hours of runtime without a working flush showed no observable A/V desync.
+
+To find the commit that made this change: `git log --all --oneline --grep='disable periodic A/V sync flush'` (commit subject is stable across amends).
+
+**Kept as a side-benefit of the investigation:** rewrote `_is_alsa_device_running()` to sample `hw_ptr` across a 50ms window instead of comparing ALSA's `owner_pid` to the main process PID. The old check compared an ALSA-reported *thread TID* (often a stale one) against the main PID, so it could never return True under normal operation. The watchdog's "GStreamer reports PAUSED but ALSA is flowing — skip restart" rescue path has always been broken; now it works.
+
+**If drift becomes a real problem in the future (easy revert):**
+1. Write a flush mechanism that does not let `alsasink` close its PCM device — either by pausing→flushing→playing the whole pipeline in one atomic block, or by replacing `syncqueue` with an element that doesn't block on `min-threshold-time`.
+2. Only after (1) works, flip `_sync_reset_enabled` back to `True` in `src/audio.py`.
+3. Re-run the soak test (`_sync_interval = 2.5 * 60` + 5-min monitor for ~45 min) and confirm `audio.restart_count` stays at 0.
+
+**Do NOT simply flip `_sync_reset_enabled` back to `True` without (1).** The bug will return.
+
+**Files modified:**
+- `src/audio.py` — `_sync_reset_enabled = False` + explanatory block comment; `_is_alsa_device_running()` rewrite
