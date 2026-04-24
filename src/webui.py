@@ -1420,6 +1420,8 @@ class WebUI:
         def api_wifi_connections():
             """Get saved WiFi connections with priorities."""
             try:
+                wifi_mgr = get_wifi_manager()
+                ap_name = wifi_mgr._ap_connection_name  # e.g. "Hotspot"
                 result = subprocess.run(
                     ['nmcli', '-t', '-f', 'NAME,UUID,TYPE,DEVICE,AUTOCONNECT,AUTOCONNECT-PRIORITY', 'connection', 'show'],
                     capture_output=True, text=True, timeout=10
@@ -1430,8 +1432,14 @@ class WebUI:
                         parts = line.split(':')
                         # Filter for wifi connections (802-11-wireless)
                         if len(parts) >= 4 and parts[2] == '802-11-wireless':
+                            name = parts[0]
+                            # Hide the internal AP/hotspot profile — it's surfaced
+                            # separately via the WiFi status card, and isn't a
+                            # user-facing "saved network" they'd want to click.
+                            if name == ap_name:
+                                continue
                             connections.append({
-                                'name': parts[0],
+                                'name': name,
                                 'uuid': parts[1],
                                 'type': 'wifi',
                                 'device': parts[3] if parts[3] else None,
@@ -1445,24 +1453,65 @@ class WebUI:
 
         @self.app.route('/api/wifi/scan')
         def api_wifi_scan():
-            """Scan for available WiFi networks."""
+            """Scan for available WiFi networks.
+
+            Returns ``ap_mode`` so clients can explain why live scan is
+            degraded on a single-radio device, and ``saved`` on each network
+            so the UI can mark known ones and skip the password prompt.
+            """
             try:
                 wifi_mgr = get_wifi_manager()
-                networks = wifi_mgr.scan_networks()
-                # Convert dataclass objects to dicts
+                # Refresh the cached _ap_mode_active flag so the response
+                # reflects the true state, not a stale value left over from
+                # the monitor thread or a prior API call.
+                wifi_mgr.get_status()
+                # If AP is active, single-radio hardware can only scan by
+                # briefly dropping the AP. The user explicitly accepted this
+                # tradeoff — a few seconds of hotspot dropout in exchange for
+                # real scan results. If ?skip_bounce=1 is passed, fall back
+                # to the cheap cached-scan behavior.
+                skip_bounce = request.args.get('skip_bounce', '').lower() in ('1', 'true', 'yes')
+                networks = wifi_mgr.scan_networks(
+                    bounce_ap=wifi_mgr._ap_mode_active and not skip_bounce
+                )
                 return jsonify({
+                    'ap_mode': wifi_mgr._ap_mode_active,
                     'networks': [
                         {
                             'ssid': n.ssid,
                             'signal': n.signal,
                             'security': n.security,
-                            'in_use': n.in_use
+                            'in_use': n.in_use,
+                            'saved': n.saved,
                         }
                         for n in networks
                     ]
                 })
             except Exception as e:
                 logger.error(f"Error scanning WiFi: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/connect-saved', methods=['POST'])
+        def api_wifi_connect_saved():
+            """Activate a previously saved WiFi connection by name."""
+            try:
+                data = request.get_json() or {}
+                name = data.get('name')
+                if not name:
+                    return jsonify({'error': 'Connection name is required'}), 400
+
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.connect_saved(name)
+                if result.get('success'):
+                    logger.info(f"[WebUI] Activated saved WiFi: {name}")
+                    return jsonify({'success': True, 'message': f'Connected to {name}', 'ssid': name})
+                return jsonify({
+                    'success': False,
+                    'error': result.get('error', 'Activation failed'),
+                    'error_code': result.get('error_code', 'unknown'),
+                }), 400
+            except Exception as e:
+                logger.error(f"Error activating saved WiFi: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/wifi/connect', methods=['POST'])
@@ -1555,10 +1604,27 @@ class WebUI:
 
         @self.app.route('/api/wifi/disconnect', methods=['POST'])
         def api_wifi_disconnect():
-            """Disconnect from current WiFi network."""
+            """Disconnect from current WiFi network.
+
+            A manual disconnect would otherwise leave the box with no way to
+            reach it until the monitor thread boots the hotspot after 30s.
+            Immediately bring the Minus AP up so the user can always rejoin.
+            """
             try:
                 wifi_mgr = get_wifi_manager()
                 result = wifi_mgr.disconnect_network()
+                if result.get('success'):
+                    # Give the radio a moment to finish disassociating before
+                    # we try to reconfigure it as an AP.
+                    time.sleep(1.5)
+                    ap_result = wifi_mgr.start_ap_mode()
+                    result['ap_started'] = ap_result.get('success', False)
+                    if ap_result.get('success'):
+                        result['ap_ssid'] = ap_result.get('ssid')
+                        result['ap_password'] = ap_result.get('password')
+                        result['ap_ip'] = ap_result.get('ip')
+                    else:
+                        result['ap_error'] = ap_result.get('error')
                 return jsonify(result)
             except Exception as e:
                 logger.error(f"Error disconnecting WiFi: {e}")

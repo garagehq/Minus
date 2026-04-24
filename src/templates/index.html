@@ -2255,17 +2255,23 @@
                 const list = document.getElementById('wifi-saved');
 
                 if (data.connections && data.connections.length > 0) {
-                    list.innerHTML = data.connections.map(c =>
-                        `<div class="wifi-item ${c.device ? 'connected' : ''}">
+                    list.innerHTML = data.connections.map(c => {
+                        const safeName = c.name.replace(/'/g, "\\'");
+                        const connected = c.device ? '(Connected)' : '';
+                        const connectBtn = c.device
+                            ? ''
+                            : `<button onclick="event.stopPropagation(); connectSavedWifi('${safeName}')" class="small-btn">Connect</button>`;
+                        return `<div class="wifi-item ${c.device ? 'connected' : ''}" ${c.device ? '' : `onclick="connectSavedWifi('${safeName}')"`} style="${c.device ? '' : 'cursor:pointer;'}">
                             <div class="wifi-info">
-                                <span class="wifi-name">${c.name}</span>
-                                <span class="wifi-details">Priority: ${c.priority} ${c.device ? '(Connected)' : ''}</span>
+                                <span class="wifi-name">${escapeHtml(c.name)}</span>
+                                <span class="wifi-details">Priority: ${c.priority} ${connected}</span>
                             </div>
                             <div class="wifi-actions">
-                                <button onclick="deleteWifiConnection('${c.name}')" class="small-btn danger">Delete</button>
+                                ${connectBtn}
+                                <button onclick="event.stopPropagation(); deleteWifiConnection('${safeName}')" class="small-btn danger">Delete</button>
                             </div>
-                        </div>`
-                    ).join('');
+                        </div>`;
+                    }).join('');
                 } else {
                     list.innerHTML = '<div class="empty-state">No saved WiFi connections</div>';
                 }
@@ -2274,26 +2280,80 @@
             }
         }
 
+        async function connectSavedWifi(name) {
+            if (!confirm(`Connect to "${name}"?\n\nIf the Minus hotspot is active it will be stopped, and this page may disconnect briefly.`)) return;
+            try {
+                const response = await fetch('/api/wifi/connect-saved', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name })
+                });
+                const data = await response.json().catch(() => ({}));
+                if (response.ok && data.success) {
+                    alert(data.message || `Connected to ${name}`);
+                    loadWifiStatus();
+                    loadWifiConnections();
+                    return;
+                }
+                if (data && data.error_code === 'password_required') {
+                    // A saved profile with bad credentials is a broken entry —
+                    // offer to delete it so the user can rejoin cleanly from
+                    // the Scan tab instead of silently re-prompting.
+                    if (confirm(`Can't connect to "${name}" — its stored password is invalid.\n\nDelete this saved network now? (You can rejoin it from the Scan tab.)`)) {
+                        try {
+                            await fetch('/api/wifi/delete', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({ name })
+                            });
+                        } catch (e) { /* ignore */ }
+                        loadWifiConnections();
+                    }
+                    return;
+                }
+                alert((data && data.error) || 'Connection failed');
+            } catch (error) {
+                // Expected when the AP drops — the browser just loses the server.
+                console.warn('connect-saved fetch failed (likely AP dropped):', error);
+                alert(`Attempting to connect to ${name}. If the hotspot was active, reconnect to your home WiFi and reload this page.`);
+            }
+        }
+
         async function scanWifi() {
             const results = document.getElementById('wifi-scan-results');
-            results.innerHTML = '<div class="empty-state">Scanning...</div>';
+            // The server will bounce AP briefly if we're in AP mode, so set
+            // expectations: the hotspot may drop for ~5 seconds during scan.
+            const apActive = document.getElementById('wifi-ap-row').style.display !== 'none';
+            results.innerHTML = apActive
+                ? '<div class="empty-state">Scanning (hotspot briefly offline)...</div>'
+                : '<div class="empty-state">Scanning...</div>';
 
             try {
                 const response = await fetch('/api/wifi/scan');
                 if (!response.ok) throw new Error('Scan failed');
 
                 const data = await response.json();
+                const apNote = '';
+
                 if (data.networks && data.networks.length > 0) {
-                    results.innerHTML = data.networks.map(n =>
-                        `<div class="wifi-item" onclick="promptWifiConnect('${n.ssid}', '${n.security}')">
+                    const items = data.networks.map(n => {
+                        const safeSsid = n.ssid.replace(/'/g, "\\'");
+                        const safeSec = (n.security || '').replace(/'/g, "\\'");
+                        const signalLabel = n.signal > 0 ? `${n.signal}%` : (n.saved ? 'Saved' : '—');
+                        const savedBadge = n.saved ? ' <span style="color:var(--accent);">· saved</span>' : '';
+                        const handler = n.saved
+                            ? `connectSavedWifi('${safeSsid}')`
+                            : `promptWifiConnect('${safeSsid}', '${safeSec}')`;
+                        return `<div class="wifi-item" onclick="${handler}" style="cursor:pointer;">
                             <div class="wifi-info">
-                                <span class="wifi-name">${n.ssid}</span>
-                                <span class="wifi-details">${n.signal}% - ${n.security}</span>
+                                <span class="wifi-name">${escapeHtml(n.ssid)}</span>
+                                <span class="wifi-details">${signalLabel} · ${escapeHtml(n.security || 'Open')}${savedBadge}</span>
                             </div>
-                        </div>`
-                    ).join('');
+                        </div>`;
+                    }).join('');
+                    results.innerHTML = apNote + items;
                 } else {
-                    results.innerHTML = '<div class="empty-state">No networks found</div>';
+                    results.innerHTML = apNote || '<div class="empty-state">No networks found</div>';
                 }
             } catch (error) {
                 console.error('WiFi scan failed:', error);
@@ -2427,18 +2487,25 @@
         }
 
         async function disconnectWifi() {
-            if (!confirm('Disconnect from current WiFi network?')) return;
+            if (!confirm('Disconnect from current WiFi network?\n\nThe Minus hotspot will start automatically so you can still reach this page.')) return;
 
             try {
                 const response = await fetch('/api/wifi/disconnect', {
                     method: 'POST'
                 });
-                if (response.ok) {
+                const data = await response.json().catch(() => ({}));
+                if (response.ok && data.success) {
+                    if (data.ap_started) {
+                        alert(`Disconnected. The Minus hotspot is now active.\n\nSSID: ${data.ap_ssid}\nPassword: ${data.ap_password}\nIP: ${data.ap_ip}`);
+                    } else if (data.ap_error) {
+                        alert(`Disconnected, but starting AP failed: ${data.ap_error}`);
+                    } else {
+                        alert('Disconnected.');
+                    }
                     loadWifiStatus();
                     loadWifiConnections();
                 } else {
-                    const data = await response.json();
-                    alert(data.error || 'Disconnect failed');
+                    alert((data && data.error) || 'Disconnect failed');
                 }
             } catch (error) {
                 console.error('WiFi disconnect failed:', error);

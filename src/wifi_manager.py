@@ -42,6 +42,7 @@ class WiFiNetwork:
     security: str  # 'Open', 'WPA', 'WPA2', etc.
     in_use: bool = False
     bssid: str = ''
+    saved: bool = False  # True if already in NetworkManager's saved connections
 
 
 @dataclass
@@ -217,13 +218,41 @@ class WiFiManager:
             pass
         return 0
 
-    def scan_networks(self) -> List[WiFiNetwork]:
-        """Scan for available WiFi networks."""
-        networks = []
+    def scan_networks(self, bounce_ap: bool = False) -> List[WiFiNetwork]:
+        """Scan for available WiFi networks.
 
-        # Trigger rescan
+        On single-radio WiFi chips (like the RK3588's) the radio can't scan
+        while hosting an AP, so a scan taken while the Minus hotspot is active
+        only sees the hotspot itself. If ``bounce_ap`` is True and the AP is
+        currently active, we briefly bring the Hotspot connection down, scan,
+        then bring it back up. Clients on the hotspot will see Minus drop for
+        ~5 seconds.
+
+        Saved networks discovered during the live scan are marked with
+        ``saved=True`` and can be connected without re-entering a password.
+        Saved networks that weren't seen in the live scan are still returned
+        (signal=0) so the user can click them directly; the caller sorts so
+        strong live results rank above out-of-range saved entries.
+        """
+        networks: List[WiFiNetwork] = []
+        saved_names = {s['name'] for s in self.get_saved_networks()}
+
+        ap_bounced = False
+        if bounce_ap and self._ap_mode_active:
+            logger.info("[WiFi] Bouncing AP to run a live scan...")
+            # Pause auto-restart behavior by leaving _ap_mode_active True so
+            # the monitor thread treats us as still in AP mode. We only take
+            # the Hotspot connection down; the profile stays so bringing it
+            # back up is a single nmcli call.
+            self._run_nmcli(['connection', 'down', self._ap_connection_name])
+            time.sleep(2.0)  # Radio switches from AP to station mode
+            ap_bounced = True
+
+        # Trigger rescan (harmless if it fails — we still read the cached list)
         self._run_nmcli(['device', 'wifi', 'rescan'])
-        time.sleep(1)  # Wait for scan
+        # Give the driver enough time to actually complete a fresh scan when
+        # we just dropped AP. Otherwise 1s is enough to read cached results.
+        time.sleep(4.0 if ap_bounced else 1.0)
 
         # Get network list - use different format to avoid BSSID colon escaping issues
         success, output = self._run_nmcli([
@@ -231,42 +260,69 @@ class WiFiManager:
             'device', 'wifi', 'list'
         ])
 
-        if not success:
-            logger.warning("[WiFi] Failed to scan networks")
-            return networks
-
         seen_ssids = set()
-        for line in output.split('\n'):
-            if not line:
-                continue
-
-            # Format: SSID:SIGNAL:SECURITY:IN-USE
-            # Split from the right to handle SSIDs that might contain colons
-            parts = line.rsplit(':', 3)
-            if len(parts) >= 4:
-                ssid = parts[0].replace('\\:', ':')  # Unescape any colons in SSID
-                try:
-                    signal = int(parts[1])
-                except ValueError:
-                    signal = 0
-                security = parts[2] if parts[2] else 'Open'
-                in_use = parts[3] == '*'
-
-                # Skip empty SSIDs and duplicates
-                if not ssid or ssid in seen_ssids:
+        if success:
+            for line in output.split('\n'):
+                if not line:
                     continue
-                seen_ssids.add(ssid)
 
-                networks.append(WiFiNetwork(
-                    ssid=ssid,
-                    signal=signal,
-                    security=security,
-                    in_use=in_use,
-                    bssid=''  # Not fetching BSSID to avoid parsing issues
-                ))
+                # Format: SSID:SIGNAL:SECURITY:IN-USE
+                # Split from the right to handle SSIDs that might contain colons
+                parts = line.rsplit(':', 3)
+                if len(parts) >= 4:
+                    ssid = parts[0].replace('\\:', ':')  # Unescape any colons in SSID
+                    try:
+                        signal = int(parts[1])
+                    except ValueError:
+                        signal = 0
+                    security = parts[2] if parts[2] else 'Open'
+                    in_use = parts[3] == '*'
 
-        # Sort by signal strength
-        networks.sort(key=lambda n: n.signal, reverse=True)
+                    # Skip empty SSIDs, duplicates, and our own AP
+                    if not ssid or ssid in seen_ssids:
+                        continue
+                    if ssid == AP_SSID and in_use:
+                        continue
+                    seen_ssids.add(ssid)
+
+                    networks.append(WiFiNetwork(
+                        ssid=ssid,
+                        signal=signal,
+                        security=security,
+                        in_use=in_use,
+                        bssid='',
+                        saved=ssid in saved_names,
+                    ))
+        else:
+            logger.warning("[WiFi] Live scan failed, returning saved networks only")
+
+        # If the live scan returned nothing useful (e.g. in AP mode the radio
+        # is busy hosting the hotspot and can't scan), surface saved networks
+        # so the user can still reconnect to a known one.
+        for name in saved_names:
+            if name in seen_ssids:
+                continue
+            networks.append(WiFiNetwork(
+                ssid=name,
+                signal=0,
+                security='WPA2',  # Assume protected; password already stored
+                in_use=False,
+                bssid='',
+                saved=True,
+            ))
+
+        # Sort: in-use first, then by signal strength. Saved is a visual flag,
+        # not a sort priority — a saved network with signal=0 (not in range)
+        # shouldn't float above strong live results the user can actually join.
+        # Tiebreaker favors saved within the same signal bucket.
+        networks.sort(key=lambda n: (not n.in_use, -n.signal, not n.saved))
+
+        if ap_bounced:
+            logger.info("[WiFi] Restoring AP after live scan")
+            self._run_nmcli(['connection', 'up', self._ap_connection_name], timeout=30)
+            time.sleep(1.0)
+            # _ap_mode_active was never cleared, so status stays consistent.
+
         return networks
 
     def get_saved_networks(self) -> List[Dict[str, Any]]:
@@ -362,6 +418,64 @@ class WiFiManager:
         except Exception as e:
             self._last_connection_error = str(e)
             logger.error(f"[WiFi] Connection error: {e}")
+            return {'success': False, 'error': str(e)}
+        finally:
+            self._connecting = False
+
+    def connect_saved(self, name: str) -> Dict[str, Any]:
+        """Activate an existing saved NetworkManager connection by name.
+
+        Unlike ``connect_to_network``, this does not need a password — it just
+        runs ``nmcli connection up <name>`` on the saved profile. If the AP
+        hotspot is currently active, we bring it down first so the radio is
+        available for client-mode association.
+        """
+        self._connecting = True
+        self._last_connection_error = ''
+        try:
+            # Confirm the connection actually exists before we tear down AP
+            saved = {s['name'] for s in self.get_saved_networks()}
+            if name not in saved:
+                self._last_connection_error = f'No saved connection named "{name}"'
+                return {'success': False, 'error': self._last_connection_error}
+
+            if self._ap_mode_active:
+                self.stop_ap_mode()
+                time.sleep(2)  # Let the radio come back as a client
+
+            success, output = self._run_nmcli([
+                'connection', 'up', name
+            ], timeout=45)
+
+            if success:
+                time.sleep(2)
+                if self.is_wifi_connected():
+                    self._last_wifi_connected_time = time.time()
+                    logger.info(f"[WiFi] Activated saved connection: {name}")
+                    return {'success': True, 'ssid': name}
+                self._last_connection_error = 'Activation reported success but verification failed'
+                error_code = 'verification_failed'
+            else:
+                low = output.lower()
+                if ('secrets were required' in low or 'no secrets' in low
+                        or 'passwords or encryption keys are required' in low):
+                    self._last_connection_error = 'Saved password is missing or wrong — please re-enter it'
+                    error_code = 'password_required'
+                elif 'not found' in low:
+                    self._last_connection_error = 'Network is not in range'
+                    error_code = 'out_of_range'
+                elif 'timeout' in low:
+                    self._last_connection_error = 'Connection timed out'
+                    error_code = 'timeout'
+                else:
+                    self._last_connection_error = output or 'Activation failed'
+                    error_code = 'unknown'
+
+            logger.warning(f"[WiFi] Failed to activate saved {name}: {self._last_connection_error}")
+            return {'success': False, 'error': self._last_connection_error, 'error_code': error_code}
+        except Exception as e:
+            self._last_connection_error = str(e)
+            logger.error(f"[WiFi] connect_saved error: {e}")
             return {'success': False, 'error': str(e)}
         finally:
             self._connecting = False
