@@ -611,8 +611,13 @@ class AudioPassthrough:
                 if time_since_sync >= self._sync_interval:
                     # Try queue flush first (faster, less disruptive)
                     if self._flush_sync_queue():
-                        # Flush succeeded, no restart needed
-                        pass
+                        # Flush succeeded. The flush-start/flush-stop event pair
+                        # transiently moves the pipeline out of PLAYING; running the
+                        # state check below in the same iteration mis-reads that as
+                        # a stall and triggers a spurious full restart. Skip to next
+                        # watchdog tick — by then the pipeline is PLAYING again.
+                        self._last_buffer_time = time.time()
+                        continue
                     else:
                         # Flush failed, fall back to full restart
                         needs_restart = True
