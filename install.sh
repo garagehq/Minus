@@ -26,7 +26,7 @@ if [ ! -f "$SERVICE_FILE" ]; then
 fi
 
 # Setup hostname and mDNS
-echo "[1/7] Setting up hostname and mDNS..."
+echo "[1/8] Setting up hostname and mDNS..."
 hostnamectl set-hostname ${HOSTNAME}
 sed -i "s/127.0.1.1.*/127.0.1.1\t${HOSTNAME}/" /etc/hosts 2>/dev/null || echo "127.0.1.1	${HOSTNAME}" >> /etc/hosts
 
@@ -41,35 +41,55 @@ echo "    Hostname set to: ${HOSTNAME}"
 echo "    Access via: http://${HOSTNAME}.local:80"
 
 # Stop existing service if running
-echo "[2/7] Stopping existing service..."
+echo "[2/8] Stopping existing service..."
 systemctl stop ${SERVICE_NAME} 2>/dev/null || true
 systemctl disable ${SERVICE_NAME} 2>/dev/null || true
 
 # Stop X11 to free up display
-echo "[3/7] Stopping X11 (gdm3)..."
+echo "[3/8] Stopping X11 (gdm3)..."
 systemctl stop gdm3 2>/dev/null || true
 systemctl disable gdm3 2>/dev/null || true
 
 # Copy service file
-echo "[4/7] Installing systemd service..."
+echo "[4/8] Installing systemd service..."
 cp "$SERVICE_FILE" /etc/systemd/system/${SERVICE_NAME}.service
 chmod 644 /etc/systemd/system/${SERVICE_NAME}.service
 
 # Reload systemd
-echo "[5/7] Reloading systemd..."
+echo "[5/8] Reloading systemd..."
 systemctl daemon-reload
 
 # Enable and start service
-echo "[6/7] Enabling service..."
+echo "[6/8] Enabling service..."
 systemctl enable ${SERVICE_NAME}
 
 # Create screenshot directories
-echo "[7/7] Creating screenshot directories..."
+echo "[7/8] Creating screenshot directories..."
 mkdir -p "${SCRIPT_DIR}/screenshots/ads"
 mkdir -p "${SCRIPT_DIR}/screenshots/non_ads"
 mkdir -p "${SCRIPT_DIR}/screenshots/vlm_spastic"
 mkdir -p "${SCRIPT_DIR}/screenshots/static"
 chown -R radxa:radxa "${SCRIPT_DIR}/screenshots" 2>/dev/null || true
+
+# Ensure login shells (tmux, ssh) source ~/.bashrc so $HOME/.local/bin is on PATH.
+# Without this, a fresh tmux window picks up /usr/local/bin/claude (older) instead
+# of ~/.local/bin/claude (newer), forcing a manual `source ~/.bashrc` each time.
+echo "[8/8] Ensuring login shells source ~/.bashrc for radxa..."
+RADXA_HOME="$(getent passwd radxa | cut -d: -f6)"
+if [ -n "$RADXA_HOME" ] && [ -d "$RADXA_HOME" ]; then
+    BASH_PROFILE="${RADXA_HOME}/.bash_profile"
+    if [ ! -f "$BASH_PROFILE" ] || ! grep -q "\.bashrc" "$BASH_PROFILE"; then
+        cat >> "$BASH_PROFILE" <<'EOF'
+if [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+EOF
+        chown radxa:radxa "$BASH_PROFILE"
+        echo "    Wrote ${BASH_PROFILE}"
+    else
+        echo "    ${BASH_PROFILE} already sources .bashrc, skipping"
+    fi
+fi
 
 echo ""
 echo "=== Installation Complete ==="
