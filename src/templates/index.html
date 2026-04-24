@@ -465,8 +465,10 @@
                 <h2>Photos</h2>
                 <p class="help-text">Uploads are auto-converted to JPEG at up to 1920px (long edge). EXIF orientation is honoured, transparency flattened, any format Pillow can open (HEIC/PNG/WebP/GIF/...) is accepted. Cap: 200 photos / 200 MB (oldest evicted when full).</p>
                 <form id="photo-upload-form" onsubmit="return uploadPhoto(event)">
-                    <input type="file" id="photo-upload-input" accept="image/*" multiple />
-                    <button type="submit">Upload</button>
+                    <input type="file" id="photo-upload-input" accept="image/*" multiple onchange="updatePhotoPickerLabel()" />
+                    <label for="photo-upload-input" class="file-picker-btn">Choose files</label>
+                    <span id="photo-picker-label" class="help-text">no files selected</span>
+                    <button type="submit" class="photo-upload-btn">Upload</button>
                     <span id="photo-upload-status" class="help-text"></span>
                 </form>
                 <div id="photo-list" class="photo-grid"></div>
@@ -1616,6 +1618,16 @@
             }
         }
 
+        function updatePhotoPickerLabel() {
+            const input = document.getElementById('photo-upload-input');
+            const lbl = document.getElementById('photo-picker-label');
+            const n = input.files ? input.files.length : 0;
+            if (!lbl) return;
+            if (n === 0) lbl.textContent = 'no files selected';
+            else if (n === 1) lbl.textContent = input.files[0].name;
+            else lbl.textContent = `${n} files selected`;
+        }
+
         async function uploadPhoto(ev) {
             ev.preventDefault();
             const input = document.getElementById('photo-upload-input');
@@ -1650,6 +1662,7 @@
                 ? `uploaded ${ok}`
                 : `${ok} uploaded, ${failed} failed (${errors[0]})`;
             input.value = '';
+            updatePhotoPickerLabel();
             loadPhotoLibrary();
             return false;
         }
