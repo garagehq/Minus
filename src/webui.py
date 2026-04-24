@@ -342,6 +342,10 @@ class WebUI:
             Optional JSON body:
             - duration: seconds to block (default: 10, max: 60)
             - source: detection source ('ocr', 'vlm', 'both', 'default')
+            - kind: force a specific replacement kind for this block instead
+              of letting the roll decide. One of 'vocab' / 'fact' / 'photos'.
+              Bypasses the 30s cooldown and lock-in RNG so test scripts can
+              exercise each rendering path deterministically.
             """
             try:
                 data = request.get_json() or {}
@@ -364,9 +368,28 @@ class WebUI:
                         'error': f'source must be one of: {", ".join(valid_sources)}'
                     }), 400
 
+                # Validate (optional) forced replacement kind
+                kind = data.get('kind')
+                valid_kinds = ('vocab', 'fact', 'photos')
+                if kind is not None and kind not in valid_kinds:
+                    return jsonify({
+                        'success': False,
+                        'error': f'kind must be one of: {", ".join(valid_kinds)}'
+                    }), 400
+
                 if self.minus.ad_blocker:
                     # Enable test mode to prevent detection loop from hiding
                     self.minus.ad_blocker.set_test_mode(duration)
+
+                    # If caller asked for a specific replacement kind, set
+                    # the lock BEFORE show() so the block-start roll uses
+                    # the forced value. Extend the cooldown past the test
+                    # duration so rotations stick with it.
+                    if kind is not None:
+                        self.minus.ad_blocker._locked_content_kind = kind
+                        self.minus.ad_blocker._content_kind_lock_until = (
+                            time.time() + duration + 60
+                        )
 
                     # Show blocking overlay
                     self.minus.ad_blocker.show(source)
@@ -381,18 +404,150 @@ class WebUI:
 
                     threading.Thread(target=auto_hide, daemon=True).start()
 
-                    logger.info(f"[WebUI] Test blocking triggered: source={source}, duration={duration}s")
+                    logger.info(
+                        f"[WebUI] Test blocking triggered: source={source}, "
+                        f"duration={duration}s, kind={kind or 'auto'}"
+                    )
                     return jsonify({
                         'success': True,
                         'source': source,
                         'duration': duration,
-                        'message': f'Blocking for {duration} seconds'
+                        'kind': kind,
+                        'message': f'Blocking for {duration} seconds',
                     })
                 else:
                     return jsonify({'error': 'Ad blocker not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error triggering test block: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/test/replacement-mode/<kind>', methods=['POST'])
+        def api_test_replacement_mode(kind):
+            """Convenience: trigger a block with `kind` forced.
+
+            Shorthand for ``/api/test/trigger-block`` with a pinned kind.
+            ``POST /api/test/replacement-mode/photos`` → 30s block locked to
+            photo-cycling regardless of cooldown or weights.
+            """
+            valid_kinds = ('vocab', 'fact', 'photos')
+            if kind not in valid_kinds:
+                return jsonify({
+                    'success': False,
+                    'error': f'kind must be one of: {", ".join(valid_kinds)}'
+                }), 400
+            try:
+                # silent=True so a POST with no body is allowed (common when
+                # exercising from curl without Content-Type: application/json).
+                data = request.get_json(silent=True) or {}
+                duration = int(data.get('duration', 30))
+                if duration < 1 or duration > 60:
+                    duration = 30
+
+                if not self.minus.ad_blocker:
+                    return jsonify({'success': False, 'error': 'ad_blocker missing'}), 500
+
+                # Gate photos mode on having at least one photo; otherwise
+                # the rotation loop silently falls back to text, which is
+                # confusing while testing.
+                if kind == 'photos':
+                    from photo_library import get_photo_library
+                    if get_photo_library().random_photo_id() is None:
+                        return jsonify({
+                            'success': False,
+                            'error': 'no photos uploaded — upload at least one in /api/media/photos first'
+                        }), 400
+
+                ab = self.minus.ad_blocker
+                ab.set_test_mode(duration)
+                ab._locked_content_kind = kind
+                ab._content_kind_lock_until = time.time() + duration + 60
+                ab.show('ocr')
+
+                def auto_hide():
+                    time.sleep(duration)
+                    if self.minus.ad_blocker:
+                        self.minus.ad_blocker.clear_test_mode()
+                        self.minus.ad_blocker.hide(force=True)
+                threading.Thread(target=auto_hide, daemon=True).start()
+
+                return jsonify({
+                    'success': True,
+                    'kind': kind,
+                    'duration': duration,
+                    'message': f'Blocking in {kind} mode for {duration}s',
+                })
+            except Exception as e:
+                logger.error(f"Error in replacement-mode test: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/test/countdown-bar', methods=['POST'])
+        def api_test_countdown_bar():
+            """Simulate an OCR ad-timer reading so the countdown bar renders.
+
+            POST body: ``{"seconds": 15}``. Triggers a 20s test block with
+            vocab mode and injects the given seconds as the ad-time-remaining
+            so the `AD LEFT [###...] 12s` bar appears in stats. Good for
+            visual regression checks of the progress bar.
+            """
+            try:
+                data = request.get_json() or {}
+                seconds = int(data.get('seconds', 15))
+                if seconds < 0 or seconds > 300:
+                    return jsonify({
+                        'success': False,
+                        'error': 'seconds must be 0..300'
+                    }), 400
+                duration = int(data.get('duration', 20))
+
+                if not self.minus.ad_blocker:
+                    return jsonify({'success': False, 'error': 'ad_blocker missing'}), 500
+
+                ab = self.minus.ad_blocker
+                ab.set_test_mode(duration)
+                ab._locked_content_kind = 'vocab'
+                ab._content_kind_lock_until = time.time() + duration + 60
+                ab.show('ocr')
+                # Inject the countdown right after show() — the bar picks
+                # this up on the next /blocking/set tick.
+                ab.set_ad_seconds_remaining(seconds)
+
+                def auto_hide():
+                    time.sleep(duration)
+                    if self.minus.ad_blocker:
+                        self.minus.ad_blocker.clear_test_mode()
+                        self.minus.ad_blocker.hide(force=True)
+                threading.Thread(target=auto_hide, daemon=True).start()
+
+                return jsonify({'success': True, 'seconds': seconds, 'duration': duration})
+            except Exception as e:
+                logger.error(f"Error in countdown-bar test: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/test/audio-bars', methods=['GET'])
+        def api_test_audio_bars():
+            """Return the current audio RMS history + the rendered bar string.
+
+            Handy for verifying the audio-reactive visualizer without having
+            to wait for a real ad block. ``width`` query param controls the
+            bar width (default 16).
+            """
+            try:
+                width = int(request.args.get('width', 16))
+                width = max(1, min(64, width))
+                if not getattr(self.minus, 'audio', None):
+                    return jsonify({'bars': '', 'history': [], 'error': 'no audio'}), 200
+                audio = self.minus.audio
+                history = list(getattr(audio, '_level_history', []))
+                bars = audio.get_level_bars(width=width) if hasattr(audio, 'get_level_bars') else ''
+                return jsonify({
+                    'bars': bars,
+                    'width': width,
+                    'history': [round(v, 3) for v in history],
+                    'samples': len(history),
+                })
+            except Exception as e:
+                logger.error(f"Error in audio-bars test: {e}")
+                return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/test/stop-block', methods=['POST'])
         def api_test_stop_block():

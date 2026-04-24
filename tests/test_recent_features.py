@@ -27,6 +27,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+# src/webui.py does `from src.wifi_manager import ...`; add project root too
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 # =============================================================================
@@ -1199,6 +1201,157 @@ class TestReplacementModesAPI(unittest.TestCase):
                        json={'modes': ['vocab', 'photos']})
             self.assertEqual(r.status_code, 200)
             minus.set_replacement_modes.assert_called_once_with(['vocab', 'photos'])
+
+
+class TestReplacementModeTestEndpoints(unittest.TestCase):
+    """New /api/test/replacement-mode/<kind> endpoint + trigger-block kind param."""
+
+    def _ui(self, photo_id='abc'):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        # Simulate a non-empty library so 'photos' passes the gate
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = photo_id
+            ui = WebUI(minus)
+        return ui, minus
+
+    def test_rejects_unknown_kind(self):
+        ui, minus = self._ui()
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/replacement-mode/bogus')
+            self.assertEqual(r.status_code, 400)
+            self.assertIn('kind must be', r.get_json()['error'])
+
+    def test_photos_without_library_returns_400(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        ui = WebUI(minus)
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = None
+            with ui.app.test_client() as c:
+                r = c.post('/api/test/replacement-mode/photos')
+                self.assertEqual(r.status_code, 400)
+                self.assertIn('no photos uploaded', r.get_json()['error'])
+
+    def test_forces_lock_and_calls_show(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        ab._content_kind_lock_until = 0
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = 'abc'
+            with ui.app.test_client() as c:
+                r = c.post('/api/test/replacement-mode/fact', json={'duration': 5})
+                self.assertEqual(r.status_code, 200)
+        self.assertEqual(ab._locked_content_kind, 'fact')
+        ab.show.assert_called_once_with('ocr')
+        ab.set_test_mode.assert_called_once_with(5)
+
+    def test_trigger_block_kind_param_sets_lock(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        ab._content_kind_lock_until = 0
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/trigger-block',
+                       json={'duration': 3, 'kind': 'photos'})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['kind'], 'photos')
+        self.assertEqual(ab._locked_content_kind, 'photos')
+
+    def test_trigger_block_rejects_bad_kind(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/trigger-block', json={'kind': 'movies'})
+            self.assertEqual(r.status_code, 400)
+
+
+class TestCountdownBarEndpoint(unittest.TestCase):
+    """/api/test/countdown-bar injects ad_seconds_remaining for visual tests."""
+
+    def test_defaults(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/countdown-bar', json={})
+            self.assertEqual(r.status_code, 200)
+        ab.set_ad_seconds_remaining.assert_called_once_with(15)
+
+    def test_custom_seconds(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/countdown-bar', json={'seconds': 30, 'duration': 4})
+            self.assertEqual(r.status_code, 200)
+        ab.set_ad_seconds_remaining.assert_called_once_with(30)
+
+    def test_rejects_out_of_range(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/countdown-bar', json={'seconds': 9999})
+            self.assertEqual(r.status_code, 400)
+
+
+class TestAudioBarsEndpoint(unittest.TestCase):
+    """/api/test/audio-bars returns the live RMS history + rendered bars."""
+
+    def test_returns_empty_when_no_audio(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.audio = None
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.get('/api/test/audio-bars')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['bars'], '')
+
+    def test_returns_bars_from_audio_history(self):
+        from webui import WebUI
+        from collections import deque
+        minus = MagicMock()
+        minus.audio = MagicMock()
+        minus.audio._level_history = deque([0.1, 0.5, 0.9], maxlen=16)
+        minus.audio.get_level_bars.return_value = '.,@'
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.get('/api/test/audio-bars?width=3')
+            self.assertEqual(r.status_code, 200)
+            data = r.get_json()
+            self.assertEqual(data['bars'], '.,@')
+            self.assertEqual(data['width'], 3)
+            self.assertEqual(data['samples'], 3)
+
+    def test_width_clamped(self):
+        from webui import WebUI
+        from collections import deque
+        minus = MagicMock()
+        minus.audio = MagicMock()
+        minus.audio._level_history = deque([0.5], maxlen=16)
+        minus.audio.get_level_bars.return_value = '*'
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            # width=999 gets clamped to 64
+            r = c.get('/api/test/audio-bars?width=999')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['width'], 64)
 
 
 class TestMinusReplacementModesLogic(unittest.TestCase):
