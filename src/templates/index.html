@@ -827,6 +827,18 @@
         </div>
     </div>
 
+    <!-- Photo Preview Modal (Replace tab) -->
+    <div id="photo-modal" class="modal hidden" onclick="closePhotoModalBackdrop(event)">
+        <div class="modal-content photo-modal-content">
+            <img id="photo-modal-img" alt="preview" />
+            <p id="photo-modal-name" class="help-text"></p>
+            <div class="modal-buttons">
+                <button onclick="closePhotoModal()" class="modal-btn cancel">Close</button>
+                <button onclick="deletePhotoFromModal()" class="modal-btn confirm" style="background: var(--danger, #c93d3d);">Delete</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         // State
         let isPaused = false;
@@ -1545,10 +1557,14 @@
                     img.src = '/api/media/photos/' + p.id;
                     img.alt = p.name;
                     img.loading = 'lazy';
+                    img.style.cursor = 'pointer';
+                    // Click on the image opens the preview modal
+                    img.onclick = () => openPhotoModal(p);
                     const del = document.createElement('button');
                     del.textContent = '✕';
                     del.title = 'Delete ' + p.name;
-                    del.onclick = () => deletePhoto(p.id);
+                    // stopPropagation so the corner button doesn't also open the modal
+                    del.onclick = (ev) => { ev.stopPropagation(); deletePhoto(p.id); };
                     cell.appendChild(img);
                     cell.appendChild(del);
                     grid.appendChild(cell);
@@ -1560,6 +1576,43 @@
                 }
             } catch (e) {
                 console.error('load photos failed', e);
+            }
+        }
+
+        // Track which photo is showing in the preview modal so the Delete
+        // button knows which id to remove.
+        let photoModalId = null;
+
+        function openPhotoModal(photo) {
+            photoModalId = photo.id;
+            document.getElementById('photo-modal-img').src = '/api/media/photos/' + photo.id;
+            const kb = photo.bytes ? (photo.bytes / 1024).toFixed(0) + ' KB' : '';
+            document.getElementById('photo-modal-name').textContent =
+                photo.name + (kb ? ' — ' + kb : '');
+            document.getElementById('photo-modal').classList.remove('hidden');
+        }
+
+        function closePhotoModal() {
+            document.getElementById('photo-modal').classList.add('hidden');
+            document.getElementById('photo-modal-img').src = '';
+            photoModalId = null;
+        }
+
+        // Click outside the modal content (on the backdrop) to close.
+        function closePhotoModalBackdrop(ev) {
+            if (ev.target.id === 'photo-modal') closePhotoModal();
+        }
+
+        async function deletePhotoFromModal() {
+            if (!photoModalId) return;
+            if (!confirm('Delete this photo?')) return;
+            const id = photoModalId;
+            closePhotoModal();
+            try {
+                await fetch('/api/media/photos/' + encodeURIComponent(id), { method: 'DELETE' });
+                loadPhotoLibrary();
+            } catch (e) {
+                console.error('modal delete failed', e);
             }
         }
 
