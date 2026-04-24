@@ -17,7 +17,7 @@ import time
 import subprocess
 import os
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from config import MinusConfig
@@ -37,6 +37,8 @@ class HealthStatus:
     last_frame_age: float = -1
     video_pipeline_ok: bool = False
     audio_pipeline_ok: bool = False
+    hdmi_tx_audio_link_ok: bool = True  # Sink-side HDMI audio link (Jack + ELD)
+    hdmi_tx_audio_link_details: dict = field(default_factory=dict)  # Raw jack/ELD readings for observability
     vlm_ready: bool = False
     vlm_consecutive_timeouts: int = 0
     ocr_ready: bool = False
@@ -92,6 +94,13 @@ class HealthMonitor:
         self._v4l2_format_cache = ""
         self._v4l2_format_cache_time = 0
         self._v4l2_format_cache_ttl = 10.0  # Cache for 10 seconds
+
+        # HDMI-TX audio link state (populated by monitor loop, read by get_status())
+        # Values the monitor thread writes; get_status() may be called from any
+        # HTTP request thread, so we never run amixer in that path.
+        self._hdmi_tx_audio_link_ok = True
+        self._hdmi_tx_audio_link_details: dict = {}
+        self._hdmi_tx_audio_link_last_logged = None  # last ok value we logged a transition for
 
         # Recovery callbacks
         self._on_hdmi_lost: Optional[Callable] = None
@@ -151,6 +160,8 @@ class HealthMonitor:
             status.output_fps = self.minus.ad_blocker.get_fps()
         if self.minus.audio:
             status.audio_pipeline_ok = self._check_audio_pipeline()
+            status.hdmi_tx_audio_link_ok = self._hdmi_tx_audio_link_ok
+            status.hdmi_tx_audio_link_details = dict(self._hdmi_tx_audio_link_details)
 
         # ML workers
         if self.minus.vlm:
@@ -183,6 +194,10 @@ class HealthMonitor:
 
     def _check_and_recover(self):
         """Check health and trigger recovery if needed."""
+        # Refresh cached HDMI-TX audio link state before building status.
+        # Runs amixer subprocesses; only done here (5s loop), never in get_status().
+        self._update_hdmi_tx_audio_link_cache()
+
         status = self.get_status()
 
         # HDMI signal monitoring
@@ -646,6 +661,146 @@ class HealthMonitor:
 
         except Exception:
             return False
+
+    def _update_hdmi_tx_audio_link_cache(self):
+        """Refresh the cached HDMI-TX audio-link state and log transitions.
+
+        Runs in the monitor thread at the normal check interval. Writes
+        self._hdmi_tx_audio_link_ok / _details so get_status() can read them
+        cheaply from any thread (HTTP handlers call get_status at request rate).
+
+        Only checked when audio pipeline is supposed to be running -
+        avoids noisy log transitions during HDMI-signal-loss or startup.
+        """
+        try:
+            if not self.minus or not self.minus.audio or not self.minus.audio.is_running:
+                return
+
+            ok, details = self._check_hdmi_tx_audio_link()
+            self._hdmi_tx_audio_link_ok = ok
+            self._hdmi_tx_audio_link_details = details
+
+            # Log only on state transition to avoid flooding at 5s cadence.
+            if self._hdmi_tx_audio_link_last_logged is None:
+                self._hdmi_tx_audio_link_last_logged = ok
+            elif ok != self._hdmi_tx_audio_link_last_logged:
+                if not ok:
+                    logger.warning(
+                        f"[HealthMonitor] HDMI-TX audio link DESYNC "
+                        f"(sink silently stopped honoring audio; projector/TV "
+                        f"power-cycle likely required): {details}"
+                    )
+                else:
+                    logger.info(
+                        f"[HealthMonitor] HDMI-TX audio link RESTORED: {details}"
+                    )
+                self._hdmi_tx_audio_link_last_logged = ok
+        except Exception as e:
+            logger.debug(f"[HealthMonitor] HDMI-TX audio link cache update failed: {e}")
+
+    def _check_hdmi_tx_audio_link(self) -> tuple:
+        """Probe sink-side HDMI audio link via ALSA controls.
+
+        ALSA state=RUNNING and hw_ptr advancing do not prove audio is
+        actually reaching the sink; we've seen a projector's HDMI audio
+        receiver silently wedge while every upstream indicator stayed green.
+        This reads two sink-reported signals:
+
+        - Jack control ('rockchip-hdmi* Jack'): boolean, 'on' while the sink
+          advertises audio presence. Independent from the DRM connector's
+          display status.
+        - ELD (EDID-Like Data, 128 bytes): the sink's audio capability block.
+          Bytes at offset 16-19 hold the manufacturer/product ID; when the
+          sink is in a bad state this region goes all-zero.
+
+        Diagnostic only. Restarting Minus has been observed NOT to recover
+        this state; recovery requires the sink to be power-cycled. We log
+        so the user knows which way to go.
+
+        Returns:
+            (ok, details) — ok False if desync detected. details has 'jack'
+            and 'eld_mfr' keys when readable.
+        """
+        try:
+            playback_device = getattr(self.minus.audio, 'playback_device', '')
+            if not playback_device.startswith('hw:'):
+                return (True, {})
+            card_num = playback_device[3:].split(',')[0]
+
+            # Enumerate controls once so we don't hard-code numids that can
+            # shift across kernel versions or card types.
+            try:
+                listing = subprocess.run(
+                    ['amixer', '-c', str(card_num), 'controls'],
+                    capture_output=True, text=True, timeout=2
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                return (True, {})
+            if listing.returncode != 0:
+                return (True, {})
+
+            jack_numid = None
+            eld_numid = None
+            for line in listing.stdout.split('\n'):
+                if 'Jack' in line and 'iface=CARD' in line:
+                    jack_numid = line.split('numid=', 1)[1].split(',', 1)[0]
+                elif "name='ELD'" in line:
+                    eld_numid = line.split('numid=', 1)[1].split(',', 1)[0]
+
+            details = {}
+            jack_ok = True
+            eld_ok = True
+
+            if jack_numid:
+                try:
+                    r = subprocess.run(
+                        ['amixer', '-c', str(card_num), 'cget', f'numid={jack_numid}'],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    for line in r.stdout.split('\n'):
+                        line = line.strip()
+                        if line.startswith(': values='):
+                            val = line.split('=', 1)[1].strip()
+                            details['jack'] = val
+                            if val not in ('on', '1'):
+                                jack_ok = False
+                            break
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    pass
+
+            if eld_numid:
+                try:
+                    r = subprocess.run(
+                        ['amixer', '-c', str(card_num), 'cget', f'numid={eld_numid}'],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    for line in r.stdout.split('\n'):
+                        line = line.strip()
+                        if line.startswith(': values='):
+                            eld_bytes = []
+                            for tok in line.split('=', 1)[1].split(','):
+                                tok = tok.strip()
+                                if tok.startswith('0x'):
+                                    try:
+                                        eld_bytes.append(int(tok, 16))
+                                    except ValueError:
+                                        pass
+                            if len(eld_bytes) >= 20:
+                                # Manufacturer/product ID bytes. All-zero here
+                                # means the sink hasn't negotiated audio caps.
+                                if all(b == 0 for b in eld_bytes[16:20]):
+                                    eld_ok = False
+                                    details['eld_mfr'] = 'zeroed'
+                                else:
+                                    details['eld_mfr'] = 'ok'
+                            break
+                except (subprocess.TimeoutExpired, FileNotFoundError):
+                    pass
+
+            return (jack_ok and eld_ok, details)
+        except Exception as e:
+            logger.debug(f"[HealthMonitor] HDMI-TX audio link probe error: {e}")
+            return (True, {})
 
     def _check_alsa_zombie_state(self) -> bool:
         """Check if ALSA playback device is in zombie state (owned by dead process).

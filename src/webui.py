@@ -1768,6 +1768,18 @@ class WebUI:
                     else:
                         audio_status = {'status': 'stopped'}
                         issues.append('audio_stopped')
+                # Sink-side HDMI audio link: catches the "ALSA/GStreamer green
+                # but projector silently wedged" state that a Minus restart
+                # does not fix. Surfaces it so the user can see when to power-
+                # cycle the TV.
+                if hasattr(self.minus, 'health_monitor') and self.minus.health_monitor:
+                    hm = self.minus.health_monitor
+                    audio_status['hdmi_tx_link'] = {
+                        'ok': bool(getattr(hm, '_hdmi_tx_audio_link_ok', True)),
+                        'details': dict(getattr(hm, '_hdmi_tx_audio_link_details', {})),
+                    }
+                    if not audio_status['hdmi_tx_link']['ok']:
+                        issues.append('hdmi_tx_audio_link_desync')
                 health['subsystems']['audio'] = audio_status
 
                 # VLM subsystem
