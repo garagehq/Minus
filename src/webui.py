@@ -2616,6 +2616,111 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # IR Transmitter (REI 8K HDMI switch)
+        # =========================================================================
+
+        @self.app.route('/api/ir/status')
+        def api_ir_status():
+            """Status of the IR transmitter feature.
+
+            Returns:
+                enabled: persisted user toggle (UI gate).
+                available: pwm3 hardware visible (overlay loaded).
+                initialized: PWM has been set up and is ready to send.
+                codes: list of valid button names for /api/ir/command.
+            """
+            try:
+                from ir_transmitter import CODES, IRTransmitter
+                tx = self.minus.ir_transmitter
+                return jsonify({
+                    'enabled': bool(self.minus.ir_enabled),
+                    'available': IRTransmitter.hardware_available(),
+                    'initialized': bool(tx and tx.initialized),
+                    'codes': list(CODES.keys()),
+                })
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/status failed: {e}")
+                return jsonify({'enabled': False, 'available': False,
+                                'initialized': False, 'codes': [],
+                                'error': str(e)}), 500
+
+        @self.app.route('/api/ir/enable', methods=['POST'])
+        def api_ir_enable():
+            try:
+                from ir_transmitter import IRTransmitter
+                if not IRTransmitter.hardware_available():
+                    return jsonify({
+                        'success': False,
+                        'error': ('IR hardware not available — enable the '
+                                  'rk3588-pwm3-m1 overlay and reboot.'),
+                    }), 503
+                result = self.minus.set_ir_enabled(True)
+                # Initialize eagerly so the first button press doesn't pay
+                # the export+polarity setup latency.
+                if self.minus.ir_transmitter is not None:
+                    try:
+                        self.minus.ir_transmitter.initialize()
+                    except Exception as e:
+                        logger.warning(f"[WebUI] IR initialize failed: {e}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/enable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/ir/disable', methods=['POST'])
+        def api_ir_disable():
+            try:
+                return jsonify(self.minus.set_ir_enabled(False))
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/disable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/ir/command', methods=['POST'])
+        def api_ir_command():
+            """Send an IR button. Body: {"button": "<name>"}.
+
+            Refuses unless ir_enabled is true so the toggle is the single
+            on/off gate the user controls.
+            """
+            try:
+                from ir_transmitter import (
+                    CODES, IRCooldownError, IRTransmitterError,
+                )
+                if not self.minus.ir_enabled:
+                    return jsonify({
+                        'success': False,
+                        'error': 'IR transmitter disabled in settings',
+                    }), 403
+                tx = self.minus.ir_transmitter
+                if tx is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'IR transmitter not loaded',
+                    }), 503
+                data = request.get_json(silent=True) or {}
+                button = data.get('button')
+                if button not in CODES:
+                    return jsonify({
+                        'success': False,
+                        'error': f"unknown button '{button}'",
+                        'codes': list(CODES.keys()),
+                    }), 400
+                try:
+                    tx.send(button)
+                except IRCooldownError as e:
+                    return jsonify({
+                        'success': False,
+                        'error': str(e),
+                        'retry_after': round(e.remaining_s, 2),
+                    }), 429
+                except IRTransmitterError as e:
+                    return jsonify({'success': False, 'error': str(e)}), 503
+                return jsonify({'success': True, 'button': button})
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/command failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Blocking Control
         # =========================================================================
 

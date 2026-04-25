@@ -19,6 +19,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
+| [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
 
 ## Visual Design
 
@@ -85,6 +86,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/webui.py` | Flask web UI for remote monitoring/control |
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
 | `src/roku.py` | Roku ECP remote control |
+| `src/ir_transmitter.py` | NEC IR transmitter over PWM3 (REI 8K HDMI switch). Thread-safe, 1.5 s cooldown |
 | `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
 | `src/wifi_manager.py` | WiFi captive portal and AP mode management |
@@ -98,9 +100,12 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/screenshots.py` | ScreenshotManager with dHash dedup + blank rejection |
 | `src/skip_detection.py` | Skip button detection (regex patterns) |
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
+| `ir_transmit.py` | Standalone CLI for the IR transmitter (`sudo python3 ir_transmit.py <button>`) |
 | `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
 | `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
+| `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
+| `tests/test_ir_ui.py` | Playwright UI tests for IR remote panel |
 | `tests/test_ocr_ad_detection.py` | OCR ad pattern detection tests (143+ cases) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
@@ -809,6 +814,9 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `POST /api/screenshots/approve` - Mark screenshot as correctly labeled
 - `POST /api/screenshots/classify` - Move screenshot between categories
 - `POST /api/screenshots/undo` - Undo last review action
+- `GET /api/ir/status` - IR transmitter status (`enabled`, `available`, `initialized`, `codes`)
+- `POST /api/ir/enable` / `disable` - Toggle the IR remote feature (gates the UI and `/command`)
+- `POST /api/ir/command` - Send a captured button. Body: `{"button": "power"|"input_1"|"input_2"|"input_3"|"next"|"auto"}`. `403` when disabled, `429` with `retry_after` inside the 1.5 s cooldown. See `docs/IR_TRANSMITTER.md`.
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
@@ -1028,6 +1036,37 @@ The Settings tab in the web UI shows:
 - `tests/test_wifi_portal.py` - Playwright tests (30 tests)
 
 **Note:** The Radxa's internal WiFi antenna has limited range. For better AP coverage in production, consider using a USB WiFi adapter with external antenna.
+
+## IR Transmitter (REI 8K HDMI Switch)
+
+An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**, muxed to `PWM3_IR_M1`) lets Minus control a REI 8K 3-port HDMI switch. The target use case is autonomous mode rotating between streaming devices (Roku / Fire TV / Google TV) on a schedule so training data covers multiple home-screen layouts.
+
+**Hardware setup (one-time):** enable the `rk3588-pwm3-m1` overlay, reboot. After reboot a new `/sys/class/pwm/pwmchipN` appears whose `device` symlink points to `fd8b0030.pwm`. See `docs/IR_TRANSMITTER.md` for overlay install steps and wiring.
+
+**Protocol:** NEC at 38 kHz carrier. Captured codes (all address `0x80`, via Flipper Zero): `input_1=0x07`, `input_2=0x1B`, `input_3=0x08`, `power=0x05`, `next=0x1F` (cycles 1→2→3→1), `auto=0x09`.
+
+**API:** `/api/ir/status | enable | disable | command`. See the Web UI *Key API Routes* section above. Server enforces a **1.5 s cooldown** between successful sends (`IRCooldownError` → HTTP `429` with `retry_after`).
+
+**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`.
+
+**Standalone CLI:** `sudo python3 ir_transmit.py <button>` sends one button; `--list` prints all valid names. Uses the same `IRTransmitter` class as the webui so there is one source of truth.
+
+**Key gotchas (the ones that burned us once already):**
+- The Radxa pinout labels GPIO3_B2 with the RK3588 pin-function `PWM3_IR_M1`, not PWM14. Only the `rk3588-pwm3-m1` overlay wires pin 38.
+- On a fresh PWM export, `polarity` defaults to `inversed` on this chip. That flips mark/space at the LED. `IRTransmitter.initialize()` sets `polarity=normal` while the PWM is disabled, before enabling.
+- Writing to `duty_cycle` returns `EINVAL` while `period` is still 0. Always set `period` before `duty_cycle` on a fresh export.
+
+**Files:**
+- `src/ir_transmitter.py` — `IRTransmitter` class, NEC encoder, cooldown, PWM sysfs wiring
+- `ir_transmit.py` — standalone CLI shim
+- `minus.py` — instantiates `self.ir_transmitter`, persists `ir_enabled` in `~/.minus_system_settings.json`
+- `src/webui.py` — `/api/ir/*` endpoints, cooldown → 429
+- `src/templates/index.html` — toggle + remote panel in Autonomous Mode section
+- `tests/test_ir_transmitter.py` — 20 unit tests (mocked sysfs)
+- `tests/test_ir_ui.py` — Playwright UI tests (live service)
+- `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
+
+**Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.
 
 ## Streaming Device Configuration
 
@@ -1289,6 +1328,8 @@ The project includes a comprehensive test suite for all extracted modules.
 python3 tests/test_modules.py            # 300+ unit tests
 python3 tests/test_autonomous_mode.py    # Autonomous mode tests
 python3 tests/test_review_ui.py          # Playwright UI tests (requires chromium)
+python3 tests/test_ir_transmitter.py     # IR transmitter unit tests (mocked sysfs)
+python3 tests/test_ir_ui.py              # Playwright UI tests for IR remote panel
 ```
 
 **Test Coverage:**

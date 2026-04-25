@@ -673,6 +673,31 @@
                 <div class="autonomous-actions">
                     <button onclick="startAutonomousModeNow()" class="action-btn" id="autonomous-start-btn">Start Now</button>
                 </div>
+
+                <!-- IR Transmitter (REI 8K HDMI switch) -->
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">IR Remote (HDMI Switch)</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="ir-toggle" onchange="toggleIRTransmitter(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text" id="ir-help-text">Controls the REI 8K HDMI switch via IR (header pin 38, PWM3). Lets autonomous mode rotate inputs to vary training data.</p>
+                <div id="ir-remote-panel" class="hidden" style="margin-top: 0.75rem;">
+                    <div class="remote-grid compact">
+                        <div class="remote-row">
+                            <button class="remote-btn select" onclick="sendIRCommand('input_1')">Input 1</button>
+                            <button class="remote-btn select" onclick="sendIRCommand('input_2')">Input 2</button>
+                            <button class="remote-btn select" onclick="sendIRCommand('input_3')">Input 3</button>
+                        </div>
+                        <div class="remote-row">
+                            <button class="remote-btn" onclick="sendIRCommand('power')">&#9211; Power</button>
+                            <button class="remote-btn nav" onclick="sendIRCommand('next')">Next &#8594;</button>
+                            <button class="remote-btn" onclick="sendIRCommand('auto')">Auto</button>
+                        </div>
+                    </div>
+                    <div class="ir-status-line" id="ir-status-line"></div>
+                </div>
             </section>
 
             <!-- Fire TV Settings (hidden when not using Fire TV) -->
@@ -1687,6 +1712,99 @@
             } catch (error) {
                 console.error('Failed to load optimization settings:', error);
             }
+        }
+
+        // =========================================================================
+        // IR Transmitter (REI HDMI switch)
+        // =========================================================================
+        async function loadIRStatus() {
+            try {
+                const r = await fetch('/api/ir/status');
+                const data = await r.json();
+                const toggle = document.getElementById('ir-toggle');
+                const panel = document.getElementById('ir-remote-panel');
+                const help = document.getElementById('ir-help-text');
+                if (!data.available) {
+                    toggle.checked = false;
+                    toggle.disabled = true;
+                    panel.classList.add('hidden');
+                    help.textContent = 'IR hardware not detected. Enable the rk3588-pwm3-m1 device-tree overlay and reboot.';
+                    return;
+                }
+                toggle.disabled = false;
+                toggle.checked = !!data.enabled;
+                panel.classList.toggle('hidden', !data.enabled);
+            } catch (e) {
+                console.error('Failed to load IR status:', e);
+            }
+        }
+
+        async function toggleIRTransmitter(enabled) {
+            const panel = document.getElementById('ir-remote-panel');
+            const toggle = document.getElementById('ir-toggle');
+            try {
+                const endpoint = enabled ? '/api/ir/enable' : '/api/ir/disable';
+                const r = await fetch(endpoint, { method: 'POST' });
+                const data = await r.json();
+                if (!data.success) {
+                    toggle.checked = !enabled;
+                    setIRStatus(data.error || 'failed', true);
+                    return;
+                }
+                panel.classList.toggle('hidden', !enabled);
+                setIRStatus(enabled ? 'enabled' : 'disabled', false);
+            } catch (e) {
+                toggle.checked = !enabled;
+                setIRStatus('error: ' + e, true);
+            }
+        }
+
+        const IR_COOLDOWN_MS = 1500;
+        let irCooldownUntil = 0;
+
+        async function sendIRCommand(button) {
+            const now = Date.now();
+            if (now < irCooldownUntil) {
+                const remaining = ((irCooldownUntil - now) / 1000).toFixed(2);
+                setIRStatus(`cooldown — wait ${remaining}s`, true);
+                return;
+            }
+            setIRStatus(`sending ${button}…`, false);
+            setIRButtonsEnabled(false);
+            try {
+                const r = await fetch('/api/ir/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ button }),
+                });
+                const data = await r.json();
+                if (data.success) {
+                    setIRStatus(`sent ${button}`, false);
+                    irCooldownUntil = Date.now() + IR_COOLDOWN_MS;
+                } else {
+                    setIRStatus(data.error || 'send failed', true);
+                    if (r.status === 429 && data.retry_after) {
+                        irCooldownUntil = Date.now() + data.retry_after * 1000;
+                    }
+                }
+            } catch (e) {
+                setIRStatus('error: ' + e, true);
+            }
+            const reEnableIn = Math.max(0, irCooldownUntil - Date.now());
+            setTimeout(() => setIRButtonsEnabled(true), reEnableIn);
+        }
+
+        function setIRButtonsEnabled(enabled) {
+            const panel = document.getElementById('ir-remote-panel');
+            if (!panel) return;
+            panel.querySelectorAll('button').forEach(b => { b.disabled = !enabled; });
+        }
+
+        function setIRStatus(text, isError) {
+            const el = document.getElementById('ir-status-line');
+            if (!el) return;
+            el.textContent = text;
+            el.style.color = isError ? 'var(--danger)' : 'var(--text-secondary)';
         }
 
         async function updateVLMStatus() {
@@ -2856,6 +2974,7 @@
         updateVLMStatus();
         loadVLMPreloadSetting();
         loadOptimizationSettings();
+        loadIRStatus();
         loadReplacementModes();
         loadPhotoLibrary();
         updateAutonomousModeStatus();

@@ -245,6 +245,14 @@ except ImportError as e:
     logger.warning(f"Fire TV module not available: {e}")
     HAS_FIRE_TV = False
 
+# Import IR Transmitter (REI 8K HDMI switch control via PWM3)
+try:
+    from ir_transmitter import IRTransmitter
+    HAS_IR = True
+except ImportError as e:
+    logger.warning(f"IR transmitter module not available: {e}")
+    HAS_IR = False
+
 # Import Notification Overlay
 try:
     from overlay import NotificationOverlay, SystemNotification
@@ -460,6 +468,10 @@ class Minus:
 
         # Night mode - automatic overnight YouTube playback for training data
         self.autonomous_mode = AutonomousMode()
+
+        # IR transmitter (REI 8K HDMI switch). Constructor is hardware-free;
+        # initialize() / first send() is what touches the PWM sysfs.
+        self.ir_transmitter = IRTransmitter() if HAS_IR else None
 
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
@@ -1737,6 +1749,7 @@ class Minus:
             'block_falloff': True,        # Shorten min-block duration on consecutive ads
             'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
             'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
+            'ir_enabled': False,          # Show REI HDMI-switch IR remote in autonomous mode
             # Which replacement-mode kinds are allowed during ad blocks. A
             # list rather than a dict so the web UI can just toggle checkboxes.
             # Valid kinds: 'vocab', 'fact', 'photos'.
@@ -1805,6 +1818,24 @@ class Minus:
     def greyscale_preview_enabled(self) -> bool:
         """Whether the ad preview window is desaturated in blocking mode."""
         return self._system_settings.get('greyscale_preview', True)
+
+    @property
+    def ir_enabled(self) -> bool:
+        """Whether the REI HDMI-switch IR remote is exposed in the web UI."""
+        return self._system_settings.get('ir_enabled', False)
+
+    def set_ir_enabled(self, enabled: bool) -> dict:
+        """Toggle IR remote visibility in the UI. When turning off, also
+        releases the PWM if it had been initialized."""
+        enabled = bool(enabled)
+        self._system_settings['ir_enabled'] = enabled
+        self._save_system_settings()
+        if not enabled and self.ir_transmitter and self.ir_transmitter.initialized:
+            try:
+                self.ir_transmitter.shutdown()
+            except Exception as e:
+                logger.warning(f"IR transmitter shutdown failed: {e}")
+        return {'success': True, 'ir_enabled': enabled}
 
     def set_optimization_setting(self, key: str, enabled: bool) -> dict:
         """Update one of the optimization toggles and persist."""
@@ -3113,6 +3144,14 @@ class Minus:
         if self.autonomous_mode:
             self.autonomous_mode.destroy()
             self.autonomous_mode = None
+
+        # Release IR transmitter PWM
+        if self.ir_transmitter:
+            try:
+                self.ir_transmitter.shutdown()
+            except Exception:
+                pass
+            self.ir_transmitter = None
 
         # Stop Fire TV setup first
         if self.fire_tv_setup:
