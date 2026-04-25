@@ -1716,3 +1716,24 @@ This guarantees only one request is ever in flight, which incidentally also fixe
 
 **Files modified:**
 - `src/vlm_worker.py` — `_detect_ad_locked` and `_query_image_locked` rewritten with multi-drain + don't-double-queue
+
+### HDMI Restored Recovery Leaves Display Dead Forever (Fixed - Apr 2026)
+
+**Symptom:** TV stays frozen on a stale frame for hours. Web app shows live content. `subsystems.video.status` reads `error`/`reason: no_pipeline`. `fps_capture` is healthy (~42 fps) but `fps_display` is essentially 0. Service uptime can be many hours; restart is the only recovery.
+
+**Root cause (two coupled defects in `Minus._on_hdmi_restored()` at `minus.py:634`):**
+
+1. **`ad_blocker.start()`'s return value was ignored.** When HDMI input recovers but HDMI-OUT (the TV) is still disconnected, kmssink can't open the DRM plane and `start()` returns `False`. The recovery handler proceeded as if all was well and logged `[Recovery] HDMI recovery complete`.
+
+2. **`self.display_connected` was left stuck at `True`.** The display retry loop (`_start_display_retry_loop`) is the only thing that can recreate a dead pipeline post-startup, but it gates on `not self.display_connected`. Since recovery never set the flag to `False` on failure, the retry loop never ran. Pipeline stayed dead until the next service restart.
+
+Observed once today across a 17-hour run: at 08:19:59 HDMI input recovered after a 550-second loss while the TV was off. Recovery declared success. `Attempting to reconnect display pipeline` log line count for the entire 17-hour run: **0**. The display sat frozen on its last decoded frame all the way until a manual restart at 12:46.
+
+**Solution:** check `start()`'s return value; on failure, set `display_connected=False`, populate `display_error`, and call `_start_display_retry_loop()`. The retry loop already exists and works correctly — it just needs to be armed. Audio remains paused/muted on the failure path; it'll be resumed by the normal start path inside the retry loop when the pipeline finally comes up.
+
+**Why the failure mode is sticky without this fix:** there is no other code path that ever flips `display_connected` from `True` back to `False` post-startup. Initial startup (`minus.py:3000`) is the only place. The retry loop never fires because its gate (`not self.display_connected`) stays `False`.
+
+**The NO SIGNAL behavior is unchanged:** the HDMI-LOST path still calls `start_no_signal_mode()` and the health monitor's "Continuous NO SIGNAL mode enforcement" loop still re-triggers it whenever HDMI input is absent. So the desired "TV shows NO SIGNAL when input is gone" behavior is preserved end-to-end.
+
+**Files modified:**
+- `minus.py` — `_on_hdmi_restored()`: capture return value, branch on success/failure, arm retry loop on failure

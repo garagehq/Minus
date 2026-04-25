@@ -652,17 +652,42 @@ class Minus:
             # Wait for ustreamer to be fully ready before restarting video pipeline
             time.sleep(2)
 
-            # Start the video pipeline (will transition from loading to live)
+            # Start the video pipeline (will transition from loading to live).
+            # If HDMI-OUT (the TV) is still disconnected, this will fail —
+            # kmssink can't open a DRM plane on a disconnected connector.
+            # We MUST check the return value: previously we logged "recovery
+            # complete" regardless and left self.display_connected stuck at
+            # True, which prevented the display retry loop from ever firing
+            # — the pipeline then stayed dead until the next service restart.
+            pipeline_ok = False
             if self.ad_blocker:
                 logger.info("[Recovery] Starting video pipeline...")
-                self.ad_blocker.start()
+                pipeline_ok = bool(self.ad_blocker.start())
 
-            if self.audio:
-                # Resume watchdog and restart pipeline (source is available again)
-                self.audio.resume_watchdog()
-                self.audio.unmute()
-
-            logger.info("[Recovery] HDMI recovery complete")
+            if pipeline_ok:
+                self.display_connected = True
+                self.display_error = None
+                if self.audio:
+                    # Resume watchdog and restart pipeline (source is available again)
+                    self.audio.resume_watchdog()
+                    self.audio.unmute()
+                logger.info("[Recovery] HDMI recovery complete")
+            else:
+                # Pipeline start failed — almost always because HDMI-OUT is
+                # still disconnected. Mark display as down and hand off to
+                # the retry loop, which will keep trying every 7s and pick up
+                # the moment HDMI-OUT comes back.
+                logger.warning(
+                    "[Recovery] Display pipeline start failed (HDMI-OUT likely "
+                    "disconnected) — marking display down and arming retry loop"
+                )
+                self.display_connected = False
+                self.display_error = (
+                    "Display output not available. Check HDMI-TX connection to TV/monitor."
+                )
+                self._start_display_retry_loop()
+                # Audio stays muted/paused; resume_watchdog will fire when the
+                # retry loop succeeds (start_display_pipeline → main resume path).
         finally:
             self._hdmi_recovery_in_progress = False
 
