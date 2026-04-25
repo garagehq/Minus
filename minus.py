@@ -395,7 +395,12 @@ class Minus:
         self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
         self.MIN_DURATION_RESET_GAP = 30.0  # seconds
         self.consecutive_ad_count = 0  # 0 = first ad, 1 = second, ...
-        self.OCR_STOP_THRESHOLD = 4  # Increased from 3 for more robust ad end detection
+        # 2 cycles ≈ 1.0s recovery (down from 4 = 2.0s). Tuned via the
+        # tests/block_latency_harness.py rig to hit a sub-1.5s recover-to-
+        # blocking-off latency. Risk: a single brief OCR miss during a real
+        # ad ends blocking; in practice OCR's ~0.5s cycle on stable ad
+        # overlays makes consecutive misses extremely rare.
+        self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
@@ -2420,13 +2425,28 @@ class Minus:
                         self.static_blocking_suppressed = False
                         self.screen_became_dynamic_time = 0
 
-                        # Clear detection state from static period to prevent false positives
-                        # The ad detected during pause was a "still ad" that shouldn't trigger
-                        # blocking when video resumes
-                        if self.ocr_ad_detected or self.vlm_ad_detected:
-                            logger.info(f"[Static] Clearing stale detection state (OCR={self.ocr_ad_detected}, VLM={self.vlm_ad_detected})")
+                        # Clear detection state from static + cooldown periods.
+                        # OCR/VLM frames during the static window were on the
+                        # paused content and during the cooldown were on the
+                        # transitioning frames — neither is fresh evidence for
+                        # the post-static screen. We must reset the trigger
+                        # COUNTER too, not just the detected flag — otherwise
+                        # the very next OCR match (which only needs count >= 1)
+                        # immediately re-triggers blocking and the cooldown
+                        # had no effect.
+                        had_state = (
+                            self.ocr_ad_detected or self.vlm_ad_detected or
+                            self.ocr_ad_detection_count > 0
+                        )
+                        if had_state:
+                            logger.info(
+                                f"[Static] Clearing stale detection state "
+                                f"(OCR={self.ocr_ad_detected}, VLM={self.vlm_ad_detected}, "
+                                f"ocr_count={self.ocr_ad_detection_count})"
+                            )
                             self.ocr_ad_detected = False
                             self.ocr_no_ad_count = 0
+                            self.ocr_ad_detection_count = 0
                             self.vlm_ad_detected = False
                             self.vlm_no_ad_count = 0
                             self.vlm_decision_history.clear()  # Clear VLM sliding window
