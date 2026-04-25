@@ -1693,3 +1693,26 @@ To find the commit that made this change: `git log --all --oneline --grep='disab
 
 **Files modified:**
 - `src/audio.py` — `_sync_reset_enabled = False` + explanatory block comment; `_is_alsa_device_running()` rewrite
+
+### VLM Queue Desync (Off-By-One on Soft Timeout) (Fixed - Apr 2026)
+
+**Symptom:** After pausing on an ad on Netflix and unpausing, the blocking overlay stayed for ~20 seconds applied against frames where the show was clearly playing again. Other variants: VLM verdicts persistently lagging actual screen content by one frame; rare reports of "Ad 1:30 left" claims long after a real ad had ended.
+
+**Root cause:** `VLMProcess._detect_ad_locked` and `_query_image_locked` (`src/vlm_worker.py`) shared the same MP request/response queues with no per-request correlation. When VLM hit a soft timeout (1.5s, ~15% of inferences in normal load), the request stayed in flight and `_pending_response` was set to `True`. On the next call:
+
+1. The drain attempt was a single `get(timeout=0.1)`. If the worker had not yet pushed its response (still mid-inference), drain timed out.
+2. The code then **fell through and `put`-ed a NEW request anyway**.
+3. Now two requests were in flight. Worker finished the first → pushed result A → caller's `get(SOFT_TIMEOUT)` received result A as the answer for request B.
+4. The queue was now permanently off-by-one. Every subsequent `get()` returned the prior frame's verdict.
+5. After a pause-on-ad (where the queue accumulated several "ad" verdicts during the pause), the entire backlog was delivered against post-unpause "show is playing" frames → 10–20 seconds of phantom blocking.
+
+The shared `/dev/shm/minus_vlm_frame_<pid>.jpg` path made it worse — the file was always the most recently written frame, so even the worker's view of "what was frame N" could be stale.
+
+**Solution:**
+1. **Drain ALL stale responses** at function entry using a `get_nowait()` loop (was a single `get(timeout=0.1)`).
+2. **If a request is genuinely still in flight** after draining, do NOT queue another. Return `"PENDING"` (or `"KILLED"` after RESTART_THRESHOLD consecutive pendings). Caller treats this exactly like the existing `"TIMEOUT"` skip path — `is_ad=False`, `confidence=0.0`, no-op on the sliding window.
+
+This guarantees only one request is ever in flight, which incidentally also fixes the file-content race because the worker dequeues and reads the file in tight succession.
+
+**Files modified:**
+- `src/vlm_worker.py` — `_detect_ad_locked` and `_query_image_locked` rewritten with multi-drain + don't-double-queue
