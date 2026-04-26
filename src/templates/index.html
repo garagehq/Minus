@@ -707,8 +707,16 @@
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
-                <p class="help-text" id="leds-help-text">7 WS2812B LEDs on header pin 19 indicate device state (initializing / idle / blocking / no-signal / autonomous / error). Requires the SPI0-M2 overlay enabled.</p>
+                <p class="help-text" id="leds-help-text">8 WS2812B LEDs on header pin 19 indicate device state (initializing / idle / blocking / paused / no-signal / autonomous / wifi / error). Requires the SPI0-M2 overlay enabled.</p>
                 <div id="leds-state-panel" class="hidden" style="margin-top: 0.75rem;">
+                    <div class="setting-item" style="margin-bottom: 0.5rem;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Only when display is on</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="leds-require-display-toggle" onchange="toggleLEDRequireDisplay(this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <p class="help-text" style="font-size: 0.75rem; margin-top: 0;">When on (default), the strip stays dark while the HDMI-TX display is disconnected or powered off. The state machine still runs — animations resume seamlessly when the display comes back.</p>
                     <div class="remote-grid compact">
                         <div class="remote-row">
                             <button class="remote-btn select" data-led-state="off" onclick="setStatusLEDState('off')">Off</button>
@@ -1867,13 +1875,46 @@
                 } else {
                     help.textContent = defaultHelp;
                     if (data.enabled) {
-                        setLEDStatus(`state: ${data.state}`, false);
+                        if (data.gated) {
+                            setLEDStatus(`state: ${data.state} (gated — display off, strip dark)`, false);
+                        } else {
+                            setLEDStatus(`state: ${data.state}`, false);
+                        }
                     } else {
                         setLEDStatus('disabled', false);
                     }
                 }
             } catch (e) {
                 console.error('Failed to load LED status:', e);
+            }
+        }
+
+        async function loadLEDRequireDisplay() {
+            try {
+                const r = await fetch('/api/leds/require_display');
+                const data = await r.json();
+                const toggle = document.getElementById('leds-require-display-toggle');
+                if (toggle) toggle.checked = !!data.leds_require_display;
+            } catch (e) {
+                console.error('Failed to load LED display-gate:', e);
+            }
+        }
+
+        async function toggleLEDRequireDisplay(enabled) {
+            try {
+                const r = await fetch('/api/leds/require_display', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled }),
+                });
+                const data = await r.json();
+                if (!data.success) {
+                    setLEDStatus(data.error || 'failed to update display-gate', true);
+                }
+                // Refresh status to pick up the new gated reading.
+                loadStatusLEDs();
+            } catch (e) {
+                setLEDStatus('error: ' + e, true);
             }
         }
 
@@ -3102,6 +3143,7 @@
         loadOptimizationSettings();
         loadIRStatus();
         loadStatusLEDs();
+        loadLEDRequireDisplay();
         loadReplacementModes();
         loadPhotoLibrary();
         updateAutonomousModeStatus();

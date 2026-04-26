@@ -97,7 +97,7 @@ class StatusLEDController:
     the user actually toggles the feature on.
     """
 
-    def __init__(self, leds_factory=None):
+    def __init__(self, leds_factory=None, drive_predicate=None):
         # Defer the import so the rest of the app can run on machines
         # without spidev installed (e.g. unit-test hosts).
         if leds_factory is None:
@@ -105,6 +105,13 @@ class StatusLEDController:
                 from status_leds import StatusLEDs
                 return StatusLEDs()
         self._leds_factory = leds_factory
+
+        # Optional gate. When set, the worker calls it once per tick; if it
+        # returns False the strip is forced to render zeros for that frame
+        # (state and frame counter still advance — animations stay in sync,
+        # they're just not visible). Used by Minus to keep the strip dark
+        # when the HDMI-TX display is off, so a dark room stays dark.
+        self._drive_predicate = drive_predicate
 
         self._lock = threading.Lock()
         self._leds = None
@@ -152,8 +159,24 @@ class StatusLEDController:
         with self._lock:
             return self._last_error
 
+    def set_drive_predicate(self, predicate):
+        """Replace the runtime gate that decides whether each tick drives
+        real frames (True) or zero frames (False). ``None`` means
+        "always drive". Worker checks the predicate every tick; a flaky
+        predicate that raises is treated as True so a broken gate never
+        leaves the strip stuck dark.
+        """
+        with self._lock:
+            self._drive_predicate = predicate
+
     def status(self):
         """Snapshot for the API. Cheap; safe to call frequently."""
+        gated = False
+        if self._drive_predicate is not None:
+            try:
+                gated = not bool(self._drive_predicate())
+            except Exception:
+                gated = False
         with self._lock:
             return {
                 "available": self.hardware_available(),
@@ -162,6 +185,7 @@ class StatusLEDController:
                 "state": self._state,
                 "states": list(VALID_STATES),
                 "last_error": self._last_error,
+                "gated": gated,
             }
 
     # ----------------------------------------------------------------- control
@@ -312,7 +336,23 @@ class StatusLEDController:
                     state = self._state
                     frame = self._frame
                     self._frame += 1
+                    predicate = self._drive_predicate
+                # Gate check outside the lock — predicate can do I/O
+                # (sysfs reads, etc.) and we don't want it blocking other
+                # callers. A raising predicate falls back to "drive" so a
+                # bug in the gate never leaves the strip dark forever.
+                drive = True
+                if predicate is not None:
+                    try:
+                        drive = bool(predicate())
+                    except Exception as e:
+                        logger.debug(
+                            f"[StatusLED] drive predicate raised: {e}; "
+                            f"falling back to drive=True")
+                        drive = True
                 renderer = _RENDERERS.get(state, _render_off)
+                if not drive:
+                    renderer = _render_off
                 if self._leds is not None:
                     renderer(self._leds, frame)
                     self._leds.show()

@@ -194,6 +194,82 @@ class StatusLEDControllerTests(unittest.TestCase):
         # Toggle survives — user's preference, not auto-changed
         self.assertTrue(ctrl.enabled)
 
+    def test_drive_predicate_false_renders_zeros(self):
+        """When the gate predicate returns False, the strip should be
+        rendered as all-zero frames regardless of the active state. The
+        state machine itself must keep ticking so animations resume
+        correctly when the gate returns True later."""
+        leds = _FakeLEDs()
+        ctrl = self.module.StatusLEDController(leds_factory=lambda: leds)
+        gate = {"on": False}
+        ctrl.set_drive_predicate(lambda: gate["on"])
+        ctrl.set_state("idle")  # would render solid green
+        ctrl.start()
+        time.sleep(0.5)  # let several ticks happen while gated
+        ctrl.stop()
+        # Every shown frame must be all-zero — never green.
+        for f in leds.shown_frames:
+            self.assertTrue(
+                all(p == (0, 0, 0) for p in f),
+                f"gated frame leaked non-zero pixels: {f}",
+            )
+
+    def test_drive_predicate_true_renders_state(self):
+        leds = _FakeLEDs()
+        ctrl = self.module.StatusLEDController(leds_factory=lambda: leds)
+        ctrl.set_drive_predicate(lambda: True)
+        ctrl.set_state("idle")
+        ctrl.start()
+        time.sleep(0.4)
+        ctrl.stop()
+        green = [p for f in leds.shown_frames for p in f if p == (0, 255, 0)]
+        self.assertTrue(green, "no green frames in gated=True history")
+
+    def test_drive_predicate_can_flip_at_runtime(self):
+        leds = _FakeLEDs()
+        ctrl = self.module.StatusLEDController(leds_factory=lambda: leds)
+        gate = {"on": True}
+        ctrl.set_drive_predicate(lambda: gate["on"])
+        ctrl.set_state("idle")
+        ctrl.start()
+        time.sleep(0.3)
+        # Snapshot how many frames we drove while ungated.
+        ungated_frame_count = len(leds.shown_frames)
+        gate["on"] = False
+        time.sleep(0.4)
+        ctrl.stop()
+        # Frames after the flip must all be dark.
+        post_flip = leds.shown_frames[ungated_frame_count:]
+        self.assertTrue(post_flip, "no frames captured after flip")
+        for f in post_flip:
+            self.assertTrue(all(p == (0, 0, 0) for p in f))
+
+    def test_drive_predicate_raising_falls_back_to_true(self):
+        """A predicate that raises must not leave the strip stuck dark."""
+        leds = _FakeLEDs()
+        ctrl = self.module.StatusLEDController(leds_factory=lambda: leds)
+        def _bad():
+            raise RuntimeError("oops")
+        ctrl.set_drive_predicate(_bad)
+        ctrl.set_state("idle")
+        ctrl.start()
+        time.sleep(0.4)
+        ctrl.stop()
+        green = [p for f in leds.shown_frames for p in f if p == (0, 255, 0)]
+        self.assertTrue(
+            green,
+            "raising predicate should fall back to drive=True, but no green",
+        )
+
+    def test_status_reports_gated_flag(self):
+        ctrl = self.module.StatusLEDController(leds_factory=_FakeLEDs)
+        ctrl.set_drive_predicate(lambda: False)
+        self.assertTrue(ctrl.status()["gated"])
+        ctrl.set_drive_predicate(lambda: True)
+        self.assertFalse(ctrl.status()["gated"])
+        ctrl.set_drive_predicate(None)
+        self.assertFalse(ctrl.status()["gated"])
+
     def test_render_recovery_clears_error(self):
         """A successful frame after a transient error clears the counter
         so a single bad frame doesn't haunt status() forever."""

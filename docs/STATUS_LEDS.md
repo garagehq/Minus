@@ -163,23 +163,51 @@ from the global 50 ms (20 fps) tick.
 ### Persistence
 
 The user-facing on/off toggle is persisted to
-`~/.minus_status_leds.json`. The chosen state itself is runtime-only —
-the system re-asserts it on every relevant event (boot →
-`initializing`, ad block → `blocking`, etc.).
+`~/.minus_status_leds.json` (the systemd service runs as root so the
+file lives at `/root/.minus_status_leds.json` in production). The
+chosen state itself is runtime-only — the system re-asserts it on
+every relevant event (boot → `initializing`, ad block → `blocking`,
+etc.).
+
+The `leds_require_display` toggle (see *Display gating* below) is
+persisted to `~/.minus_system_settings.json` alongside the rest of the
+system flags.
+
+### Display gating
+
+By default the strip stays dark while the **HDMI-TX display is
+disconnected or powered off** so a dark room stays dark. The state
+machine still ticks underneath — animations resume seamlessly when
+the display comes back on, no service restart needed.
+
+Mechanics: the controller takes an optional `drive_predicate` callable.
+`Minus` sets one that calls `health_monitor._check_hdmi_output_connected()`
+(reads `/sys/class/drm/card0-HDMI-A-*/status`) once per tick. When the
+predicate returns False, the worker renders an all-zero frame for the
+strip while leaving `state` and `frame` untouched. Sub-200 ms latency
+on plug/unplug because that's the tick interval.
+
+Toggle off the gate from the WebUI to keep the strip lit regardless of
+display state — useful for headless boxes or initial bring-up.
 
 ## HTTP API
 
 | Method + Path | Purpose | Status codes |
 |---|---|---|
-| `GET /api/leds/status` | Returns `{available, enabled, running, state, states}` | 200, 503 if module not loaded |
+| `GET /api/leds/status` | Returns `{available, enabled, running, state, states, last_error, gated}` | 200, 503 if module not loaded |
 | `POST /api/leds/enable` | Turn the feature on; persists; starts the thread; defaults to `idle` | 200, 503 if hardware missing |
 | `POST /api/leds/disable` | Turn the feature off; persists; stops the thread; blanks the strip | 200, 503 if module not loaded |
 | `POST /api/leds/state` | Body `{"state": "<name>"}` switches state | 200, 400 unknown state, 403 disabled, 503 module not loaded |
+| `GET /api/leds/require_display` | Returns `{leds_require_display, display_connected}` (live HDMI-TX read) | 200, 500 |
+| `POST /api/leds/require_display` | Body `{"enabled": true|false}` toggles the display gate | 200, 500 |
 
 Examples:
 
 ```bash
-curl http://localhost/api/leds/status
+curl http://localhost/api/leds/status                 # includes "gated"
+curl http://localhost/api/leds/require_display
+curl -X POST -H 'Content-Type: application/json' \
+     -d '{"enabled":false}' http://localhost/api/leds/require_display
 curl -X POST http://localhost/api/leds/enable
 curl -X POST -H 'Content-Type: application/json' \
      -d '{"state":"blocking"}' http://localhost/api/leds/state
@@ -193,6 +221,11 @@ section of the Settings tab, right beside the IR Remote panel. The
 panel is hidden until the toggle is on. The active state button is
 outlined in green and updates whenever something else (ad blocker,
 health monitor, API) pushes a state change.
+
+Inside the panel: a secondary "Only when display is on" toggle
+controls the display-gate behavior described above. When gated the
+status line shows `state: <name> (gated — display off, strip dark)`
+so it's obvious why the LEDs aren't visible.
 
 Hardware-not-detected (the SPI overlay isn't loaded) disables the
 toggle and replaces the help text with the overlay-enable instructions.

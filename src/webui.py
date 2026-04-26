@@ -2827,6 +2827,34 @@ class WebUI:
                 logger.error(f"[WebUI] /api/leds/state failed: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
+        @self.app.route('/api/leds/require_display', methods=['GET'])
+        def api_leds_require_display_get():
+            """Read the 'only drive LEDs while display is connected' toggle
+            plus a live snapshot of the HDMI-TX state, so the UI can
+            explain why the strip is currently dark."""
+            try:
+                return jsonify({
+                    'leds_require_display':
+                        bool(self.minus.leds_require_display),
+                    'display_connected':
+                        bool(self.minus.is_display_connected_live()),
+                })
+            except Exception as e:
+                logger.error(
+                    f"[WebUI] /api/leds/require_display GET failed: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/leds/require_display', methods=['POST'])
+        def api_leds_require_display_post():
+            try:
+                data = request.get_json(silent=True) or {}
+                enabled = bool(data.get('enabled', True))
+                return jsonify(self.minus.set_leds_require_display(enabled))
+            except Exception as e:
+                logger.error(
+                    f"[WebUI] /api/leds/require_display POST failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
         # =========================================================================
         # Blocking Control
         # =========================================================================

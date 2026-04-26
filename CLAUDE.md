@@ -824,9 +824,11 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `GET /api/ir/status` - IR transmitter status (`enabled`, `available`, `initialized`, `codes`)
 - `POST /api/ir/enable` / `disable` - Toggle the IR remote feature (gates the UI and `/command`)
 - `POST /api/ir/command` - Send a captured button. Body: `{"button": "power"|"input_1"|"input_2"|"input_3"|"next"|"auto"}`. `403` when disabled, `429` with `retry_after` inside the 1.5 s cooldown. See `docs/IR_TRANSMITTER.md`.
-- `GET /api/leds/status` - Status LEDs status (`available`, `enabled`, `running`, `state`, `states`)
+- `GET /api/leds/status` - Status LEDs status (`available`, `enabled`, `running`, `state`, `states`, `last_error`, `gated`)
 - `POST /api/leds/enable` / `disable` - Toggle the WS2812B status strip; persists; starts/stops the animation thread
-- `POST /api/leds/state` - Switch animation state. Body: `{"state": "<name>"}`. `403` when disabled, `400` for unknown state. States: `off / initializing / idle / blocking / no_signal / autonomous / error`. See `docs/STATUS_LEDS.md`.
+- `POST /api/leds/state` - Switch animation state. Body: `{"state": "<name>"}`. `403` when disabled, `400` for unknown state. States: `off / initializing / idle / blocking / paused / no_signal / autonomous / wifi_setup / error`. See `docs/STATUS_LEDS.md`.
+- `GET /api/leds/require_display` - Display-gate status (`leds_require_display`, live `display_connected`)
+- `POST /api/leds/require_display` - Body `{"enabled": true|false}` — when on (default), the strip stays dark while the HDMI-TX display is disconnected or powered off.
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
@@ -1104,6 +1106,8 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 | `error` | fast red blink (2 Hz) | manual / subsystem failure |
 
 **Persistence:** the on/off toggle is in `~/.minus_status_leds.json`. State itself is runtime-only and gets re-asserted by the next event.
+
+**Display gating:** by default the strip stays dark while the HDMI-TX display is disconnected or powered off — keeps a dark room dark when the TV is off. State machine still ticks; only the wire output is suppressed, so animations resume seamlessly within ~200 ms of the display coming back. Implemented as an optional `drive_predicate` on the controller that `Minus` wires to `health_monitor._check_hdmi_output_connected()`. The `leds_require_display` flag (default True) toggles the gate from the WebUI; persisted in `~/.minus_system_settings.json`.
 
 **Hardware setup (one-time):** enable `rk3588-spi0-m2-cs0-spidev` overlay, install `python3-spidev`, add user to `spi` group, reboot. `./install.sh` does all of that idempotently.
 

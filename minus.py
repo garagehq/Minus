@@ -487,6 +487,16 @@ class Minus:
         # so the "initializing" state shows until ad_blocker fires up.
         self.status_leds = (
             StatusLEDController() if HAS_STATUS_LEDS else None)
+        if self.status_leds is not None:
+            # Gate the strip on the HDMI-TX display being connected when
+            # ``leds_require_display`` is set (default). State machine still
+            # ticks normally — only the wire output is suppressed, so the
+            # animation resumes seamlessly when the display comes back on.
+            def _led_drive_predicate():
+                if not self.leds_require_display:
+                    return True
+                return self.is_display_connected_live()
+            self.status_leds.set_drive_predicate(_led_drive_predicate)
 
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
@@ -1820,6 +1830,8 @@ class Minus:
             'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
             'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
             'ir_enabled': False,          # Show REI HDMI-switch IR remote in autonomous mode
+            'leds_require_display': True, # Only drive the WS2812B strip when HDMI-TX is connected
+                                          # (so a powered-off TV in a dark room stays dark)
             # Which replacement-mode kinds are allowed during ad blocks. A
             # list rather than a dict so the web UI can just toggle checkboxes.
             # Valid kinds: 'vocab', 'fact', 'photos'.
@@ -1906,6 +1918,37 @@ class Minus:
             except Exception as e:
                 logger.warning(f"IR transmitter shutdown failed: {e}")
         return {'success': True, 'ir_enabled': enabled}
+
+    @property
+    def leds_require_display(self) -> bool:
+        """Whether the status-LED strip should only drive frames when the
+        HDMI-TX display is actually connected. Default True — keeps a
+        dark room dark when the TV is powered off."""
+        return self._system_settings.get('leds_require_display', True)
+
+    def set_leds_require_display(self, enabled: bool) -> dict:
+        self._system_settings['leds_require_display'] = bool(enabled)
+        self._save_system_settings()
+        return {'success': True, 'leds_require_display': bool(enabled)}
+
+    def is_display_connected_live(self) -> bool:
+        """Live HDMI-TX presence check (sysfs, no caching).
+
+        ``self.display_connected`` reflects the *display pipeline's* state
+        — once the pipeline has come up successfully it stays True until
+        a long-running retry loop notices a real disconnect. For the
+        LED gate we want a fast yes/no based on the kernel's current
+        view of /sys/class/drm, so we route through the health monitor's
+        sysfs probe.
+        """
+        if self.health_monitor is not None:
+            try:
+                return self.health_monitor._check_hdmi_output_connected()
+            except Exception:
+                pass
+        # Fall back to the cached pipeline-side flag so we never
+        # accidentally gate to dark on a flaky probe.
+        return self.display_connected
 
     def set_optimization_setting(self, key: str, enabled: bool) -> dict:
         """Update one of the optimization toggles and persist."""
