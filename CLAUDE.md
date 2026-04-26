@@ -330,27 +330,29 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 **OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
-- Stops blocking after 4 consecutive no-ads (`OCR_STOP_THRESHOLD`)
+- Stops blocking after **2 consecutive no-ads** (`OCR_STOP_THRESHOLD=2`, was 4 — tuned via `tests/block_latency_harness.py`)
 - **Authoritative for stopping** when OCR triggered the block
 - Tracks `last_ocr_ad_time` for VLM context
 - Handles common OCR misreads in ad timestamps (see below)
 
 **VLM (Secondary - Anti-Waffle Protected):**
 - Uses sliding window of last 45 seconds of VLM decisions (`vlm_history_window`)
-- Only triggers blocking alone if 80%+ of recent decisions are "ad" (`vlm_start_agreement`)
-- Hysteresis: needs 90% agreement to START (80% + 10% boost for state change)
+- Only triggers blocking alone if 90%+ of recent decisions are "ad" (`vlm_start_agreement`)
+- Hysteresis: needs 100% agreement to START (capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever)
 - Minimum 4 decisions in window before VLM can act (`vlm_min_decisions`)
 - 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
-- **Sliding window only for starting** - stopping uses simple consecutive count
+- **Sliding window only for starting** - stopping uses simple consecutive count (`VLM_STOP_THRESHOLD=2`)
 
 **Sliding Window Parameters:**
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `vlm_history_window` | 45s | How far back to look at VLM decisions |
 | `vlm_min_decisions` | 4 | Minimum decisions needed before acting |
-| `vlm_start_agreement` | 80% | Agreement threshold to start blocking |
+| `vlm_start_agreement` | 90% | Agreement threshold to start blocking |
 | `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
+| `vlm_start_threshold_cap` | 95% | Maximum effective start threshold (so hysteresis can't make it unreachable) |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
+| `VLM_STOP_THRESHOLD` | 2 | Consecutive no-ad votes for fast-stop path |
 
 **Transition Frame Detection:**
 When blocking is active, black/solid-color frames are detected as transitions between ads and held in blocking state to prevent premature unblocking and re-blocking flicker. The `_is_transition_frame()` method analyzes:
@@ -1286,10 +1288,36 @@ The project includes a comprehensive test suite for all extracted modules.
 
 **Running Tests:**
 ```bash
-python3 tests/test_modules.py            # 300+ unit tests
-python3 tests/test_autonomous_mode.py    # Autonomous mode tests
-python3 tests/test_review_ui.py          # Playwright UI tests (requires chromium)
+python3 tests/test_modules.py                  # 300+ unit tests
+python3 tests/test_autonomous_mode.py          # Autonomous mode tests
+python3 tests/test_recent_features.py          # Recent feature tests
+python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
+python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
 ```
+
+**Block-latency test harness (`tests/block_latency_harness.py`):**
+
+Headless rig for tuning the blocking decision engine. Plays Big Buck Bunny
+in a Python loop, lets the test orchestrator inject "AD"-style overlay
+text on/off at controlled timestamps, and measures detect / recover
+latency end-to-end through the production OCR + VLM workers + a faithful
+mirror of `minus.py`'s blocking decision logic. No HDMI, no ustreamer,
+no DRM, no audio.
+
+```bash
+# Place a video file at /home/radxa/test_assets/bbb.mp4 first.
+python3 tests/block_latency_harness.py round1   # 9 detect/recover combos
+python3 tests/block_latency_harness.py round4   # realistic ad-break shapes
+python3 tests/block_latency_harness.py round5   # VLM state machine (injected verdicts)
+python3 tests/block_latency_harness.py round6   # user-bug pause-on-ad regression
+python3 tests/block_latency_harness.py round7   # production-shaped, OCR + VLM corroborated
+```
+
+`use_real_vlm=False` mode uses injected VLM verdicts so the engine's
+sliding-window state machine can be driven deterministically without the
+~30s real-VLM model load. Override `PARAMS` from a small wrapper script
+to A/B-test tuning candidates; the in-rig defaults mirror the locked-in
+production values.
 
 **Test Coverage:**
 
@@ -1737,3 +1765,41 @@ Observed once today across a 17-hour run: at 08:19:59 HDMI input recovered after
 
 **Files modified:**
 - `minus.py` — `_on_hdmi_restored()`: capture return value, branch on success/failure, arm retry loop on failure
+
+### Phantom Re-Block After Pause-On-Ad (Fixed - Apr 2026)
+
+**Symptom:** User pauses on a real ad on Netflix, ad ends offscreen during the pause, user unpauses to actual show content — and Minus shows the blocking overlay for ~5 more seconds on the show content. Reproduced via the block-latency harness (`round6`): with the OLD parameters, **3/3 scenarios** observed phantom re-blocks at ~0.9s after unpause.
+
+**Root cause:** three coupled defects in the static-suppression / cooldown machinery, each individually plausible but combining badly:
+
+1. **`OCR_STOP_THRESHOLD = 4`** meant blocking took 4 OCR cycles × 0.5s = 2s to clear once the ad ended — already over the 1.5s responsiveness target the user wanted.
+2. **`scene_change_threshold = 0.01`** misclassified ~26% of natural low-motion frames in real video content as "static" (measured against BBB's actual inter-frame mean-abs-diff distribution: p5=0.002, p50=0.017, max=0.31). Static suppression therefore flapped on/off mid-content during slow scenes.
+3. **`dynamic_cooldown = 0.5s`** was too short for the post-pause AD overlay to actually transition off-screen. The cooldown completed → state was cleared → the very next OCR cycle re-detected the still-lingering AD text → blocking re-fired immediately.
+
+The user only saw symptom 3 in the worst form (the phantom re-block), but symptoms 1 and 2 amplified its visibility — symptom 2 was also responsible for the related "blocking flips off mid-content" issue earlier in the same investigation.
+
+**Solution:** three coordinated tuning changes, locked in via `tests/block_latency_harness.py` measurements (rounds 1, 4, 6, 7):
+
+| Parameter | Old | New | Effect |
+|---|---|---|---|
+| `OCR_STOP_THRESHOLD` (`minus.py`) | 4 | **2** | recover 2.0s → 1.0s |
+| `scene_change_threshold` (`config.py`) | 0.01 | **0.001** | only truly-frozen frames (~1.7% of BBB) register as static; natural low-motion content (~98%) keeps flowing |
+| `dynamic_cooldown` (`config.py`) | 0.5s | **1.5s** | post-pause AD overlay actually finishes transitioning off-screen before state is cleared |
+
+**Verification:** `round6` of the harness re-runs the user's scenario 3× per parameter set:
+- OLD params: 3/3 phantom re-blocks, max 0.90s after unpause
+- NEW params: **0/3** phantom re-blocks ✓
+
+**Final scenario performance with locked-in params:**
+- detect: mean 0.59s, max 0.66s, **9/9 clean** across all round-1 ad shapes
+- recover: mean 0.97s, max 1.15s, **all under 1.5s goal**
+- 0 false-positive blocking events across 15s of clean content (round 7)
+- 0 mid-block flaps across a 30s sustained ad (round 7)
+
+**Defense-in-depth:** `tests/test_block_decision_engine.py` adds 11 lightweight unit tests for the DecisionEngine state machine (cooldown clearing, OCR stop threshold, VLM-only fast-stop, the user-bug regression itself with both OLD and NEW params asserted). Runs as part of the standard test suite.
+
+**Files modified:**
+- `minus.py` — `OCR_STOP_THRESHOLD = 2` + comment with link to harness
+- `src/config.py` — `scene_change_threshold = 0.001` + measurement-derived comment, `dynamic_cooldown = 1.5` (already changed in the cooldown-fix commit earlier this session)
+- `tests/block_latency_harness.py` — new ~700-line headless harness (BBB source, OCR/VLM workers, decision-engine mirror, 7 rounds of scenarios)
+- `tests/test_block_decision_engine.py` — new 11 unit tests
