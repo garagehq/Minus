@@ -673,6 +673,65 @@
                 <div class="autonomous-actions">
                     <button onclick="startAutonomousModeNow()" class="action-btn" id="autonomous-start-btn">Start Now</button>
                 </div>
+
+                <!-- IR Transmitter (REI 8K HDMI switch) -->
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">IR Remote (HDMI Switch)</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="ir-toggle" onchange="toggleIRTransmitter(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text" id="ir-help-text">Controls the REI 8K HDMI switch via IR (header pin 38, PWM3). Lets autonomous mode rotate inputs to vary training data.</p>
+                <div id="ir-remote-panel" class="hidden" style="margin-top: 0.75rem;">
+                    <div class="remote-grid compact">
+                        <div class="remote-row">
+                            <button class="remote-btn select" onclick="sendIRCommand('input_1')">Input 1</button>
+                            <button class="remote-btn select" onclick="sendIRCommand('input_2')">Input 2</button>
+                            <button class="remote-btn select" onclick="sendIRCommand('input_3')">Input 3</button>
+                        </div>
+                        <div class="remote-row">
+                            <button class="remote-btn" onclick="sendIRCommand('power')">&#9211; Power</button>
+                            <button class="remote-btn nav" onclick="sendIRCommand('next')">Next &#8594;</button>
+                            <button class="remote-btn" onclick="sendIRCommand('auto')">Auto</button>
+                        </div>
+                    </div>
+                    <div class="ir-status-line" id="ir-status-line"></div>
+                </div>
+
+                <!-- Status LED strip (WS2812B on SPI0 MOSI) -->
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">Status LEDs</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="leds-toggle" onchange="toggleStatusLEDs(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <p class="help-text" id="leds-help-text">8 WS2812B LEDs on header pin 19 indicate device state (initializing / idle / blocking / paused / no-signal / autonomous / wifi / error). Requires the SPI0-M2 overlay enabled.</p>
+                <div id="leds-state-panel" class="hidden" style="margin-top: 0.75rem;">
+                    <div class="setting-item" style="margin-bottom: 0.5rem;">
+                        <span class="setting-label" style="font-size: 0.85rem;">Only when display is on</span>
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="leds-require-display-toggle" onchange="toggleLEDRequireDisplay(this.checked)">
+                            <span class="toggle-slider"></span>
+                        </label>
+                    </div>
+                    <p class="help-text" style="font-size: 0.75rem; margin-top: 0;">When on (default), the strip stays dark while the HDMI-TX display is disconnected or powered off. The state machine still runs — animations resume seamlessly when the display comes back.</p>
+                    <div class="remote-grid compact">
+                        <div class="remote-row">
+                            <button class="remote-btn select" data-led-state="off" onclick="setStatusLEDState('off')">Off</button>
+                            <button class="remote-btn select" data-led-state="initializing" onclick="setStatusLEDState('initializing')">Init</button>
+                            <button class="remote-btn select" data-led-state="idle" onclick="setStatusLEDState('idle')">Idle</button>
+                            <button class="remote-btn select" data-led-state="blocking" onclick="setStatusLEDState('blocking')">Blocking</button>
+                        </div>
+                        <div class="remote-row">
+                            <button class="remote-btn" data-led-state="no_signal" onclick="setStatusLEDState('no_signal')">No Signal</button>
+                            <button class="remote-btn nav" data-led-state="autonomous" onclick="setStatusLEDState('autonomous')">Autonomous</button>
+                            <button class="remote-btn" data-led-state="error" onclick="setStatusLEDState('error')">Error</button>
+                        </div>
+                    </div>
+                    <div class="ir-status-line" id="leds-status-line"></div>
+                </div>
             </section>
 
             <!-- Fire TV Settings (hidden when not using Fire TV) -->
@@ -1687,6 +1746,232 @@
             } catch (error) {
                 console.error('Failed to load optimization settings:', error);
             }
+        }
+
+        // =========================================================================
+        // IR Transmitter (REI HDMI switch)
+        // =========================================================================
+        async function loadIRStatus() {
+            try {
+                const r = await fetch('/api/ir/status');
+                const data = await r.json();
+                const toggle = document.getElementById('ir-toggle');
+                const panel = document.getElementById('ir-remote-panel');
+                const help = document.getElementById('ir-help-text');
+                if (!data.available) {
+                    toggle.checked = false;
+                    toggle.disabled = true;
+                    panel.classList.add('hidden');
+                    help.textContent = 'IR hardware not detected. Enable the rk3588-pwm3-m1 device-tree overlay and reboot.';
+                    return;
+                }
+                toggle.disabled = false;
+                toggle.checked = !!data.enabled;
+                panel.classList.toggle('hidden', !data.enabled);
+            } catch (e) {
+                console.error('Failed to load IR status:', e);
+            }
+        }
+
+        async function toggleIRTransmitter(enabled) {
+            const panel = document.getElementById('ir-remote-panel');
+            const toggle = document.getElementById('ir-toggle');
+            try {
+                const endpoint = enabled ? '/api/ir/enable' : '/api/ir/disable';
+                const r = await fetch(endpoint, { method: 'POST' });
+                const data = await r.json();
+                if (!data.success) {
+                    toggle.checked = !enabled;
+                    setIRStatus(data.error || 'failed', true);
+                    return;
+                }
+                panel.classList.toggle('hidden', !enabled);
+                setIRStatus(enabled ? 'enabled' : 'disabled', false);
+            } catch (e) {
+                toggle.checked = !enabled;
+                setIRStatus('error: ' + e, true);
+            }
+        }
+
+        const IR_COOLDOWN_MS = 1500;
+        let irCooldownUntil = 0;
+
+        async function sendIRCommand(button) {
+            const now = Date.now();
+            if (now < irCooldownUntil) {
+                const remaining = ((irCooldownUntil - now) / 1000).toFixed(2);
+                setIRStatus(`cooldown — wait ${remaining}s`, true);
+                return;
+            }
+            setIRStatus(`sending ${button}…`, false);
+            setIRButtonsEnabled(false);
+            try {
+                const r = await fetch('/api/ir/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ button }),
+                });
+                const data = await r.json();
+                if (data.success) {
+                    setIRStatus(`sent ${button}`, false);
+                    irCooldownUntil = Date.now() + IR_COOLDOWN_MS;
+                } else {
+                    setIRStatus(data.error || 'send failed', true);
+                    if (r.status === 429 && data.retry_after) {
+                        irCooldownUntil = Date.now() + data.retry_after * 1000;
+                    }
+                }
+            } catch (e) {
+                setIRStatus('error: ' + e, true);
+            }
+            const reEnableIn = Math.max(0, irCooldownUntil - Date.now());
+            setTimeout(() => setIRButtonsEnabled(true), reEnableIn);
+        }
+
+        function setIRButtonsEnabled(enabled) {
+            const panel = document.getElementById('ir-remote-panel');
+            if (!panel) return;
+            panel.querySelectorAll('button').forEach(b => { b.disabled = !enabled; });
+        }
+
+        function setIRStatus(text, isError) {
+            const el = document.getElementById('ir-status-line');
+            if (!el) return;
+            el.textContent = text;
+            el.style.color = isError ? 'var(--danger)' : 'var(--text-secondary)';
+        }
+
+        // =========================================================================
+        // Status LEDs (WS2812B strip on SPI0 MOSI)
+        // =========================================================================
+        async function loadStatusLEDs() {
+            try {
+                const r = await fetch('/api/leds/status');
+                const data = await r.json();
+                const toggle = document.getElementById('leds-toggle');
+                const panel = document.getElementById('leds-state-panel');
+                const help = document.getElementById('leds-help-text');
+                const defaultHelp = '7 WS2812B LEDs on header pin 19 indicate device state (initializing / idle / blocking / no-signal / autonomous / error). Requires the SPI0-M2 overlay enabled.';
+
+                if (!data.available) {
+                    toggle.checked = !!data.enabled;
+                    toggle.disabled = true;
+                    panel.classList.add('hidden');
+                    help.textContent = 'SPI hardware not detected (/dev/spidev0.0 missing). Run install.sh or enable the rk3588-spi0-m2-cs0-spidev overlay and reboot.';
+                    setLEDStatus(data.last_error || 'hardware unavailable', true);
+                    return;
+                }
+                toggle.disabled = false;
+                toggle.checked = !!data.enabled;
+                panel.classList.toggle('hidden', !data.enabled);
+                highlightLEDState(data.state);
+
+                // Surface a runtime SPI error (e.g. wire pulled mid-run): the
+                // controller auto-stops itself, the toggle remains "on" so the
+                // user sees the intent + the cause. Toggle off → on retries.
+                if (data.last_error) {
+                    help.textContent = defaultHelp + ' (auto-stopped — toggle off then on to retry after fixing wiring.)';
+                    setLEDStatus(data.last_error, true);
+                } else {
+                    help.textContent = defaultHelp;
+                    if (data.enabled) {
+                        if (data.gated) {
+                            setLEDStatus(`state: ${data.state} (gated — display off, strip dark)`, false);
+                        } else {
+                            setLEDStatus(`state: ${data.state}`, false);
+                        }
+                    } else {
+                        setLEDStatus('disabled', false);
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to load LED status:', e);
+            }
+        }
+
+        async function loadLEDRequireDisplay() {
+            try {
+                const r = await fetch('/api/leds/require_display');
+                const data = await r.json();
+                const toggle = document.getElementById('leds-require-display-toggle');
+                if (toggle) toggle.checked = !!data.leds_require_display;
+            } catch (e) {
+                console.error('Failed to load LED display-gate:', e);
+            }
+        }
+
+        async function toggleLEDRequireDisplay(enabled) {
+            try {
+                const r = await fetch('/api/leds/require_display', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ enabled }),
+                });
+                const data = await r.json();
+                if (!data.success) {
+                    setLEDStatus(data.error || 'failed to update display-gate', true);
+                }
+                // Refresh status to pick up the new gated reading.
+                loadStatusLEDs();
+            } catch (e) {
+                setLEDStatus('error: ' + e, true);
+            }
+        }
+
+        async function toggleStatusLEDs(enabled) {
+            const panel = document.getElementById('leds-state-panel');
+            const toggle = document.getElementById('leds-toggle');
+            try {
+                const endpoint = enabled ? '/api/leds/enable' : '/api/leds/disable';
+                const r = await fetch(endpoint, { method: 'POST' });
+                const data = await r.json();
+                if (!data.success) {
+                    toggle.checked = !enabled;
+                    setLEDStatus(data.error || 'failed', true);
+                    return;
+                }
+                panel.classList.toggle('hidden', !enabled);
+                setLEDStatus(enabled ? 'enabled — idle' : 'disabled', false);
+                if (enabled) highlightLEDState('idle');
+            } catch (e) {
+                toggle.checked = !enabled;
+                setLEDStatus('error: ' + e, true);
+            }
+        }
+
+        async function setStatusLEDState(state) {
+            setLEDStatus(`switching to ${state}…`, false);
+            try {
+                const r = await fetch('/api/leds/state', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ state }),
+                });
+                const data = await r.json();
+                if (data.success) {
+                    setLEDStatus(`state: ${state}`, false);
+                    highlightLEDState(state);
+                } else {
+                    setLEDStatus(data.error || 'failed', true);
+                }
+            } catch (e) {
+                setLEDStatus('error: ' + e, true);
+            }
+        }
+
+        function highlightLEDState(state) {
+            const panel = document.getElementById('leds-state-panel');
+            if (!panel) return;
+            panel.querySelectorAll('button[data-led-state]').forEach(b => {
+                b.classList.toggle('active', b.dataset.ledState === state);
+            });
+        }
+
+        function setLEDStatus(text, isError) {
+            const el = document.getElementById('leds-status-line');
+            if (!el) return;
+            el.textContent = text;
+            el.style.color = isError ? 'var(--danger)' : 'var(--text-secondary)';
         }
 
         async function updateVLMStatus() {
@@ -2856,6 +3141,9 @@
         updateVLMStatus();
         loadVLMPreloadSetting();
         loadOptimizationSettings();
+        loadIRStatus();
+        loadStatusLEDs();
+        loadLEDRequireDisplay();
         loadReplacementModes();
         loadPhotoLibrary();
         updateAutonomousModeStatus();
@@ -2868,6 +3156,7 @@
         setInterval(updateFireTVStatus, 5000);
         setInterval(updateVLMStatus, 3000);
         setInterval(updateAutonomousModeStatus, 5000);
+        setInterval(loadStatusLEDs, 2500);
     // =========================================================================
     // Screenshot Review Modal (Tinder-style swipe classification)
     // =========================================================================

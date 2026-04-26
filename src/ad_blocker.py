@@ -475,6 +475,7 @@ class DRMAdBlocker:
                 return False
 
             logger.info("[DRMAdBlocker] Pipeline started")
+            self._set_led_state('idle')
             self._start_watchdog()
 
             # Reset failure counters on fresh start (important after long HDMI outages)
@@ -716,6 +717,16 @@ class DRMAdBlocker:
         logger.info(f"[DRMAdBlocker] External restart requested (hdmi_reconnect={hdmi_reconnect})")
         threading.Thread(target=self._restart_pipeline, args=(hdmi_reconnect,), daemon=True).start()
 
+    def _set_led_state(self, state):
+        """Push a state to the WS2812B status strip if hooked up. Wrapped
+        because LED issues must never break ad blocking."""
+        if self.minus is None:
+            return
+        try:
+            self.minus._set_led_state(state)
+        except Exception:
+            pass
+
     def _attempt_bandwidth_fallback(self) -> bool:
         """
         Attempt to fix display by falling back to lower bandwidth color format.
@@ -814,6 +825,7 @@ class DRMAdBlocker:
         """
         try:
             logger.debug("[DRMAdBlocker] Starting no-signal mode...")
+            self._set_led_state('no_signal')
 
             # Stop the watchdog - we don't want it restarting the normal pipeline
             self._stop_watchdog_thread()
@@ -1815,6 +1827,7 @@ class DRMAdBlocker:
 
             self.is_visible = True
             self.current_source = source
+            self._set_led_state('blocking')
 
             # Write blocking state to file for zero-overhead checks (avoids HTTP)
             try:
@@ -1857,6 +1870,13 @@ class DRMAdBlocker:
             was_visible = self.is_visible
             self.is_visible = False
             self.current_source = None
+            if was_visible:
+                # Pick the right background state — autonomous mode running,
+                # blocking paused, or just plain idle.
+                if self.minus and hasattr(self.minus, '_baseline_led_state'):
+                    self._set_led_state(self.minus._baseline_led_state())
+                else:
+                    self._set_led_state('idle')
 
             if self.minus:
                 self.minus.blocking_active = False

@@ -2616,6 +2616,246 @@ class WebUI:
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================
+        # IR Transmitter (REI 8K HDMI switch)
+        # =========================================================================
+
+        @self.app.route('/api/ir/status')
+        def api_ir_status():
+            """Status of the IR transmitter feature.
+
+            Returns:
+                enabled: persisted user toggle (UI gate).
+                available: pwm3 hardware visible (overlay loaded).
+                initialized: PWM has been set up and is ready to send.
+                codes: list of valid button names for /api/ir/command.
+            """
+            try:
+                from ir_transmitter import CODES, IRTransmitter
+                tx = self.minus.ir_transmitter
+                return jsonify({
+                    'enabled': bool(self.minus.ir_enabled),
+                    'available': IRTransmitter.hardware_available(),
+                    'initialized': bool(tx and tx.initialized),
+                    'codes': list(CODES.keys()),
+                })
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/status failed: {e}")
+                return jsonify({'enabled': False, 'available': False,
+                                'initialized': False, 'codes': [],
+                                'error': str(e)}), 500
+
+        @self.app.route('/api/ir/enable', methods=['POST'])
+        def api_ir_enable():
+            try:
+                from ir_transmitter import IRTransmitter
+                if not IRTransmitter.hardware_available():
+                    return jsonify({
+                        'success': False,
+                        'error': ('IR hardware not available — enable the '
+                                  'rk3588-pwm3-m1 overlay and reboot.'),
+                    }), 503
+                result = self.minus.set_ir_enabled(True)
+                # Initialize eagerly so the first button press doesn't pay
+                # the export+polarity setup latency.
+                if self.minus.ir_transmitter is not None:
+                    try:
+                        self.minus.ir_transmitter.initialize()
+                    except Exception as e:
+                        logger.warning(f"[WebUI] IR initialize failed: {e}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/enable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/ir/disable', methods=['POST'])
+        def api_ir_disable():
+            try:
+                return jsonify(self.minus.set_ir_enabled(False))
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/disable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/ir/command', methods=['POST'])
+        def api_ir_command():
+            """Send an IR button. Body: {"button": "<name>"}.
+
+            Refuses unless ir_enabled is true so the toggle is the single
+            on/off gate the user controls.
+            """
+            try:
+                from ir_transmitter import (
+                    CODES, IRCooldownError, IRTransmitterError,
+                )
+                if not self.minus.ir_enabled:
+                    return jsonify({
+                        'success': False,
+                        'error': 'IR transmitter disabled in settings',
+                    }), 403
+                tx = self.minus.ir_transmitter
+                if tx is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'IR transmitter not loaded',
+                    }), 503
+                data = request.get_json(silent=True) or {}
+                button = data.get('button')
+                if button not in CODES:
+                    return jsonify({
+                        'success': False,
+                        'error': f"unknown button '{button}'",
+                        'codes': list(CODES.keys()),
+                    }), 400
+                try:
+                    tx.send(button)
+                except IRCooldownError as e:
+                    return jsonify({
+                        'success': False,
+                        'error': str(e),
+                        'retry_after': round(e.remaining_s, 2),
+                    }), 429
+                except IRTransmitterError as e:
+                    return jsonify({'success': False, 'error': str(e)}), 503
+                return jsonify({'success': True, 'button': button})
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/command failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Status LEDs (WS2812B strip on SPI0 MOSI)
+        # =========================================================================
+
+        @self.app.route('/api/leds/status')
+        def api_leds_status():
+            """Status of the status-LED strip.
+
+            Returns:
+                available: /dev/spidev0.0 visible (SPI overlay loaded).
+                enabled:   persisted user toggle (UI gate).
+                running:   animation thread alive.
+                state:     current animation state name.
+                states:    list of valid state names.
+            """
+            try:
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'available': False,
+                        'enabled': False,
+                        'running': False,
+                        'state': 'off',
+                        'states': [],
+                        'error': 'status LED module not loaded',
+                    }), 503
+                return jsonify(ctrl.status())
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/status failed: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/leds/enable', methods=['POST'])
+        def api_leds_enable():
+            try:
+                from status_led_controller import StatusLEDController
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LED module not loaded',
+                    }), 503
+                if not StatusLEDController.hardware_available():
+                    return jsonify({
+                        'success': False,
+                        'error': ('SPI hardware not available — enable the '
+                                  'rk3588-spi0-m2-cs0-spidev overlay and reboot.'),
+                    }), 503
+                result = ctrl.set_enabled(True)
+                # Pick up the right baseline (no_signal / paused / autonomous
+                # / idle) instead of always starting on idle — matches what
+                # the system would have shown if it hadn't been disabled.
+                if hasattr(self.minus, '_baseline_led_state'):
+                    ctrl.set_state(self.minus._baseline_led_state())
+                else:
+                    ctrl.set_state('idle')
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/enable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/leds/disable', methods=['POST'])
+        def api_leds_disable():
+            try:
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LED module not loaded',
+                    }), 503
+                return jsonify(ctrl.set_enabled(False))
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/disable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/leds/state', methods=['POST'])
+        def api_leds_state():
+            """Set the animation state. Body: {"state": "<name>"}.
+
+            Refuses unless the strip is enabled so the toggle is the single
+            on/off gate the user controls.
+            """
+            try:
+                from status_led_controller import VALID_STATES
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LED module not loaded',
+                    }), 503
+                if not ctrl.enabled:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LEDs disabled in settings',
+                    }), 403
+                data = request.get_json(silent=True) or {}
+                state = data.get('state')
+                if not ctrl.set_state(state):
+                    return jsonify({
+                        'success': False,
+                        'error': f"unknown state {state!r}",
+                        'states': list(VALID_STATES),
+                    }), 400
+                return jsonify({'success': True, 'state': state})
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/state failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/leds/require_display', methods=['GET'])
+        def api_leds_require_display_get():
+            """Read the 'only drive LEDs while display is connected' toggle
+            plus a live snapshot of the HDMI-TX state, so the UI can
+            explain why the strip is currently dark."""
+            try:
+                return jsonify({
+                    'leds_require_display':
+                        bool(self.minus.leds_require_display),
+                    'display_connected':
+                        bool(self.minus.is_display_connected_live()),
+                })
+            except Exception as e:
+                logger.error(
+                    f"[WebUI] /api/leds/require_display GET failed: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/leds/require_display', methods=['POST'])
+        def api_leds_require_display_post():
+            try:
+                data = request.get_json(silent=True) or {}
+                enabled = bool(data.get('enabled', True))
+                return jsonify(self.minus.set_leds_require_display(enabled))
+            except Exception as e:
+                logger.error(
+                    f"[WebUI] /api/leds/require_display POST failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
         # Blocking Control
         # =========================================================================
 

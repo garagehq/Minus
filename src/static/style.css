@@ -929,6 +929,21 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     padding: 0.75rem;
 }
 
+.ir-status-line {
+    font-family: var(--font-body);
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+    text-align: center;
+    margin-top: 0.5rem;
+    min-height: 1em;
+}
+
+/* Active state highlight for status-LED state buttons. */
+.remote-btn.active {
+    outline: 1px solid var(--matrix-green);
+    background: rgba(0, 255, 0, 0.08);
+}
+
 .inline-remote .remote-grid.compact .remote-btn {
     padding: 0.6rem 0.4rem;
     font-size: 0.8rem;

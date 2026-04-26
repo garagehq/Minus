@@ -19,6 +19,8 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
+| [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
+| [docs/STATUS_LEDS.md](docs/STATUS_LEDS.md) | WS2812B status strip on SPI0 MOSI (pin 19) — wiring, state catalogue, API, encoding rationale |
 
 ## Visual Design
 
@@ -85,6 +87,9 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/webui.py` | Flask web UI for remote monitoring/control |
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
 | `src/roku.py` | Roku ECP remote control |
+| `src/ir_transmitter.py` | NEC IR transmitter over PWM3 (REI 8K HDMI switch). Thread-safe, 1.5 s cooldown |
+| `src/status_leds.py` | Raw WS2812B SPI driver. 8 LEDs, 10% brightness cap, Adafruit-canonical 8-bit-per-WS-bit encoding at 6.4 MHz |
+| `src/status_led_controller.py` | State machine + animation thread on top of `status_leds.py`. States: off/initializing/idle/blocking/no_signal/autonomous/error |
 | `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
 | `src/wifi_manager.py` | WiFi captive portal and AP mode management |
@@ -98,9 +103,16 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/screenshots.py` | ScreenshotManager with dHash dedup + blank rejection |
 | `src/skip_detection.py` | Skip button detection (regex patterns) |
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
+| `ir_transmit.py` | Standalone CLI for the IR transmitter (`sudo python3 ir_transmit.py <button>`) |
 | `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
 | `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
+| `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
+| `tests/test_ir_ui.py` | Playwright UI tests for IR remote panel |
+| `tests/test_status_led_controller.py` | Unit tests for status-LED state machine (mocked hardware, 31 tests) |
+| `tests/test_status_leds_ui.py` | Playwright UI tests for status-LED toggle + state palette |
+| `tests/test_status_led_states.py` | Hardware walk: every controller state across all 8 LEDs, 5 s each |
+| `test_status_leds.py` | Hardware walk/flash test for the WS2812B strip (R/G/B/W) |
 | `tests/test_ocr_ad_detection.py` | OCR ad pattern detection tests (143+ cases) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
@@ -811,6 +823,14 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `POST /api/screenshots/approve` - Mark screenshot as correctly labeled
 - `POST /api/screenshots/classify` - Move screenshot between categories
 - `POST /api/screenshots/undo` - Undo last review action
+- `GET /api/ir/status` - IR transmitter status (`enabled`, `available`, `initialized`, `codes`)
+- `POST /api/ir/enable` / `disable` - Toggle the IR remote feature (gates the UI and `/command`)
+- `POST /api/ir/command` - Send a captured button. Body: `{"button": "power"|"input_1"|"input_2"|"input_3"|"next"|"auto"}`. `403` when disabled, `429` with `retry_after` inside the 1.5 s cooldown. See `docs/IR_TRANSMITTER.md`.
+- `GET /api/leds/status` - Status LEDs status (`available`, `enabled`, `running`, `state`, `states`, `last_error`, `gated`)
+- `POST /api/leds/enable` / `disable` - Toggle the WS2812B status strip; persists; starts/stops the animation thread
+- `POST /api/leds/state` - Switch animation state. Body: `{"state": "<name>"}`. `403` when disabled, `400` for unknown state. States: `off / initializing / idle / blocking / paused / no_signal / autonomous / wifi_setup / error`. See `docs/STATUS_LEDS.md`.
+- `GET /api/leds/require_display` - Display-gate status (`leds_require_display`, live `display_connected`)
+- `POST /api/leds/require_display` - Body `{"enabled": true|false}` — when on (default), the strip stays dark while the HDMI-TX display is disconnected or powered off.
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
@@ -1030,6 +1050,84 @@ The Settings tab in the web UI shows:
 - `tests/test_wifi_portal.py` - Playwright tests (30 tests)
 
 **Note:** The Radxa's internal WiFi antenna has limited range. For better AP coverage in production, consider using a USB WiFi adapter with external antenna.
+
+## IR Transmitter (REI 8K HDMI Switch)
+
+An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**, muxed to `PWM3_IR_M1`) lets Minus control a REI 8K 3-port HDMI switch. The target use case is autonomous mode rotating between streaming devices (Roku / Fire TV / Google TV) on a schedule so training data covers multiple home-screen layouts.
+
+**Hardware setup (one-time):** enable the `rk3588-pwm3-m1` overlay, reboot. After reboot a new `/sys/class/pwm/pwmchipN` appears whose `device` symlink points to `fd8b0030.pwm`. See `docs/IR_TRANSMITTER.md` for overlay install steps and wiring.
+
+**Protocol:** NEC at 38 kHz carrier. Captured codes (all address `0x80`, via Flipper Zero): `input_1=0x07`, `input_2=0x1B`, `input_3=0x08`, `power=0x05`, `next=0x1F` (cycles 1→2→3→1), `auto=0x09`.
+
+**API:** `/api/ir/status | enable | disable | command`. See the Web UI *Key API Routes* section above. Server enforces a **1.5 s cooldown** between successful sends (`IRCooldownError` → HTTP `429` with `retry_after`).
+
+**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`.
+
+**Standalone CLI:** `sudo python3 ir_transmit.py <button>` sends one button; `--list` prints all valid names. Uses the same `IRTransmitter` class as the webui so there is one source of truth.
+
+**Key gotchas (the ones that burned us once already):**
+- The Radxa pinout labels GPIO3_B2 with the RK3588 pin-function `PWM3_IR_M1`, not PWM14. Only the `rk3588-pwm3-m1` overlay wires pin 38.
+- On a fresh PWM export, `polarity` defaults to `inversed` on this chip. That flips mark/space at the LED. `IRTransmitter.initialize()` sets `polarity=normal` while the PWM is disabled, before enabling.
+- Writing to `duty_cycle` returns `EINVAL` while `period` is still 0. Always set `period` before `duty_cycle` on a fresh export.
+
+**Files:**
+- `src/ir_transmitter.py` — `IRTransmitter` class, NEC encoder, cooldown, PWM sysfs wiring
+- `ir_transmit.py` — standalone CLI shim
+- `minus.py` — instantiates `self.ir_transmitter`, persists `ir_enabled` in `~/.minus_system_settings.json`
+- `src/webui.py` — `/api/ir/*` endpoints, cooldown → 429
+- `src/templates/index.html` — toggle + remote panel in Autonomous Mode section
+- `tests/test_ir_transmitter.py` — 20 unit tests (mocked sysfs)
+- `tests/test_ir_ui.py` — Playwright UI tests (live service)
+- `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
+
+**Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.
+
+## Status LED Strip (WS2812B on SPI0 MOSI)
+
+8× WS2812B addressable strip on header pin 19 (`GPIO1_B2` muxed as `SPI0_MOSI_M2`). All 8 LEDs are user-addressable.
+
+**Why SPI MOSI:** WS2812B's 800 kHz protocol needs sub-µs timing. Userspace GPIO can't deliver that on Linux; the SPI controller can. We clock SPI at **6.4 MHz** and encode each WS bit as one full SPI byte (`0b11110000` = WS-1, `0b11000000` = WS-0) — the canonical Adafruit `NeoPixel_SPI` pattern. The frame is wrapped with **80 µs zero-byte resets on both sides** and sent via `writebytes2(bytes)`. We initially tried 3-SPI-bits-per-WS-bit at 2.4 MHz; the `spi-rockchip` driver's PIO mode inserts inter-byte gaps when its FIFO refills, and the tighter scheme didn't have enough skew tolerance — visible symptom was "solid green decoded as cycling red/blue/white". `rpi_ws281x` and friends depend on Broadcom PWM+DMA hardware and don't work on RK3588.
+
+**Hardware:** bare-wire data line direct from header pin 19 to the strip — no level shifter, no inline resistor, no bulk cap needed for reliable operation on this board (verified: removed both the Adafruit-recommended 470 Ω series resistor and the 1000 µF V+/GND electrolytic, decoding stayed clean across all 8 LEDs). Keep the data wire ≤ 10 cm. (We previously shipped a "sacrificial first pixel" workaround that exposed only 7 LEDs; the encoding switch made it unnecessary and it has been removed.)
+
+**Brightness cap (load-bearing):** `BRIGHTNESS = 0.10` is applied inside `set_pixel()` before storage; every other setter funnels through it. Caps peak draw at ~48 mA across all 8 LEDs — small enough to keep current swings from corrupting the data line on the marginal 3.3V signalling. Don't bypass it from the application layer; if you need more brightness, add external 5 V power to the strip first.
+
+**Controller (`src/status_led_controller.py`):** `StatusLEDController` runs a 200 ms (5 fps) animation thread. Each renderer self-paces in seconds via the shared `_to_ticks()` helper, so per-animation cadence is preserved if the global tick rate is changed. State transitions are atomic and thread-safe; the lifecycle holds `_thread` populated until `join()` returns so a racing `start()` can't open a second SPI handle.
+
+**State catalogue:**
+| State | Visual | Trigger |
+|---|---|---|
+| `off` | dark | feature disabled |
+| `initializing` | white pulse 1% → 10% → 1% (1 step/500 ms; 14 s/breath) | `Minus.run()` start, HDMI restoration |
+| `idle` | solid green | `ad_blocker.start()`, `ad_blocker.hide()`, recovery complete |
+| `blocking` | bouncing red Cylon eye + 2-pixel tail (~200 ms/step) | `ad_blocker.show(...)` |
+| `paused` | slow yellow breathing (3 s) | `Minus.pause_blocking(...)` |
+| `no_signal` | slow amber breathing (4 s) | `_on_hdmi_lost`, `start_no_signal_mode` |
+| `autonomous` | slow blue breathing (4 s) | autonomous-mode active callback |
+| `wifi_setup` | cyan alternating sweep (~250 ms/swap) | WiFi AP-mode started |
+| `error` | fast red blink (2 Hz) | manual / subsystem failure |
+
+**Persistence:** the on/off toggle is in `~/.minus_status_leds.json`. State itself is runtime-only and gets re-asserted by the next event.
+
+**Display gating:** by default the strip stays dark while the HDMI-TX display is disconnected or powered off — keeps a dark room dark when the TV is off. State machine still ticks; only the wire output is suppressed, so animations resume seamlessly within ~200 ms of the display coming back. Implemented as an optional `drive_predicate` on the controller that `Minus` wires to `health_monitor._check_hdmi_output_connected()`. The `leds_require_display` flag (default True) toggles the gate from the WebUI; persisted in `~/.minus_system_settings.json`.
+
+**Hardware setup (one-time):** enable `rk3588-spi0-m2-cs0-spidev` overlay, install `python3-spidev`, add user to `spi` group, reboot. `./install.sh` does all of that idempotently.
+
+**API endpoints:** see the *Web UI* section above.
+
+**Files:**
+- `src/status_leds.py` — raw SPI driver, brightness cap, encoding
+- `src/status_led_controller.py` — state machine + animation thread + persistence
+- `minus.py` — instantiates `self.status_leds`, wires `_set_led_state` helper, hooks `_on_hdmi_lost` / `_on_hdmi_restored`
+- `src/ad_blocker.py` — calls `_set_led_state` from `show()`/`hide()`/`start()`/`start_no_signal_mode()`
+- `src/webui.py` — `/api/leds/*` endpoints
+- `src/templates/index.html` — toggle + state palette in Autonomous Mode section
+- `test_status_leds.py` — hardware walk/flash test
+- `tests/test_status_led_controller.py` — 26 unit tests (mocked hardware)
+- `tests/test_status_leds_ui.py` — Playwright UI tests (live service)
+- `docs/STATUS_LEDS.md` — full docs
+
+**Future work:** per-LED subsystem indicators (OCR / VLM / audio / HDMI / wifi / autonomous each get one LED), one-shot detection-event flashes, automatic `autonomous` state on autonomous-mode entry/exit.
 
 ## Streaming Device Configuration
 
@@ -1293,6 +1391,10 @@ python3 tests/test_autonomous_mode.py          # Autonomous mode tests
 python3 tests/test_recent_features.py          # Recent feature tests
 python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
 python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
+python3 tests/test_ir_transmitter.py           # IR transmitter unit tests (mocked sysfs)
+python3 tests/test_ir_ui.py                    # Playwright UI tests for IR remote panel
+python3 tests/test_status_led_controller.py    # Status LED state-machine tests (mocked hardware)
+python3 tests/test_status_leds_ui.py           # Playwright UI tests for status-LED panel
 ```
 
 **Block-latency test harness (`tests/block_latency_harness.py`):**
