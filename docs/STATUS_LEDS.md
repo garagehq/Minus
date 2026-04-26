@@ -11,20 +11,17 @@ the line in hardware, so timing is exact.
 
 | Role | Header pin | Notes |
 |---|---|---|
-| Data | **19** (`GPIO1_B2` / `SPI0_MOSI_M2`) | 470 Ω in series; no level shifter |
+| Data | **19** (`GPIO1_B2` / `SPI0_MOSI_M2`) | direct 3.3 V drive; no level shifter, no series resistor |
 | 5V power | 2 or 4 | Shared with the SoC and USB; see brightness cap below |
 | GND | any GND pin | |
 
-Adafruit's NeoPixel best-practices guide is the right recipe and
-solves the data-line signal-integrity story at this voltage and
-distance:
-
-- **470 Ω in series on the data line** — damps reflections, also
-  protects the WS2812B input if 5 V ever back-feeds into the SoC.
-- **1000 µF electrolytic across V+/GND at the strip end** — smooths
-  the chips' internal PWM current pulses and absorbs power-on inrush.
-- Keep the data wire short (≤ 10 cm) so the 3.3 V → 5 V threshold
-  margin stays comfortable.
+A bare-wire connection works on this build — no inline resistor on the
+data line and no bulk capacitor across V+/GND are needed for reliable
+operation. We tried both with and without the Adafruit-recommended
+470 Ω series resistor and 1000 µF electrolytic; the strip behaves
+identically. Keep the data wire short (≤ 10 cm) so the 3.3 V → 5 V
+threshold margin stays comfortable. If you push to a longer wire or a
+larger strip, both parts are still cheap insurance.
 
 ### Historical note: the first-LED problem
 
@@ -36,8 +33,9 @@ API exposed the remaining seven LEDs. The assumption was that the
 
 After switching the SPI encoding to the canonical Adafruit
 8-bit-per-WS-bit at 6.4 MHz pattern (see *Encoding* below), the first
-LED decodes reliably with no further intervention. The workaround is
-gone; the driver now exposes all 8 LEDs.
+LED decodes reliably with no further intervention — verified bare-wire
+on this board. The workaround is gone; the driver now exposes all 8
+LEDs.
 
 ## One-time system setup
 
@@ -269,7 +267,7 @@ Expected failure patterns:
 |---|---|
 | Steady state mis-decodes as cycling colours | Encoding too tight for the SPI driver's inter-byte gaps — should not happen with the current 8-bit-per-WS-bit scheme; suspect a modified copy |
 | All LEDs show wrong colours | GRB ↔ RGB reordering (driver handles this; suspect a modified copy) |
-| First LED stuck on a single colour | Marginal 3.3V data signalling — check the 470 Ω resistor and 1000 µF cap, and keep the data wire short |
+| First LED stuck on a single colour | Marginal 3.3V data signalling — keep the data wire short (≤ 10 cm); add a 470 Ω inline resistor and/or 1000 µF V+/GND cap if it persists |
 | `/dev/spidev0.0` missing | overlay didn't load; see system-setup section |
 | `PermissionError` opening device | user not in `spi` group, and not root |
 
