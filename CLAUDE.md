@@ -20,6 +20,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
 | [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
+| [docs/STATUS_LEDS.md](docs/STATUS_LEDS.md) | WS2812B status strip on SPI0 MOSI (pin 19) — wiring, state catalogue, API, first-LED problem |
 
 ## Visual Design
 
@@ -87,6 +88,8 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
 | `src/roku.py` | Roku ECP remote control |
 | `src/ir_transmitter.py` | NEC IR transmitter over PWM3 (REI 8K HDMI switch). Thread-safe, 1.5 s cooldown |
+| `src/status_leds.py` | Raw WS2812B SPI driver. 7 user LEDs (1 sacrificed under bezel for 3.3→5V threshold). 10% brightness cap |
+| `src/status_led_controller.py` | State machine + animation thread on top of `status_leds.py`. States: off/initializing/idle/blocking/no_signal/autonomous/error |
 | `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
 | `src/wifi_manager.py` | WiFi captive portal and AP mode management |
@@ -106,6 +109,9 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
 | `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
 | `tests/test_ir_ui.py` | Playwright UI tests for IR remote panel |
+| `tests/test_status_led_controller.py` | Unit tests for status-LED state machine (mocked hardware, 26 tests) |
+| `tests/test_status_leds_ui.py` | Playwright UI tests for status-LED toggle + state palette |
+| `test_status_leds.py` | Hardware walk/flash test for the WS2812B strip |
 | `tests/test_ocr_ad_detection.py` | OCR ad pattern detection tests (143+ cases) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
@@ -817,6 +823,9 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `GET /api/ir/status` - IR transmitter status (`enabled`, `available`, `initialized`, `codes`)
 - `POST /api/ir/enable` / `disable` - Toggle the IR remote feature (gates the UI and `/command`)
 - `POST /api/ir/command` - Send a captured button. Body: `{"button": "power"|"input_1"|"input_2"|"input_3"|"next"|"auto"}`. `403` when disabled, `429` with `retry_after` inside the 1.5 s cooldown. See `docs/IR_TRANSMITTER.md`.
+- `GET /api/leds/status` - Status LEDs status (`available`, `enabled`, `running`, `state`, `states`)
+- `POST /api/leds/enable` / `disable` - Toggle the WS2812B status strip; persists; starts/stops the animation thread
+- `POST /api/leds/state` - Switch animation state. Body: `{"state": "<name>"}`. `403` when disabled, `400` for unknown state. States: `off / initializing / idle / blocking / no_signal / autonomous / error`. See `docs/STATUS_LEDS.md`.
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
@@ -1067,6 +1076,52 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 - `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
 
 **Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.
+
+## Status LED Strip (WS2812B on SPI0 MOSI)
+
+8× WS2812B addressable strip on header pin 19 (`GPIO1_B2` muxed as `SPI0_MOSI_M2`). One pixel is sacrificed under a physical bezel — see *first-LED problem* below — so the user-facing API exposes 7 LEDs.
+
+**Why SPI MOSI:** WS2812B's 800 kHz protocol needs sub-µs timing. Userspace GPIO can't deliver that on Linux; the SPI controller can. We clock SPI at **6.4 MHz** and encode each WS bit as one full SPI byte (`0b11110000` = WS-1, `0b11000000` = WS-0) — the canonical Adafruit `NeoPixel_SPI` pattern. The frame is wrapped with **80 µs zero-byte resets on both sides** and sent via `writebytes2(bytes)`. We initially tried 3-SPI-bits-per-WS-bit at 2.4 MHz; the `spi-rockchip` driver's PIO mode inserts inter-byte gaps when its FIFO refills, and the tighter scheme didn't have enough skew tolerance — visible symptom was "solid green decoded as cycling red/blue/white". `rpi_ws281x` and friends depend on Broadcom PWM+DMA hardware and don't work on RK3588.
+
+**First-LED problem:** 3.3 V SPI MOSI is below the strip's V<sub>IH</sub> = 0.7 × V<sub>DD</sub> = 3.5 V threshold. The first LED latches garbage at full brightness on power-up and ignores subsequent frames. Three fixes, in order of effort:
+1. **Physical bezel (chosen).** Block LED 0 with the enclosure. `SACRIFICIAL_FIRST_PIXEL = True` in `src/status_leds.py` makes the driver always send `(0, 0, 0)` to physical LED 0 and exposes the rest as user indices 0..6.
+2. **Diode trick.** 1N4148 in series with V<sub>DD</sub> of LED 0 only — drops V<sub>IH</sub> to ~3.0 V.
+3. **74AHCT125 / 74HCT245 level shifter.** Textbook fix.
+
+**Brightness cap (load-bearing):** `BRIGHTNESS = 0.10` is applied inside `set_pixel()` before storage; every other setter funnels through it. Caps peak draw at ~42 mA across the 7 LEDs — small enough to keep current swings from corrupting the marginal 3.3V → 5V data line, even with the 470 Ω + 1000 µF Adafruit recipe in place. Don't bypass it from the application layer; if you need more brightness, add external 5 V power to the strip first.
+
+**Controller (`src/status_led_controller.py`):** `StatusLEDController` runs a 50 ms (20 fps) animation thread. Each state has a renderer that takes the LED handle and frame number; renderers self-pace via `frame % N` / `frame // N`. State transitions are atomic and thread-safe.
+
+**State catalogue:**
+| State | Visual | Trigger |
+|---|---|---|
+| `off` | dark | feature disabled |
+| `initializing` | white pulse 1% → 15% → 1% (1%/500 ms; 14 s/breath) | `Minus.run()` start, HDMI restoration |
+| `idle` | solid green | `ad_blocker.start()`, `ad_blocker.hide()`, recovery complete |
+| `blocking` | bouncing red Cylon eye + 2-pixel tail (~150 ms/step) | `ad_blocker.show(...)` |
+| `no_signal` | slow amber breathing (4 s) | `_on_hdmi_lost`, `start_no_signal_mode` |
+| `autonomous` | slow blue breathing (4 s) | manual / future autonomous-mode hook |
+| `error` | fast red blink (2 Hz) | manual / subsystem failure |
+
+**Persistence:** the on/off toggle is in `~/.minus_status_leds.json`. State itself is runtime-only and gets re-asserted by the next event.
+
+**Hardware setup (one-time):** enable `rk3588-spi0-m2-cs0-spidev` overlay, install `python3-spidev`, add user to `spi` group, reboot. `./install.sh` does all of that idempotently.
+
+**API endpoints:** see the *Web UI* section above.
+
+**Files:**
+- `src/status_leds.py` — raw SPI driver, brightness cap, sacrificial pixel
+- `src/status_led_controller.py` — state machine + animation thread + persistence
+- `minus.py` — instantiates `self.status_leds`, wires `_set_led_state` helper, hooks `_on_hdmi_lost` / `_on_hdmi_restored`
+- `src/ad_blocker.py` — calls `_set_led_state` from `show()`/`hide()`/`start()`/`start_no_signal_mode()`
+- `src/webui.py` — `/api/leds/*` endpoints
+- `src/templates/index.html` — toggle + state palette in Autonomous Mode section
+- `test_status_leds.py` — hardware walk/flash test
+- `tests/test_status_led_controller.py` — 26 unit tests (mocked hardware)
+- `tests/test_status_leds_ui.py` — Playwright UI tests (live service)
+- `docs/STATUS_LEDS.md` — full docs
+
+**Future work:** per-LED subsystem indicators (OCR / VLM / audio / HDMI / wifi / autonomous each get one LED), one-shot detection-event flashes, automatic `autonomous` state on autonomous-mode entry/exit.
 
 ## Streaming Device Configuration
 
@@ -1330,6 +1385,8 @@ python3 tests/test_autonomous_mode.py    # Autonomous mode tests
 python3 tests/test_review_ui.py          # Playwright UI tests (requires chromium)
 python3 tests/test_ir_transmitter.py     # IR transmitter unit tests (mocked sysfs)
 python3 tests/test_ir_ui.py              # Playwright UI tests for IR remote panel
+python3 tests/test_status_led_controller.py  # Status LED state-machine tests (mocked hardware)
+python3 tests/test_status_leds_ui.py     # Playwright UI tests for status-LED panel
 ```
 
 **Test Coverage:**

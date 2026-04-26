@@ -253,6 +253,14 @@ except ImportError as e:
     logger.warning(f"IR transmitter module not available: {e}")
     HAS_IR = False
 
+# Import Status LED controller (WS2812B status strip on SPI0 MOSI)
+try:
+    from status_led_controller import StatusLEDController
+    HAS_STATUS_LEDS = True
+except ImportError as e:
+    logger.warning(f"Status LED module not available: {e}")
+    HAS_STATUS_LEDS = False
+
 # Import Notification Overlay
 try:
     from overlay import NotificationOverlay, SystemNotification
@@ -473,6 +481,13 @@ class Minus:
         # initialize() / first send() is what touches the PWM sysfs.
         self.ir_transmitter = IRTransmitter() if HAS_IR else None
 
+        # Status LED strip (7× WS2812B on SPI0 MOSI). Constructor is hardware-
+        # free; start() touches /dev/spidev0.0. If the user has the toggle
+        # persisted to enabled, the thread is started near the end of __init__
+        # so the "initializing" state shows until ad_blocker fires up.
+        self.status_leds = (
+            StatusLEDController() if HAS_STATUS_LEDS else None)
+
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
         self.auto_skip_enabled = True  # Enable auto-skip (fixed: now properly detects countdown)
@@ -630,11 +645,55 @@ class Minus:
 
     # ===== Health Recovery Methods =====
 
+    def _set_led_state(self, state):
+        """Forward a state change to the status-LED strip. No-op if disabled
+        or hardware missing. Errors are swallowed — LED issues must never
+        crash core paths."""
+        ctrl = getattr(self, 'status_leds', None)
+        if ctrl is None or not ctrl.enabled:
+            return
+        try:
+            ctrl.set_state(state)
+        except Exception as e:
+            logger.debug(f"[StatusLED] set_state({state}) failed: {e}")
+
+    def _baseline_led_state(self):
+        """Resolve what the LEDs should show when an acute state (blocking)
+        ends. Priority high → low: no_signal, wifi_setup, paused,
+        autonomous, idle. The first thing that's currently true wins.
+
+        Used by ad_blocker.hide(), resume_blocking(), and the autonomous
+        deactivate hook. error is intentionally NOT in this list — it's a
+        manual / subsystem-failure override that the next legitimate state
+        change will overwrite anyway.
+        """
+        # Prefer the health monitor's live `hdmi_signal` over the boolean we
+        # toggle in _on_hdmi_lost / _on_hdmi_restored. The flag toggles only
+        # on transitions, but the live status is always current.
+        try:
+            if self.health_monitor is not None:
+                hs = self.health_monitor.get_status()
+                if hs is not None and not hs.hdmi_signal:
+                    return 'no_signal'
+        except Exception:
+            pass
+        if getattr(self, '_hdmi_signal_lost', False):
+            return 'no_signal'
+        if self.wifi_manager is not None and getattr(
+                self.wifi_manager, '_ap_mode_active', False):
+            return 'wifi_setup'
+        if self.is_blocking_paused():
+            return 'paused'
+        if getattr(self, '_autonomous_was_active', False):
+            return 'autonomous'
+        return 'idle'
+
     def _on_hdmi_lost(self):
         """Handle HDMI signal loss."""
         logger.warning("[Recovery] HDMI signal lost - showing NO SIGNAL display")
         # Pause detection workers to prevent memory leak from repeated snapshot timeouts
         self._hdmi_signal_lost = True
+        self._set_led_state('no_signal')
         # Switch to standalone NO SIGNAL display (doesn't depend on ustreamer)
         if self.ad_blocker:
             self.ad_blocker.start_no_signal_mode()
@@ -652,6 +711,8 @@ class Minus:
 
         # Set flag to prevent main loop from interfering with recovery
         self._hdmi_recovery_in_progress = True
+
+        self._set_led_state('initializing')
 
         try:
             # Switch to loading display while we restart everything
@@ -675,6 +736,7 @@ class Minus:
                 self.audio.unmute()
 
             logger.info("[Recovery] HDMI recovery complete")
+            self._set_led_state('idle')
         finally:
             self._hdmi_recovery_in_progress = False
 
@@ -1342,6 +1404,10 @@ class Minus:
         if self.audio:
             self.audio.unmute()
 
+        # ad_blocker.hide() will have set state=idle; override with paused
+        # so the LED visually distinguishes "user-paused" from "running clean".
+        self._set_led_state('paused')
+
     def resume_blocking(self):
         """Resume ad blocking immediately."""
         with self._state_lock:
@@ -1350,6 +1416,10 @@ class Minus:
 
         # Re-evaluate current state
         self._update_blocking_state()
+        # Don't override an active block — only return to baseline if we
+        # weren't blocking when the user clicked resume.
+        if not self.blocking_active:
+            self._set_led_state(self._baseline_led_state())
 
     def is_blocking_paused(self) -> bool:
         """Check if blocking is currently paused."""
@@ -2871,6 +2941,16 @@ class Minus:
         """Start the stream processing."""
         logger.info("Starting Minus...")
 
+        # Status LEDs: if the user persisted the toggle as enabled, start the
+        # animation thread now and show the "initializing" white pulse until
+        # the rest of the boot sequence settles into idle / blocking / etc.
+        if self.status_leds and self.status_leds.enabled:
+            try:
+                self.status_leds.start()
+                self.status_leds.set_state("initializing")
+            except Exception as e:
+                logger.warning(f"Status LEDs start failed: {e}")
+
         # Start web UI early so it's accessible even when waiting for HDMI signal
         if HAS_WEBUI:
             try:
@@ -2904,6 +2984,7 @@ class Minus:
                 # Define callbacks for AP mode events
                 def on_ap_started():
                     logger.info("[WiFi] AP mode started - captive portal available")
+                    self._set_led_state('wifi_setup')
                     if HAS_OVERLAY:
                         try:
                             overlay = SystemNotification(ustreamer_port=self.config.ustreamer_port)
@@ -2917,6 +2998,7 @@ class Minus:
 
                 def on_ap_stopped():
                     logger.info("[WiFi] AP mode stopped - connected to WiFi")
+                    self._set_led_state('idle')
                     if HAS_OVERLAY:
                         try:
                             overlay = SystemNotification(ustreamer_port=self.config.ustreamer_port)
@@ -3088,6 +3170,25 @@ class Minus:
                 self.autonomous_mode.set_vlm(self.vlm)
             if hasattr(self, 'frame_capture') and self.frame_capture:
                 self.autonomous_mode.set_frame_capture(self.frame_capture)
+
+            # Track autonomous active/inactive transitions and reflect on the
+            # status LEDs. Don't override blocking — when an ad is blocked
+            # while autonomous is running, blocking visuals win and we'll
+            # come back to autonomous after hide().
+            self._autonomous_was_active = False
+            def _on_autonomous_status(status):
+                active = bool(status.get('active'))
+                if active and not self._autonomous_was_active:
+                    self._autonomous_was_active = True
+                    if not self.blocking_active:
+                        self._set_led_state('autonomous')
+                elif not active and self._autonomous_was_active:
+                    self._autonomous_was_active = False
+                    if not self.blocking_active:
+                        # Fall back to whatever baseline applies (paused?
+                        # — unlikely while autonomous was running but possible).
+                        self._set_led_state(self._baseline_led_state())
+            self.autonomous_mode.set_status_callback(_on_autonomous_status)
             self.autonomous_mode.start_if_enabled()
 
         logger.info("Minus running - press Ctrl+C to stop")
@@ -3152,6 +3253,14 @@ class Minus:
             except Exception:
                 pass
             self.ir_transmitter = None
+
+        # Stop status-LED animation thread and blank the strip
+        if self.status_leds:
+            try:
+                self.status_leds.stop()
+            except Exception:
+                pass
+            self.status_leds = None
 
         # Stop Fire TV setup first
         if self.fire_tv_setup:
