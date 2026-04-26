@@ -2299,8 +2299,21 @@ class Minus:
         if self.ad_blocker.start():
             logger.info("Display pipeline started - 30 FPS with instant ad blocking")
 
-            # Start audio passthrough
+            # Start audio passthrough. If the TV was off at boot,
+            # __init__ fell back to hw:0,0 — re-probe now and re-point
+            # the audio sink at the live HDMI output before starting,
+            # otherwise audio plays out the wrong port.
             if self.audio:
+                drm_info = probe_drm_output()
+                if (drm_info['audio_device'] and
+                        drm_info['audio_device'] != self.audio.playback_device):
+                    logger.info(
+                        f"Audio device changed: {self.audio.playback_device} "
+                        f"-> {drm_info['audio_device']}"
+                    )
+                    self.audio.stop()
+                    self.audio.playback_device = drm_info['audio_device']
+                    self.config.audio_playback_device = drm_info['audio_device']
                 if self.audio.start():
                     logger.info("Audio passthrough started")
                 else:
