@@ -109,9 +109,10 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
 | `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
 | `tests/test_ir_ui.py` | Playwright UI tests for IR remote panel |
-| `tests/test_status_led_controller.py` | Unit tests for status-LED state machine (mocked hardware, 26 tests) |
+| `tests/test_status_led_controller.py` | Unit tests for status-LED state machine (mocked hardware, 31 tests) |
 | `tests/test_status_leds_ui.py` | Playwright UI tests for status-LED toggle + state palette |
-| `test_status_leds.py` | Hardware walk/flash test for the WS2812B strip |
+| `tests/test_status_led_states.py` | Hardware walk: every controller state across all 8 LEDs, 5 s each |
+| `test_status_leds.py` | Hardware walk/flash test for the WS2812B strip (R/G/B/W) |
 | `tests/test_ocr_ad_detection.py` | OCR ad pattern detection tests (143+ cases) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |

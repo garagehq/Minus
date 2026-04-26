@@ -296,8 +296,9 @@ Expected failure patterns:
 
 - `src/status_leds.py` — raw SPI driver
 - `src/status_led_controller.py` — state machine + animation thread
-- `test_status_leds.py` — walk/flash hardware test
-- `tests/test_status_led_controller.py` — unit tests (mocked hardware)
+- `test_status_leds.py` — walk/flash hardware test (R/G/B/W cycle)
+- `tests/test_status_led_states.py` — hardware walk through every controller state across all 8 LEDs
+- `tests/test_status_led_controller.py` — unit tests (mocked hardware, 31 tests)
 - `tests/test_status_leds_ui.py` — Playwright UI tests
 - `docs/STATUS_LEDS.md` — this document
 - `install.sh` — overlay enabler / dep installer
