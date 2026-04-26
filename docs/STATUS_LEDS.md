@@ -11,41 +11,33 @@ the line in hardware, so timing is exact.
 
 | Role | Header pin | Notes |
 |---|---|---|
-| Data | **19** (`GPIO1_B2` / `SPI0_MOSI_M2`) | No level shifter; first LED is sacrificed |
+| Data | **19** (`GPIO1_B2` / `SPI0_MOSI_M2`) | 470 Ω in series; no level shifter |
 | 5V power | 2 or 4 | Shared with the SoC and USB; see brightness cap below |
 | GND | any GND pin | |
 
-### The first-LED problem
+Adafruit's NeoPixel best-practices guide is the right recipe and
+solves the data-line signal-integrity story at this voltage and
+distance:
 
-Driving the WS2812B data line directly from 3.3 V SPI MOSI is *just below*
-the strip's V<sub>IH(min)</sub> = 0.7 × V<sub>DD</sub> = 3.5 V threshold.
-That marginal logic level makes the first LED in the chain unreliable —
-typical symptom: it latches on a single colour at full brightness on
-first power-up and ignores subsequent frames, while the rest of the chain
-behaves correctly (each downstream LED retimes and re-emits at its own
-clean 5 V supply).
+- **470 Ω in series on the data line** — damps reflections, also
+  protects the WS2812B input if 5 V ever back-feeds into the SoC.
+- **1000 µF electrolytic across V+/GND at the strip end** — smooths
+  the chips' internal PWM current pulses and absorbs power-on inrush.
+- Keep the data wire short (≤ 10 cm) so the 3.3 V → 5 V threshold
+  margin stays comfortable.
 
-We tried a software workaround (always send `(0, 0, 0)` to LED 0 so it
-acts as a level-buffering re-transmitter) and it didn't work — at 3.3 V
-the first LED can't reliably latch *anything*, including zeros.
+### Historical note: the first-LED problem
 
-The accepted solutions, in order of effort:
+Earlier revisions of this driver shipped a "sacrificial first pixel"
+workaround: physical LED 0 was always sent zeros and the user-facing
+API exposed the remaining seven LEDs. The assumption was that the
+3.3 V SPI signal sat just below V<sub>IH(min)</sub> = 0.7 × V<sub>DD</sub>
+= 3.5 V, and LED 0 latched garbage on first power-up.
 
-1. **Physical bezel (chosen here).** Block LED 0 with the enclosure so
-   whatever colour it gets stuck on is invisible. The driver still
-   sends zeros to it, and the user-facing API exposes the remaining 7
-   LEDs as indices 0..6. This is what `SACRIFICIAL_FIRST_PIXEL = True`
-   in `src/status_leds.py` enables.
-2. **Diode trick.** Put a 1N4148 / 1N4001 in series with V<sub>DD</sub>
-   of LED 0 only. Drops V<sub>DD</sub> to ~4.3 V, which drops V<sub>IH</sub>
-   to ~3.0 V, comfortably below 3.3 V. Cheap, reliable, restores LED 0.
-3. **74AHCT125 / 74HCT245 level shifter.** The textbook fix.
-
-Adafruit's NeoPixel best-practices guide also recommends a 470 Ω series
-resistor on the data line (damps reflections, doesn't change voltage)
-and a 1000 µF bulk capacitor across the strip's V+/GND (smooths PWM
-current and absorbs power-on inrush). Both are cheap insurance even
-when the threshold issue is solved.
+After switching the SPI encoding to the canonical Adafruit
+8-bit-per-WS-bit at 6.4 MHz pattern (see *Encoding* below), the first
+LED decodes reliably with no further intervention. The workaround is
+gone; the driver now exposes all 8 LEDs.
 
 ## One-time system setup
 
@@ -135,29 +127,15 @@ stored. Every other setter funnels through `set_pixel()`, so the cap is
 inherited everywhere — no call site can bypass it, by design.
 
 Reason: each WS2812B draws ~60 mA at full white. Seven at peak =
-~420 mA through the 40-pin header's 5V rail, which is shared with the
+~480 mA through the 40-pin header's 5V rail, which is shared with the
 SoC and USB. That inrush dips the rail enough to brown out the board
-or drop USB devices. 10% caps peak draw at ~42 mA total — well within
-safe header limits, plenty bright for status indicators, and small
-enough to keep the marginal 3.3V → 5V data line decoding cleanly even
-without a level shifter (we observed reliable decoding at 10% but
-intermittent decode errors at 20% on this exact wiring, even with the
-recommended 470 Ω data-line resistor and 1000 µF bulk cap in place).
+or drop USB devices. 10% caps peak draw at ~48 mA across all 8 LEDs —
+well within safe header limits, plenty bright for status indicators,
+and small enough to keep the marginal 3.3V → 5V data line decoding
+cleanly even without a level shifter.
 
 If you ever need more brightness, add external 5 V power to the strip
 (common ground with the Pi); only then is it safe to raise the cap.
-
-### Sacrificial first pixel
-
-`SACRIFICIAL_FIRST_PIXEL = True` makes the driver send `(0, 0, 0)` to
-physical LED 0 on every frame and shifts the user-facing index by one.
-On an 8-LED strip the API reports `num_leds == 7`; user index `i` maps
-to physical LED `i + 1`. Combined with a physical bezel covering LED 0,
-this is the practical workaround for the first-LED threshold issue
-above.
-
-If you add a level shifter or the diode trick, set
-`SACRIFICIAL_FIRST_PIXEL = False` to expose all 8 LEDs.
 
 ## Controller layer (`src/status_led_controller.py`)
 
@@ -272,23 +250,26 @@ so any consumer (UI, monitoring) can show it.
 
 ## Walk/cycle test
 
-`test_status_leds.py` at repo root walks one LED at a time 0→6 and
-then flashes all 7 for each of red, green, blue, white. Useful for
-verifying wiring after install and that the bezel is correctly
-covering LED 0.
+`test_status_leds.py` at repo root walks one LED at a time 0→7 and
+then flashes all 8 for each of red, green, blue, white. Useful for
+verifying wiring after install.
 
 ```bash
 python3 test_status_leds.py      # needs spi group membership
 sudo python3 test_status_leds.py # otherwise
 ```
 
+`tests/test_status_led_states.py` walks every controller state across
+all 8 LEDs at five seconds each — useful for revalidating animation
+timing and decode stability after a wiring or overlay change.
+
 Expected failure patterns:
 
 | Symptom | Likely cause |
 |---|---|
-| First LED visible past bezel | bezel misaligned, or `SACRIFICIAL_FIRST_PIXEL=False` |
+| Steady state mis-decodes as cycling colours | Encoding too tight for the SPI driver's inter-byte gaps — should not happen with the current 8-bit-per-WS-bit scheme; suspect a modified copy |
 | All LEDs show wrong colours | GRB ↔ RGB reordering (driver handles this; suspect a modified copy) |
-| All LEDs flicker randomly | SPI clock off — 2.4 MHz is the sweet spot for the 3-bit-per-WS-bit encoding |
+| First LED stuck on a single colour | Marginal 3.3V data signalling — check the 470 Ω resistor and 1000 µF cap, and keep the data wire short |
 | `/dev/spidev0.0` missing | overlay didn't load; see system-setup section |
 | `PermissionError` opening device | user not in `spi` group, and not root |
 

@@ -61,32 +61,29 @@ Each WS2812B can pull ~60 mA at full white, so 8 LEDs at peak would
 draw ~480 mA through the header. That inrush dips the 5V rail enough
 to reset the board or cause USB devices to disconnect.
 
-A 10% software cap keeps peak draw at ~42 mA across 7 active LEDs,
-far inside safe header limits. The lower cap (vs. the WS2812B spec's
+A 10% software cap keeps peak draw at ~48 mA across all 8 LEDs, far
+inside safe header limits. The lower cap (vs. the WS2812B spec's
 many-amp ceiling) also keeps current swings during animation small
-enough that the marginal 3.3V → 5V data signaling stays decode-clean
+enough that the marginal 3.3V → 5V data signalling stays decode-clean
 even without a level shifter. The cap is applied inside `set_pixel()`
 before storage, so every caller (including `set_all()`, animations,
 etc.) gets it automatically. There is intentionally no way to bypass
 it from the application layer.
 
-Sacrificial first pixel
------------------------
-Without a proper 3.3→5V level shifter, the first WS2812B in the chain
-often mis-latches the marginal signal and gets stuck on a single colour
-while the rest of the chain behaves normally. The fix is a "sacrificial"
-pixel: always send zeros to physical LED 0 so it sits dark and acts as
-a level-buffering re-transmitter for the rest of the chain (WS2812Bs
-retime and re-emit at their own supply rail, so every downstream LED
-sees clean 5V logic). Callers see N-1 usable LEDs — indices 0..N-2 map
-to physical LEDs 1..N-1. Toggle `SACRIFICIAL_FIRST_PIXEL` to False
-after adding a real level shifter.
+Historical note: the first LED in the chain
+-------------------------------------------
+We previously shipped a "sacrificial first pixel" workaround — the
+driver always sent ``(0, 0, 0)`` to physical LED 0 and exposed the
+remaining ``N-1`` LEDs to callers, on the assumption that the marginal
+3.3V → 5V data line would make LED 0 latch unreliable. With the
+encoding switch from 3-bit-per-WS-bit at 2.4 MHz to the canonical
+8-bit-per-WS-bit at 6.4 MHz (see "Why SPI MOSI..." above), the first
+LED decodes reliably and the workaround is no longer needed; this
+driver now exposes all 8 LEDs directly.
 """
 
 import spidev
 
-# Physical LEDs wired on the SPI MOSI chain (including the sacrificial one,
-# if SACRIFICIAL_FIRST_PIXEL is True — see below).
 NUM_LEDS = 8
 
 SPI_BUS = 0
@@ -104,24 +101,13 @@ SPI_DEVICE = 0
 SPI_SPEED_HZ = 6_400_000
 
 # See module docstring: capped at 10% to keep peak current on the 40-pin
-# header's shared 5V rail well under safe limits across the 7 active LEDs
-# (≈7 × 60 mA × 0.10 ≈ 42 mA peak — sacrificial pixel always dark).
-# 10% is also conservative enough that current swings during animation
-# don't induce decode errors on the marginal 3.3V → 5V data line, even
-# at low frame rates. Applied in set_pixel() before storage so every
-# caller inherits it. Do not expose a way to override from the
-# application layer.
+# header's shared 5V rail well under safe limits across all 8 LEDs
+# (≈8 × 60 mA × 0.10 ≈ 48 mA peak). 10% is also conservative enough
+# that current swings during animation don't induce decode errors on
+# the marginal 3.3V → 5V data line. Applied in set_pixel() before
+# storage so every caller inherits it. Do not expose a way to override
+# from the application layer.
 BRIGHTNESS = 0.10
-
-# When driving the WS2812B data line directly from SPI MOSI at 3.3V
-# (no level shifter), the first LED frequently mis-latches its frame —
-# classic symptom: LED 0 stays stuck on one colour while the rest of the
-# chain behaves correctly. The fix is a "sacrificial" pixel: always send
-# zeros to physical LED 0 so it acts purely as a level-buffering
-# re-transmitter for the rest of the chain (WS2812Bs retime/re-emit at
-# their own 5V supply, so every downstream LED sees clean logic). Set to
-# False if you add a proper 3.3→5V level shifter on the data line.
-SACRIFICIAL_FIRST_PIXEL = True
 
 # Per-WS-bit encoding at 6.4 MHz SPI (each SPI bit = 156.25 ns, each WS
 # bit = 8 SPI bits = 1.25 µs):
@@ -160,18 +146,10 @@ class StatusLEDs:
             leds.show()
     """
 
-    def __init__(self, num_leds=NUM_LEDS, bus=SPI_BUS, device=SPI_DEVICE,
-                 sacrificial_first=SACRIFICIAL_FIRST_PIXEL):
-        self._physical_count = num_leds
-        self._offset = 1 if sacrificial_first else 0
-        self._user_count = num_leds - self._offset
-        if self._user_count < 1:
-            raise StatusLEDsError(
-                f"need at least {self._offset + 1} physical LED(s) with "
-                f"sacrificial_first={sacrificial_first}")
-        # Internal buffer mirrors the wire: sacrificial pixel (if any) sits
-        # at index 0 and is never exposed to callers — it stays (0,0,0)
-        # so that first LED is always dark and acts as a level buffer.
+    def __init__(self, num_leds=NUM_LEDS, bus=SPI_BUS, device=SPI_DEVICE):
+        if num_leds < 1:
+            raise StatusLEDsError(f"num_leds must be >= 1 (got {num_leds})")
+        self._num_leds = num_leds
         self._pixels = [(0, 0, 0)] * num_leds
         self._spi = spidev.SpiDev()
         try:
@@ -188,13 +166,12 @@ class StatusLEDs:
 
     @property
     def num_leds(self):
-        """User-addressable LED count (excludes sacrificial pixel if used)."""
-        return self._user_count
+        return self._num_leds
 
     def set_pixel(self, index, r, g, b):
-        if not 0 <= index < self._user_count:
+        if not 0 <= index < self._num_leds:
             raise IndexError(
-                f"pixel {index} out of range (0..{self._user_count - 1})")
+                f"pixel {index} out of range (0..{self._num_leds - 1})")
         # Clamp then scale. Brightness cap applied here so every caller
         # inherits it — see module docstring for rationale.
         r = max(0, min(255, int(r)))
@@ -203,16 +180,14 @@ class StatusLEDs:
         r = int(round(r * BRIGHTNESS))
         g = int(round(g * BRIGHTNESS))
         b = int(round(b * BRIGHTNESS))
-        self._pixels[index + self._offset] = (r, g, b)
+        self._pixels[index] = (r, g, b)
 
     def set_all(self, r, g, b):
-        for i in range(self._user_count):
+        for i in range(self._num_leds):
             self.set_pixel(i, r, g, b)
 
     def clear(self):
-        # Blanks every pixel including the sacrificial one (which was
-        # already zero, but keeps state consistent after reuse).
-        self._pixels = [(0, 0, 0)] * self._physical_count
+        self._pixels = [(0, 0, 0)] * self._num_leds
 
     def show(self):
         """Push the framebuffer to the strip over SPI.

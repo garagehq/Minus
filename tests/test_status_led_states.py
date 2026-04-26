@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
-"""Hardware walk test: all controller states across all 8 physical LEDs.
+"""Hardware walk test: every controller state across all 8 LEDs.
 
 Drives every state in :mod:`status_led_controller` (off, initializing,
 idle, blocking, paused, no_signal, autonomous, wifi_setup, error) for
-five seconds each, with ``sacrificial_first=False`` so all 8 physical
-LEDs participate. Useful for verifying:
+five seconds each. Useful for verifying:
 
 - the SPI encoding is healthy on this board (steady frames render as
   steady colours, not as cycling decode artifacts);
-- the first LED in the chain is reliable enough to drop the
-  sacrificial-first-pixel workaround;
 - every state's animation timing looks right (breath periods, blink
   rates, bounce speed, etc.).
 
@@ -49,8 +46,8 @@ ORDER = (
 
 
 def main():
-    leds = StatusLEDs(sacrificial_first=False)
-    print(f"strip num_leds (user-facing) = {leds.num_leds}")
+    leds = StatusLEDs()
+    print(f"strip num_leds = {leds.num_leds}")
     try:
         for name in ORDER:
             renderer = _RENDERERS[name]

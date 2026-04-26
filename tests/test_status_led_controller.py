@@ -29,7 +29,7 @@ class _FakeLEDs:
     Records the last frame written to .show() so tests can assert on it.
     """
 
-    num_leds = 7
+    num_leds = 8
 
     def __init__(self):
         self.pixels = [(0, 0, 0)] * self.num_leds
