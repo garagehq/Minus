@@ -20,6 +20,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
 | [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
+| [docs/IR_RECEIVER.md](docs/IR_RECEIVER.md) | IR receiver eval on pin 3 (`gpiochip4 11`) — bench-tested decode of NEC remotes, gotchas, sketch for a future `IRReceiver` module |
 | [docs/STATUS_LEDS.md](docs/STATUS_LEDS.md) | WS2812B status strip on SPI0 MOSI (pin 19) — wiring, state catalogue, API, encoding rationale |
 
 ## Visual Design
@@ -1081,6 +1082,22 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 - `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
 
 **Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.
+
+## IR Receiver (Bench-Tested, Not Wired Into App)
+
+A 3-pin IR receiver (TSOP38238 / VS1838B class) was evaluated on header pin **3** (`GPIO4_B3` / `gpiochip4` line **11**, Linux GPIO 139). Decoded the REI remote's NEC frames cleanly — `0x80 / 0x07,1B,08,1F` plus REPEAT codes — using `gpiomon` + a Python decoder in `test_ir_receiver.py`. **No production code yet**, just exploratory.
+
+**Why pin 3 instead of pin 38 (alongside the transmitter):** the `rk3588-pwm3-m1` overlay parks pin 38's pad-mux on PWM3 at boot. `gpiomon` will *claim* the line but the GPIO controller is electrically disconnected from the pad — `gpioget` reads a constant `0` and no edges fire. Pin 3 / `GPIO4_B3` has no overlay claiming it, so default GPIO mux applies and it Just Works. Sanity check: `gpioget gpiochip4 11` returns `1` with the receiver powered and idle.
+
+**Two gotchas burned dev time, captured here so we don't re-discover:**
+- `gpiomon -B both` is invalid in libgpiod 1.6 — `-B` is *bias*, not edge. Default already monitors both edges; pass nothing.
+- After a falling edge the line is LOW (a MARK), not a SPACE. Get the polarity backwards and every frame appears to start with a `~4500/~600 µs` "leader" because the real 9 ms leader mark gets filtered by the empty-buffer guard.
+
+**Status:** test script only. Decoder is a copy-able starting point if/when we want a real `IRReceiver` module — see `docs/IR_RECEIVER.md` for the full sketch including threading model, suggested API surface, and integration ideas (closed-loop transmitter verification, external hardware trigger, remote learning, post-send confirmation for autonomous-mode scheduling).
+
+**Files:**
+- `test_ir_receiver.py` — standalone bench-test script (gpiomon subprocess + NEC decoder + `--raw` mode for non-NEC remotes)
+- `docs/IR_RECEIVER.md` — findings, gotchas, future-module sketch
 
 ## Status LED Strip (WS2812B on SPI0 MOSI)
 
