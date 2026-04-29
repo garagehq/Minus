@@ -87,10 +87,22 @@ class MinusConfig:
         default_factory=lambda: _get_env_int('MINUS_VLM_ALONE_THRESHOLD', 5)
     )
     scene_change_threshold: float = field(
-        default_factory=lambda: _get_env_float('MINUS_SCENE_CHANGE_THRESHOLD', 0.01)
+        # 0.001 — measured min/p25/p50 inter-frame mean-abs-diff on real
+        # video content (BBB) at the OCR sample cadence: p5≈0.002, p50≈0.017,
+        # max=0.31 (scene cuts). Frozen frames sit at 0. The previous 0.01
+        # default classified ~26% of natural low-motion frames as "static"
+        # and tripped STATIC_OCR_THRESHOLD on long static-suppression runs
+        # mid-content. 0.001 only flags genuinely-frozen frames (~1.7% of
+        # BBB), correctly distinguishing user-pause from slow content.
+        # Tuned via tests/block_latency_harness.py.
+        default_factory=lambda: _get_env_float('MINUS_SCENE_CHANGE_THRESHOLD', 0.001)
     )
     dynamic_cooldown: float = field(
-        default_factory=lambda: _get_env_float('MINUS_DYNAMIC_COOLDOWN', 0.5)
+        # 1.5s — long enough for screen content to actually settle into the
+        # post-pause/post-static state. The previous 0.5s was too short:
+        # the first OCR cycle after cooldown often still saw frames that
+        # were transitioning off the ad and immediately re-triggered blocking.
+        default_factory=lambda: _get_env_float('MINUS_DYNAMIC_COOLDOWN', 1.5)
     )
 
 

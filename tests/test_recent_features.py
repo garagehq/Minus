@@ -27,6 +27,8 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / 'src'))
+# src/webui.py does `from src.wifi_manager import ...`; add project root too
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 # =============================================================================
@@ -567,6 +569,839 @@ class TestWebUIDeviceAgnosticSkip(unittest.TestCase):
             r = client.post('/api/blocking/skip')
             self.assertEqual(r.status_code, 500)
             self.assertFalse(r.get_json()['success'])
+
+
+# =============================================================================
+# various-optimizations branch — falloff, grace period, vocabulary, toggles
+# =============================================================================
+
+
+class _MinStub:
+    """Minimal stand-in for a Minus instance. Binds real helper methods so we
+    exercise production code without running Minus.__init__ (which touches
+    hardware)."""
+
+    def __init__(self):
+        import threading
+        self.MIN_BLOCKING_DURATION_BASE = 3.0
+        self.MIN_BLOCKING_DURATION_STEP = 0.5
+        self.MIN_BLOCKING_DURATION_FLOOR_OCR = 1.0
+        self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
+        self.consecutive_ad_count = 0
+        self.blocking_source = "ocr"
+        self.HDMI_RECONNECT_GRACE_SECONDS = 90.0
+        self.hdmi_reconnect_time = 0.0
+        self._falloff_enabled = True
+        self._grace_enabled = True
+        self._state_lock = threading.Lock()
+
+    @property
+    def block_falloff_enabled(self):
+        return self._falloff_enabled
+
+    @property
+    def hdmi_reconnect_grace_enabled(self):
+        return self._grace_enabled
+
+
+def _make_min_stub():
+    """Factory that binds the real Minus helpers onto a stub instance."""
+    import types
+    # minus.py lives at the project root, not in src/ — add it to path so
+    # the Minus helper methods can be imported without running __init__.
+    project_root = str(Path(__file__).parent.parent)
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    import minus as _minus_mod
+
+    stub = _MinStub()
+    stub._current_min_blocking_duration = types.MethodType(
+        _minus_mod.Minus._current_min_blocking_duration, stub)
+    stub.notify_hdmi_reconnect = types.MethodType(
+        _minus_mod.Minus.notify_hdmi_reconnect, stub)
+    stub.is_in_hdmi_reconnect_grace = types.MethodType(
+        _minus_mod.Minus.is_in_hdmi_reconnect_grace, stub)
+    stub.get_hdmi_reconnect_grace_remaining = types.MethodType(
+        _minus_mod.Minus.get_hdmi_reconnect_grace_remaining, stub)
+    return stub
+
+
+class TestBlockingDurationFalloff(unittest.TestCase):
+    """3.0 -> 2.5 -> 2.0 -> 1.5 -> 1.0 on consecutive ads, 1.5s floor for OCR+VLM."""
+
+    def setUp(self):
+        self.m = _make_min_stub()
+
+    def test_first_ad_is_3_seconds(self):
+        self.m.consecutive_ad_count = 0
+        self.assertAlmostEqual(self.m._current_min_blocking_duration(), 3.0, places=2)
+
+    def test_falloff_steps_ocr(self):
+        self.m.blocking_source = "ocr"
+        expected = [3.0, 2.5, 2.0, 1.5, 1.0, 1.0, 1.0]
+        for i, want in enumerate(expected):
+            self.m.consecutive_ad_count = i
+            self.assertAlmostEqual(
+                self.m._current_min_blocking_duration(), want, places=2,
+                msg=f"ocr falloff at i={i} expected {want}")
+
+    def test_falloff_floor_for_both_is_1_5(self):
+        self.m.blocking_source = "both"
+        expected = [3.0, 2.5, 2.0, 1.5, 1.5, 1.5]
+        for i, want in enumerate(expected):
+            self.m.consecutive_ad_count = i
+            self.assertAlmostEqual(
+                self.m._current_min_blocking_duration(), want, places=2,
+                msg=f"both-floor at i={i} expected {want}")
+
+    def test_disabling_falloff_pins_to_base(self):
+        self.m._falloff_enabled = False
+        for i in range(0, 10):
+            self.m.consecutive_ad_count = i
+            self.assertAlmostEqual(
+                self.m._current_min_blocking_duration(), 3.0, places=2)
+
+
+class TestHDMIReconnectGrace(unittest.TestCase):
+    """notify_hdmi_reconnect sets the timestamp; the grace helpers read it."""
+
+    def setUp(self):
+        self.m = _make_min_stub()
+
+    def test_no_grace_before_reconnect(self):
+        self.assertFalse(self.m.is_in_hdmi_reconnect_grace())
+        self.assertEqual(self.m.get_hdmi_reconnect_grace_remaining(), 0)
+
+    def test_grace_active_after_notify(self):
+        self.m.notify_hdmi_reconnect()
+        self.assertTrue(self.m.is_in_hdmi_reconnect_grace())
+        remaining = self.m.get_hdmi_reconnect_grace_remaining()
+        self.assertGreater(remaining, 85)
+        self.assertLessEqual(remaining, 90)
+
+    def test_grace_expires(self):
+        self.m.hdmi_reconnect_time = time.time() - 100
+        self.assertFalse(self.m.is_in_hdmi_reconnect_grace())
+        self.assertEqual(self.m.get_hdmi_reconnect_grace_remaining(), 0)
+
+    def test_disabled_setting_skips_grace(self):
+        self.m.notify_hdmi_reconnect()
+        self.m._grace_enabled = False
+        self.assertFalse(self.m.is_in_hdmi_reconnect_grace())
+
+
+class TestVocabularyExtended(unittest.TestCase):
+    """Extended vocabulary supplies dual example sentences."""
+
+    def test_combined_list_is_larger_than_base(self):
+        from vocabulary import (
+            SPANISH_VOCABULARY,
+            SPANISH_VOCABULARY_EXTENDED,
+            VOCABULARY_COMBINED,
+        )
+        self.assertEqual(
+            len(VOCABULARY_COMBINED),
+            len(SPANISH_VOCABULARY) + len(SPANISH_VOCABULARY_EXTENDED))
+        self.assertGreater(len(SPANISH_VOCABULARY_EXTENDED), 150)
+
+    def test_extended_entries_are_5_tuples(self):
+        from vocabulary import SPANISH_VOCABULARY_EXTENDED
+        for entry in SPANISH_VOCABULARY_EXTENDED:
+            self.assertEqual(
+                len(entry), 5,
+                f"extended entry must be 5-tuple: {entry[:1]}")
+            for field in entry:
+                self.assertIsInstance(field, str)
+                self.assertTrue(
+                    field.strip(),
+                    f"empty field in extended entry {entry[:1]}")
+
+
+class TestOptimizationSettingsAPI(unittest.TestCase):
+    """POST /api/settings/optimization flips the persisted toggle."""
+
+    def test_get_returns_all_three_flags(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.block_falloff_enabled = True
+        minus.hdmi_reconnect_grace_enabled = False
+        minus.greyscale_preview_enabled = True
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            r = client.get('/api/settings/optimization')
+            self.assertEqual(r.status_code, 200)
+            data = r.get_json()
+            self.assertTrue(data['block_falloff'])
+            self.assertFalse(data['hdmi_reconnect_grace'])
+            self.assertTrue(data['greyscale_preview'])
+
+    def test_post_invalid_key_returns_400(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_optimization_setting.return_value = {
+            'success': False, 'error': 'unknown setting bogus'}
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            r = client.post('/api/settings/optimization',
+                            json={'key': 'bogus', 'enabled': True})
+            self.assertEqual(r.status_code, 400)
+
+    def test_post_greyscale_propagates_to_ad_blocker(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_optimization_setting.return_value = {
+            'success': True, 'greyscale_preview': False}
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            r = client.post('/api/settings/optimization',
+                            json={'key': 'greyscale_preview', 'enabled': False})
+            self.assertEqual(r.status_code, 200)
+            minus.ad_blocker.set_preview_grayscale.assert_called_once_with(False)
+
+    def test_post_falloff_does_not_touch_ad_blocker(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_optimization_setting.return_value = {
+            'success': True, 'block_falloff': True}
+        ui = WebUI(minus)
+        with ui.app.test_client() as client:
+            client.post('/api/settings/optimization',
+                        json={'key': 'block_falloff', 'enabled': True})
+            minus.ad_blocker.set_preview_grayscale.assert_not_called()
+
+
+# =============================================================================
+# various-optimizations follow-up: countdown bar, content rotation, audio bars,
+# photo library, replacement modes. Heavy emphasis on memory bounds + offline.
+# =============================================================================
+
+
+class TestAdCountdownExtraction(unittest.TestCase):
+    """OCR ad-timer parser: seconds remaining from 'Ad N:MM', 'Ad N', etc."""
+
+    def test_returns_none_when_no_timer(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertIsNone(extract_ad_seconds_remaining([]))
+        self.assertIsNone(extract_ad_seconds_remaining(['hello', 'world']))
+
+    def test_parses_minute_seconds(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 0:30']), 30)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 1:05']), 65)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad0:45']), 45)
+
+    def test_parses_ocr_misreads(self):
+        from skip_detection import extract_ad_seconds_remaining
+        # 0 -> o, 1 -> l, : -> ;
+        self.assertEqual(extract_ad_seconds_remaining(['Ado:30']), 30)
+        self.assertEqual(extract_ad_seconds_remaining(['Adl:05']), 65)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad0;45']), 45)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad0.30']), 30)
+
+    def test_parses_standalone_countdown(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 10']), 10)
+        self.assertEqual(extract_ad_seconds_remaining(['Ad 5']), 5)
+
+    def test_hulu_pipe_style(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertEqual(extract_ad_seconds_remaining(['0:30 | Ad']), 30)
+
+    def test_rejects_nonsense(self):
+        from skip_detection import extract_ad_seconds_remaining
+        self.assertIsNone(extract_ad_seconds_remaining(['email@ad.com']))
+        # "99:99" — out of range minutes/seconds rejected
+        self.assertIsNone(extract_ad_seconds_remaining(['Ad 99:99']))
+
+
+class TestAdBlockerCountdownBar(unittest.TestCase):
+    """The visual progress bar rendered from ad_seconds_remaining."""
+
+    def _make(self):
+        from ad_blocker import DRMAdBlocker
+        stub = MagicMock()
+        stub._ad_seconds_remaining = None
+        stub._ad_seconds_peak = None
+        stub._ad_seconds_anchor = 0.0
+        stub._ad_countdown_bar = types.MethodType(DRMAdBlocker._ad_countdown_bar, stub)
+        stub.set_ad_seconds_remaining = types.MethodType(
+            DRMAdBlocker.set_ad_seconds_remaining, stub)
+        stub._clear_ad_countdown = types.MethodType(
+            DRMAdBlocker._clear_ad_countdown, stub)
+        return stub
+
+    def test_empty_when_no_data(self):
+        bar = self._make()._ad_countdown_bar()
+        self.assertEqual(bar, '')
+
+    def test_bar_full_at_start(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(30)
+        # Re-anchor to 'now' so wall-clock drift between set and render
+        # doesn't shave a second off the display.
+        stub._ad_seconds_anchor = time.time() + 0.1
+        bar = stub._ad_countdown_bar(width=10)
+        # All 10 slots should be filled (#) since current >= peak
+        self.assertIn('##########', bar)
+        # Seconds should be within one of the value we set
+        self.assertTrue(
+            any(s in bar for s in ('29s', '30s', '31s')),
+            f"expected ~30s in bar, got: {bar!r}")
+
+    def test_bar_half_drained(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(30)
+        stub._ad_seconds_remaining = 15  # simulate OCR re-read at half
+        bar = stub._ad_countdown_bar(width=10)
+        self.assertEqual(bar.count('#'), 5)
+
+    def test_clear_wipes_bar(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(10)
+        stub._clear_ad_countdown()
+        self.assertEqual(stub._ad_countdown_bar(), '')
+
+    def test_rejects_negative_seconds(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining(-5)
+        self.assertIsNone(stub._ad_seconds_remaining)
+
+    def test_rejects_non_int(self):
+        stub = self._make()
+        stub.set_ad_seconds_remaining("abc")
+        self.assertIsNone(stub._ad_seconds_remaining)
+
+
+import types  # placed here so the helper above can reference it
+
+
+class TestContentRotationModes(unittest.TestCase):
+    """Vocab/fact/haiku rotation with per-block lock-in."""
+
+    def _make(self):
+        from ad_blocker import DRMAdBlocker
+        stub = MagicMock()
+        stub._CONTENT_KINDS = DRMAdBlocker._CONTENT_KINDS
+        stub._CONTENT_KIND_WEIGHTS = DRMAdBlocker._CONTENT_KIND_WEIGHTS
+        stub._PHOTO_MODE_CHANCE = DRMAdBlocker._PHOTO_MODE_CHANCE
+        stub._locked_content_kind = None
+        stub._content_kind_lock_until = 0.0
+        stub.CONTENT_KIND_COOLDOWN_SECONDS = 30.0
+        stub.minus = None
+        stub._current_vocab = None
+        stub._pick_content_kind = types.MethodType(
+            DRMAdBlocker._pick_content_kind, stub)
+        stub._get_enabled_replacement_modes = types.MethodType(
+            DRMAdBlocker._get_enabled_replacement_modes, stub)
+        stub._roll_replacement_mode = types.MethodType(
+            DRMAdBlocker._roll_replacement_mode, stub)
+        stub._render_vocab = types.MethodType(DRMAdBlocker._render_vocab, stub)
+        stub._render_fact = types.MethodType(DRMAdBlocker._render_fact, stub)
+        stub._get_blocking_text = types.MethodType(
+            DRMAdBlocker._get_blocking_text, stub)
+        return stub
+
+    def test_lock_forces_fixed_kind(self):
+        stub = self._make()
+        stub._locked_content_kind = 'fact'
+        for _ in range(30):
+            self.assertEqual(stub._pick_content_kind(), 'fact')
+
+    def test_all_kinds_appear_without_lock(self):
+        stub = self._make()
+        seen = set()
+        for _ in range(400):
+            seen.add(stub._pick_content_kind())
+        self.assertEqual(seen, {'vocab', 'fact'})
+
+    def test_disabled_text_kinds_excluded_from_roll(self):
+        stub = self._make()
+        # Only vocab allowed — never roll fact/haiku/photos
+        mock_minus = MagicMock()
+        mock_minus.get_replacement_modes.return_value = ['vocab']
+        stub.minus = mock_minus
+        for _ in range(50):
+            self.assertEqual(stub._roll_replacement_mode(), 'vocab')
+
+    def test_photos_skipped_when_library_empty(self):
+        stub = self._make()
+        mock_minus = MagicMock()
+        mock_minus.get_replacement_modes.return_value = ['vocab', 'photos']
+        stub.minus = mock_minus
+        # Patch photo_library to report empty
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = None
+            kinds = {stub._roll_replacement_mode() for _ in range(30)}
+        self.assertEqual(kinds, {'vocab'})
+
+    def test_blocking_text_fact_renders(self):
+        stub = self._make()
+        stub._locked_content_kind = 'fact'
+        text = stub._get_blocking_text(source='ocr')
+        self.assertIn('DID YOU KNOW', text)
+
+    def test_blocking_text_vocab_renders(self):
+        stub = self._make()
+        stub._locked_content_kind = 'vocab'
+        text = stub._get_blocking_text(source='ocr')
+        # Header always present
+        self.assertIn('BLOCKING', text)
+        # Should include the '=' translation marker from _render_vocab
+        self.assertIn('=', text)
+
+
+class TestFactsOffline(unittest.TestCase):
+    """Content library is pure data — no network, no import surprises."""
+
+    def test_facts_module_has_content(self):
+        from facts import DID_YOU_KNOW
+        self.assertGreater(len(DID_YOU_KNOW), 50)
+        for title, body in DID_YOU_KNOW:
+            self.assertIsInstance(title, str)
+            self.assertIsInstance(body, str)
+            self.assertTrue(title.strip())
+            self.assertTrue(body.strip())
+
+    def test_haiku_module_is_gone(self):
+        """Haikus were removed per user preference — the module must not exist."""
+        import pathlib
+        src_dir = pathlib.Path(__file__).parent.parent / 'src'
+        self.assertFalse((src_dir / 'haiku.py').exists())
+
+    def test_modules_have_no_imports_of_net_libs(self):
+        """We run offline — content module should have no network imports."""
+        import pathlib
+        src_dir = pathlib.Path(__file__).parent.parent / 'src'
+        txt = (src_dir / 'facts.py').read_text()
+        for forbidden in ('import requests', 'from requests',
+                          'urllib.request', 'urlopen', 'socket.connect'):
+            self.assertNotIn(
+                forbidden, txt,
+                f"facts.py references {forbidden!r} — breaks offline mode")
+
+
+class TestAudioLevelBars(unittest.TestCase):
+    """Audio-reactive bar renderer uses a bounded deque + pure math."""
+
+    def _make(self):
+        from audio import AudioPassthrough
+        # Avoid running __init__ (which touches GStreamer) — just pull the
+        # deque and render function onto a naked object.
+        from collections import deque
+        stub = type('S', (), {})()
+        stub._level_history = deque(maxlen=16)
+        stub.get_level_bars = types.MethodType(AudioPassthrough.get_level_bars, stub)
+        return stub
+
+    def test_empty_history_returns_empty(self):
+        stub = self._make()
+        self.assertEqual(stub.get_level_bars(), '')
+
+    def test_bars_respond_to_levels(self):
+        stub = self._make()
+        for v in [0.0, 0.0, 0.5, 0.5, 1.0, 1.0]:
+            stub._level_history.append(v)
+        bars = stub.get_level_bars(width=6)
+        self.assertEqual(len(bars), 6)
+        # Left end should be quietest character
+        self.assertEqual(bars[0], ' ')
+        # Right end should be the loudest char from the ramp
+        self.assertEqual(bars[-1], '@')
+
+    def test_memory_bound_of_level_history(self):
+        """24h run: appending a million samples still bounds memory to maxlen."""
+        stub = self._make()
+        for i in range(1_000_000):
+            stub._level_history.append((i % 7) / 7.0)
+        self.assertLessEqual(len(stub._level_history), 16)
+
+
+class TestPhotoLibrary(unittest.TestCase):
+    """Photo upload / list / delete with caps enforced."""
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        from photo_library import PhotoLibrary
+        self.lib = PhotoLibrary(base_dir=self._tmpdir.name)
+
+    def tearDown(self):
+        self._tmpdir.cleanup()
+
+    def _tiny_jpeg(self, color=(128, 64, 32)):
+        from PIL import Image
+        import io as _io
+        img = Image.new('RGB', (64, 64), color)
+        buf = _io.BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        return buf.getvalue()
+
+    def test_add_and_list_photo(self):
+        self.assertEqual(self.lib.count(), 0)
+        meta = self.lib.add_photo(self._tiny_jpeg(), original_name='cat.jpg')
+        self.assertEqual(self.lib.count(), 1)
+        self.assertIn(meta['id'], {p['id'] for p in self.lib.list_photos()})
+
+    def test_rejects_empty_upload(self):
+        with self.assertRaises(ValueError):
+            self.lib.add_photo(b'', original_name='x')
+
+    def test_rejects_garbage(self):
+        with self.assertRaises(ValueError):
+            self.lib.add_photo(b'not a real image payload', original_name='x')
+
+    def test_delete_photo(self):
+        meta = self.lib.add_photo(self._tiny_jpeg(), original_name='x.jpg')
+        self.assertTrue(self.lib.remove_photo(meta['id']))
+        self.assertEqual(self.lib.count(), 0)
+
+    def test_random_photo_id_returns_none_when_empty(self):
+        self.assertIsNone(self.lib.random_photo_id())
+
+    def test_name_sanitization_rejects_traversal(self):
+        meta = self.lib.add_photo(self._tiny_jpeg(), original_name='../../etc/passwd')
+        self.assertNotIn('/', meta['name'])
+        self.assertNotIn('..', meta['name'])
+
+    def test_delete_sanitizes_id(self):
+        """Path traversal / non-hex id can't escape the library dir."""
+        self.lib.add_photo(self._tiny_jpeg(), original_name='a.jpg')
+        # Attempt path-traversal delete: should sanitize and NOT remove anything
+        self.assertFalse(self.lib.remove_photo('../../../etc/passwd'))
+        self.assertEqual(self.lib.count(), 1)
+
+    def test_count_cap_eviction(self):
+        """More than PHOTO_MAX_COUNT adds evict the oldest."""
+        import photo_library as pl
+        original = pl.PHOTO_MAX_COUNT
+        pl.PHOTO_MAX_COUNT = 3
+        try:
+            for i in range(5):
+                # Each call gets a different color so its hash differs
+                self.lib.add_photo(self._tiny_jpeg(color=(i * 40, 0, 0)),
+                                    original_name=f'p{i}.jpg')
+            self.assertLessEqual(self.lib.count(), 3)
+        finally:
+            pl.PHOTO_MAX_COUNT = original
+
+    def test_memory_footprint_stable_under_churn(self):
+        """Repeated add/delete should not leak filesystem entries."""
+        for i in range(20):
+            meta = self.lib.add_photo(self._tiny_jpeg(color=(i * 12, 0, 0)))
+            self.lib.remove_photo(meta['id'])
+        # No residue after churn
+        self.assertEqual(self.lib.count(), 0)
+        # total_bytes should be 0 too
+        self.assertEqual(self.lib.total_bytes(), 0)
+
+    # ---- auto-conversion: any format Pillow can open becomes JPEG ----
+
+    def _make_png_rgba(self, size=(128, 96)):
+        """PNG with alpha — should get flattened against black."""
+        from PIL import Image
+        import io as _io
+        img = Image.new('RGBA', size, (180, 50, 50, 128))
+        buf = _io.BytesIO()
+        img.save(buf, format='PNG')
+        return buf.getvalue()
+
+    def _make_palette_gif(self, size=(80, 80)):
+        from PIL import Image
+        import io as _io
+        img = Image.new('P', size, 7)  # palette mode
+        img.putpalette([i % 256 for i in range(768)])
+        buf = _io.BytesIO()
+        img.save(buf, format='GIF')
+        return buf.getvalue()
+
+    def _make_huge_jpeg(self, size=(4000, 3000)):
+        from PIL import Image
+        import io as _io
+        img = Image.new('RGB', size, (30, 180, 30))
+        buf = _io.BytesIO()
+        img.save(buf, format='JPEG', quality=80)
+        return buf.getvalue()
+
+    def test_accepts_png_with_alpha(self):
+        """RGBA PNG should be accepted and normalized (alpha flattened)."""
+        meta = self.lib.add_photo(self._make_png_rgba(), original_name='pic.png')
+        self.assertGreater(meta['bytes'], 0)
+        # Stored file is a JPEG, not a PNG (normalized on disk)
+        data = self.lib.get_photo_bytes(meta['id'])
+        self.assertEqual(data[:3], b'\xff\xd8\xff', "stored file should be JPEG")
+
+    def test_accepts_palette_gif(self):
+        """Palette-mode GIFs should be accepted and converted to JPEG."""
+        meta = self.lib.add_photo(self._make_palette_gif(), original_name='x.gif')
+        data = self.lib.get_photo_bytes(meta['id'])
+        self.assertEqual(data[:3], b'\xff\xd8\xff')
+
+    def test_downsizes_huge_image(self):
+        """Source bigger than PHOTO_MAX_DIM is thumbnailed."""
+        import photo_library as pl
+        meta = self.lib.add_photo(self._make_huge_jpeg(), original_name='big.jpg')
+        self.assertLessEqual(max(meta['dim']), pl.PHOTO_MAX_DIM)
+
+    def test_exif_orientation_applied(self):
+        """EXIF Orientation=6 (90deg) should be honored — image is rotated
+        before storage so the saved dimensions reflect the visual
+        orientation, not the raw pixel grid."""
+        from PIL import Image
+        import io as _io
+        # Build a portrait-oriented 'wide' image whose EXIF claims orientation=6
+        # (rotate 90 CW for display). After load, visual size is (H, W).
+        img = Image.new('RGB', (300, 100), (50, 50, 200))
+        buf = _io.BytesIO()
+        # Minimal EXIF blob with orientation=6. We use PIL's own hook since
+        # synthesising raw EXIF is fiddly.
+        exif = img.getexif()
+        exif[0x0112] = 6  # Orientation tag
+        img.save(buf, format='JPEG', exif=exif.tobytes())
+        meta = self.lib.add_photo(buf.getvalue(), original_name='portrait.jpg')
+        # After exif_transpose, dims should be swapped: was 300x100 → 100x300
+        self.assertEqual(meta['dim'][0], 100)
+        self.assertEqual(meta['dim'][1], 300)
+
+    def test_rejects_truly_unopenable(self):
+        """Garbage that isn't any known image format is still rejected."""
+        with self.assertRaises(ValueError):
+            self.lib.add_photo(b"this is just text, not an image",
+                                original_name='fake.jpg')
+
+
+class TestReplacementModesAPI(unittest.TestCase):
+    """Web UI can GET/POST the enabled replacement kinds."""
+
+    def test_get_returns_minus_list(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.get_replacement_modes.return_value = ['vocab', 'fact']
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.get('/api/settings/replacement-modes')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['replacement_modes'], ['vocab', 'fact'])
+
+    def test_post_rejects_non_list(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/settings/replacement-modes',
+                       json={'modes': 'vocab'})
+            self.assertEqual(r.status_code, 400)
+
+    def test_post_persists(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.set_replacement_modes.return_value = {
+            'success': True, 'replacement_modes': ['vocab', 'photos']}
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/settings/replacement-modes',
+                       json={'modes': ['vocab', 'photos']})
+            self.assertEqual(r.status_code, 200)
+            minus.set_replacement_modes.assert_called_once_with(['vocab', 'photos'])
+
+
+class TestReplacementModeTestEndpoints(unittest.TestCase):
+    """New /api/test/replacement-mode/<kind> endpoint + trigger-block kind param."""
+
+    def _ui(self, photo_id='abc'):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        # Simulate a non-empty library so 'photos' passes the gate
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = photo_id
+            ui = WebUI(minus)
+        return ui, minus
+
+    def test_rejects_unknown_kind(self):
+        ui, minus = self._ui()
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/replacement-mode/bogus')
+            self.assertEqual(r.status_code, 400)
+            self.assertIn('kind must be', r.get_json()['error'])
+
+    def test_photos_without_library_returns_400(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        ui = WebUI(minus)
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = None
+            with ui.app.test_client() as c:
+                r = c.post('/api/test/replacement-mode/photos')
+                self.assertEqual(r.status_code, 400)
+                self.assertIn('no photos uploaded', r.get_json()['error'])
+
+    def test_forces_lock_and_calls_show(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        ab._content_kind_lock_until = 0
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with patch('photo_library.get_photo_library') as gpl:
+            gpl.return_value.random_photo_id.return_value = 'abc'
+            with ui.app.test_client() as c:
+                r = c.post('/api/test/replacement-mode/fact', json={'duration': 5})
+                self.assertEqual(r.status_code, 200)
+        self.assertEqual(ab._locked_content_kind, 'fact')
+        ab.show.assert_called_once_with('ocr')
+        ab.set_test_mode.assert_called_once_with(5)
+
+    def test_trigger_block_kind_param_sets_lock(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        ab._content_kind_lock_until = 0
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/trigger-block',
+                       json={'duration': 3, 'kind': 'photos'})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['kind'], 'photos')
+        self.assertEqual(ab._locked_content_kind, 'photos')
+
+    def test_trigger_block_rejects_bad_kind(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/trigger-block', json={'kind': 'movies'})
+            self.assertEqual(r.status_code, 400)
+
+
+class TestCountdownBarEndpoint(unittest.TestCase):
+    """/api/test/countdown-bar injects ad_seconds_remaining for visual tests."""
+
+    def test_defaults(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/countdown-bar', json={})
+            self.assertEqual(r.status_code, 200)
+        ab.set_ad_seconds_remaining.assert_called_once_with(15)
+
+    def test_custom_seconds(self):
+        from webui import WebUI
+        minus = MagicMock()
+        ab = MagicMock()
+        minus.ad_blocker = ab
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/countdown-bar', json={'seconds': 30, 'duration': 4})
+            self.assertEqual(r.status_code, 200)
+        ab.set_ad_seconds_remaining.assert_called_once_with(30)
+
+    def test_rejects_out_of_range(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.ad_blocker = MagicMock()
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.post('/api/test/countdown-bar', json={'seconds': 9999})
+            self.assertEqual(r.status_code, 400)
+
+
+class TestAudioBarsEndpoint(unittest.TestCase):
+    """/api/test/audio-bars returns the live RMS history + rendered bars."""
+
+    def test_returns_empty_when_no_audio(self):
+        from webui import WebUI
+        minus = MagicMock()
+        minus.audio = None
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.get('/api/test/audio-bars')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['bars'], '')
+
+    def test_returns_bars_from_audio_history(self):
+        from webui import WebUI
+        from collections import deque
+        minus = MagicMock()
+        minus.audio = MagicMock()
+        minus.audio._level_history = deque([0.1, 0.5, 0.9], maxlen=16)
+        minus.audio.get_level_bars.return_value = '.,@'
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            r = c.get('/api/test/audio-bars?width=3')
+            self.assertEqual(r.status_code, 200)
+            data = r.get_json()
+            self.assertEqual(data['bars'], '.,@')
+            self.assertEqual(data['width'], 3)
+            self.assertEqual(data['samples'], 3)
+
+    def test_width_clamped(self):
+        from webui import WebUI
+        from collections import deque
+        minus = MagicMock()
+        minus.audio = MagicMock()
+        minus.audio._level_history = deque([0.5], maxlen=16)
+        minus.audio.get_level_bars.return_value = '*'
+        ui = WebUI(minus)
+        with ui.app.test_client() as c:
+            # width=999 gets clamped to 64
+            r = c.get('/api/test/audio-bars?width=999')
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(r.get_json()['width'], 64)
+
+
+class TestMinusReplacementModesLogic(unittest.TestCase):
+    """Minus.set_replacement_modes enforces a text-kind floor."""
+
+    def _make(self):
+        import types as _t
+        import minus as _m
+        stub = type('S', (), {})()
+        stub._system_settings = {'replacement_modes': ['vocab', 'fact']}
+        stub._save_system_settings = lambda self=None: None
+        stub.get_replacement_modes = _t.MethodType(
+            _m.Minus.get_replacement_modes, stub)
+        stub.set_replacement_modes = _t.MethodType(
+            _m.Minus.set_replacement_modes, stub)
+        return stub
+
+    def test_empty_modes_force_vocab(self):
+        """Disabling every kind should force vocab back on."""
+        stub = self._make()
+        result = stub.set_replacement_modes([])
+        self.assertIn('vocab', result['replacement_modes'])
+
+    def test_photos_only_still_gets_vocab(self):
+        """User picks only photos → vocab is added as the text fallback."""
+        stub = self._make()
+        result = stub.set_replacement_modes(['photos'])
+        self.assertIn('vocab', result['replacement_modes'])
+        self.assertIn('photos', result['replacement_modes'])
+
+    def test_unknown_kinds_stripped(self):
+        stub = self._make()
+        result = stub.set_replacement_modes(['vocab', 'bogus', 'fact'])
+        self.assertNotIn('bogus', result['replacement_modes'])
+
+
+class TestOfflineImportHygiene(unittest.TestCase):
+    """None of the new modules should require network access at import time."""
+
+    def test_new_modules_import_without_network(self):
+        # We can't easily sandbox network here; instead assert the modules
+        # don't mention common net libraries in their top-level imports.
+        import pathlib
+        src_dir = pathlib.Path(__file__).parent.parent / 'src'
+        for name in ('facts.py', 'photo_library.py'):
+            txt = (src_dir / name).read_text()
+            for forbidden in ('import requests', 'from requests',
+                              'urllib.request', 'urlopen', 'socket.connect'):
+                self.assertNotIn(forbidden, txt,
+                                 f"{name} references {forbidden!r} — breaks offline mode")
 
 
 if __name__ == '__main__':

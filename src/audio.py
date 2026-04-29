@@ -130,66 +130,91 @@ class AudioPassthrough:
         # A/V sync watchdog - periodic queue flush to prevent drift
         # The sync queue adds fixed delay but clock drift over time could cause issues
         # Flushing every 45 minutes resets the sync queue with minimal audio dropout (~300ms)
-        self._sync_interval = 45 * 60  # 45 minutes between sync resets
+        self._sync_interval = 45 * 60  # 45 minutes between sync resets (currently disabled — see _sync_reset_enabled)
         self._last_sync_reset = 0
-        self._sync_reset_enabled = True
+
+        # Rolling audio level history for the blocking-overlay visualizer.
+        # Stores normalized RMS (0.0-1.0) samples of the mixer output. Kept
+        # as a bounded deque so memory is O(1) over a 24h run.
+        from collections import deque
+        self._level_history = deque(maxlen=16)
+        self._last_level_sample_time = 0.0
+        # Only sample RMS every N seconds — full-rate would thrash the CPU
+        # and we only need ~10 Hz updates for the bar visualizer.
+        self._level_sample_interval = 0.1
+        # Disabled: the sync-queue flush cannot cleanly recover the pipeline —
+        # alsasink closes the PCM device when the pipeline goes to PAUSED mid-
+        # flush, and with min-threshold-time on the upstream queue, nothing
+        # short of a full pipeline restart wakes it back up. The flush has
+        # therefore always triggered a full restart every fire (~ once per
+        # 45min of uptime), which is the exact "spurious restart" we set out
+        # to eliminate. Drift isn't a real concern here (provide-clock=false,
+        # sync=false) and 48h+ runs without a working flush showed no A/V
+        # sync issues. Set to True only if a proper drift-recovery mechanism
+        # is added.
+        self._sync_reset_enabled = False
 
         # Initialize GStreamer (may already be initialized by video pipeline)
         Gst.init(None)
 
     def _is_alsa_device_running(self) -> bool:
-        """Check if our ALSA playback device is actually running with our PID.
+        """Check if our ALSA playback device is actually producing audio.
 
-        This checks /proc/asound/cardX/pcmYp/sub0/status to see if the device
-        is in RUNNING state and owned by our process. This is more reliable
-        than GStreamer state queries when PipeWire/WirePlumber is involved.
+        Uses /proc/asound/.../status as the source of truth: ALSA state must
+        be RUNNING AND hw_ptr must advance between two samples. If hw_ptr moves,
+        audio is definitively flowing — regardless of what GStreamer's state
+        machine or owner_pid reports.
 
-        Returns:
-            True if device is RUNNING and owned by us, False otherwise
+        Historical note: the old implementation compared ALSA's owner_pid to
+        self._our_pid (main PID), but owner_pid is actually a thread TID — and
+        often a stale one from the thread that originally opened the device.
+        That made this check return False in healthy states and the watchdog
+        fired a spurious full restart every time GStreamer transiently reported
+        PAUSED (e.g. post-flush). Sampling hw_ptr sidesteps all that.
         """
         try:
-            # Parse playback device from self.playback_device (e.g., "hw:1,0")
-            # Format: hw:card,device
             if not self.playback_device.startswith("hw:"):
                 return False
 
             parts = self.playback_device[3:].split(",")
             if len(parts) != 2:
                 return False
-
             card = parts[0]
             device = parts[1]
 
-            # Check status file: /proc/asound/cardX/pcmYp/sub0/status
-            # 'p' suffix means playback (vs 'c' for capture)
             status_path = f"/proc/asound/card{card}/pcm{device}p/sub0/status"
-
             if not os.path.exists(status_path):
                 return False
 
-            with open(status_path, 'r') as f:
-                status_content = f.read()
+            def _read():
+                with open(status_path, 'r') as f:
+                    content = f.read()
+                state_running = False
+                hw_ptr = None
+                for line in content.split('\n'):
+                    line = line.strip()
+                    if line.startswith('state:'):
+                        state_running = 'RUNNING' in line
+                    elif line.startswith('hw_ptr'):
+                        try:
+                            hw_ptr = int(line.split(':', 1)[1].strip())
+                        except (IndexError, ValueError):
+                            pass
+                return state_running, hw_ptr
 
-            # Parse status - looking for:
-            # state: RUNNING
-            # owner_pid: <our_pid>
-            state_running = False
-            owner_is_us = False
+            state1, ptr1 = _read()
+            if not state1 or ptr1 is None:
+                return False
 
-            for line in status_content.split('\n'):
-                line = line.strip()
-                if line.startswith('state:'):
-                    state_running = 'RUNNING' in line
-                elif line.startswith('owner_pid'):
-                    # Format: "owner_pid   : 12345"
-                    try:
-                        pid_str = line.split(':')[1].strip()
-                        owner_pid = int(pid_str)
-                        owner_is_us = (owner_pid == self._our_pid)
-                    except (IndexError, ValueError):
-                        pass
+            # 50ms at 48kHz ≈ 2400 frames — any real playback will advance
+            # well beyond any noise. Costs ~50ms on the watchdog thread,
+            # which runs every 3s.
+            time.sleep(0.05)
+            state2, ptr2 = _read()
+            if not state2 or ptr2 is None:
+                return False
 
-            return state_running and owner_is_us
+            return ptr2 > ptr1
 
         except Exception as e:
             logger.debug(f"[AudioPassthrough] Error checking ALSA status: {e}")
@@ -251,9 +276,24 @@ class AudioPassthrough:
             self.pipeline = None
 
     def _buffer_probe(self, pad, info, user_data):
-        """Probe callback to track buffer flow for stall detection."""
+        """Probe callback to track buffer flow for stall detection.
+
+        Also samples the buffer's RMS at `_level_sample_interval` so the
+        blocking overlay can render an audio-reactive bar visualization.
+        Skips the RMS math on most buffers to keep CPU overhead negligible.
+        """
         now = time.time()
         self._last_buffer_time = now
+
+        # Sample audio level for the visualizer (throttled)
+        if now - self._last_level_sample_time >= self._level_sample_interval:
+            self._last_level_sample_time = now
+            try:
+                buf = info.get_buffer()
+                if buf is not None:
+                    self._sample_rms(buf)
+            except Exception as e:
+                logger.debug(f"[AudioPassthrough] RMS sample skipped: {e}")
 
         # Reset backoff counter after sustained buffer flow (5+ seconds)
         if self._consecutive_failures > 0:
@@ -264,6 +304,69 @@ class AudioPassthrough:
                 logger.debug("[AudioPassthrough] Backoff reset - sustained buffer flow")
 
         return Gst.PadProbeReturn.OK
+
+    def _sample_rms(self, buf):
+        """Compute RMS from an S16LE audio buffer, append to history.
+
+        Format is locked to S16LE stereo at 48 kHz elsewhere in the pipeline
+        so we can treat the buffer as signed 16-bit little-endian samples.
+        """
+        success, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not success:
+            return
+        try:
+            import struct
+            data = bytes(mapinfo.data)
+            # Down-sample — we don't need every one of ~1000 samples per 50ms
+            # buffer. Stride picks one sample every ~0.5 ms, plenty for bar
+            # heights.
+            n = len(data) // 2  # S16 = 2 bytes
+            if n == 0:
+                return
+            stride = max(1, n // 64)
+            samples = struct.unpack_from(f'<{n}h', data)
+            total = 0
+            count = 0
+            peak = 0
+            for i in range(0, n, stride):
+                s = samples[i]
+                total += s * s
+                if abs(s) > peak:
+                    peak = abs(s)
+                count += 1
+            if count == 0:
+                return
+            import math
+            rms = math.sqrt(total / count) / 32767.0
+            # Nudge the perceived range — quiet speech is ~0.02 RMS, peaks
+            # are ~0.3. A sqrt curve makes the bars feel more responsive.
+            visual = min(1.0, math.sqrt(rms))
+            self._level_history.append(visual)
+        finally:
+            buf.unmap(mapinfo)
+
+    def get_level_bars(self, width=16):
+        """Render the current audio history as a unicode block bar string.
+
+        Returns a `width`-character string like `.,;ozIMI;,.` that rises and
+        falls with audio energy. Designed for the blocking overlay stats
+        area (monospace). Returns empty string if no history yet.
+        """
+        if not self._level_history:
+            return ''
+        # ASCII-only bar ramp so it renders reliably through the MPP text pass
+        # no matter what font the encoder picked.
+        ramp = ' .,-;+ox*#@'
+        levels = list(self._level_history)[-width:]
+        # Pad with zeros on the left if history is shorter than width
+        if len(levels) < width:
+            levels = [0.0] * (width - len(levels)) + levels
+        chars = []
+        for lv in levels:
+            idx = int(round(lv * (len(ramp) - 1)))
+            idx = max(0, min(len(ramp) - 1, idx))
+            chars.append(ramp[idx])
+        return ''.join(chars)
 
     def _on_error(self, bus, message):
         """Handle GStreamer error messages."""
@@ -523,8 +626,13 @@ class AudioPassthrough:
                 if time_since_sync >= self._sync_interval:
                     # Try queue flush first (faster, less disruptive)
                     if self._flush_sync_queue():
-                        # Flush succeeded, no restart needed
-                        pass
+                        # Flush succeeded. The flush-start/flush-stop event pair
+                        # transiently moves the pipeline out of PLAYING; running the
+                        # state check below in the same iteration mis-reads that as
+                        # a stall and triggers a spurious full restart. Skip to next
+                        # watchdog tick — by then the pipeline is PLAYING again.
+                        self._last_buffer_time = time.time()
+                        continue
                     else:
                         # Flush failed, fall back to full restart
                         needs_restart = True

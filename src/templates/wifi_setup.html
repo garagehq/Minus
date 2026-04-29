@@ -446,20 +446,24 @@
                 return;
             }
 
-            list.innerHTML = networks.map(net => `
+            list.innerHTML = networks.map(net => {
+                const safeSsid = net.ssid.replace(/'/g, "\\'");
+                const savedFlag = net.saved ? 'true' : 'false';
+                const savedBadge = net.saved ? '<span class="network-security" style="color:var(--accent);">· saved</span>' : '';
+                return `
                 <li class="network-item ${selectedNetwork === net.ssid ? 'selected' : ''}"
-                    onclick="selectNetwork('${net.ssid.replace(/'/g, "\\'")}', '${net.security}')"
+                    onclick="selectNetwork('${safeSsid}', '${net.security}', ${savedFlag})"
                     tabindex="0">
                     <span class="network-icon">
                         <span class="signal-bars">${getSignalBars(net.signal)}</span>
                     </span>
                     <div class="network-info">
                         <div class="network-name">${escapeHtml(net.ssid)}</div>
-                        <div class="network-security">${net.security}</div>
+                        <div class="network-security">${net.security} ${savedBadge}</div>
                     </div>
-                    ${net.security !== 'Open' ? '<span class="network-lock">🔒</span>' : ''}
-                </li>
-            `).join('');
+                    ${net.security !== 'Open' && !net.saved ? '<span class="network-lock">🔒</span>' : ''}
+                </li>`;
+            }).join('');
         }
 
         function escapeHtml(text) {
@@ -468,13 +472,17 @@
             return div.innerHTML;
         }
 
-        function selectNetwork(ssid, security) {
+        function selectNetwork(ssid, security, saved) {
             selectedNetwork = ssid;
             document.getElementById('selected-ssid').textContent = ssid;
 
             const passwordSection = document.getElementById('password-section');
 
-            if (security === 'Open') {
+            if (saved === true || saved === 'true') {
+                // Already saved — reuse stored credentials via connect-saved
+                passwordSection.classList.remove('visible');
+                connectSavedNetwork(ssid);
+            } else if (security === 'Open') {
                 passwordSection.classList.remove('visible');
                 connectToNetwork();
             } else {
@@ -483,6 +491,33 @@
             }
 
             renderNetworks();
+        }
+
+        async function connectSavedNetwork(name) {
+            showStatus('Connecting to ' + name + '...', 'loading');
+            try {
+                const response = await fetch('/api/wifi/connect-saved', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name })
+                });
+                const data = await response.json().catch(() => ({}));
+                if (response.ok && data.success) {
+                    showStatus('Connected! Reconnect to your home WiFi to continue.', 'success');
+                    return;
+                }
+                if (data && data.error_code === 'password_required') {
+                    // Stored password is missing or wrong — fall back to the password prompt.
+                    hideStatus();
+                    document.getElementById('password-section').classList.add('visible');
+                    document.getElementById('password-input').focus();
+                    return;
+                }
+                showStatus((data && data.error) || 'Connection failed', 'error');
+            } catch (error) {
+                // Browser connection to the hotspot likely dropped — that means it worked.
+                showStatus('Hotspot stopped. Reconnect your phone to your home WiFi.', 'success');
+            }
         }
 
         async function scanNetworks() {

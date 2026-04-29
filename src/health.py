@@ -256,6 +256,12 @@ class HealthMonitor:
                     # Output just reconnected (TV turned on/restarted)
                     self._hdmi_output_reconnect_time = time.time()
                     logger.info("[HealthMonitor] HDMI output reconnected (TV turned on)")
+                    # Tell the detection loop so it can apply the grace window
+                    if self.minus and hasattr(self.minus, 'notify_hdmi_reconnect'):
+                        try:
+                            self.minus.notify_hdmi_reconnect()
+                        except Exception as e:
+                            logger.warning(f"[HealthMonitor] notify_hdmi_reconnect failed: {e}")
 
                     # Give HDMI link time to fully establish before restarting
                     # The TV needs time to complete HDCP handshake and EDID negotiation

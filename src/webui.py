@@ -247,10 +247,9 @@ class WebUI:
 
         @self.app.route('/api/debug-overlay/enable', methods=['POST'])
         def api_debug_overlay_enable():
-            """Enable the debug overlay."""
+            """Enable the debug overlay (persisted)."""
             try:
-                if self.minus.ad_blocker:
-                    self.minus.ad_blocker.set_debug_overlay_enabled(True)
+                self.minus.set_debug_overlay_enabled(True)
                 return jsonify({'success': True, 'debug_overlay_enabled': True})
             except Exception as e:
                 logger.error(f"Error enabling debug overlay: {e}")
@@ -258,10 +257,9 @@ class WebUI:
 
         @self.app.route('/api/debug-overlay/disable', methods=['POST'])
         def api_debug_overlay_disable():
-            """Disable the debug overlay."""
+            """Disable the debug overlay (persisted)."""
             try:
-                if self.minus.ad_blocker:
-                    self.minus.ad_blocker.set_debug_overlay_enabled(False)
+                self.minus.set_debug_overlay_enabled(False)
                 return jsonify({'success': True, 'debug_overlay_enabled': False})
             except Exception as e:
                 logger.error(f"Error disabling debug overlay: {e}")
@@ -342,6 +340,10 @@ class WebUI:
             Optional JSON body:
             - duration: seconds to block (default: 10, max: 60)
             - source: detection source ('ocr', 'vlm', 'both', 'default')
+            - kind: force a specific replacement kind for this block instead
+              of letting the roll decide. One of 'vocab' / 'fact' / 'photos'.
+              Bypasses the 30s cooldown and lock-in RNG so test scripts can
+              exercise each rendering path deterministically.
             """
             try:
                 data = request.get_json() or {}
@@ -364,12 +366,37 @@ class WebUI:
                         'error': f'source must be one of: {", ".join(valid_sources)}'
                     }), 400
 
+                # Validate (optional) forced replacement kind
+                kind = data.get('kind')
+                valid_kinds = ('vocab', 'fact', 'photos')
+                if kind is not None and kind not in valid_kinds:
+                    return jsonify({
+                        'success': False,
+                        'error': f'kind must be one of: {", ".join(valid_kinds)}'
+                    }), 400
+
                 if self.minus.ad_blocker:
                     # Enable test mode to prevent detection loop from hiding
                     self.minus.ad_blocker.set_test_mode(duration)
 
-                    # Show blocking overlay
-                    self.minus.ad_blocker.show(source)
+                    # If caller asked for a specific replacement kind, set
+                    # the lock BEFORE show() so the block-start roll uses
+                    # the forced value. Extend the cooldown past the test
+                    # duration so rotations stick with it.
+                    if kind is not None:
+                        self.minus.ad_blocker._locked_content_kind = kind
+                        self.minus.ad_blocker._content_kind_lock_until = (
+                            time.time() + duration + 60
+                        )
+
+                    # Show blocking overlay. For OCR-shaped sources, inject a
+                    # synthetic trigger snippet so the top-right "(Ad) 0:30 left"
+                    # hint actually renders during a test-fired block (real
+                    # detection would supply this from check_ad_keywords).
+                    fake_trigger = ''
+                    if source in ('ocr', 'both'):
+                        fake_trigger = ('Ad', 'Ad 0:30 left')
+                    self.minus.ad_blocker.show(source, ocr_trigger_text=fake_trigger)
 
                     # Schedule auto-hide after duration
                     def auto_hide():
@@ -381,18 +408,150 @@ class WebUI:
 
                     threading.Thread(target=auto_hide, daemon=True).start()
 
-                    logger.info(f"[WebUI] Test blocking triggered: source={source}, duration={duration}s")
+                    logger.info(
+                        f"[WebUI] Test blocking triggered: source={source}, "
+                        f"duration={duration}s, kind={kind or 'auto'}"
+                    )
                     return jsonify({
                         'success': True,
                         'source': source,
                         'duration': duration,
-                        'message': f'Blocking for {duration} seconds'
+                        'kind': kind,
+                        'message': f'Blocking for {duration} seconds',
                     })
                 else:
                     return jsonify({'error': 'Ad blocker not initialized'}), 500
             except Exception as e:
                 logger.error(f"Error triggering test block: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/test/replacement-mode/<kind>', methods=['POST'])
+        def api_test_replacement_mode(kind):
+            """Convenience: trigger a block with `kind` forced.
+
+            Shorthand for ``/api/test/trigger-block`` with a pinned kind.
+            ``POST /api/test/replacement-mode/photos`` → 30s block locked to
+            photo-cycling regardless of cooldown or weights.
+            """
+            valid_kinds = ('vocab', 'fact', 'photos')
+            if kind not in valid_kinds:
+                return jsonify({
+                    'success': False,
+                    'error': f'kind must be one of: {", ".join(valid_kinds)}'
+                }), 400
+            try:
+                # silent=True so a POST with no body is allowed (common when
+                # exercising from curl without Content-Type: application/json).
+                data = request.get_json(silent=True) or {}
+                duration = int(data.get('duration', 30))
+                if duration < 1 or duration > 60:
+                    duration = 30
+
+                if not self.minus.ad_blocker:
+                    return jsonify({'success': False, 'error': 'ad_blocker missing'}), 500
+
+                # Gate photos mode on having at least one photo; otherwise
+                # the rotation loop silently falls back to text, which is
+                # confusing while testing.
+                if kind == 'photos':
+                    from photo_library import get_photo_library
+                    if get_photo_library().random_photo_id() is None:
+                        return jsonify({
+                            'success': False,
+                            'error': 'no photos uploaded — upload at least one in /api/media/photos first'
+                        }), 400
+
+                ab = self.minus.ad_blocker
+                ab.set_test_mode(duration)
+                ab._locked_content_kind = kind
+                ab._content_kind_lock_until = time.time() + duration + 60
+                ab.show('ocr')
+
+                def auto_hide():
+                    time.sleep(duration)
+                    if self.minus.ad_blocker:
+                        self.minus.ad_blocker.clear_test_mode()
+                        self.minus.ad_blocker.hide(force=True)
+                threading.Thread(target=auto_hide, daemon=True).start()
+
+                return jsonify({
+                    'success': True,
+                    'kind': kind,
+                    'duration': duration,
+                    'message': f'Blocking in {kind} mode for {duration}s',
+                })
+            except Exception as e:
+                logger.error(f"Error in replacement-mode test: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/test/countdown-bar', methods=['POST'])
+        def api_test_countdown_bar():
+            """Simulate an OCR ad-timer reading so the countdown bar renders.
+
+            POST body: ``{"seconds": 15}``. Triggers a 20s test block with
+            vocab mode and injects the given seconds as the ad-time-remaining
+            so the `AD LEFT [###...] 12s` bar appears in stats. Good for
+            visual regression checks of the progress bar.
+            """
+            try:
+                data = request.get_json() or {}
+                seconds = int(data.get('seconds', 15))
+                if seconds < 0 or seconds > 300:
+                    return jsonify({
+                        'success': False,
+                        'error': 'seconds must be 0..300'
+                    }), 400
+                duration = int(data.get('duration', 20))
+
+                if not self.minus.ad_blocker:
+                    return jsonify({'success': False, 'error': 'ad_blocker missing'}), 500
+
+                ab = self.minus.ad_blocker
+                ab.set_test_mode(duration)
+                ab._locked_content_kind = 'vocab'
+                ab._content_kind_lock_until = time.time() + duration + 60
+                ab.show('ocr')
+                # Inject the countdown right after show() — the bar picks
+                # this up on the next /blocking/set tick.
+                ab.set_ad_seconds_remaining(seconds)
+
+                def auto_hide():
+                    time.sleep(duration)
+                    if self.minus.ad_blocker:
+                        self.minus.ad_blocker.clear_test_mode()
+                        self.minus.ad_blocker.hide(force=True)
+                threading.Thread(target=auto_hide, daemon=True).start()
+
+                return jsonify({'success': True, 'seconds': seconds, 'duration': duration})
+            except Exception as e:
+                logger.error(f"Error in countdown-bar test: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/test/audio-bars', methods=['GET'])
+        def api_test_audio_bars():
+            """Return the current audio RMS history + the rendered bar string.
+
+            Handy for verifying the audio-reactive visualizer without having
+            to wait for a real ad block. ``width`` query param controls the
+            bar width (default 16).
+            """
+            try:
+                width = int(request.args.get('width', 16))
+                width = max(1, min(64, width))
+                if not getattr(self.minus, 'audio', None):
+                    return jsonify({'bars': '', 'history': [], 'error': 'no audio'}), 200
+                audio = self.minus.audio
+                history = list(getattr(audio, '_level_history', []))
+                bars = audio.get_level_bars(width=width) if hasattr(audio, 'get_level_bars') else ''
+                return jsonify({
+                    'bars': bars,
+                    'width': width,
+                    'history': [round(v, 3) for v in history],
+                    'samples': len(history),
+                })
+            except Exception as e:
+                logger.error(f"Error in audio-bars test: {e}")
+                return jsonify({'error': str(e)}), 500
 
         @self.app.route('/api/test/stop-block', methods=['POST'])
         def api_test_stop_block():
@@ -1265,6 +1424,8 @@ class WebUI:
         def api_wifi_connections():
             """Get saved WiFi connections with priorities."""
             try:
+                wifi_mgr = get_wifi_manager()
+                ap_name = wifi_mgr._ap_connection_name  # e.g. "Hotspot"
                 result = subprocess.run(
                     ['nmcli', '-t', '-f', 'NAME,UUID,TYPE,DEVICE,AUTOCONNECT,AUTOCONNECT-PRIORITY', 'connection', 'show'],
                     capture_output=True, text=True, timeout=10
@@ -1275,8 +1436,14 @@ class WebUI:
                         parts = line.split(':')
                         # Filter for wifi connections (802-11-wireless)
                         if len(parts) >= 4 and parts[2] == '802-11-wireless':
+                            name = parts[0]
+                            # Hide the internal AP/hotspot profile — it's surfaced
+                            # separately via the WiFi status card, and isn't a
+                            # user-facing "saved network" they'd want to click.
+                            if name == ap_name:
+                                continue
                             connections.append({
-                                'name': parts[0],
+                                'name': name,
                                 'uuid': parts[1],
                                 'type': 'wifi',
                                 'device': parts[3] if parts[3] else None,
@@ -1290,24 +1457,65 @@ class WebUI:
 
         @self.app.route('/api/wifi/scan')
         def api_wifi_scan():
-            """Scan for available WiFi networks."""
+            """Scan for available WiFi networks.
+
+            Returns ``ap_mode`` so clients can explain why live scan is
+            degraded on a single-radio device, and ``saved`` on each network
+            so the UI can mark known ones and skip the password prompt.
+            """
             try:
                 wifi_mgr = get_wifi_manager()
-                networks = wifi_mgr.scan_networks()
-                # Convert dataclass objects to dicts
+                # Refresh the cached _ap_mode_active flag so the response
+                # reflects the true state, not a stale value left over from
+                # the monitor thread or a prior API call.
+                wifi_mgr.get_status()
+                # If AP is active, single-radio hardware can only scan by
+                # briefly dropping the AP. The user explicitly accepted this
+                # tradeoff — a few seconds of hotspot dropout in exchange for
+                # real scan results. If ?skip_bounce=1 is passed, fall back
+                # to the cheap cached-scan behavior.
+                skip_bounce = request.args.get('skip_bounce', '').lower() in ('1', 'true', 'yes')
+                networks = wifi_mgr.scan_networks(
+                    bounce_ap=wifi_mgr._ap_mode_active and not skip_bounce
+                )
                 return jsonify({
+                    'ap_mode': wifi_mgr._ap_mode_active,
                     'networks': [
                         {
                             'ssid': n.ssid,
                             'signal': n.signal,
                             'security': n.security,
-                            'in_use': n.in_use
+                            'in_use': n.in_use,
+                            'saved': n.saved,
                         }
                         for n in networks
                     ]
                 })
             except Exception as e:
                 logger.error(f"Error scanning WiFi: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/wifi/connect-saved', methods=['POST'])
+        def api_wifi_connect_saved():
+            """Activate a previously saved WiFi connection by name."""
+            try:
+                data = request.get_json() or {}
+                name = data.get('name')
+                if not name:
+                    return jsonify({'error': 'Connection name is required'}), 400
+
+                wifi_mgr = get_wifi_manager()
+                result = wifi_mgr.connect_saved(name)
+                if result.get('success'):
+                    logger.info(f"[WebUI] Activated saved WiFi: {name}")
+                    return jsonify({'success': True, 'message': f'Connected to {name}', 'ssid': name})
+                return jsonify({
+                    'success': False,
+                    'error': result.get('error', 'Activation failed'),
+                    'error_code': result.get('error_code', 'unknown'),
+                }), 400
+            except Exception as e:
+                logger.error(f"Error activating saved WiFi: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         @self.app.route('/api/wifi/connect', methods=['POST'])
@@ -1400,10 +1608,27 @@ class WebUI:
 
         @self.app.route('/api/wifi/disconnect', methods=['POST'])
         def api_wifi_disconnect():
-            """Disconnect from current WiFi network."""
+            """Disconnect from current WiFi network.
+
+            A manual disconnect would otherwise leave the box with no way to
+            reach it until the monitor thread boots the hotspot after 30s.
+            Immediately bring the Minus AP up so the user can always rejoin.
+            """
             try:
                 wifi_mgr = get_wifi_manager()
                 result = wifi_mgr.disconnect_network()
+                if result.get('success'):
+                    # Give the radio a moment to finish disassociating before
+                    # we try to reconfigure it as an AP.
+                    time.sleep(1.5)
+                    ap_result = wifi_mgr.start_ap_mode()
+                    result['ap_started'] = ap_result.get('success', False)
+                    if ap_result.get('success'):
+                        result['ap_ssid'] = ap_result.get('ssid')
+                        result['ap_password'] = ap_result.get('password')
+                        result['ap_ip'] = ap_result.get('ip')
+                    else:
+                        result['ap_error'] = ap_result.get('error')
                 return jsonify(result)
             except Exception as e:
                 logger.error(f"Error disconnecting WiFi: {e}")
@@ -2278,6 +2503,360 @@ class WebUI:
                 return jsonify(result)
             except Exception as e:
                 logger.error(f"Error with VLM preload setting: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/settings/replacement-modes', methods=['GET', 'POST'])
+        def api_replacement_modes():
+            """Get or set which replacement-mode kinds are enabled.
+
+            GET returns the list; POST takes ``{"modes": ["vocab","photos"]}``
+            and persists it via Minus.set_replacement_modes (which enforces
+            at least one text kind).
+            """
+            try:
+                if request.method == 'GET':
+                    return jsonify({
+                        'replacement_modes': self.minus.get_replacement_modes()
+                    })
+                data = request.get_json() or {}
+                modes = data.get('modes', [])
+                if not isinstance(modes, list):
+                    return jsonify({'success': False, 'error': 'modes must be a list'}), 400
+                return jsonify(self.minus.set_replacement_modes(modes))
+            except Exception as e:
+                logger.error(f"Error with replacement-modes setting: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Photo library (for 'photos' replacement mode)
+        # =========================================================================
+
+        @self.app.route('/api/media/photos', methods=['GET', 'POST'])
+        def api_media_photos():
+            """List photos (GET) or upload a new one (POST multipart).
+
+            POST accepts ``multipart/form-data`` with a single ``file`` field.
+            Server re-encodes to JPEG, caps dimensions/size, and stores under
+            ``~/.minus_media/photos/``. See src/photo_library.py.
+            """
+            from photo_library import get_photo_library
+            lib = get_photo_library()
+            try:
+                if request.method == 'GET':
+                    return jsonify({
+                        'photos': lib.list_photos(),
+                        'total_bytes': lib.total_bytes(),
+                        'count': lib.count(),
+                    })
+                # POST upload
+                if 'file' not in request.files:
+                    return jsonify({'success': False, 'error': 'missing file field'}), 400
+                f = request.files['file']
+                data = f.read()
+                if not data:
+                    return jsonify({'success': False, 'error': 'empty upload'}), 400
+                try:
+                    meta = lib.add_photo(data, original_name=f.filename or 'photo')
+                    return jsonify({'success': True, 'photo': meta})
+                except ValueError as ve:
+                    return jsonify({'success': False, 'error': str(ve)}), 400
+            except Exception as e:
+                logger.error(f"Error in photo library: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/media/photos/<photo_id>', methods=['GET', 'DELETE'])
+        def api_media_photo_detail(photo_id):
+            """Download (GET) or delete (DELETE) one photo by id."""
+            from photo_library import get_photo_library
+            lib = get_photo_library()
+            try:
+                if request.method == 'DELETE':
+                    removed = lib.remove_photo(photo_id)
+                    return jsonify({'success': removed})
+                # GET — return JPEG bytes inline
+                data = lib.get_photo_bytes(photo_id)
+                if data is None:
+                    return jsonify({'error': 'not found'}), 404
+                from flask import Response
+                return Response(data, mimetype='image/jpeg')
+            except Exception as e:
+                logger.error(f"Error in photo detail {photo_id}: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/settings/optimization', methods=['GET', 'POST'])
+        def api_optimization_settings():
+            """Get or set the three optimization toggles.
+
+            Keys: ``block_falloff``, ``hdmi_reconnect_grace``, ``greyscale_preview``.
+            POST body: ``{"key": "block_falloff", "enabled": true}``.
+            """
+            try:
+                if request.method == 'GET':
+                    return jsonify({
+                        'block_falloff': self.minus.block_falloff_enabled,
+                        'hdmi_reconnect_grace': self.minus.hdmi_reconnect_grace_enabled,
+                        'greyscale_preview': self.minus.greyscale_preview_enabled,
+                    })
+
+                data = request.get_json() or {}
+                key = data.get('key')
+                enabled = data.get('enabled')
+                if key is None or enabled is None:
+                    return jsonify({'success': False, 'error': 'key and enabled required'}), 400
+                result = self.minus.set_optimization_setting(key, bool(enabled))
+                if not result.get('success'):
+                    return jsonify(result), 400
+
+                # Greyscale needs to flow to ad_blocker immediately so the
+                # current (and future) blocking uses the new setting.
+                if key == 'greyscale_preview' and self.minus.ad_blocker:
+                    try:
+                        self.minus.ad_blocker.set_preview_grayscale(bool(enabled))
+                    except Exception as e:
+                        logger.warning(f"[WebUI] set_preview_grayscale failed: {e}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"Error with optimization setting: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # IR Transmitter (REI 8K HDMI switch)
+        # =========================================================================
+
+        @self.app.route('/api/ir/status')
+        def api_ir_status():
+            """Status of the IR transmitter feature.
+
+            Returns:
+                enabled: persisted user toggle (UI gate).
+                available: pwm3 hardware visible (overlay loaded).
+                initialized: PWM has been set up and is ready to send.
+                codes: list of valid button names for /api/ir/command.
+            """
+            try:
+                from ir_transmitter import CODES, IRTransmitter
+                tx = self.minus.ir_transmitter
+                return jsonify({
+                    'enabled': bool(self.minus.ir_enabled),
+                    'available': IRTransmitter.hardware_available(),
+                    'initialized': bool(tx and tx.initialized),
+                    'codes': list(CODES.keys()),
+                })
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/status failed: {e}")
+                return jsonify({'enabled': False, 'available': False,
+                                'initialized': False, 'codes': [],
+                                'error': str(e)}), 500
+
+        @self.app.route('/api/ir/enable', methods=['POST'])
+        def api_ir_enable():
+            try:
+                from ir_transmitter import IRTransmitter
+                if not IRTransmitter.hardware_available():
+                    return jsonify({
+                        'success': False,
+                        'error': ('IR hardware not available — enable the '
+                                  'rk3588-pwm3-m1 overlay and reboot.'),
+                    }), 503
+                result = self.minus.set_ir_enabled(True)
+                # Initialize eagerly so the first button press doesn't pay
+                # the export+polarity setup latency.
+                if self.minus.ir_transmitter is not None:
+                    try:
+                        self.minus.ir_transmitter.initialize()
+                    except Exception as e:
+                        logger.warning(f"[WebUI] IR initialize failed: {e}")
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/enable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/ir/disable', methods=['POST'])
+        def api_ir_disable():
+            try:
+                return jsonify(self.minus.set_ir_enabled(False))
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/disable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/ir/command', methods=['POST'])
+        def api_ir_command():
+            """Send an IR button. Body: {"button": "<name>"}.
+
+            Refuses unless ir_enabled is true so the toggle is the single
+            on/off gate the user controls.
+            """
+            try:
+                from ir_transmitter import (
+                    CODES, IRCooldownError, IRTransmitterError,
+                )
+                if not self.minus.ir_enabled:
+                    return jsonify({
+                        'success': False,
+                        'error': 'IR transmitter disabled in settings',
+                    }), 403
+                tx = self.minus.ir_transmitter
+                if tx is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'IR transmitter not loaded',
+                    }), 503
+                data = request.get_json(silent=True) or {}
+                button = data.get('button')
+                if button not in CODES:
+                    return jsonify({
+                        'success': False,
+                        'error': f"unknown button '{button}'",
+                        'codes': list(CODES.keys()),
+                    }), 400
+                try:
+                    tx.send(button)
+                except IRCooldownError as e:
+                    return jsonify({
+                        'success': False,
+                        'error': str(e),
+                        'retry_after': round(e.remaining_s, 2),
+                    }), 429
+                except IRTransmitterError as e:
+                    return jsonify({'success': False, 'error': str(e)}), 503
+                return jsonify({'success': True, 'button': button})
+            except Exception as e:
+                logger.error(f"[WebUI] /api/ir/command failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        # =========================================================================
+        # Status LEDs (WS2812B strip on SPI0 MOSI)
+        # =========================================================================
+
+        @self.app.route('/api/leds/status')
+        def api_leds_status():
+            """Status of the status-LED strip.
+
+            Returns:
+                available: /dev/spidev0.0 visible (SPI overlay loaded).
+                enabled:   persisted user toggle (UI gate).
+                running:   animation thread alive.
+                state:     current animation state name.
+                states:    list of valid state names.
+            """
+            try:
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'available': False,
+                        'enabled': False,
+                        'running': False,
+                        'state': 'off',
+                        'states': [],
+                        'error': 'status LED module not loaded',
+                    }), 503
+                return jsonify(ctrl.status())
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/status failed: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/leds/enable', methods=['POST'])
+        def api_leds_enable():
+            try:
+                from status_led_controller import StatusLEDController
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LED module not loaded',
+                    }), 503
+                if not StatusLEDController.hardware_available():
+                    return jsonify({
+                        'success': False,
+                        'error': ('SPI hardware not available — enable the '
+                                  'rk3588-spi0-m2-cs0-spidev overlay and reboot.'),
+                    }), 503
+                result = ctrl.set_enabled(True)
+                # Pick up the right baseline (no_signal / paused / autonomous
+                # / idle) instead of always starting on idle — matches what
+                # the system would have shown if it hadn't been disabled.
+                if hasattr(self.minus, '_baseline_led_state'):
+                    ctrl.set_state(self.minus._baseline_led_state())
+                else:
+                    ctrl.set_state('idle')
+                return jsonify(result)
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/enable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/leds/disable', methods=['POST'])
+        def api_leds_disable():
+            try:
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LED module not loaded',
+                    }), 503
+                return jsonify(ctrl.set_enabled(False))
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/disable failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/leds/state', methods=['POST'])
+        def api_leds_state():
+            """Set the animation state. Body: {"state": "<name>"}.
+
+            Refuses unless the strip is enabled so the toggle is the single
+            on/off gate the user controls.
+            """
+            try:
+                from status_led_controller import VALID_STATES
+                ctrl = self.minus.status_leds
+                if ctrl is None:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LED module not loaded',
+                    }), 503
+                if not ctrl.enabled:
+                    return jsonify({
+                        'success': False,
+                        'error': 'status LEDs disabled in settings',
+                    }), 403
+                data = request.get_json(silent=True) or {}
+                state = data.get('state')
+                if not ctrl.set_state(state):
+                    return jsonify({
+                        'success': False,
+                        'error': f"unknown state {state!r}",
+                        'states': list(VALID_STATES),
+                    }), 400
+                return jsonify({'success': True, 'state': state})
+            except Exception as e:
+                logger.error(f"[WebUI] /api/leds/state failed: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/leds/require_display', methods=['GET'])
+        def api_leds_require_display_get():
+            """Read the 'only drive LEDs while display is connected' toggle
+            plus a live snapshot of the HDMI-TX state, so the UI can
+            explain why the strip is currently dark."""
+            try:
+                return jsonify({
+                    'leds_require_display':
+                        bool(self.minus.leds_require_display),
+                    'display_connected':
+                        bool(self.minus.is_display_connected_live()),
+                })
+            except Exception as e:
+                logger.error(
+                    f"[WebUI] /api/leds/require_display GET failed: {e}")
+                return jsonify({'error': str(e)}), 500
+
+        @self.app.route('/api/leds/require_display', methods=['POST'])
+        def api_leds_require_display_post():
+            try:
+                data = request.get_json(silent=True) or {}
+                enabled = bool(data.get('enabled', True))
+                return jsonify(self.minus.set_leds_require_display(enabled))
+            except Exception as e:
+                logger.error(
+                    f"[WebUI] /api/leds/require_display POST failed: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================

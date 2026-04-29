@@ -5,6 +5,7 @@ This allows us to actually KILL stuck OCR inference instead of just timing out.
 """
 
 import os
+import re
 import sys
 import time
 import multiprocessing as mp
@@ -314,8 +315,6 @@ class OCRProcess:
         Returns:
             Tuple of (found_ad, matched_keywords, all_texts, is_terminal)
         """
-        import re
-
         # Ad keyword lists (from PaddleOCR)
         AD_KEYWORDS_EXACT = [
             'skip ad', 'skip ads', 'skip in', 'video will play after ad',
@@ -327,6 +326,7 @@ class OCRProcess:
             'download now', 'install now', 'get the app', 'free download',
             'limited time', 'offer ends', 'dont miss', "don't miss",
             'buy now', 'order now', 'sign up', 'subscribe now',
+            'visit advertiser', 'visitadvertiser',  # YouTube pre-roll CTA
         ]
         AD_KEYWORDS_WORD = [
             'ad', 'ads',
@@ -338,6 +338,9 @@ class OCRProcess:
             # Minus overlay messages (Fire TV notifications)
             'ad skipping enabled', 'ad skipping', 'adskipping',
         ]
+        # Fuzzy "Skip Intro" — OCR often swaps 'i' with '1'/'l'/'I'. Covers
+        # "Skip Intro", "Sk1p Intro", "Skip 1ntro", "Sk1p 1ntro", "Sk1p1ntro".
+        SKIP_INTRO_FUZZY_RE = re.compile(r's[kK][i1lI]p\s*[i1lI]ntro', re.IGNORECASE)
         TERMINAL_PATTERNS = [
             r'^\$\s*',
             r'^>\s*',
@@ -356,6 +359,16 @@ class OCRProcess:
             text_lower = text.lower()
             text_clean = ''.join(c for c in text_lower if c.isalnum())
 
+            # Exclusion gate FIRST — prevents e.g. "skip in" (AD_KEYWORDS_EXACT
+            # substring) from matching "Skip Intro" before we can exclude it.
+            is_excluded = (
+                any(excl in text_lower or excl.replace(' ', '') in text_clean
+                    for excl in AD_EXCLUSIONS)
+                or SKIP_INTRO_FUZZY_RE.search(text_lower) is not None
+            )
+            if is_excluded:
+                continue
+
             # Check exact phrase keywords
             for keyword in AD_KEYWORDS_EXACT:
                 keyword_clean = ''.join(c for c in keyword if c.isalnum())
@@ -364,15 +377,11 @@ class OCRProcess:
                     break
 
             # Check word-boundary keywords
-            is_excluded = any(excl in text_lower or excl.replace(' ', '') in text_clean
-                              for excl in AD_EXCLUSIONS)
-
-            if not is_excluded:
-                for keyword in AD_KEYWORDS_WORD:
-                    pattern = r'\b' + re.escape(keyword) + r'\b'
-                    if re.search(pattern, text_lower):
-                        matched.append((keyword, text))
-                        break
+            for keyword in AD_KEYWORDS_WORD:
+                pattern = r'\b' + re.escape(keyword) + r'\b'
+                if re.search(pattern, text_lower):
+                    matched.append((keyword, text))
+                    break
 
             # Fuzzy matches for common OCR misreads
             if 'skipad' in text_clean or 'skipads' in text_clean:
@@ -390,17 +399,26 @@ class OCRProcess:
             if re.search(r'^ad\s*\d+$', text_lower.strip()):
                 matched.append(('ad countdown', text))
 
-            # "Ad | 0:30" timestamp pattern
-            if re.search(r'\bad\b', text_lower) and re.search(r'\d:\d{2}', text):
+            # "Ad | 0:30" timestamp pattern. Accept 'o' misreads for 0 in both
+            # minute and seconds positions (e.g. "Ado:o5").
+            if re.search(r'\bad\b', text_lower) and re.search(r'[0-9o]:[0-9o]{2}', text_lower):
                 matched.append(('ad with timestamp', text))
 
         # Cross-element check
         if not matched and len(all_texts) <= 5:
             combined = ' '.join(all_texts).lower()
-            has_ad_word = re.search(r'\bad\b', combined)
-            has_timestamp = re.search(r'\d:\d{2}', ' '.join(all_texts))
-            if has_ad_word and has_timestamp:
-                matched.append(('ad with timestamp (cross-element)', combined[:50]))
+            # Apply the same exclusions to combined text
+            combined_clean = ''.join(c for c in combined if c.isalnum())
+            is_combined_excluded = (
+                any(excl in combined or excl.replace(' ', '') in combined_clean
+                    for excl in AD_EXCLUSIONS)
+                or SKIP_INTRO_FUZZY_RE.search(combined) is not None
+            )
+            if not is_combined_excluded:
+                has_ad_word = re.search(r'\bad\b', combined)
+                has_timestamp = re.search(r'[0-9o]:[0-9o]{2}', combined)
+                if has_ad_word and has_timestamp:
+                    matched.append(('ad with timestamp (cross-element)', combined[:50]))
 
         # Check for terminal content
         is_terminal = False

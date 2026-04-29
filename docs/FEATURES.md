@@ -26,15 +26,34 @@ Minus is an HDMI passthrough device that detects and blocks advertisements in re
 **When ads are detected:**
 - Full-screen blocking overlay at 60fps
 - Pixelated background from pre-ad content (optional)
-- Live preview window showing blocked content
+- Live preview window showing blocked content — **desaturated** (greyscale chroma) by default so the Spanish overlay is more eye-catching than the ad
 - Spanish vocabulary practice during blocks
 - Debug dashboard with stats
 
 **Overlay Features:**
 - Smooth animations (0.3s start, 0.25s end)
-- Multi-color text rendering via FreeType
+- Multi-color text rendering via FreeType — Spanish word cycles through a 10-color YUV palette (purple / magenta / cyan / lime / amber / pink / mint / sky / coral / teal) each rotation so the overlay doesn't feel static
 - Hardware-accelerated compositing in ustreamer MPP encoder
-- Configurable preview window and debug overlay
+- Configurable preview window, debug overlay, and greyscale-preview flag (all toggleable in the web UI Settings tab)
+
+**Block-duration falloff:**
+Minimum block time starts at 3.0s for the first ad in a sequence and shrinks by 0.5s on each consecutive ad (3.0 → 2.5 → 2.0 → 1.5 → 1.0s). Floor is 1.5s when OCR+VLM both agree, 1.0s when OCR is alone. Counter resets after 30s without a block. The goal: unblock as soon as the ad actually ends instead of holding a fixed 3-4s every time. Can be disabled from Settings → Blocking Optimizations.
+
+**HDMI reconnect grace period:**
+For 90 seconds after the TV reconnects (detected by the health monitor), ad blocking is suppressed so the user can navigate menus without overlays jumping in. Toggleable from Settings → Blocking Optimizations.
+
+**Replacement modes (Settings → Replace):**
+The blocking overlay rolls a single *replacement mode* at the start of each ad break and sticks with it for the whole break (plus a 30-second cooldown so back-to-back ads reuse the same style). Available kinds:
+- **Vocabulary** — Spanish words with 1-2 example sentences (default)
+- **Did You Know?** — short trivia cards (`src/facts.py`)
+- **Haikus** — classical + modern short poems (`src/haiku.py`)
+- **Photo Screensaver** — cycles user-uploaded photos as the blocking background every 5 seconds. Photos are uploaded via the web UI Settings → Replace tab, stored under `~/.minus_media/photos/` (re-encoded to 1920px max, JPEG quality 85, capped at 200 photos / 200 MB).
+
+The overlay also gets:
+- **Pixelated pre-ad background** — heavy pixelation + 60% darken of the screen as it looked ~6s before the ad. Gives context without competing for attention. Falls back to a dark radial gradient when the snapshot buffer is empty (e.g. within the first seconds after a restart).
+- **Ad countdown bar** — when OCR reads "Ad 0:30" or "Ad 10", a `[###...] 12s` bar drains in real time so the user sees how long is left.
+- **Audio-reactive visualizer** — a short ASCII ramp bar (`' .,-;+ox*#@'`) driven by RMS of the alsasrc capture in `src/audio.py`. Bounded 16-sample deque — no memory growth over a 24h run.
+- **Rotating Spanish word color** — 10-color YUV palette cycled per rotation.
 
 ### Audio Passthrough
 
