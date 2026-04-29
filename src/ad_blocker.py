@@ -115,6 +115,11 @@ class DRMAdBlocker:
         self._total_blocking_time = 0.0
         self._current_block_start = None
         self._total_ads_blocked = 0
+        # Top-right OCR trigger snippet, e.g. `(Ad) 0:30 left`. Populated when
+        # OCR fires the block; rendered only while debug overlay is enabled.
+        # Skipped/cleared for VLM-only blocks. OCR reads /snapshot/raw which
+        # excludes the blocking composite, so this can't recurse.
+        self._ocr_trigger_text = ""
 
         # Preview settings - use actual capture resolution for positioning
         self._preview_enabled = True
@@ -1252,18 +1257,67 @@ class DRMAdBlocker:
         spanish, pronunciation, english = vocab[0], vocab[1], vocab[2]
         examples = [ex for ex in vocab[3:] if ex]
         example_block = "\n".join(f'"{ex}"' for ex in examples)
-        return f"{header}\n\n{spanish}\n({pronunciation})\n\n= {english}\n\n{example_block}"
+        prefix = f"{header}\n\n" if header else ""
+        return f"{prefix}{spanish}\n({pronunciation})\n\n= {english}\n\n{example_block}"
 
     def _render_fact(self, header):
         title, body = random.choice(DID_YOU_KNOW)
-        return f"{header}\n\nDID YOU KNOW?\n{title}\n\n{body}"
+        prefix = f"{header}\n\n" if header else ""
+        return f"{prefix}DID YOU KNOW?\n{title}\n\n{body}"
+
+    def _format_ocr_trigger(self, raw, source):
+        """Build the top-right OCR snippet, ~50 chars max, parens around match.
+
+        ``raw`` is either a (matched_keyword, snippet_text) tuple, an already-
+        formatted string, or empty. We wrap the matched substring in parens
+        within the snippet, e.g. ``(Ad) 0:30 left``. For VLM-only blocks or
+        if no trigger is provided, returns ''.
+        """
+        if not raw or source == 'vlm':
+            return ""
+        try:
+            if isinstance(raw, tuple) and len(raw) == 2:
+                keyword, snippet = raw
+                snippet = (snippet or '').strip()
+                keyword = (keyword or '').strip()
+                if keyword and snippet:
+                    idx = snippet.lower().find(keyword.lower())
+                    if idx >= 0:
+                        marked = (
+                            snippet[:idx]
+                            + '(' + snippet[idx:idx + len(keyword)] + ')'
+                            + snippet[idx + len(keyword):]
+                        )
+                    else:
+                        marked = f"({keyword}) {snippet}"
+                else:
+                    marked = snippet or f"({keyword})"
+            else:
+                marked = str(raw).strip()
+        except Exception:
+            return ""
+        marked = ' '.join(marked.split())  # collapse whitespace + newlines
+        if len(marked) > 50:
+            marked = marked[:47] + '...'
+        return marked
+
+    def _render_ocr_text(self):
+        """Return the snippet string ustreamer should render in the top-right.
+
+        Empty when debug overlay is off (so the C side draws nothing).
+        """
+        if not self._debug_overlay_enabled:
+            return ""
+        return self._ocr_trigger_text or ""
 
     def _get_blocking_text(self, source='default'):
         if source == 'hdmi_lost':
             return "[ NO SIGNAL ]\n\nHDMI DISCONNECTED\n\nWaiting for signal..."
         if source == 'no_hdmi_device':
             return "[ NO SIGNAL ]\n\nWAITING FOR HDMI..."
-        if source == 'ocr':
+        if not self._debug_overlay_enabled:
+            header = ""
+        elif source == 'ocr':
             header = "[ BLOCKING // OCR ]"
         elif source == 'vlm':
             header = "[ BLOCKING // VLM ]"
@@ -1367,6 +1421,7 @@ class DRMAdBlocker:
             preview_state = {
                 'preview_enabled': 'true' if self._preview_enabled else 'false',
                 'preview_grayscale': 'true' if self._preview_grayscale else 'false',
+                'text_ocr': self._render_ocr_text(),
             }
             if kind == 'photos':
                 # Photo-cycling replacement mode: swap the background image
@@ -1713,12 +1768,30 @@ class DRMAdBlocker:
         self._debug_overlay_enabled = enabled
         logger.info(f"[DRMAdBlocker] Debug overlay {'enabled' if enabled else 'disabled'}")
         if self.is_visible:
+            # Re-render the vocab so the [BLOCKING // ...] header appears or
+            # disappears immediately, plus push the top-right OCR text in
+            # whichever direction (filled when on, empty when off).
+            self._blocking_api_call('/blocking/set', {
+                'text_vocab': self._get_blocking_text(self.current_source or 'default'),
+                'text_ocr': self._render_ocr_text(),
+            })
             if enabled:
                 if not self._debug_thread or not self._debug_thread.is_alive():
                     self._start_debug()
             else:
                 self._stop_debug_thread()
                 self._blocking_api_call('/blocking/set', {'text_stats': ''})
+
+    def set_ocr_trigger_text(self, raw, source=None):
+        """Update the top-right OCR snippet during an active block.
+
+        Called when OCR re-fires while a block is already up, e.g. countdown
+        ticking from "Ad 0:30" -> "Ad 0:15". Cheap (one /blocking/set).
+        """
+        eff_source = source if source is not None else (self.current_source or 'default')
+        self._ocr_trigger_text = self._format_ocr_trigger(raw, eff_source)
+        if self.is_visible:
+            self._blocking_api_call('/blocking/set', {'text_ocr': self._render_ocr_text()})
 
     def is_pixelated_background_enabled(self):
         return self._pixelated_background_enabled
@@ -1766,23 +1839,41 @@ class DRMAdBlocker:
     def is_test_mode_active(self) -> bool:
         return self._test_blocking_until > time.time()
 
-    def show(self, source='default'):
+    def show(self, source='default', ocr_trigger_text=''):
         with self._lock:
             # Note: We still enable ustreamer blocking even without display pipeline
             # because blocking overlay works via ustreamer (for web stream) independently
             # of GStreamer display pipeline (for TV output via DRM)
 
+            # Update the snippet only if the caller gave us something fresh, OR if
+            # this is now a VLM-only block (which has no OCR snippet). Otherwise
+            # keep whatever set the block — OCR text often disappears mid-block as
+            # the timer ticks past the model's confidence cutoff and we don't want
+            # the top-right slot to flicker on/off.
+            new_snippet = self._format_ocr_trigger(ocr_trigger_text, source)
+            if new_snippet or source == 'vlm':
+                self._ocr_trigger_text = new_snippet
+
             if self.is_visible and self._animation_direction != 'end':
                 if self.current_source != source:
                     self.current_source = source
                     # Update overlay text to reflect new source (e.g., OCR -> OCR+VLM)
-                    self._blocking_api_call('/blocking/set', {'text_vocab': self._get_blocking_text(source)})
+                    self._blocking_api_call('/blocking/set', {
+                        'text_vocab': self._get_blocking_text(source),
+                        'text_ocr': self._render_ocr_text(),
+                    })
+                else:
+                    # Same source, fresh trigger snippet — push only the OCR text.
+                    self._blocking_api_call('/blocking/set', {'text_ocr': self._render_ocr_text()})
                 return
 
             if self._animating and self._animation_direction == 'start':
                 if self.current_source != source:
                     self.current_source = source
-                    self._blocking_api_call('/blocking/set', {'text_vocab': self._get_blocking_text(source)})
+                    self._blocking_api_call('/blocking/set', {
+                        'text_vocab': self._get_blocking_text(source),
+                        'text_ocr': self._render_ocr_text(),
+                    })
                 return
 
             if self._animating and self._animation_direction == 'end':
@@ -1816,7 +1907,7 @@ class DRMAdBlocker:
                 'preview_w': str(self._frame_width), 'preview_h': str(self._frame_height),
                 'preview_enabled': 'true' if self._preview_enabled else 'false',
                 'preview_grayscale': 'true' if self._preview_grayscale else 'false',
-                'text_vocab': '', 'text_stats': '',
+                'text_vocab': '', 'text_stats': '', 'text_ocr': self._render_ocr_text(),
                 'text_vocab_scale': str(vocab_scale),
                 'text_stats_scale': str(stats_scale),
                 'box_alpha': str(self._box_alpha),

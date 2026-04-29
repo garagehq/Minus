@@ -247,10 +247,9 @@ class WebUI:
 
         @self.app.route('/api/debug-overlay/enable', methods=['POST'])
         def api_debug_overlay_enable():
-            """Enable the debug overlay."""
+            """Enable the debug overlay (persisted)."""
             try:
-                if self.minus.ad_blocker:
-                    self.minus.ad_blocker.set_debug_overlay_enabled(True)
+                self.minus.set_debug_overlay_enabled(True)
                 return jsonify({'success': True, 'debug_overlay_enabled': True})
             except Exception as e:
                 logger.error(f"Error enabling debug overlay: {e}")
@@ -258,10 +257,9 @@ class WebUI:
 
         @self.app.route('/api/debug-overlay/disable', methods=['POST'])
         def api_debug_overlay_disable():
-            """Disable the debug overlay."""
+            """Disable the debug overlay (persisted)."""
             try:
-                if self.minus.ad_blocker:
-                    self.minus.ad_blocker.set_debug_overlay_enabled(False)
+                self.minus.set_debug_overlay_enabled(False)
                 return jsonify({'success': True, 'debug_overlay_enabled': False})
             except Exception as e:
                 logger.error(f"Error disabling debug overlay: {e}")
@@ -391,8 +389,14 @@ class WebUI:
                             time.time() + duration + 60
                         )
 
-                    # Show blocking overlay
-                    self.minus.ad_blocker.show(source)
+                    # Show blocking overlay. For OCR-shaped sources, inject a
+                    # synthetic trigger snippet so the top-right "(Ad) 0:30 left"
+                    # hint actually renders during a test-fired block (real
+                    # detection would supply this from check_ad_keywords).
+                    fake_trigger = ''
+                    if source in ('ocr', 'both'):
+                        fake_trigger = ('Ad', 'Ad 0:30 left')
+                    self.minus.ad_blocker.show(source, ocr_trigger_text=fake_trigger)
 
                     # Schedule auto-hide after duration
                     def auto_hide():

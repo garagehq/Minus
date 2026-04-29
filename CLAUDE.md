@@ -433,12 +433,13 @@ Streaming UIs render a `Skip Intro` button that OCR sometimes reads as `Sk1p Int
 
 When ads are detected, the screen shows a full blocking overlay **rendered at 60fps via ustreamer's native MPP blocking mode**:
 - **Pixelated Background**: Blurred/pixelated version of the screen from ~6 seconds before the ad
-- **Header**: `BLOCKING (OCR)`, `BLOCKING (VLM)`, or `BLOCKING (OCR+VLM)`
+- **Header** (debug only): `[ BLOCKING // OCR ]`, `[ BLOCKING // VLM ]`, or `[ BLOCKING // OCR+VLM ]`
 - **Spanish vocabulary**: Random intermediate-level word with translation
 - **Example sentence**: Shows the word in context
 - **Rotation**: New vocabulary every 11-15 seconds
 - **Ad Preview Window**: Live preview of the blocked ad in bottom-right corner (60fps!)
-- **Debug Dashboard**: Stats overlay in bottom-left corner
+- **Debug stats** (debug only): bottom-left dashboard with uptime, blocks, time saved, ad countdown bar, audio level
+- **OCR trigger snippet** (debug only): top-right `(Ad) 0:30 left` style — the OCR text that fired the block, with the matched keyword wrapped in parens. Empty for VLM-only blocks. Capped at 50 chars.
 
 **Multi-color Text Per Line:**
 - **Purple** - Spanish word (IBM Plex Mono Bold font)
@@ -474,7 +475,9 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 - Hardware-accelerated scaling in the MPP encoder
 - Automatic resolution handling (works at 1080p, 2K, 4K)
 
-**Web UI Toggles:** Ad Preview Window and Debug Dashboard toggleable via Settings (both default ON)
+**Web UI Toggles:** *Ad Preview Window* and *Debug* toggleable via Settings (both default ON). The unified *Debug* toggle controls all three on-screen debug elements together — header, bottom-left stats dashboard, and top-right OCR trigger snippet — and is persisted to `~/.minus_system_settings.json` (`debug_overlay`) so off survives a service restart.
+
+**Recursion safety for the OCR snippet:** OCR consumes `/snapshot/raw` (`src/capture.py:134`), which the patched ustreamer serves from `us_blocking_store_raw_frame()` *before* the blocking composite is applied. The new top-right text — and every other element on the blocking overlay — is therefore invisible to OCR, so the displayed `(Ad) 0:30 left` cannot loop back into detection. Don't break this: if you ever route OCR through `/snapshot` (the composited path), all of these debug texts will become self-triggering.
 
 ## Spanish Vocabulary
 
@@ -696,7 +699,7 @@ curl "http://localhost:9090/overlay/set?clear=true"
 
 **Blocking Mode Endpoints:**
 - `GET /blocking` - Get current config (enabled, preview, colors, etc.)
-- `GET /blocking/set?enabled=true&text_vocab=...&preview_enabled=true&preview_grayscale=true&word_y=140&word_u=175&word_v=145` - Configure (includes `preview_grayscale` flag to desaturate the corner preview, plus `word_y/word_u/word_v` for cycling the Spanish word color per rotation)
+- `GET /blocking/set?enabled=true&text_vocab=...&text_ocr=...&preview_enabled=true&preview_grayscale=true&word_y=140&word_u=175&word_v=145` - Configure. Includes `preview_grayscale` to desaturate the corner preview, `word_y/word_u/word_v` for cycling the Spanish word color per rotation, and `text_ocr` for the top-right OCR-trigger snippet (renders in IBM Plex Mono Regular at the same scale as `text_stats`; empty string clears it).
 - `POST /blocking/background` - Upload pixelated NV12 background (width*height*1.5 bytes)
 
 **Multi-color text auto-detection:** Lines starting with `[` → white (header), `(` → gray (pronunciation), `=` → white (translation), `"` → gray (example), other → purple (Spanish word)
@@ -803,7 +806,7 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 **Key API Routes:**
 - `GET /`, `/api/status`, `/api/detections`, `/api/logs`
 - `POST /api/pause/N`, `/api/resume`
-- `GET/POST /api/preview/*`, `/api/debug-overlay/*`
+- `GET/POST /api/preview/*`, `/api/debug-overlay/*` (the debug-overlay route is the unified *Debug* toggle: header + bottom-left stats + top-right OCR snippet, persisted to `~/.minus_system_settings.json` as `debug_overlay`)
 - `POST /api/test/trigger-block`, `/api/test/stop-block`
 - `GET /stream`, `/snapshot` - Proxy to ustreamer
 - `GET /api/health` - Health check for uptime monitors
@@ -848,8 +851,9 @@ curl -X POST http://localhost:80/api/test/stop-block
 Parameters for trigger-block:
 - `duration`: seconds to block (default: 10, max: 60)
 - `source`: detection source - 'ocr', 'vlm', 'both', or 'default'
+- `kind`: optional forced replacement kind - 'vocab', 'fact', or 'photos'
 
-Test mode prevents the detection loop from canceling the blocking, allowing full testing of pixelated background, animations, and audio muting.
+Test mode prevents the detection loop from canceling the blocking, allowing full testing of pixelated background, animations, and audio muting. When `source` is `ocr` or `both`, the endpoint also injects a synthetic `(Ad) 0:30 left` snippet into the top-right OCR-trigger slot so you can exercise that rendering path without waiting for real OCR.
 
 **Access URLs:**
 - Local: `http://localhost:80`
@@ -1922,3 +1926,26 @@ The user only saw symptom 3 in the worst form (the phantom re-block), but sympto
 - `src/config.py` — `scene_change_threshold = 0.001` + measurement-derived comment, `dynamic_cooldown = 1.5` (already changed in the cooldown-fix commit earlier this session)
 - `tests/block_latency_harness.py` — new ~700-line headless harness (BBB source, OCR/VLM workers, decision-engine mirror, 7 rounds of scenarios)
 - `tests/test_block_decision_engine.py` — new 11 unit tests
+
+### Unified Debug Toggle + Top-Right OCR Snippet (Added - Apr 2026)
+
+The blocking overlay grew a third debug element: a top-right `(Ad) 0:30 left` snippet showing the OCR text that triggered the block, with the matched keyword wrapped in parens. The existing *Debug Dashboard* settings toggle was unified into a single *Debug* toggle that gates three things together: the `[ BLOCKING // ... ]` header (top), the bottom-left stats dashboard, and this new top-right OCR snippet.
+
+**Persistence:** the toggle is a system setting (`debug_overlay`, default `True`) in `~/.minus_system_settings.json`. Pushed into `ad_blocker.set_debug_overlay_enabled()` at startup so off survives a service restart.
+
+**Recursion concern (resolved by existing architecture):** the natural worry is that putting the OCR trigger text back on screen would make OCR keep seeing "Ad" forever. That cannot happen because OCR consumes `/snapshot/raw` (`src/capture.py:134`), which the patched ustreamer serves from `us_blocking_store_raw_frame()` *before* the blocking composite runs (`ustreamer-garagehq/src/ustreamer/http/server.c:1026`). The new top-right text — and every other element on the blocking overlay — is therefore invisible to OCR. **Do not change OCR to read `/snapshot` (the composited path)** without first stripping the debug texts; otherwise the displayed snippet becomes self-triggering. The `Minus Overlay Text Triggering False Positive Ad Detection` fix in this same Known Issues list is the cautionary tale — the *notification* overlay (`/overlay`, distinct from `/blocking`) DOES composite before the snapshot and required keyword exclusions to suppress recursion.
+
+**ustreamer C-side change:** added a third text region. Files in `ustreamer-garagehq`:
+- `src/libs/blocking.h` — `text_ocr` field on `us_blocking_config_s`, `US_BLOCKING_TEXT_OCR_SIZE = 256`, declaration of `us_blocking_set_text_ocr()`
+- `src/libs/blocking.c` — setter, clear/snapshot/composite all extended; render block draws at `text_x = dst_width - text_w - 30, text_y = 30` using the same IBM Plex Mono Regular face as `text_stats`. Reuses the existing `_ft_mutex` since FreeType is not thread-safe across the 4 MPP workers.
+- `src/ustreamer/http/server.c` — `text_ocr` URL param parsing in `_http_callback_blocking_set`. `text_stats_scale` is reused for the OCR text size (no separate scale param needed).
+
+**Python wiring:**
+- `src/ad_blocker.py` — `_ocr_trigger_text` instance, `_format_ocr_trigger(raw, source)` builds the `(Ad) 0:30 left` snippet (paren-wraps the matched keyword inside the OCR text snippet, ASCII-collapsed, ≤50 chars), `_render_ocr_text()` returns empty when debug is off so the C side draws nothing. `show(source, ocr_trigger_text="")` accepts the trigger payload from minus; only overwrites the stored snippet when given a non-empty value (or when transitioning to vlm-only) so the top-right does not flicker as OCR text comes and goes during a block. `set_debug_overlay_enabled()` re-renders `text_vocab` (to add/strip the header) and pushes `text_ocr` in the right direction without waiting for the next rotation.
+- `minus.py` — stashes `last_matched_keywords` in the OCR loop, helper `_first_match_for_overlay()` returns `(keyword, snippet_text)` for the most recent match. `_load_system_settings` adds `debug_overlay: True` default + `set_debug_overlay_enabled(enabled)` persists and propagates. Cleared in the block-end branch so the next block starts fresh.
+- `src/webui.py` — `/api/debug-overlay/{enable,disable}` route through `minus.set_debug_overlay_enabled()` for persistence. The `POST /api/test/trigger-block` endpoint injects a synthetic `("Ad", "Ad 0:30 left")` snippet when `source` is `ocr`/`both` so the top-right slot can be exercised without real ads.
+- `src/templates/index.html` — toggle relabeled "Debug Dashboard" → "Debug" with a tooltip listing what it controls.
+
+**Files modified:**
+- `ustreamer-garagehq/src/libs/blocking.{h,c}`, `src/ustreamer/http/server.c` — new `text_ocr` API + top-right render
+- `minus.py`, `src/ad_blocker.py`, `src/webui.py`, `src/templates/index.html`

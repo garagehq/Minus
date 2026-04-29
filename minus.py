@@ -381,6 +381,10 @@ class Minus:
         }
 
         self.last_ocr_texts = []            # Last OCR detected texts
+        # Most recent OCR matched keywords (list of (keyword, snippet) tuples).
+        # Picked up by ad_blocker.show() to render a "(Ad) 0:30 left" hint in
+        # the top-right of the blocking overlay when debug mode is on.
+        self.last_matched_keywords = []
         self.home_screen_detected = False   # True if home screen keywords found
         self.home_screen_detect_time = 0    # When home screen was last detected
         self.video_interface_detected = False  # True if video player interface detected
@@ -582,6 +586,9 @@ class Minus:
                 # Apply persisted greyscale-preview setting from disk
                 if hasattr(self.ad_blocker, 'set_preview_grayscale'):
                     self.ad_blocker.set_preview_grayscale(self.greyscale_preview_enabled)
+                # Apply persisted debug-overlay setting from disk
+                if hasattr(self.ad_blocker, 'set_debug_overlay_enabled'):
+                    self.ad_blocker.set_debug_overlay_enabled(self.debug_overlay_enabled)
                 logger.info("AdBlocker initialized (instant input-selector switching)")
             except Exception as e:
                 logger.exception(f"AdBlocker init failed: {e}")
@@ -1861,6 +1868,7 @@ class Minus:
             'block_falloff': True,        # Shorten min-block duration on consecutive ads
             'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
             'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
+            'debug_overlay': True,        # Show BLOCKING header + bottom-left stats + top-right OCR snippet
             'ir_enabled': False,          # Show REI HDMI-switch IR remote in autonomous mode
             'leds_require_display': True, # Only drive the WS2812B strip when HDMI-TX is connected
                                           # (so a powered-off TV in a dark room stays dark)
@@ -1932,6 +1940,25 @@ class Minus:
     def greyscale_preview_enabled(self) -> bool:
         """Whether the ad preview window is desaturated in blocking mode."""
         return self._system_settings.get('greyscale_preview', True)
+
+    @property
+    def debug_overlay_enabled(self) -> bool:
+        """Whether the blocking overlay shows debug info (header, stats, OCR snippet)."""
+        return self._system_settings.get('debug_overlay', True)
+
+    def set_debug_overlay_enabled(self, enabled: bool) -> dict:
+        """Toggle the unified debug-overlay flag and persist it.
+
+        Controls three on-screen elements together: the [BLOCKING // ...]
+        header, the bottom-left stats dashboard, and the top-right OCR
+        trigger snippet. Off hides all three.
+        """
+        enabled = bool(enabled)
+        self._system_settings['debug_overlay'] = enabled
+        self._save_system_settings()
+        if self.ad_blocker:
+            self.ad_blocker.set_debug_overlay_enabled(enabled)
+        return {'success': True, 'debug_overlay': enabled}
 
     @property
     def ir_enabled(self) -> bool:
@@ -2056,6 +2083,21 @@ class Minus:
                 self.system_notification.show_vlm_failed()
 
         return vlm_loaded
+
+    def _first_match_for_overlay(self):
+        """Return ``(keyword, snippet)`` for the most recent OCR match, or ''.
+
+        Picked up by the blocking overlay's top-right "(Ad) 0:30 left" hint.
+        Returns '' for VLM-only blocks or if OCR hasn't matched yet — the
+        ad_blocker preserves any prior snippet across empty values.
+        """
+        if not self.last_matched_keywords:
+            return ''
+        try:
+            kw, snippet = self.last_matched_keywords[0]
+            return (kw, snippet)
+        except (TypeError, ValueError):
+            return ''
 
     def _hdmi_audio_present(self) -> bool:
         """Check if HDMI-IN is currently receiving audio from the source device.
@@ -2454,6 +2496,10 @@ class Minus:
                     self.ad_detected = False
                     source_was = self.blocking_source
                     self.blocking_source = None
+                    # Clear the OCR snippet so the next block starts fresh
+                    # (otherwise the prior ad's "(Ad) 0:30" would render briefly
+                    # on the next OCR trigger before fresh OCR data arrives).
+                    self.last_matched_keywords = []
                     # Also clear VLM state so it doesn't immediately re-trigger
                     self.vlm_ad_detected = False
                     self.vlm_decision_history.clear()
@@ -2479,7 +2525,10 @@ class Minus:
 
             if self.ad_blocker:
                 if should_show_blocking:
-                    self.ad_blocker.show(self.blocking_source)
+                    self.ad_blocker.show(
+                        self.blocking_source,
+                        ocr_trigger_text=self._first_match_for_overlay(),
+                    )
                 else:
                     self.ad_blocker.hide()
 
@@ -2653,6 +2702,8 @@ class Minus:
 
                 # Store OCR texts and check for home screen / video interface keywords
                 self.last_ocr_texts = all_texts
+                if matched_keywords:
+                    self.last_matched_keywords = matched_keywords
                 if all_texts:
                     combined_text = ' '.join(all_texts).lower()
 
