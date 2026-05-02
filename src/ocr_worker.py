@@ -399,9 +399,21 @@ class OCRProcess:
             if re.search(r'^ad\s*\d+$', text_lower.strip()):
                 matched.append(('ad countdown', text))
 
-            # "Ad | 0:30" timestamp pattern. Accept 'o' misreads for 0 in both
-            # minute and seconds positions (e.g. "Ado:o5").
-            if re.search(r'\bad\b', text_lower) and re.search(r'[0-9o]:[0-9o]{2}', text_lower):
+            # "Ad | 0:30", "Ad0:30", "Ad1:09" timestamp pattern. Accept the
+            # following common OCR misreads:
+            #   0 ↔ o ↔ O   (zero vs letter o)
+            #   1 ↔ l ↔ I ↔ i  (one vs lowercase L vs uppercase i)
+            #   : ↔ ; ↔ .   (colon misreads)
+            # Two ways "ad" can appear: at a word boundary ("Ad 0:30") OR
+            # immediately followed by a digit-like char + separator
+            # ("Ad1:09"). The latter is critical — when OCR drops the space
+            # between "Ad" and the timer, \bad\b fails because the digit is a
+            # word character, and we'd lose the entire ad-timestamp signal.
+            # Mirrors src/ocr.py:595 — keep these in sync.
+            has_ad = (re.search(r'\bad\b', text_lower)
+                      or re.search(r'ad[0-9oOlIi][:;.]', text_lower))
+            has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', text_lower)
+            if has_ad and has_timestamp:
                 matched.append(('ad with timestamp', text))
 
         # Cross-element check
@@ -415,8 +427,10 @@ class OCRProcess:
                 or SKIP_INTRO_FUZZY_RE.search(combined) is not None
             )
             if not is_combined_excluded:
-                has_ad_word = re.search(r'\bad\b', combined)
-                has_timestamp = re.search(r'[0-9o]:[0-9o]{2}', combined)
+                # Mirrors src/ocr.py:612 — keep in sync.
+                has_ad_word = (re.search(r'\bad\b', combined)
+                               or re.search(r'ad[0-9oOlIi][:;.]', combined))
+                has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', combined)
                 if has_ad_word and has_timestamp:
                     matched.append(('ad with timestamp (cross-element)', combined[:50]))
 

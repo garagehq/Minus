@@ -420,6 +420,8 @@ Combined misreads are also handled (e.g., "Adl;lo" for "Ad1:10"). The timestamp 
 - One misreads: `Adl:30`, `Ad1:l5`, `Adl:lo`
 - Separator misreads: `Ad0;30`, `Ad0.30`, `Ado;3o`
 
+The pattern lives in **two places** that must stay in sync: `src/ocr.py:595` (PaddleOCR class) and `src/ocr_worker.py:404` (OCRProcess, which is what production actually calls — `self.ocr = OCRProcess()` in `minus.py:563`). Each side carries a `Mirrors src/ocr.py:NNN — keep in sync` / vice-versa comment. The deeper fix is to delete the duplicate in `ocr_worker.py` and have it call `PaddleOCR.check_ad_keywords` directly; until then, any change to one file's pattern must be mirrored to the other. See *OCR Worker Keyword-Pattern Drift* under Known Issues for the past failure mode.
+
 **Ad-keyword policy:**
 - Bare `Ad` / `Ads` at a word boundary triggers blocking. Past false positives from words like `Loading`, `reading`, `Adobe` are handled via the word-boundary regex (`\bad\b` / `\bads\b`) and the `AD_EXCLUSIONS` list — bare `Ad` inside a longer word will not match.
 - `Visit advertiser` (YouTube pre-roll CTA) is treated as an exact ad keyword.
@@ -1926,6 +1928,55 @@ The user only saw symptom 3 in the worst form (the phantom re-block), but sympto
 - `src/config.py` — `scene_change_threshold = 0.001` + measurement-derived comment, `dynamic_cooldown = 1.5` (already changed in the cooldown-fix commit earlier this session)
 - `tests/block_latency_harness.py` — new ~700-line headless harness (BBB source, OCR/VLM workers, decision-engine mirror, 7 rounds of scenarios)
 - `tests/test_block_decision_engine.py` — new 11 unit tests
+
+### OCR Worker Keyword-Pattern Drift (Fixed - May 2026)
+
+**Symptom:** During real ad breaks, blocking flapped on/off every 5–15 seconds even though OCR was reading the ad timer cleanly every frame. Logs showed sequences like:
+
+```
+00:29:00 [BLOCKING OCR] - Ad 1:11        ← match (boundary)
+00:29:01 [BLOCKING OCR] - RATED TV-MA    ← no_ad #1
+00:29:03 OCR #62188            - Ad1:09   ← no_ad #2 — silently!
+00:29:03 OCR: ad no longer detected (after 2 no-ads)
+00:29:03 AD BLOCKING ENDED after 3.1s
+00:29:08 - Ad 1:02 → AD BLOCKING STARTED again
+```
+
+OCR's text output was literally the running ad timer, but `check_ad_keywords` was returning `ad_detected=False`, so the no-ad counter incremented and tripped `OCR_STOP_THRESHOLD=2`.
+
+**Root cause:** there are two `check_ad_keywords` implementations — `src/ocr.py:515` on the `PaddleOCR` class, and `src/ocr_worker.py:310` on `OCRProcess`. Production wires `self.ocr = OCRProcess()` in `minus.py:563`, so `OCRProcess.check_ad_keywords` is what actually runs. The two have drifted: `ocr.py` was updated months ago to handle the OCR-drops-the-space variant ("Ad1:09") and looser separator/digit misreads, but `ocr_worker.py` was never updated.
+
+The drifted worker pattern was:
+
+```python
+# src/ocr_worker.py (pre-fix) — ONLY matches when there's a word boundary after "ad"
+if re.search(r'\bad\b', text_lower) and re.search(r'[0-9o]:[0-9o]{2}', text_lower):
+    matched.append(('ad with timestamp', text))
+```
+
+`\bad\b` requires a non-word char after `d`. "Ad1:09" puts a digit (word char) right after `d`, so the boundary doesn't exist and the pattern fails. The timestamp side was also stricter: `[0-9o]` only (no `l/I/i`), and `:` only (no `;/.`).
+
+So every frame OCR'd as `Ad1:09` was silently a no-ad, and a streaming service that briefly replaces the timer with a rating card ("RATED TV-MA") at ad-to-ad transitions was enough to chain two consecutive no-ads and trip the unblock — even though the same ad break was still running.
+
+**Fix:** `src/ocr_worker.py:404` and the cross-element check at `src/ocr_worker.py:418` now mirror `src/ocr.py:595` exactly:
+
+```python
+has_ad = (re.search(r'\bad\b', text_lower)
+          or re.search(r'ad[0-9oOlIi][:;.]', text_lower))
+has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', text_lower)
+if has_ad and has_timestamp:
+    matched.append(('ad with timestamp', text))
+```
+
+Verified against actual log samples: `Ad1:09`, `Ad 1:11`, `Ad0:30`, `Ado:30`, `Adl:l0`, `Ad1:02`, `Ad0:55` all match; bare `Ad`, `RATED TV-MA`, `loading`, `reading` correctly do not.
+
+Both files now carry a `Mirrors src/ocr.py:NNN — keep in sync` comment to make the next drift visible at the patch site.
+
+**Why this isn't *just* a tighter mirror:** the duplication exists at all because `OCRProcess` runs `check_ad_keywords` locally in the main process (it's just string matching, no NPU work) instead of in the worker subprocess where `PaddleOCR` lives. Deleting the duplicate would require either (a) importing `PaddleOCR` from `ocr.py` into `ocr_worker.py` and calling its method, or (b) sending `ocr_results` back into the worker for keyword check. (a) is the right fix and a small refactor — open task for next session. Until then, the mirror comments are the guardrail.
+
+**Files modified:**
+- `src/ocr_worker.py` — per-element + cross-element keyword patterns updated; mirror comments added
+- `CLAUDE.md` — *OCR Timestamp Pattern Handling* section now calls out the dual-source requirement
 
 ### Unified Debug Toggle + Top-Right OCR Snippet (Added - Apr 2026)
 
