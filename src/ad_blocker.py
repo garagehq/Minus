@@ -1200,7 +1200,7 @@ class DRMAdBlocker:
     # least one photo, each ad block has a one-in-N chance of rolling into
     # photo-cycling mode instead of a text rotation. Lock-in applies the
     # same way so we don't flip-flop mid-break.
-    _PHOTO_MODE_CHANCE = 0.5
+    _PHOTO_MODE_CHANCE = 0.25
 
     def _pick_content_kind(self):
         """Choose which kind of content to show next.
@@ -1886,9 +1886,10 @@ class DRMAdBlocker:
             # ad cluster). If the user has enabled 'photos' mode and uploaded
             # at least one photo, we may roll into photo-cycling instead.
             now = time.time()
-            if not self._locked_content_kind or now > self._content_kind_lock_until:
+            reused = bool(self._locked_content_kind) and now <= self._content_kind_lock_until
+            if not reused:
                 self._locked_content_kind = self._roll_replacement_mode()
-            logger.info(f"[DRMAdBlocker] Starting blocking ({source})")
+            logger.info(f"[DRMAdBlocker] Starting blocking ({source}) kind={self._locked_content_kind} {'reused' if reused else 'rolled'} lock_until_in={self._content_kind_lock_until - now:.1f}s")
 
             # Mute audio immediately
             if self.audio:
