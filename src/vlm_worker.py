@@ -373,23 +373,40 @@ class VLMProcess:
             if not self.start():
                 return False, "VLM not ready", 0, 0.0
 
-        # If we have a pending slow response, try to drain it first
-        if self._pending_response:
+        # Drain ALL stale responses before sending a new request.
+        #
+        # This is the critical fix for the queue-desync bug: a prior soft
+        # timeout left a request in flight; that request eventually completed
+        # and its result is sitting in response_queue. If we just put a new
+        # request and call get(), FIFO semantics return the OLD result as
+        # the answer to our NEW request — every subsequent call would then
+        # be off-by-one indefinitely. Drain anything that's already there.
+        drained = 0
+        while True:
             try:
-                # Quick check if previous response arrived
-                status, result = self.response_queue.get(timeout=0.1)
+                self.response_queue.get_nowait()
+                drained += 1
+            except Exception:
+                break
+        if drained:
+            logger.debug(f"[VLMProcess] Drained {drained} stale response(s)")
+            self._pending_response = False
+            self._consecutive_timeouts = 0
+
+        # If a request is still genuinely in flight (worker hasn't pushed
+        # its response yet), DO NOT send another. Sending now would create
+        # two requests in flight and re-introduce the off-by-one. Caller
+        # treats this as a skipped frame.
+        if self._pending_response:
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
+                logger.warning(
+                    f"[VLMProcess] {self._consecutive_timeouts} consecutive pending — restarting worker"
+                )
+                self.restart()
                 self._pending_response = False
-                self._consecutive_timeouts = 0
-                logger.debug("[VLMProcess] Drained late response from previous request")
-            except:
-                # Still no response, check if we should restart
-                if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
-                    logger.warning(
-                        f"[VLMProcess] {self._consecutive_timeouts} consecutive timeouts, restarting worker"
-                    )
-                    self.restart()
-                    self._pending_response = False
-                    return False, "KILLED", 0, 0.0
+                return False, "KILLED", 0, 0.0
+            return False, "PENDING", 0, 0.0
 
         start_time = time.time()
 
@@ -485,20 +502,32 @@ class VLMProcess:
             if not self.start():
                 return "VLM not ready", 0.0
 
-        if self._pending_response:
+        # Drain ALL stale responses before sending a new request. See the
+        # detailed explanation in _detect_ad_locked — same off-by-one queue
+        # desync applies here, since detect_ad and query_image share the
+        # same request/response queues.
+        drained = 0
+        while True:
             try:
-                status, result = self.response_queue.get(timeout=0.1)
+                self.response_queue.get_nowait()
+                drained += 1
+            except Exception:
+                break
+        if drained:
+            logger.debug(f"[VLMProcess] Drained {drained} stale response(s)")
+            self._pending_response = False
+            self._consecutive_timeouts = 0
+
+        if self._pending_response:
+            self._consecutive_timeouts += 1
+            if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
+                logger.warning(
+                    f"[VLMProcess] {self._consecutive_timeouts} consecutive pending — restarting worker"
+                )
+                self.restart()
                 self._pending_response = False
-                self._consecutive_timeouts = 0
-                logger.debug("[VLMProcess] Drained late response from previous request")
-            except:
-                if self._consecutive_timeouts >= self.RESTART_THRESHOLD:
-                    logger.warning(
-                        f"[VLMProcess] {self._consecutive_timeouts} consecutive timeouts, restarting worker"
-                    )
-                    self.restart()
-                    self._pending_response = False
-                    return "KILLED", 0.0
+                return "KILLED", 0.0
+            return "PENDING", 0.0
 
         start_time = time.time()
         self.request_queue.put((image_path, prompt, max_new_tokens, 'query'))

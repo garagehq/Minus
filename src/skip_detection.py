@@ -101,3 +101,59 @@ def check_skip_opportunity(all_texts: list) -> tuple:
             return (True, text, 0)
 
     return (False, None, None)
+
+
+# Common OCR digit misreads used by YouTube/Netflix ad timers.
+_DIGIT_FIXUP = str.maketrans({
+    'o': '0', 'O': '0',
+    'l': '1', 'I': '1', 'i': '1',
+})
+
+
+def extract_ad_seconds_remaining(all_texts):
+    """Extract the seconds left on the current ad from OCR text.
+
+    Recognised formats (and their OCR-misread siblings):
+      - ``Ad 0:30`` / ``Ad0:30`` / ``Ado:30`` / ``Ad0;30`` / ``Ad1:05``
+      - ``0:30 | Ad`` (Hulu)
+      - ``Ad 10`` / ``Ad 5`` (Netflix countdown, seconds only)
+
+    Returns the number of seconds remaining as an int, or ``None`` if no
+    timer was spotted. Caller decides what to do with it (progress bar,
+    stats row, etc.). Pure function, no side effects — easy to unit test.
+    """
+    for text in all_texts or []:
+        if not text:
+            continue
+        raw = str(text).strip()
+        # Normalise OCR digit/separator misreads FIRST so 'Ado;30' becomes
+        # 'Ad0:30' for the patterns below.
+        normalized = raw.translate(_DIGIT_FIXUP).replace(';', ':').replace('.', ':')
+        norm_lower = normalized.lower()
+        # "Ad MM:SS" — OCR often drops the space ('Ad0:30'). Allow optional
+        # whitespace AND no boundary between 'ad' and the digit. Check this
+        # before standalone "Ad N" because 'Ad 0:30' would otherwise match
+        # the second regex with seconds=0.
+        m = re.search(r'ad\s*(\d{1,2}):(\d{2})', norm_lower)
+        if m:
+            mins = int(m.group(1))
+            secs = int(m.group(2))
+            if 0 <= mins < 60 and 0 <= secs < 60:
+                return mins * 60 + secs
+        # Hulu-style: "0:30 | Ad" — timestamp BEFORE the 'ad' token
+        if re.search(r'\bad\b', norm_lower):
+            m = re.search(r'(\d{1,2}):(\d{2})', normalized)
+            if m:
+                mins = int(m.group(1))
+                secs = int(m.group(2))
+                if 0 <= mins < 60 and 0 <= secs < 60:
+                    return mins * 60 + secs
+        # "Ad N" standalone countdown (Netflix etc.) — 1-3 digit seconds.
+        # Reject 'Ad N:MM' here because that was caught above already; the
+        # negative lookahead prevents 'Ad 0' matching when ':30' follows.
+        m = re.search(r'\bad\s+(\d{1,3})\b(?!\s*:)', norm_lower)
+        if m:
+            val = int(m.group(1))
+            if 0 <= val <= 600:
+                return val
+    return None

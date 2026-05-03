@@ -19,6 +19,9 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
+| [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
+| [docs/IR_RECEIVER.md](docs/IR_RECEIVER.md) | IR receiver eval on pin 3 (`gpiochip4 11`) — bench-tested decode of NEC remotes, gotchas, sketch for a future `IRReceiver` module |
+| [docs/STATUS_LEDS.md](docs/STATUS_LEDS.md) | WS2812B status strip on SPI0 MOSI (pin 19) — wiring, state catalogue, API, encoding rationale |
 
 ## Visual Design
 
@@ -85,11 +88,14 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/webui.py` | Flask web UI for remote monitoring/control |
 | `src/fire_tv.py` | Fire TV ADB remote control for ad skipping |
 | `src/roku.py` | Roku ECP remote control |
+| `src/ir_transmitter.py` | NEC IR transmitter over PWM3 (REI 8K HDMI switch). Thread-safe, 1.5 s cooldown |
+| `src/status_leds.py` | Raw WS2812B SPI driver. 8 LEDs, 10% brightness cap, Adafruit-canonical 8-bit-per-WS-bit encoding at 6.4 MHz |
+| `src/status_led_controller.py` | State machine + animation thread on top of `status_leds.py`. States: off/initializing/idle/blocking/no_signal/autonomous/error |
 | `src/device_config.py` | Streaming device type configuration and persistence |
 | `src/fire_tv_setup.py` | Fire TV auto-setup flow with overlay notifications |
 | `src/wifi_manager.py` | WiFi captive portal and AP mode management |
 | `src/overlay.py` | Notification overlay via ustreamer API |
-| `src/vocabulary.py` | Spanish vocabulary list (120+ words) |
+| `src/vocabulary.py` | Spanish vocabulary — original `SPANISH_VOCABULARY` (~550 entries, 4-tuples) plus `SPANISH_VOCABULARY_EXTENDED` (~200 entries, 5-tuples with two example sentences). `VOCABULARY_COMBINED` is the unified list the ad overlay iterates. |
 | `src/console.py` | Console blanking/restore functions |
 | `src/drm.py` | DRM output probing, adaptive bandwidth fallback |
 | `src/v4l2.py` | V4L2 device probing (format, resolution) |
@@ -98,9 +104,16 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/screenshots.py` | ScreenshotManager with dHash dedup + blank rejection |
 | `src/skip_detection.py` | Skip button detection (regex patterns) |
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
+| `ir_transmit.py` | Standalone CLI for the IR transmitter (`sudo python3 ir_transmit.py <button>`) |
 | `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
 | `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
+| `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
+| `tests/test_ir_ui.py` | Playwright UI tests for IR remote panel |
+| `tests/test_status_led_controller.py` | Unit tests for status-LED state machine (mocked hardware, 31 tests) |
+| `tests/test_status_leds_ui.py` | Playwright UI tests for status-LED toggle + state palette |
+| `tests/test_status_led_states.py` | Hardware walk: every controller state across all 8 LEDs, 5 s each |
+| `test_status_leds.py` | Hardware walk/flash test for the WS2812B strip (R/G/B/W) |
 | `tests/test_ocr_ad_detection.py` | OCR ad pattern detection tests (143+ cases) |
 | `src/templates/index.html` | Web UI single-page app |
 | `src/static/style.css` | Web UI dark theme styles |
@@ -330,27 +343,29 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 **OCR (Primary - Authoritative):**
 - Triggers blocking immediately on 1 detection
-- Stops blocking after 4 consecutive no-ads (`OCR_STOP_THRESHOLD`)
+- Stops blocking after **2 consecutive no-ads** (`OCR_STOP_THRESHOLD=2`, was 4 — tuned via `tests/block_latency_harness.py`)
 - **Authoritative for stopping** when OCR triggered the block
 - Tracks `last_ocr_ad_time` for VLM context
 - Handles common OCR misreads in ad timestamps (see below)
 
 **VLM (Secondary - Anti-Waffle Protected):**
 - Uses sliding window of last 45 seconds of VLM decisions (`vlm_history_window`)
-- Only triggers blocking alone if 80%+ of recent decisions are "ad" (`vlm_start_agreement`)
-- Hysteresis: needs 90% agreement to START (80% + 10% boost for state change)
+- Only triggers blocking alone if 90%+ of recent decisions are "ad" (`vlm_start_agreement`)
+- Hysteresis: needs 100% agreement to START (capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever)
 - Minimum 4 decisions in window before VLM can act (`vlm_min_decisions`)
 - 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
-- **Sliding window only for starting** - stopping uses simple consecutive count
+- **Sliding window only for starting** - stopping uses simple consecutive count (`VLM_STOP_THRESHOLD=2`)
 
 **Sliding Window Parameters:**
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `vlm_history_window` | 45s | How far back to look at VLM decisions |
 | `vlm_min_decisions` | 4 | Minimum decisions needed before acting |
-| `vlm_start_agreement` | 80% | Agreement threshold to start blocking |
+| `vlm_start_agreement` | 90% | Agreement threshold to start blocking |
 | `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
+| `vlm_start_threshold_cap` | 95% | Maximum effective start threshold (so hysteresis can't make it unreachable) |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
+| `VLM_STOP_THRESHOLD` | 2 | Consecutive no-ad votes for fast-stop path |
 
 **Transition Frame Detection:**
 When blocking is active, black/solid-color frames are detected as transitions between ads and held in blocking state to prevent premature unblocking and re-blocking flicker. The `_is_transition_frame()` method analyzes:
@@ -378,9 +393,10 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - VLM stopping uses simple consecutive count (not sliding window) for responsiveness
 
 **Anti-flicker:**
-- Minimum 3s blocking duration (`MIN_BLOCKING_DURATION`)
+- Minimum blocking duration starts at 3.0s (`MIN_BLOCKING_DURATION_BASE`) and falls off by `MIN_BLOCKING_DURATION_STEP` (0.5s) on each consecutive ad: 3.0 → 2.5 → 2.0 → 1.5 → 1.0s. Floor is 1.0s for OCR-only, 1.5s for OCR+VLM both agreeing. Counter resets after `MIN_DURATION_RESET_GAP` (30s) without a block. Toggleable via Settings → Blocking Optimizations → *Block-duration Falloff*.
 - VLM history cleared on stop prevents false re-triggers
 - Transition frame detection holds blocking through black screens between ads
+- After TV reconnect, ad blocking is suppressed for `HDMI_RECONNECT_GRACE_SECONDS` (90s) so the user can navigate without overlays jumping in. The health monitor calls `Minus.notify_hdmi_reconnect()` when it sees the HDMI-TX link return. Toggleable via Settings → Blocking Optimizations → *HDMI Reconnect Grace*.
 
 **Static Screen Suppression:**
 - Prevents blocking on paused video screens (Netflix/YouTube show ads when paused)
@@ -400,20 +416,32 @@ OCR frequently misreads characters in ad timestamps. The detection handles these
 
 Combined misreads are also handled (e.g., "Adl;lo" for "Ad1:10"). The timestamp pattern matches:
 - Standard: `Ad 0:30`, `Ad0:30`, `Ad1:45`
-- Zero misreads: `Ado:30`, `Ad0:3o`, `Ado:oo`
+- Zero misreads: `Ado:30`, `Ad0:3o`, `Ado:oo`, `Ado:o5` (zeros misread on both sides of the colon)
 - One misreads: `Adl:30`, `Ad1:l5`, `Adl:lo`
 - Separator misreads: `Ad0;30`, `Ad0.30`, `Ado;3o`
+
+The pattern lives in **two places** that must stay in sync: `src/ocr.py:595` (PaddleOCR class) and `src/ocr_worker.py:404` (OCRProcess, which is what production actually calls — `self.ocr = OCRProcess()` in `minus.py:563`). Each side carries a `Mirrors src/ocr.py:NNN — keep in sync` / vice-versa comment. The deeper fix is to delete the duplicate in `ocr_worker.py` and have it call `PaddleOCR.check_ad_keywords` directly; until then, any change to one file's pattern must be mirrored to the other. See *OCR Worker Keyword-Pattern Drift* under Known Issues for the past failure mode.
+
+**Ad-keyword policy:**
+- Bare `Ad` / `Ads` at a word boundary triggers blocking. Past false positives from words like `Loading`, `reading`, `Adobe` are handled via the word-boundary regex (`\bad\b` / `\bads\b`) and the `AD_EXCLUSIONS` list — bare `Ad` inside a longer word will not match.
+- `Visit advertiser` (YouTube pre-roll CTA) is treated as an exact ad keyword.
+
+**Fuzzy "Skip Intro" exclusion:**
+Streaming UIs render a `Skip Intro` button that OCR sometimes reads as `Sk1p Intro`, `Skip 1ntro`, `Sk1p 1ntro`, `Sk1p1ntro`, etc. (`i` ↔ `1` ↔ `l` ↔ `I` swaps). A compiled regex `s[kK][i1lI]p\s*[i1lI]ntro` (in `src/ocr.py` as `SKIP_INTRO_FUZZY_RE` and mirrored in `src/ocr_worker.py`) covers all permutations. It's applied as part of the exclusion gate at the top of the per-text and cross-element matching paths, before either exact-keyword or word-boundary detection runs — important because `skip in` (inside `AD_KEYWORDS_EXACT`) is a substring of `skip intro` and would otherwise match first.
+
+`Skip Ad` is **not** excluded — it still triggers ad detection (via the `skip ad` exact keyword) and is independently recognized as a skip button by `src/skip_detection.py`, so Minus will press it to dismiss the ad.
 
 ## Blocking Overlay
 
 When ads are detected, the screen shows a full blocking overlay **rendered at 60fps via ustreamer's native MPP blocking mode**:
 - **Pixelated Background**: Blurred/pixelated version of the screen from ~6 seconds before the ad
-- **Header**: `BLOCKING (OCR)`, `BLOCKING (VLM)`, or `BLOCKING (OCR+VLM)`
+- **Header** (debug only): `[ BLOCKING // OCR ]`, `[ BLOCKING // VLM ]`, or `[ BLOCKING // OCR+VLM ]`
 - **Spanish vocabulary**: Random intermediate-level word with translation
 - **Example sentence**: Shows the word in context
 - **Rotation**: New vocabulary every 11-15 seconds
 - **Ad Preview Window**: Live preview of the blocked ad in bottom-right corner (60fps!)
-- **Debug Dashboard**: Stats overlay in bottom-left corner
+- **Debug stats** (debug only): bottom-left dashboard with uptime, blocks, time saved, ad countdown bar, audio level
+- **OCR trigger snippet** (debug only): top-right `(Ad) 0:30 left` style — the OCR text that fired the block, with the matched keyword wrapped in parens. Empty for VLM-only blocks. Capped at 50 chars.
 
 **Multi-color Text Per Line:**
 - **Purple** - Spanish word (IBM Plex Mono Bold font)
@@ -449,7 +477,9 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 - Hardware-accelerated scaling in the MPP encoder
 - Automatic resolution handling (works at 1080p, 2K, 4K)
 
-**Web UI Toggles:** Ad Preview Window and Debug Dashboard toggleable via Settings (both default ON)
+**Web UI Toggles:** *Ad Preview Window* and *Debug* toggleable via Settings (both default ON). The unified *Debug* toggle controls all three on-screen debug elements together — header, bottom-left stats dashboard, and top-right OCR trigger snippet — and is persisted to `~/.minus_system_settings.json` (`debug_overlay`) so off survives a service restart.
+
+**Recursion safety for the OCR snippet:** OCR consumes `/snapshot/raw` (`src/capture.py:134`), which the patched ustreamer serves from `us_blocking_store_raw_frame()` *before* the blocking composite is applied. The new top-right text — and every other element on the blocking overlay — is therefore invisible to OCR, so the displayed `(Ad) 0:30 left` cannot loop back into detection. Don't break this: if you ever route OCR through `/snapshot` (the composited path), all of these debug texts will become self-triggering.
 
 ## Spanish Vocabulary
 
@@ -671,7 +701,7 @@ curl "http://localhost:9090/overlay/set?clear=true"
 
 **Blocking Mode Endpoints:**
 - `GET /blocking` - Get current config (enabled, preview, colors, etc.)
-- `GET /blocking/set?enabled=true&text_vocab=...&preview_enabled=true` - Configure
+- `GET /blocking/set?enabled=true&text_vocab=...&text_ocr=...&preview_enabled=true&preview_grayscale=true&word_y=140&word_u=175&word_v=145` - Configure. Includes `preview_grayscale` to desaturate the corner preview, `word_y/word_u/word_v` for cycling the Spanish word color per rotation, and `text_ocr` for the top-right OCR-trigger snippet (renders in IBM Plex Mono Regular at the same scale as `text_stats`; empty string clears it).
 - `POST /blocking/background` - Upload pixelated NV12 background (width*height*1.5 bytes)
 
 **Multi-color text auto-detection:** Lines starting with `[` → white (header), `(` → gray (pronunciation), `=` → white (translation), `"` → gray (example), other → purple (Spanish word)
@@ -778,7 +808,7 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 **Key API Routes:**
 - `GET /`, `/api/status`, `/api/detections`, `/api/logs`
 - `POST /api/pause/N`, `/api/resume`
-- `GET/POST /api/preview/*`, `/api/debug-overlay/*`
+- `GET/POST /api/preview/*`, `/api/debug-overlay/*` (the debug-overlay route is the unified *Debug* toggle: header + bottom-left stats + top-right OCR snippet, persisted to `~/.minus_system_settings.json` as `debug_overlay`)
 - `POST /api/test/trigger-block`, `/api/test/stop-block`
 - `GET /stream`, `/snapshot` - Proxy to ustreamer
 - `GET /api/health` - Health check for uptime monitors
@@ -799,6 +829,14 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 - `POST /api/screenshots/approve` - Mark screenshot as correctly labeled
 - `POST /api/screenshots/classify` - Move screenshot between categories
 - `POST /api/screenshots/undo` - Undo last review action
+- `GET /api/ir/status` - IR transmitter status (`enabled`, `available`, `initialized`, `codes`)
+- `POST /api/ir/enable` / `disable` - Toggle the IR remote feature (gates the UI and `/command`)
+- `POST /api/ir/command` - Send a captured button. Body: `{"button": "power"|"input_1"|"input_2"|"input_3"|"next"|"auto"}`. `403` when disabled, `429` with `retry_after` inside the 1.5 s cooldown. See `docs/IR_TRANSMITTER.md`.
+- `GET /api/leds/status` - Status LEDs status (`available`, `enabled`, `running`, `state`, `states`, `last_error`, `gated`)
+- `POST /api/leds/enable` / `disable` - Toggle the WS2812B status strip; persists; starts/stops the animation thread
+- `POST /api/leds/state` - Switch animation state. Body: `{"state": "<name>"}`. `403` when disabled, `400` for unknown state. States: `off / initializing / idle / blocking / paused / no_signal / autonomous / wifi_setup / error`. See `docs/STATUS_LEDS.md`.
+- `GET /api/leds/require_display` - Display-gate status (`leds_require_display`, live `display_connected`)
+- `POST /api/leds/require_display` - Body `{"enabled": true|false}` — when on (default), the strip stays dark while the HDMI-TX display is disconnected or powered off.
 
 **Test API Endpoints:**
 For development and testing ad blocking without waiting for real ads:
@@ -815,8 +853,9 @@ curl -X POST http://localhost:80/api/test/stop-block
 Parameters for trigger-block:
 - `duration`: seconds to block (default: 10, max: 60)
 - `source`: detection source - 'ocr', 'vlm', 'both', or 'default'
+- `kind`: optional forced replacement kind - 'vocab', 'fact', or 'photos'
 
-Test mode prevents the detection loop from canceling the blocking, allowing full testing of pixelated background, animations, and audio muting.
+Test mode prevents the detection loop from canceling the blocking, allowing full testing of pixelated background, animations, and audio muting. When `source` is `ocr` or `both`, the endpoint also injects a synthetic `(Ad) 0:30 left` snippet into the top-right OCR-trigger slot so you can exercise that rendering path without waiting for real OCR.
 
 **Access URLs:**
 - Local: `http://localhost:80`
@@ -958,6 +997,10 @@ VLM preload loads the model at startup before HDMI signal arrives (configurable 
 - `POST /api/autonomous/schedule` - Set hours and always_on flag
 - `GET /api/autonomous/logs` - Recent log entries
 - `GET/POST /api/settings/vlm-preload` - VLM preload toggle
+- `GET/POST /api/settings/optimization` - Toggle block-duration falloff, HDMI reconnect grace, and greyscale preview. POST body: `{"key": "block_falloff"|"hdmi_reconnect_grace"|"greyscale_preview", "enabled": true|false}`. Persisted to `~/.minus_system_settings.json`. Setting `greyscale_preview` here propagates to the running ad_blocker immediately via `/blocking/set?preview_grayscale=...` so the current block updates on the fly.
+- `GET/POST /api/settings/replacement-modes` - Which content kinds the blocking overlay rolls into. POST body: `{"modes": ["vocab","fact","haiku","photos"]}`. Server enforces at least one text kind (vocab/fact/haiku) remains enabled. Persisted with the rest of system settings.
+- `GET/POST /api/media/photos` - List all uploaded photos (GET) or upload a new one (POST multipart with `file` field). Server re-encodes to JPEG (max 1920px long edge, quality 85) under `~/.minus_media/photos/`. Count cap 200, size cap 200 MB (oldest evicted on add).
+- `GET/DELETE /api/media/photos/<id>` - Download JPEG bytes inline (GET) or remove by id (DELETE). Id is sanitized to hex to prevent path traversal.
 
 **Web UI:** Toggle button, schedule time selectors, 24/7 checkbox (auto-enables mode), stats display in Settings tab, VLM preload toggle.
 
@@ -1014,6 +1057,100 @@ The Settings tab in the web UI shows:
 - `tests/test_wifi_portal.py` - Playwright tests (30 tests)
 
 **Note:** The Radxa's internal WiFi antenna has limited range. For better AP coverage in production, consider using a USB WiFi adapter with external antenna.
+
+## IR Transmitter (REI 8K HDMI Switch)
+
+An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**, muxed to `PWM3_IR_M1`) lets Minus control a REI 8K 3-port HDMI switch. The target use case is autonomous mode rotating between streaming devices (Roku / Fire TV / Google TV) on a schedule so training data covers multiple home-screen layouts.
+
+**Hardware setup (one-time):** enable the `rk3588-pwm3-m1` overlay, reboot. After reboot a new `/sys/class/pwm/pwmchipN` appears whose `device` symlink points to `fd8b0030.pwm`. See `docs/IR_TRANSMITTER.md` for overlay install steps and wiring.
+
+**Protocol:** NEC at 38 kHz carrier. Captured codes (all address `0x80`, via Flipper Zero): `input_1=0x07`, `input_2=0x1B`, `input_3=0x08`, `power=0x05`, `next=0x1F` (cycles 1→2→3→1), `auto=0x09`.
+
+**API:** `/api/ir/status | enable | disable | command`. See the Web UI *Key API Routes* section above. Server enforces a **1.5 s cooldown** between successful sends (`IRCooldownError` → HTTP `429` with `retry_after`).
+
+**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`.
+
+**Standalone CLI:** `sudo python3 ir_transmit.py <button>` sends one button; `--list` prints all valid names. Uses the same `IRTransmitter` class as the webui so there is one source of truth.
+
+**Key gotchas (the ones that burned us once already):**
+- The Radxa pinout labels GPIO3_B2 with the RK3588 pin-function `PWM3_IR_M1`, not PWM14. Only the `rk3588-pwm3-m1` overlay wires pin 38.
+- On a fresh PWM export, `polarity` defaults to `inversed` on this chip. That flips mark/space at the LED. `IRTransmitter.initialize()` sets `polarity=normal` while the PWM is disabled, before enabling.
+- Writing to `duty_cycle` returns `EINVAL` while `period` is still 0. Always set `period` before `duty_cycle` on a fresh export.
+
+**Files:**
+- `src/ir_transmitter.py` — `IRTransmitter` class, NEC encoder, cooldown, PWM sysfs wiring
+- `ir_transmit.py` — standalone CLI shim
+- `minus.py` — instantiates `self.ir_transmitter`, persists `ir_enabled` in `~/.minus_system_settings.json`
+- `src/webui.py` — `/api/ir/*` endpoints, cooldown → 429
+- `src/templates/index.html` — toggle + remote panel in Autonomous Mode section
+- `tests/test_ir_transmitter.py` — 20 unit tests (mocked sysfs)
+- `tests/test_ir_ui.py` — Playwright UI tests (live service)
+- `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
+
+**Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.
+
+## IR Receiver (Bench-Tested, Not Wired Into App)
+
+A 3-pin IR receiver (TSOP38238 / VS1838B class) was evaluated on header pin **3** (`GPIO4_B3` / `gpiochip4` line **11**, Linux GPIO 139). Decoded the REI remote's NEC frames cleanly — `0x80 / 0x07,1B,08,1F` plus REPEAT codes — using `gpiomon` + a Python decoder in `test_ir_receiver.py`. **No production code yet**, just exploratory.
+
+**Why pin 3 instead of pin 38 (alongside the transmitter):** the `rk3588-pwm3-m1` overlay parks pin 38's pad-mux on PWM3 at boot. `gpiomon` will *claim* the line but the GPIO controller is electrically disconnected from the pad — `gpioget` reads a constant `0` and no edges fire. Pin 3 / `GPIO4_B3` has no overlay claiming it, so default GPIO mux applies and it Just Works. Sanity check: `gpioget gpiochip4 11` returns `1` with the receiver powered and idle.
+
+**Two gotchas burned dev time, captured here so we don't re-discover:**
+- `gpiomon -B both` is invalid in libgpiod 1.6 — `-B` is *bias*, not edge. Default already monitors both edges; pass nothing.
+- After a falling edge the line is LOW (a MARK), not a SPACE. Get the polarity backwards and every frame appears to start with a `~4500/~600 µs` "leader" because the real 9 ms leader mark gets filtered by the empty-buffer guard.
+
+**Status:** test script only. Decoder is a copy-able starting point if/when we want a real `IRReceiver` module — see `docs/IR_RECEIVER.md` for the full sketch including threading model, suggested API surface, and integration ideas (closed-loop transmitter verification, external hardware trigger, remote learning, post-send confirmation for autonomous-mode scheduling).
+
+**Files:**
+- `test_ir_receiver.py` — standalone bench-test script (gpiomon subprocess + NEC decoder + `--raw` mode for non-NEC remotes)
+- `docs/IR_RECEIVER.md` — findings, gotchas, future-module sketch
+
+## Status LED Strip (WS2812B on SPI0 MOSI)
+
+8× WS2812B addressable strip on header pin 19 (`GPIO1_B2` muxed as `SPI0_MOSI_M2`). All 8 LEDs are user-addressable.
+
+**Why SPI MOSI:** WS2812B's 800 kHz protocol needs sub-µs timing. Userspace GPIO can't deliver that on Linux; the SPI controller can. We clock SPI at **6.4 MHz** and encode each WS bit as one full SPI byte (`0b11110000` = WS-1, `0b11000000` = WS-0) — the canonical Adafruit `NeoPixel_SPI` pattern. The frame is wrapped with **80 µs zero-byte resets on both sides** and sent via `writebytes2(bytes)`. We initially tried 3-SPI-bits-per-WS-bit at 2.4 MHz; the `spi-rockchip` driver's PIO mode inserts inter-byte gaps when its FIFO refills, and the tighter scheme didn't have enough skew tolerance — visible symptom was "solid green decoded as cycling red/blue/white". `rpi_ws281x` and friends depend on Broadcom PWM+DMA hardware and don't work on RK3588.
+
+**Hardware:** bare-wire data line direct from header pin 19 to the strip — no level shifter, no inline resistor, no bulk cap needed for reliable operation on this board (verified: removed both the Adafruit-recommended 470 Ω series resistor and the 1000 µF V+/GND electrolytic, decoding stayed clean across all 8 LEDs). Keep the data wire ≤ 10 cm. (We previously shipped a "sacrificial first pixel" workaround that exposed only 7 LEDs; the encoding switch made it unnecessary and it has been removed.)
+
+**Brightness cap (load-bearing):** `BRIGHTNESS = 0.10` is applied inside `set_pixel()` before storage; every other setter funnels through it. Caps peak draw at ~48 mA across all 8 LEDs — small enough to keep current swings from corrupting the data line on the marginal 3.3V signalling. Don't bypass it from the application layer; if you need more brightness, add external 5 V power to the strip first.
+
+**Controller (`src/status_led_controller.py`):** `StatusLEDController` runs a 200 ms (5 fps) animation thread. Each renderer self-paces in seconds via the shared `_to_ticks()` helper, so per-animation cadence is preserved if the global tick rate is changed. State transitions are atomic and thread-safe; the lifecycle holds `_thread` populated until `join()` returns so a racing `start()` can't open a second SPI handle.
+
+**State catalogue:**
+| State | Visual | Trigger |
+|---|---|---|
+| `off` | dark | feature disabled |
+| `initializing` | white pulse 1% → 10% → 1% (1 step/500 ms; 14 s/breath) | `Minus.run()` start, HDMI restoration |
+| `idle` | solid green | `ad_blocker.start()`, `ad_blocker.hide()`, recovery complete |
+| `blocking` | bouncing red Cylon eye + 2-pixel tail (~200 ms/step) | `ad_blocker.show(...)` |
+| `paused` | slow yellow breathing (3 s) | `Minus.pause_blocking(...)` |
+| `no_signal` | slow amber breathing (4 s) | `_on_hdmi_lost`, `start_no_signal_mode` |
+| `autonomous` | slow blue breathing (4 s) | autonomous-mode active callback |
+| `wifi_setup` | cyan alternating sweep (~250 ms/swap) | WiFi AP-mode started |
+| `error` | fast red blink (2 Hz) | manual / subsystem failure |
+
+**Persistence:** the on/off toggle is in `~/.minus_status_leds.json`. State itself is runtime-only and gets re-asserted by the next event.
+
+**Display gating:** by default the strip stays dark while the HDMI-TX display is disconnected or powered off — keeps a dark room dark when the TV is off. State machine still ticks; only the wire output is suppressed, so animations resume seamlessly within ~200 ms of the display coming back. Implemented as an optional `drive_predicate` on the controller that `Minus` wires to `health_monitor._check_hdmi_output_connected()`. The `leds_require_display` flag (default True) toggles the gate from the WebUI; persisted in `~/.minus_system_settings.json`.
+
+**Hardware setup (one-time):** enable `rk3588-spi0-m2-cs0-spidev` overlay, install `python3-spidev`, add user to `spi` group, reboot. `./install.sh` does all of that idempotently.
+
+**API endpoints:** see the *Web UI* section above.
+
+**Files:**
+- `src/status_leds.py` — raw SPI driver, brightness cap, encoding
+- `src/status_led_controller.py` — state machine + animation thread + persistence
+- `minus.py` — instantiates `self.status_leds`, wires `_set_led_state` helper, hooks `_on_hdmi_lost` / `_on_hdmi_restored`
+- `src/ad_blocker.py` — calls `_set_led_state` from `show()`/`hide()`/`start()`/`start_no_signal_mode()`
+- `src/webui.py` — `/api/leds/*` endpoints
+- `src/templates/index.html` — toggle + state palette in Autonomous Mode section
+- `test_status_leds.py` — hardware walk/flash test
+- `tests/test_status_led_controller.py` — 26 unit tests (mocked hardware)
+- `tests/test_status_leds_ui.py` — Playwright UI tests (live service)
+- `docs/STATUS_LEDS.md` — full docs
+
+**Future work:** per-LED subsystem indicators (OCR / VLM / audio / HDMI / wifi / autonomous each get one LED), one-shot detection-event flashes, automatic `autonomous` state on autonomous-mode entry/exit.
 
 ## Streaming Device Configuration
 
@@ -1272,10 +1409,40 @@ The project includes a comprehensive test suite for all extracted modules.
 
 **Running Tests:**
 ```bash
-python3 tests/test_modules.py            # 300+ unit tests
-python3 tests/test_autonomous_mode.py    # Autonomous mode tests
-python3 tests/test_review_ui.py          # Playwright UI tests (requires chromium)
+python3 tests/test_modules.py                  # 300+ unit tests
+python3 tests/test_autonomous_mode.py          # Autonomous mode tests
+python3 tests/test_recent_features.py          # Recent feature tests
+python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
+python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
+python3 tests/test_ir_transmitter.py           # IR transmitter unit tests (mocked sysfs)
+python3 tests/test_ir_ui.py                    # Playwright UI tests for IR remote panel
+python3 tests/test_status_led_controller.py    # Status LED state-machine tests (mocked hardware)
+python3 tests/test_status_leds_ui.py           # Playwright UI tests for status-LED panel
 ```
+
+**Block-latency test harness (`tests/block_latency_harness.py`):**
+
+Headless rig for tuning the blocking decision engine. Plays Big Buck Bunny
+in a Python loop, lets the test orchestrator inject "AD"-style overlay
+text on/off at controlled timestamps, and measures detect / recover
+latency end-to-end through the production OCR + VLM workers + a faithful
+mirror of `minus.py`'s blocking decision logic. No HDMI, no ustreamer,
+no DRM, no audio.
+
+```bash
+# Place a video file at /home/radxa/test_assets/bbb.mp4 first.
+python3 tests/block_latency_harness.py round1   # 9 detect/recover combos
+python3 tests/block_latency_harness.py round4   # realistic ad-break shapes
+python3 tests/block_latency_harness.py round5   # VLM state machine (injected verdicts)
+python3 tests/block_latency_harness.py round6   # user-bug pause-on-ad regression
+python3 tests/block_latency_harness.py round7   # production-shaped, OCR + VLM corroborated
+```
+
+`use_real_vlm=False` mode uses injected VLM verdicts so the engine's
+sliding-window state machine can be driven deterministically without the
+~30s real-VLM model load. Override `PARAMS` from a small wrapper script
+to A/B-test tuning candidates; the in-rig defaults mirror the locked-in
+production values.
 
 **Test Coverage:**
 
@@ -1647,3 +1814,189 @@ Upstream's tuple-shape defensive guards (introduced in commit `7c42e80`) are kep
 
 **Files modified:**
 - `src/vlm_worker.py` — `_call_lock`, `_detect_ad_locked`, `_query_image_locked`
+
+### A/V Sync Flush Disabled (Apr 2026)
+
+**Symptom:** Every 45 minutes of uptime, the `AudioPassthrough` watchdog ran its periodic sync-queue flush; `Sync queue flushed` was always followed ~12s later by `Pipeline issue detected: not in PLAYING state (paused)` and a full `Restarting pipeline (attempt N)`. Cumulative effect: ~32 spurious audio restarts per day, each a brief dropout. The feature that was supposed to *prevent* restarts was *causing* them.
+
+**Root cause (investigated in 4 failed fix iterations):** the flush itself is unrecoverable without a full pipeline rebuild on this pipeline configuration.
+1. `flush-start` event puts the sync queue and downstream into flushing mode.
+2. `flush-stop` should resume streaming, but `syncqueue` has `min-threshold-time=300ms` that blocks downstream reads until the queue has refilled past the threshold.
+3. While the queue is blocking, `alsasink` — having no data to consume — closes its PCM device. ALSA `state` transitions out of `RUNNING`, `hw_ptr` goes to 0.
+4. `set_state(PLAYING)` on the pipeline cannot bring `alsasink` back up because the upstream queue is still blocked. The pipeline gets stuck in `PAUSED` for 10+ seconds until the watchdog gives up and restarts the whole pipeline.
+
+Attempts that did **not** work:
+- Same-iteration `continue` after flush (commit `3b4e0d0`) — subsequent iterations still trip on the lingering `PAUSED`.
+- 10-second post-flush "grace window" — flush recovery takes longer than that.
+- Explicit `pipeline.set_state(PLAYING)` with bounded 2s wait — `get_state` returns `PAUSED` regardless.
+- Temporarily zeroing `syncqueue.min-threshold-time` across the flush + 400ms refill sleep — `alsasink` had already dropped the PCM by then.
+
+**Solution:** flip `self._sync_reset_enabled = False` in `AudioPassthrough.__init__` (see `src/audio.py:151`). The periodic flush never runs, so it can never cascade. Drift isn't a real concern in this pipeline (`provide-clock=false` on alsasrc, `sync=false` on alsasink) and 48+ hours of runtime without a working flush showed no observable A/V desync.
+
+To find the commit that made this change: `git log --all --oneline --grep='disable periodic A/V sync flush'` (commit subject is stable across amends).
+
+**Kept as a side-benefit of the investigation:** rewrote `_is_alsa_device_running()` to sample `hw_ptr` across a 50ms window instead of comparing ALSA's `owner_pid` to the main process PID. The old check compared an ALSA-reported *thread TID* (often a stale one) against the main PID, so it could never return True under normal operation. The watchdog's "GStreamer reports PAUSED but ALSA is flowing — skip restart" rescue path has always been broken; now it works.
+
+**If drift becomes a real problem in the future (easy revert):**
+1. Write a flush mechanism that does not let `alsasink` close its PCM device — either by pausing→flushing→playing the whole pipeline in one atomic block, or by replacing `syncqueue` with an element that doesn't block on `min-threshold-time`.
+2. Only after (1) works, flip `_sync_reset_enabled` back to `True` in `src/audio.py`.
+3. Re-run the soak test (`_sync_interval = 2.5 * 60` + 5-min monitor for ~45 min) and confirm `audio.restart_count` stays at 0.
+
+**Do NOT simply flip `_sync_reset_enabled` back to `True` without (1).** The bug will return.
+
+**Files modified:**
+- `src/audio.py` — `_sync_reset_enabled = False` + explanatory block comment; `_is_alsa_device_running()` rewrite
+
+### VLM Queue Desync (Off-By-One on Soft Timeout) (Fixed - Apr 2026)
+
+**Symptom:** After pausing on an ad on Netflix and unpausing, the blocking overlay stayed for ~20 seconds applied against frames where the show was clearly playing again. Other variants: VLM verdicts persistently lagging actual screen content by one frame; rare reports of "Ad 1:30 left" claims long after a real ad had ended.
+
+**Root cause:** `VLMProcess._detect_ad_locked` and `_query_image_locked` (`src/vlm_worker.py`) shared the same MP request/response queues with no per-request correlation. When VLM hit a soft timeout (1.5s, ~15% of inferences in normal load), the request stayed in flight and `_pending_response` was set to `True`. On the next call:
+
+1. The drain attempt was a single `get(timeout=0.1)`. If the worker had not yet pushed its response (still mid-inference), drain timed out.
+2. The code then **fell through and `put`-ed a NEW request anyway**.
+3. Now two requests were in flight. Worker finished the first → pushed result A → caller's `get(SOFT_TIMEOUT)` received result A as the answer for request B.
+4. The queue was now permanently off-by-one. Every subsequent `get()` returned the prior frame's verdict.
+5. After a pause-on-ad (where the queue accumulated several "ad" verdicts during the pause), the entire backlog was delivered against post-unpause "show is playing" frames → 10–20 seconds of phantom blocking.
+
+The shared `/dev/shm/minus_vlm_frame_<pid>.jpg` path made it worse — the file was always the most recently written frame, so even the worker's view of "what was frame N" could be stale.
+
+**Solution:**
+1. **Drain ALL stale responses** at function entry using a `get_nowait()` loop (was a single `get(timeout=0.1)`).
+2. **If a request is genuinely still in flight** after draining, do NOT queue another. Return `"PENDING"` (or `"KILLED"` after RESTART_THRESHOLD consecutive pendings). Caller treats this exactly like the existing `"TIMEOUT"` skip path — `is_ad=False`, `confidence=0.0`, no-op on the sliding window.
+
+This guarantees only one request is ever in flight, which incidentally also fixes the file-content race because the worker dequeues and reads the file in tight succession.
+
+**Files modified:**
+- `src/vlm_worker.py` — `_detect_ad_locked` and `_query_image_locked` rewritten with multi-drain + don't-double-queue
+
+### HDMI Restored Recovery Leaves Display Dead Forever (Fixed - Apr 2026)
+
+**Symptom:** TV stays frozen on a stale frame for hours. Web app shows live content. `subsystems.video.status` reads `error`/`reason: no_pipeline`. `fps_capture` is healthy (~42 fps) but `fps_display` is essentially 0. Service uptime can be many hours; restart is the only recovery.
+
+**Root cause (two coupled defects in `Minus._on_hdmi_restored()` at `minus.py:634`):**
+
+1. **`ad_blocker.start()`'s return value was ignored.** When HDMI input recovers but HDMI-OUT (the TV) is still disconnected, kmssink can't open the DRM plane and `start()` returns `False`. The recovery handler proceeded as if all was well and logged `[Recovery] HDMI recovery complete`.
+
+2. **`self.display_connected` was left stuck at `True`.** The display retry loop (`_start_display_retry_loop`) is the only thing that can recreate a dead pipeline post-startup, but it gates on `not self.display_connected`. Since recovery never set the flag to `False` on failure, the retry loop never ran. Pipeline stayed dead until the next service restart.
+
+Observed once today across a 17-hour run: at 08:19:59 HDMI input recovered after a 550-second loss while the TV was off. Recovery declared success. `Attempting to reconnect display pipeline` log line count for the entire 17-hour run: **0**. The display sat frozen on its last decoded frame all the way until a manual restart at 12:46.
+
+**Solution:** check `start()`'s return value; on failure, set `display_connected=False`, populate `display_error`, and call `_start_display_retry_loop()`. The retry loop already exists and works correctly — it just needs to be armed. Audio remains paused/muted on the failure path; it'll be resumed by the normal start path inside the retry loop when the pipeline finally comes up.
+
+**Why the failure mode is sticky without this fix:** there is no other code path that ever flips `display_connected` from `True` back to `False` post-startup. Initial startup (`minus.py:3000`) is the only place. The retry loop never fires because its gate (`not self.display_connected`) stays `False`.
+
+**The NO SIGNAL behavior is unchanged:** the HDMI-LOST path still calls `start_no_signal_mode()` and the health monitor's "Continuous NO SIGNAL mode enforcement" loop still re-triggers it whenever HDMI input is absent. So the desired "TV shows NO SIGNAL when input is gone" behavior is preserved end-to-end.
+
+**Files modified:**
+- `minus.py` — `_on_hdmi_restored()`: capture return value, branch on success/failure, arm retry loop on failure
+
+### Phantom Re-Block After Pause-On-Ad (Fixed - Apr 2026)
+
+**Symptom:** User pauses on a real ad on Netflix, ad ends offscreen during the pause, user unpauses to actual show content — and Minus shows the blocking overlay for ~5 more seconds on the show content. Reproduced via the block-latency harness (`round6`): with the OLD parameters, **3/3 scenarios** observed phantom re-blocks at ~0.9s after unpause.
+
+**Root cause:** three coupled defects in the static-suppression / cooldown machinery, each individually plausible but combining badly:
+
+1. **`OCR_STOP_THRESHOLD = 4`** meant blocking took 4 OCR cycles × 0.5s = 2s to clear once the ad ended — already over the 1.5s responsiveness target the user wanted.
+2. **`scene_change_threshold = 0.01`** misclassified ~26% of natural low-motion frames in real video content as "static" (measured against BBB's actual inter-frame mean-abs-diff distribution: p5=0.002, p50=0.017, max=0.31). Static suppression therefore flapped on/off mid-content during slow scenes.
+3. **`dynamic_cooldown = 0.5s`** was too short for the post-pause AD overlay to actually transition off-screen. The cooldown completed → state was cleared → the very next OCR cycle re-detected the still-lingering AD text → blocking re-fired immediately.
+
+The user only saw symptom 3 in the worst form (the phantom re-block), but symptoms 1 and 2 amplified its visibility — symptom 2 was also responsible for the related "blocking flips off mid-content" issue earlier in the same investigation.
+
+**Solution:** three coordinated tuning changes, locked in via `tests/block_latency_harness.py` measurements (rounds 1, 4, 6, 7):
+
+| Parameter | Old | New | Effect |
+|---|---|---|---|
+| `OCR_STOP_THRESHOLD` (`minus.py`) | 4 | **2** | recover 2.0s → 1.0s |
+| `scene_change_threshold` (`config.py`) | 0.01 | **0.001** | only truly-frozen frames (~1.7% of BBB) register as static; natural low-motion content (~98%) keeps flowing |
+| `dynamic_cooldown` (`config.py`) | 0.5s | **1.5s** | post-pause AD overlay actually finishes transitioning off-screen before state is cleared |
+
+**Verification:** `round6` of the harness re-runs the user's scenario 3× per parameter set:
+- OLD params: 3/3 phantom re-blocks, max 0.90s after unpause
+- NEW params: **0/3** phantom re-blocks ✓
+
+**Final scenario performance with locked-in params:**
+- detect: mean 0.59s, max 0.66s, **9/9 clean** across all round-1 ad shapes
+- recover: mean 0.97s, max 1.15s, **all under 1.5s goal**
+- 0 false-positive blocking events across 15s of clean content (round 7)
+- 0 mid-block flaps across a 30s sustained ad (round 7)
+
+**Defense-in-depth:** `tests/test_block_decision_engine.py` adds 11 lightweight unit tests for the DecisionEngine state machine (cooldown clearing, OCR stop threshold, VLM-only fast-stop, the user-bug regression itself with both OLD and NEW params asserted). Runs as part of the standard test suite.
+
+**Files modified:**
+- `minus.py` — `OCR_STOP_THRESHOLD = 2` + comment with link to harness
+- `src/config.py` — `scene_change_threshold = 0.001` + measurement-derived comment, `dynamic_cooldown = 1.5` (already changed in the cooldown-fix commit earlier this session)
+- `tests/block_latency_harness.py` — new ~700-line headless harness (BBB source, OCR/VLM workers, decision-engine mirror, 7 rounds of scenarios)
+- `tests/test_block_decision_engine.py` — new 11 unit tests
+
+### OCR Worker Keyword-Pattern Drift (Fixed - May 2026)
+
+**Symptom:** During real ad breaks, blocking flapped on/off every 5–15 seconds even though OCR was reading the ad timer cleanly every frame. Logs showed sequences like:
+
+```
+00:29:00 [BLOCKING OCR] - Ad 1:11        ← match (boundary)
+00:29:01 [BLOCKING OCR] - RATED TV-MA    ← no_ad #1
+00:29:03 OCR #62188            - Ad1:09   ← no_ad #2 — silently!
+00:29:03 OCR: ad no longer detected (after 2 no-ads)
+00:29:03 AD BLOCKING ENDED after 3.1s
+00:29:08 - Ad 1:02 → AD BLOCKING STARTED again
+```
+
+OCR's text output was literally the running ad timer, but `check_ad_keywords` was returning `ad_detected=False`, so the no-ad counter incremented and tripped `OCR_STOP_THRESHOLD=2`.
+
+**Root cause:** there are two `check_ad_keywords` implementations — `src/ocr.py:515` on the `PaddleOCR` class, and `src/ocr_worker.py:310` on `OCRProcess`. Production wires `self.ocr = OCRProcess()` in `minus.py:563`, so `OCRProcess.check_ad_keywords` is what actually runs. The two have drifted: `ocr.py` was updated months ago to handle the OCR-drops-the-space variant ("Ad1:09") and looser separator/digit misreads, but `ocr_worker.py` was never updated.
+
+The drifted worker pattern was:
+
+```python
+# src/ocr_worker.py (pre-fix) — ONLY matches when there's a word boundary after "ad"
+if re.search(r'\bad\b', text_lower) and re.search(r'[0-9o]:[0-9o]{2}', text_lower):
+    matched.append(('ad with timestamp', text))
+```
+
+`\bad\b` requires a non-word char after `d`. "Ad1:09" puts a digit (word char) right after `d`, so the boundary doesn't exist and the pattern fails. The timestamp side was also stricter: `[0-9o]` only (no `l/I/i`), and `:` only (no `;/.`).
+
+So every frame OCR'd as `Ad1:09` was silently a no-ad, and a streaming service that briefly replaces the timer with a rating card ("RATED TV-MA") at ad-to-ad transitions was enough to chain two consecutive no-ads and trip the unblock — even though the same ad break was still running.
+
+**Fix:** `src/ocr_worker.py:404` and the cross-element check at `src/ocr_worker.py:418` now mirror `src/ocr.py:595` exactly:
+
+```python
+has_ad = (re.search(r'\bad\b', text_lower)
+          or re.search(r'ad[0-9oOlIi][:;.]', text_lower))
+has_timestamp = re.search(r'[0-9oOlIi][:;.][0-9oOlIi][0-9oOlIi]', text_lower)
+if has_ad and has_timestamp:
+    matched.append(('ad with timestamp', text))
+```
+
+Verified against actual log samples: `Ad1:09`, `Ad 1:11`, `Ad0:30`, `Ado:30`, `Adl:l0`, `Ad1:02`, `Ad0:55` all match; bare `Ad`, `RATED TV-MA`, `loading`, `reading` correctly do not.
+
+Both files now carry a `Mirrors src/ocr.py:NNN — keep in sync` comment to make the next drift visible at the patch site.
+
+**Why this isn't *just* a tighter mirror:** the duplication exists at all because `OCRProcess` runs `check_ad_keywords` locally in the main process (it's just string matching, no NPU work) instead of in the worker subprocess where `PaddleOCR` lives. Deleting the duplicate would require either (a) importing `PaddleOCR` from `ocr.py` into `ocr_worker.py` and calling its method, or (b) sending `ocr_results` back into the worker for keyword check. (a) is the right fix and a small refactor — open task for next session. Until then, the mirror comments are the guardrail.
+
+**Files modified:**
+- `src/ocr_worker.py` — per-element + cross-element keyword patterns updated; mirror comments added
+- `CLAUDE.md` — *OCR Timestamp Pattern Handling* section now calls out the dual-source requirement
+
+### Unified Debug Toggle + Top-Right OCR Snippet (Added - Apr 2026)
+
+The blocking overlay grew a third debug element: a top-right `(Ad) 0:30 left` snippet showing the OCR text that triggered the block, with the matched keyword wrapped in parens. The existing *Debug Dashboard* settings toggle was unified into a single *Debug* toggle that gates three things together: the `[ BLOCKING // ... ]` header (top), the bottom-left stats dashboard, and this new top-right OCR snippet.
+
+**Persistence:** the toggle is a system setting (`debug_overlay`, default `True`) in `~/.minus_system_settings.json`. Pushed into `ad_blocker.set_debug_overlay_enabled()` at startup so off survives a service restart.
+
+**Recursion concern (resolved by existing architecture):** the natural worry is that putting the OCR trigger text back on screen would make OCR keep seeing "Ad" forever. That cannot happen because OCR consumes `/snapshot/raw` (`src/capture.py:134`), which the patched ustreamer serves from `us_blocking_store_raw_frame()` *before* the blocking composite runs (`ustreamer-garagehq/src/ustreamer/http/server.c:1026`). The new top-right text — and every other element on the blocking overlay — is therefore invisible to OCR. **Do not change OCR to read `/snapshot` (the composited path)** without first stripping the debug texts; otherwise the displayed snippet becomes self-triggering. The `Minus Overlay Text Triggering False Positive Ad Detection` fix in this same Known Issues list is the cautionary tale — the *notification* overlay (`/overlay`, distinct from `/blocking`) DOES composite before the snapshot and required keyword exclusions to suppress recursion.
+
+**ustreamer C-side change:** added a third text region. Files in `ustreamer-garagehq`:
+- `src/libs/blocking.h` — `text_ocr` field on `us_blocking_config_s`, `US_BLOCKING_TEXT_OCR_SIZE = 256`, declaration of `us_blocking_set_text_ocr()`
+- `src/libs/blocking.c` — setter, clear/snapshot/composite all extended; render block draws at `text_x = dst_width - text_w - 30, text_y = 30` using the same IBM Plex Mono Regular face as `text_stats`. Reuses the existing `_ft_mutex` since FreeType is not thread-safe across the 4 MPP workers.
+- `src/ustreamer/http/server.c` — `text_ocr` URL param parsing in `_http_callback_blocking_set`. `text_stats_scale` is reused for the OCR text size (no separate scale param needed).
+
+**Python wiring:**
+- `src/ad_blocker.py` — `_ocr_trigger_text` instance, `_format_ocr_trigger(raw, source)` builds the `(Ad) 0:30 left` snippet (paren-wraps the matched keyword inside the OCR text snippet, ASCII-collapsed, ≤50 chars), `_render_ocr_text()` returns empty when debug is off so the C side draws nothing. `show(source, ocr_trigger_text="")` accepts the trigger payload from minus; only overwrites the stored snippet when given a non-empty value (or when transitioning to vlm-only) so the top-right does not flicker as OCR text comes and goes during a block. `set_debug_overlay_enabled()` re-renders `text_vocab` (to add/strip the header) and pushes `text_ocr` in the right direction without waiting for the next rotation.
+- `minus.py` — stashes `last_matched_keywords` in the OCR loop, helper `_first_match_for_overlay()` returns `(keyword, snippet_text)` for the most recent match. `_load_system_settings` adds `debug_overlay: True` default + `set_debug_overlay_enabled(enabled)` persists and propagates. Cleared in the block-end branch so the next block starts fresh.
+- `src/webui.py` — `/api/debug-overlay/{enable,disable}` route through `minus.set_debug_overlay_enabled()` for persistence. The `POST /api/test/trigger-block` endpoint injects a synthetic `("Ad", "Ad 0:30 left")` snippet when `source` is `ocr`/`both` so the top-right slot can be exercised without real ads.
+- `src/templates/index.html` — toggle relabeled "Debug Dashboard" → "Debug" with a tooltip listing what it controls.
+
+**Files modified:**
+- `ustreamer-garagehq/src/libs/blocking.{h,c}`, `src/ustreamer/http/server.c` — new `text_ocr` API + top-right render
+- `minus.py`, `src/ad_blocker.py`, `src/webui.py`, `src/templates/index.html`

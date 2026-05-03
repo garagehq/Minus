@@ -184,7 +184,7 @@ from v4l2 import probe_v4l2_device
 from config import MinusConfig, USTREAMER_PATH, OCR_MODEL_DIR
 from capture import UstreamerCapture
 from screenshots import ScreenshotManager
-from skip_detection import check_skip_opportunity
+from skip_detection import check_skip_opportunity, extract_ad_seconds_remaining
 
 # Import OCR module
 try:
@@ -244,6 +244,22 @@ try:
 except ImportError as e:
     logger.warning(f"Fire TV module not available: {e}")
     HAS_FIRE_TV = False
+
+# Import IR Transmitter (REI 8K HDMI switch control via PWM3)
+try:
+    from ir_transmitter import IRTransmitter
+    HAS_IR = True
+except ImportError as e:
+    logger.warning(f"IR transmitter module not available: {e}")
+    HAS_IR = False
+
+# Import Status LED controller (WS2812B status strip on SPI0 MOSI)
+try:
+    from status_led_controller import StatusLEDController
+    HAS_STATUS_LEDS = True
+except ImportError as e:
+    logger.warning(f"Status LED module not available: {e}")
+    HAS_STATUS_LEDS = False
 
 # Import Notification Overlay
 try:
@@ -320,9 +336,10 @@ class Minus:
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
         self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
         self.vlm_min_decisions = 4          # Need at least 4 decisions to act
-        self.vlm_start_agreement = 0.80     # Need 80% ad agreement to START blocking
+        self.vlm_start_agreement = 0.90     # Need 90% ad agreement to START blocking (solo; OCR-corroborated uses immediate shortcut at ~line 2778). Raised from 0.80 to tighten VLM-alone triggers.
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
         self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
+        self.vlm_start_threshold_cap = 0.95 # Cap on effective start threshold so hysteresis can't push it beyond what real-world noise allows
 
         # State change rate limiting
         self.vlm_last_state_change = 0      # When VLM state last changed
@@ -364,6 +381,10 @@ class Minus:
         }
 
         self.last_ocr_texts = []            # Last OCR detected texts
+        # Most recent OCR matched keywords (list of (keyword, snippet) tuples).
+        # Picked up by ad_blocker.show() to render a "(Ad) 0:30 left" hint in
+        # the top-right of the blocking overlay when debug mode is on.
+        self.last_matched_keywords = []
         self.home_screen_detected = False   # True if home screen keywords found
         self.home_screen_detect_time = 0    # When home screen was last detected
         self.video_interface_detected = False  # True if video player interface detected
@@ -382,8 +403,24 @@ class Minus:
         # Weighted detection parameters
         self.OCR_TRUST_WINDOW = 5.0
         self.VLM_ALONE_THRESHOLD = self.config.vlm_alone_threshold
-        self.MIN_BLOCKING_DURATION = 4.0
-        self.OCR_STOP_THRESHOLD = 4  # Increased from 3 for more robust ad end detection
+        # MIN_BLOCKING_DURATION has a falloff. Each consecutive ad (second ad
+        # that starts shortly after the previous one ended) shortens the
+        # minimum block duration: 3.0 -> 2.5 -> 2.0 -> 1.5 -> 1.0 s.
+        # Floor is 1.0s for OCR-only, 1.5s when OCR+VLM both agree (the extra
+        # stagger lets VLM's slower cycle catch up before we unblock). Counter
+        # resets after MIN_DURATION_RESET_GAP seconds without any block.
+        self.MIN_BLOCKING_DURATION_BASE = 3.0
+        self.MIN_BLOCKING_DURATION_STEP = 0.5
+        self.MIN_BLOCKING_DURATION_FLOOR_OCR = 1.0
+        self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
+        self.MIN_DURATION_RESET_GAP = 30.0  # seconds
+        self.consecutive_ad_count = 0  # 0 = first ad, 1 = second, ...
+        # 2 cycles ≈ 1.0s recovery (down from 4 = 2.0s). Tuned via the
+        # tests/block_latency_harness.py rig to hit a sub-1.5s recover-to-
+        # blocking-off latency. Risk: a single brief OCR miss during a real
+        # ad ends blocking; in practice OCR's ~0.5s cycle on stable ad
+        # overlays makes consecutive misses extremely rare.
+        self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
@@ -421,6 +458,19 @@ class Minus:
         self.webui = None
         self.start_time = time.time()
         self.blocking_paused_until = 0  # Timestamp when pause expires
+        # HDMI reconnect grace period: when the TV reconnects, blocking is
+        # suppressed for HDMI_RECONNECT_GRACE_SECONDS so the user can grab the
+        # remote and navigate without an overlay jumping in. The health monitor
+        # sets hdmi_reconnect_time on reconnect; we compare against it each
+        # cycle instead of persisting a "paused_until" to keep the two
+        # suppression mechanisms independent.
+        self.HDMI_RECONNECT_GRACE_SECONDS = 90.0
+        self.hdmi_reconnect_time = 0.0
+        # Ad's own countdown (seconds remaining) extracted from OCR, plus the
+        # wall-clock time of the last update so the overlay can decay the bar
+        # smoothly between OCR samples.
+        self.ad_seconds_remaining = None
+        self.ad_seconds_remaining_at = 0.0
         from collections import deque
         self.detection_history = deque(maxlen=50)  # Recent detections for web UI
 
@@ -435,6 +485,27 @@ class Minus:
 
         # Night mode - automatic overnight YouTube playback for training data
         self.autonomous_mode = AutonomousMode()
+
+        # IR transmitter (REI 8K HDMI switch). Constructor is hardware-free;
+        # initialize() / first send() is what touches the PWM sysfs.
+        self.ir_transmitter = IRTransmitter() if HAS_IR else None
+
+        # Status LED strip (7× WS2812B on SPI0 MOSI). Constructor is hardware-
+        # free; start() touches /dev/spidev0.0. If the user has the toggle
+        # persisted to enabled, the thread is started near the end of __init__
+        # so the "initializing" state shows until ad_blocker fires up.
+        self.status_leds = (
+            StatusLEDController() if HAS_STATUS_LEDS else None)
+        if self.status_leds is not None:
+            # Gate the strip on the HDMI-TX display being connected when
+            # ``leds_require_display`` is set (default). State machine still
+            # ticks normally — only the wire output is suppressed, so the
+            # animation resumes seamlessly when the display comes back on.
+            def _led_drive_predicate():
+                if not self.leds_require_display:
+                    return True
+                return self.is_display_connected_live()
+            self.status_leds.set_drive_predicate(_led_drive_predicate)
 
         # Skip opportunity state - CONSERVATIVE approach to avoid accidental pauses
         # Key principle: Only try to skip ONCE per ad. If it doesn't work, don't retry.
@@ -512,6 +583,12 @@ class Minus:
                     output_width=config.output_width,
                     output_height=config.output_height
                 )
+                # Apply persisted greyscale-preview setting from disk
+                if hasattr(self.ad_blocker, 'set_preview_grayscale'):
+                    self.ad_blocker.set_preview_grayscale(self.greyscale_preview_enabled)
+                # Apply persisted debug-overlay setting from disk
+                if hasattr(self.ad_blocker, 'set_debug_overlay_enabled'):
+                    self.ad_blocker.set_debug_overlay_enabled(self.debug_overlay_enabled)
                 logger.info("AdBlocker initialized (instant input-selector switching)")
             except Exception as e:
                 logger.exception(f"AdBlocker init failed: {e}")
@@ -590,11 +667,55 @@ class Minus:
 
     # ===== Health Recovery Methods =====
 
+    def _set_led_state(self, state):
+        """Forward a state change to the status-LED strip. No-op if disabled
+        or hardware missing. Errors are swallowed — LED issues must never
+        crash core paths."""
+        ctrl = getattr(self, 'status_leds', None)
+        if ctrl is None or not ctrl.enabled:
+            return
+        try:
+            ctrl.set_state(state)
+        except Exception as e:
+            logger.debug(f"[StatusLED] set_state({state}) failed: {e}")
+
+    def _baseline_led_state(self):
+        """Resolve what the LEDs should show when an acute state (blocking)
+        ends. Priority high → low: no_signal, wifi_setup, paused,
+        autonomous, idle. The first thing that's currently true wins.
+
+        Used by ad_blocker.hide(), resume_blocking(), and the autonomous
+        deactivate hook. error is intentionally NOT in this list — it's a
+        manual / subsystem-failure override that the next legitimate state
+        change will overwrite anyway.
+        """
+        # Prefer the health monitor's live `hdmi_signal` over the boolean we
+        # toggle in _on_hdmi_lost / _on_hdmi_restored. The flag toggles only
+        # on transitions, but the live status is always current.
+        try:
+            if self.health_monitor is not None:
+                hs = self.health_monitor.get_status()
+                if hs is not None and not hs.hdmi_signal:
+                    return 'no_signal'
+        except Exception:
+            pass
+        if getattr(self, '_hdmi_signal_lost', False):
+            return 'no_signal'
+        if self.wifi_manager is not None and getattr(
+                self.wifi_manager, '_ap_mode_active', False):
+            return 'wifi_setup'
+        if self.is_blocking_paused():
+            return 'paused'
+        if getattr(self, '_autonomous_was_active', False):
+            return 'autonomous'
+        return 'idle'
+
     def _on_hdmi_lost(self):
         """Handle HDMI signal loss."""
         logger.warning("[Recovery] HDMI signal lost - showing NO SIGNAL display")
         # Pause detection workers to prevent memory leak from repeated snapshot timeouts
         self._hdmi_signal_lost = True
+        self._set_led_state('no_signal')
         # Switch to standalone NO SIGNAL display (doesn't depend on ustreamer)
         if self.ad_blocker:
             self.ad_blocker.start_no_signal_mode()
@@ -613,6 +734,8 @@ class Minus:
         # Set flag to prevent main loop from interfering with recovery
         self._hdmi_recovery_in_progress = True
 
+        self._set_led_state('initializing')
+
         try:
             # Switch to loading display while we restart everything
             if self.ad_blocker:
@@ -624,17 +747,45 @@ class Minus:
             # Wait for ustreamer to be fully ready before restarting video pipeline
             time.sleep(2)
 
-            # Start the video pipeline (will transition from loading to live)
+            # Start the video pipeline (will transition from loading to live).
+            # If HDMI-OUT (the TV) is still disconnected, this will fail —
+            # kmssink can't open a DRM plane on a disconnected connector.
+            # We MUST check the return value: previously we logged "recovery
+            # complete" regardless and left self.display_connected stuck at
+            # True, which prevented the display retry loop from ever firing
+            # — the pipeline then stayed dead until the next service restart.
+            pipeline_ok = False
             if self.ad_blocker:
                 logger.info("[Recovery] Starting video pipeline...")
-                self.ad_blocker.start()
+                pipeline_ok = bool(self.ad_blocker.start())
 
-            if self.audio:
-                # Resume watchdog and restart pipeline (source is available again)
-                self.audio.resume_watchdog()
-                self.audio.unmute()
-
-            logger.info("[Recovery] HDMI recovery complete")
+            if pipeline_ok:
+                self.display_connected = True
+                self.display_error = None
+                if self.audio:
+                    # Resume watchdog and restart pipeline (source is available again)
+                    self.audio.resume_watchdog()
+                    self.audio.unmute()
+                logger.info("[Recovery] HDMI recovery complete")
+                self._set_led_state('idle')
+            else:
+                # Pipeline start failed — almost always because HDMI-OUT is
+                # still disconnected. Mark display as down and hand off to
+                # the retry loop, which will keep trying every 7s and pick up
+                # the moment HDMI-OUT comes back.
+                logger.warning(
+                    "[Recovery] Display pipeline start failed (HDMI-OUT likely "
+                    "disconnected) — marking display down and arming retry loop"
+                )
+                self.display_connected = False
+                self.display_error = (
+                    "Display output not available. Check HDMI-TX connection to TV/monitor."
+                )
+                self._start_display_retry_loop()
+                # Audio stays muted/paused; resume_watchdog will fire when the
+                # retry loop succeeds (start_display_pipeline → main resume path).
+                # LED state stays at no_signal — the display gate keeps the
+                # strip dark while the retry loop runs.
         finally:
             self._hdmi_recovery_in_progress = False
 
@@ -1302,6 +1453,10 @@ class Minus:
         if self.audio:
             self.audio.unmute()
 
+        # ad_blocker.hide() will have set state=idle; override with paused
+        # so the LED visually distinguishes "user-paused" from "running clean".
+        self._set_led_state('paused')
+
     def resume_blocking(self):
         """Resume ad blocking immediately."""
         with self._state_lock:
@@ -1310,6 +1465,10 @@ class Minus:
 
         # Re-evaluate current state
         self._update_blocking_state()
+        # Don't override an active block — only return to baseline if we
+        # weren't blocking when the user clicked resume.
+        if not self.blocking_active:
+            self._set_led_state(self._baseline_led_state())
 
     def is_blocking_paused(self) -> bool:
         """Check if blocking is currently paused."""
@@ -1318,6 +1477,29 @@ class Minus:
     def get_pause_remaining(self) -> int:
         """Get seconds remaining in pause, or 0 if not paused."""
         remaining = self.blocking_paused_until - time.time()
+        return max(0, int(remaining))
+
+    def notify_hdmi_reconnect(self):
+        """Called by the health monitor when the TV output reconnects."""
+        self.hdmi_reconnect_time = time.time()
+        logger.info(
+            f"[Minus] HDMI reconnect recorded; ad blocking suppressed for "
+            f"{self.HDMI_RECONNECT_GRACE_SECONDS:.0f}s"
+        )
+
+    def is_in_hdmi_reconnect_grace(self) -> bool:
+        """True if we're within the post-reconnect grace window."""
+        if not self.hdmi_reconnect_grace_enabled:
+            return False
+        if self.hdmi_reconnect_time <= 0:
+            return False
+        return (time.time() - self.hdmi_reconnect_time) < self.HDMI_RECONNECT_GRACE_SECONDS
+
+    def get_hdmi_reconnect_grace_remaining(self) -> int:
+        """Seconds left in the HDMI reconnect grace window (0 if inactive)."""
+        if not self.is_in_hdmi_reconnect_grace():
+            return 0
+        remaining = self.HDMI_RECONNECT_GRACE_SECONDS - (time.time() - self.hdmi_reconnect_time)
         return max(0, int(remaining))
 
     def add_detection(self, source: str, texts: list, matched_keywords: list = None):
@@ -1379,6 +1561,8 @@ class Minus:
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
+            'hdmi_reconnect_grace': self.is_in_hdmi_reconnect_grace(),
+            'hdmi_reconnect_grace_remaining': self.get_hdmi_reconnect_grace_remaining(),
             'static_suppressed': self.static_blocking_suppressed,
 
             # Detection counts
@@ -1551,6 +1735,28 @@ class Minus:
             logger.debug(f"Transition detection error: {e}")
             return False, None
 
+    def _current_min_blocking_duration(self) -> float:
+        """Compute the dynamic minimum blocking duration for the current ad.
+
+        Consecutive ads shorten the floor so we don't hold the block longer than
+        the ad itself. Index 0 is the first ad of a sequence, index N is the
+        (N+1)th consecutive ad. Floor depends on whether OCR+VLM both agree
+        (slightly longer — 1.5s — because VLM's cycle is slower and we don't
+        want to unblock before it confirms) or OCR alone (1.0s).
+
+        When falloff is disabled via the settings toggle, the base 3.0s is held
+        regardless of how many ads fired in a row.
+        """
+        if not self.block_falloff_enabled:
+            return self.MIN_BLOCKING_DURATION_BASE
+        floor = (
+            self.MIN_BLOCKING_DURATION_FLOOR_BOTH
+            if self.blocking_source == "both"
+            else self.MIN_BLOCKING_DURATION_FLOOR_OCR
+        )
+        duration = self.MIN_BLOCKING_DURATION_BASE - self.consecutive_ad_count * self.MIN_BLOCKING_DURATION_STEP
+        return max(duration, floor)
+
     def _get_vlm_agreement(self) -> tuple:
         """
         Calculate VLM agreement percentage from sliding window using confidence-weighted votes.
@@ -1612,11 +1818,16 @@ class Minus:
             if time_since_change < self.vlm_min_state_duration:
                 return False  # Still in cooldown
 
-        # Need strong ad agreement to start
+        # Need strong ad agreement to start. Caller only reaches this function
+        # when VLM is acting alone — the OCR-corroborated path at ~line 2778
+        # takes an immediate shortcut and bypasses the sliding window entirely.
         threshold = self.vlm_start_agreement
         if not self.vlm_ad_detected:
             # Not currently detecting - need even stronger evidence to start
             threshold += self.vlm_hysteresis_boost
+        # Cap so hysteresis + raised base can't push us past what real-world
+        # noise allows (a few spurious "no" responses would block triggering forever).
+        threshold = min(threshold, self.vlm_start_threshold_cap)
 
         return ad_ratio >= threshold
 
@@ -1653,7 +1864,18 @@ class Minus:
     def _load_system_settings(self) -> dict:
         """Load system settings from disk."""
         defaults = {
-            'vlm_preload': True,  # Load VLM at startup (vs wait for HDMI)
+            'vlm_preload': True,          # Load VLM at startup (vs wait for HDMI)
+            'block_falloff': True,        # Shorten min-block duration on consecutive ads
+            'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
+            'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
+            'debug_overlay': True,        # Show BLOCKING header + bottom-left stats + top-right OCR snippet
+            'ir_enabled': False,          # Show REI HDMI-switch IR remote in autonomous mode
+            'leds_require_display': True, # Only drive the WS2812B strip when HDMI-TX is connected
+                                          # (so a powered-off TV in a dark room stays dark)
+            # Which replacement-mode kinds are allowed during ad blocks. A
+            # list rather than a dict so the web UI can just toggle checkboxes.
+            # Valid kinds: 'vocab', 'fact', 'photos'.
+            'replacement_modes': ['vocab', 'fact'],
         }
         try:
             if SYSTEM_SETTINGS_FILE.exists():
@@ -1663,7 +1885,12 @@ class Minus:
                     for key in defaults:
                         if key in saved:
                             defaults[key] = saved[key]
-                    logger.info(f"Loaded system settings: vlm_preload={defaults['vlm_preload']}")
+                    logger.info(
+                        f"Loaded system settings: vlm_preload={defaults['vlm_preload']}, "
+                        f"block_falloff={defaults['block_falloff']}, "
+                        f"hdmi_reconnect_grace={defaults['hdmi_reconnect_grace']}, "
+                        f"greyscale_preview={defaults['greyscale_preview']}"
+                    )
         except Exception as e:
             logger.warning(f"Could not load system settings: {e}")
         return defaults
@@ -1698,6 +1925,122 @@ class Minus:
     def vlm_preload(self) -> bool:
         """Whether to preload VLM at startup."""
         return self._system_settings.get('vlm_preload', True)
+
+    @property
+    def block_falloff_enabled(self) -> bool:
+        """Whether consecutive-ad min-duration falloff is active."""
+        return self._system_settings.get('block_falloff', True)
+
+    @property
+    def hdmi_reconnect_grace_enabled(self) -> bool:
+        """Whether ad blocking is suppressed for 90s after HDMI reconnect."""
+        return self._system_settings.get('hdmi_reconnect_grace', True)
+
+    @property
+    def greyscale_preview_enabled(self) -> bool:
+        """Whether the ad preview window is desaturated in blocking mode."""
+        return self._system_settings.get('greyscale_preview', True)
+
+    @property
+    def debug_overlay_enabled(self) -> bool:
+        """Whether the blocking overlay shows debug info (header, stats, OCR snippet)."""
+        return self._system_settings.get('debug_overlay', True)
+
+    def set_debug_overlay_enabled(self, enabled: bool) -> dict:
+        """Toggle the unified debug-overlay flag and persist it.
+
+        Controls three on-screen elements together: the [BLOCKING // ...]
+        header, the bottom-left stats dashboard, and the top-right OCR
+        trigger snippet. Off hides all three.
+        """
+        enabled = bool(enabled)
+        self._system_settings['debug_overlay'] = enabled
+        self._save_system_settings()
+        if self.ad_blocker:
+            self.ad_blocker.set_debug_overlay_enabled(enabled)
+        return {'success': True, 'debug_overlay': enabled}
+
+    @property
+    def ir_enabled(self) -> bool:
+        """Whether the REI HDMI-switch IR remote is exposed in the web UI."""
+        return self._system_settings.get('ir_enabled', False)
+
+    def set_ir_enabled(self, enabled: bool) -> dict:
+        """Toggle IR remote visibility in the UI. When turning off, also
+        releases the PWM if it had been initialized."""
+        enabled = bool(enabled)
+        self._system_settings['ir_enabled'] = enabled
+        self._save_system_settings()
+        if not enabled and self.ir_transmitter and self.ir_transmitter.initialized:
+            try:
+                self.ir_transmitter.shutdown()
+            except Exception as e:
+                logger.warning(f"IR transmitter shutdown failed: {e}")
+        return {'success': True, 'ir_enabled': enabled}
+
+    @property
+    def leds_require_display(self) -> bool:
+        """Whether the status-LED strip should only drive frames when the
+        HDMI-TX display is actually connected. Default True — keeps a
+        dark room dark when the TV is powered off."""
+        return self._system_settings.get('leds_require_display', True)
+
+    def set_leds_require_display(self, enabled: bool) -> dict:
+        self._system_settings['leds_require_display'] = bool(enabled)
+        self._save_system_settings()
+        return {'success': True, 'leds_require_display': bool(enabled)}
+
+    def is_display_connected_live(self) -> bool:
+        """Live HDMI-TX presence check (sysfs, no caching).
+
+        ``self.display_connected`` reflects the *display pipeline's* state
+        — once the pipeline has come up successfully it stays True until
+        a long-running retry loop notices a real disconnect. For the
+        LED gate we want a fast yes/no based on the kernel's current
+        view of /sys/class/drm, so we route through the health monitor's
+        sysfs probe.
+        """
+        if self.health_monitor is not None:
+            try:
+                return self.health_monitor._check_hdmi_output_connected()
+            except Exception:
+                pass
+        # Fall back to the cached pipeline-side flag so we never
+        # accidentally gate to dark on a flaky probe.
+        return self.display_connected
+
+    def set_optimization_setting(self, key: str, enabled: bool) -> dict:
+        """Update one of the optimization toggles and persist."""
+        allowed = {'block_falloff', 'hdmi_reconnect_grace', 'greyscale_preview'}
+        if key not in allowed:
+            return {'success': False, 'error': f'unknown setting {key}'}
+        self._system_settings[key] = bool(enabled)
+        self._save_system_settings()
+        return {'success': True, key: bool(enabled)}
+
+    def get_replacement_modes(self) -> list:
+        """Which replacement-mode kinds the overlay may roll into."""
+        modes = self._system_settings.get(
+            'replacement_modes', ['vocab', 'fact'])
+        allowed = {'vocab', 'fact', 'photos'}
+        # Strip any legacy 'haiku' entries silently (kind was removed)
+        return [m for m in modes if m in allowed]
+
+    def set_replacement_modes(self, modes: list) -> dict:
+        """Persist the user's replacement-mode selection.
+
+        At least one text kind must remain enabled; if the caller tried to
+        disable every text option we force ``vocab`` back on so the overlay
+        has *something* to show when photos run out or aren't enabled.
+        """
+        allowed = {'vocab', 'fact', 'photos'}
+        cleaned = [m for m in (modes or []) if m in allowed]
+        text_kinds = {'vocab', 'fact'}
+        if not any(m in text_kinds for m in cleaned):
+            cleaned.append('vocab')
+        self._system_settings['replacement_modes'] = sorted(set(cleaned))
+        self._save_system_settings()
+        return {'success': True, 'replacement_modes': self._system_settings['replacement_modes']}
 
     def _load_vlm_model(self) -> bool:
         """Load VLM model with retry logic.
@@ -1740,6 +2083,21 @@ class Minus:
                 self.system_notification.show_vlm_failed()
 
         return vlm_loaded
+
+    def _first_match_for_overlay(self):
+        """Return ``(keyword, snippet)`` for the most recent OCR match, or ''.
+
+        Picked up by the blocking overlay's top-right "(Ad) 0:30 left" hint.
+        Returns '' for VLM-only blocks or if OCR hasn't matched yet — the
+        ad_blocker preserves any prior snippet across empty values.
+        """
+        if not self.last_matched_keywords:
+            return ''
+        try:
+            kw, snippet = self.last_matched_keywords[0]
+            return (kw, snippet)
+        except (TypeError, ValueError):
+            return ''
 
     def _hdmi_audio_present(self) -> bool:
         """Check if HDMI-IN is currently receiving audio from the source device.
@@ -1983,8 +2341,21 @@ class Minus:
         if self.ad_blocker.start():
             logger.info("Display pipeline started - 30 FPS with instant ad blocking")
 
-            # Start audio passthrough
+            # Start audio passthrough. If the TV was off at boot,
+            # __init__ fell back to hw:0,0 — re-probe now and re-point
+            # the audio sink at the live HDMI output before starting,
+            # otherwise audio plays out the wrong port.
             if self.audio:
+                drm_info = probe_drm_output()
+                if (drm_info['audio_device'] and
+                        drm_info['audio_device'] != self.audio.playback_device):
+                    logger.info(
+                        f"Audio device changed: {self.audio.playback_device} "
+                        f"-> {drm_info['audio_device']}"
+                    )
+                    self.audio.stop()
+                    self.audio.playback_device = drm_info['audio_device']
+                    self.config.audio_playback_device = drm_info['audio_device']
                 if self.audio.start():
                     logger.info("Audio passthrough started")
                 else:
@@ -2060,10 +2431,25 @@ class Minus:
                         ad_ratio, _, total = self._get_vlm_agreement()
                         logger.info(f"VLM triggered alone (agreement: {ad_ratio*100:.0f}% of {total} decisions)")
 
+                if should_start and self.is_in_hdmi_reconnect_grace():
+                    remaining = self.get_hdmi_reconnect_grace_remaining()
+                    logger.info(
+                        f"Blocking suppressed - HDMI reconnect grace period "
+                        f"({remaining}s remaining)"
+                    )
+                    should_start = False
+
                 if should_start:
                     self.ad_detected = True
                     self.blocking_start_time = now
                     self.blocking_source = source
+                    # Falloff counter: if the last block ended recently (within the
+                    # reset gap), this is a consecutive ad — bump the counter. If
+                    # it's been a while, this is a fresh ad sequence — reset.
+                    if self.blocking_end_time > 0 and (now - self.blocking_end_time) <= self.MIN_DURATION_RESET_GAP:
+                        self.consecutive_ad_count += 1
+                    else:
+                        self.consecutive_ad_count = 0
                     # Reset skip and pause detection for new ad
                     self.accidental_pause_detected = False
                     self.skip_attempted_this_ad = False
@@ -2082,7 +2468,8 @@ class Minus:
                 blocking_elapsed = now - self.blocking_start_time
                 should_stop = False
 
-                if blocking_elapsed >= self.MIN_BLOCKING_DURATION:
+                min_duration = self._current_min_blocking_duration()
+                if blocking_elapsed >= min_duration:
                     ocr_says_stop = (self.ocr_no_ad_count >= self.OCR_STOP_THRESHOLD)
                     # For VLM stopping, use consecutive no-ad count (not sliding window)
                     # This ensures responsive stopping after ad ends
@@ -2109,6 +2496,10 @@ class Minus:
                     self.ad_detected = False
                     source_was = self.blocking_source
                     self.blocking_source = None
+                    # Clear the OCR snippet so the next block starts fresh
+                    # (otherwise the prior ad's "(Ad) 0:30" would render briefly
+                    # on the next OCR trigger before fresh OCR data arrives).
+                    self.last_matched_keywords = []
                     # Also clear VLM state so it doesn't immediately re-trigger
                     self.vlm_ad_detected = False
                     self.vlm_decision_history.clear()
@@ -2134,7 +2525,10 @@ class Minus:
 
             if self.ad_blocker:
                 if should_show_blocking:
-                    self.ad_blocker.show(self.blocking_source)
+                    self.ad_blocker.show(
+                        self.blocking_source,
+                        ocr_trigger_text=self._first_match_for_overlay(),
+                    )
                 else:
                     self.ad_blocker.hide()
 
@@ -2239,13 +2633,28 @@ class Minus:
                         self.static_blocking_suppressed = False
                         self.screen_became_dynamic_time = 0
 
-                        # Clear detection state from static period to prevent false positives
-                        # The ad detected during pause was a "still ad" that shouldn't trigger
-                        # blocking when video resumes
-                        if self.ocr_ad_detected or self.vlm_ad_detected:
-                            logger.info(f"[Static] Clearing stale detection state (OCR={self.ocr_ad_detected}, VLM={self.vlm_ad_detected})")
+                        # Clear detection state from static + cooldown periods.
+                        # OCR/VLM frames during the static window were on the
+                        # paused content and during the cooldown were on the
+                        # transitioning frames — neither is fresh evidence for
+                        # the post-static screen. We must reset the trigger
+                        # COUNTER too, not just the detected flag — otherwise
+                        # the very next OCR match (which only needs count >= 1)
+                        # immediately re-triggers blocking and the cooldown
+                        # had no effect.
+                        had_state = (
+                            self.ocr_ad_detected or self.vlm_ad_detected or
+                            self.ocr_ad_detection_count > 0
+                        )
+                        if had_state:
+                            logger.info(
+                                f"[Static] Clearing stale detection state "
+                                f"(OCR={self.ocr_ad_detected}, VLM={self.vlm_ad_detected}, "
+                                f"ocr_count={self.ocr_ad_detection_count})"
+                            )
                             self.ocr_ad_detected = False
                             self.ocr_no_ad_count = 0
+                            self.ocr_ad_detection_count = 0
                             self.vlm_ad_detected = False
                             self.vlm_no_ad_count = 0
                             self.vlm_decision_history.clear()  # Clear VLM sliding window
@@ -2293,6 +2702,8 @@ class Minus:
 
                 # Store OCR texts and check for home screen / video interface keywords
                 self.last_ocr_texts = all_texts
+                if matched_keywords:
+                    self.last_matched_keywords = matched_keywords
                 if all_texts:
                     combined_text = ' '.join(all_texts).lower()
 
@@ -2315,6 +2726,16 @@ class Minus:
                 # Check for skip opportunity (for Fire TV ad skipping)
                 # CONSERVATIVE APPROACH: Only try to skip ONCE per ad to avoid accidental pauses
                 is_skippable, skip_text, countdown = check_skip_opportunity(all_texts)
+
+                # Extract the ad's *own* countdown (Ad 0:30 etc.) — distinct
+                # from the skip-button countdown above. Feeds a progress bar
+                # in the blocking overlay so the user sees how long is left.
+                ad_seconds_left = extract_ad_seconds_remaining(all_texts)
+                if ad_seconds_left is not None:
+                    self.ad_seconds_remaining = ad_seconds_left
+                    self.ad_seconds_remaining_at = time.time()
+                    if self.ad_blocker and hasattr(self.ad_blocker, 'set_ad_seconds_remaining'):
+                        self.ad_blocker.set_ad_seconds_remaining(ad_seconds_left)
 
                 # Calculate time since ad blocking started
                 time_since_blocking = 0
@@ -2674,6 +3095,16 @@ class Minus:
         """Start the stream processing."""
         logger.info("Starting Minus...")
 
+        # Status LEDs: if the user persisted the toggle as enabled, start the
+        # animation thread now and show the "initializing" white pulse until
+        # the rest of the boot sequence settles into idle / blocking / etc.
+        if self.status_leds and self.status_leds.enabled:
+            try:
+                self.status_leds.start()
+                self.status_leds.set_state("initializing")
+            except Exception as e:
+                logger.warning(f"Status LEDs start failed: {e}")
+
         # Start web UI early so it's accessible even when waiting for HDMI signal
         if HAS_WEBUI:
             try:
@@ -2707,6 +3138,7 @@ class Minus:
                 # Define callbacks for AP mode events
                 def on_ap_started():
                     logger.info("[WiFi] AP mode started - captive portal available")
+                    self._set_led_state('wifi_setup')
                     if HAS_OVERLAY:
                         try:
                             overlay = SystemNotification(ustreamer_port=self.config.ustreamer_port)
@@ -2720,6 +3152,7 @@ class Minus:
 
                 def on_ap_stopped():
                     logger.info("[WiFi] AP mode stopped - connected to WiFi")
+                    self._set_led_state('idle')
                     if HAS_OVERLAY:
                         try:
                             overlay = SystemNotification(ustreamer_port=self.config.ustreamer_port)
@@ -2891,6 +3324,25 @@ class Minus:
                 self.autonomous_mode.set_vlm(self.vlm)
             if hasattr(self, 'frame_capture') and self.frame_capture:
                 self.autonomous_mode.set_frame_capture(self.frame_capture)
+
+            # Track autonomous active/inactive transitions and reflect on the
+            # status LEDs. Don't override blocking — when an ad is blocked
+            # while autonomous is running, blocking visuals win and we'll
+            # come back to autonomous after hide().
+            self._autonomous_was_active = False
+            def _on_autonomous_status(status):
+                active = bool(status.get('active'))
+                if active and not self._autonomous_was_active:
+                    self._autonomous_was_active = True
+                    if not self.blocking_active:
+                        self._set_led_state('autonomous')
+                elif not active and self._autonomous_was_active:
+                    self._autonomous_was_active = False
+                    if not self.blocking_active:
+                        # Fall back to whatever baseline applies (paused?
+                        # — unlikely while autonomous was running but possible).
+                        self._set_led_state(self._baseline_led_state())
+            self.autonomous_mode.set_status_callback(_on_autonomous_status)
             self.autonomous_mode.start_if_enabled()
 
         logger.info("Minus running - press Ctrl+C to stop")
@@ -2947,6 +3399,22 @@ class Minus:
         if self.autonomous_mode:
             self.autonomous_mode.destroy()
             self.autonomous_mode = None
+
+        # Release IR transmitter PWM
+        if self.ir_transmitter:
+            try:
+                self.ir_transmitter.shutdown()
+            except Exception:
+                pass
+            self.ir_transmitter = None
+
+        # Stop status-LED animation thread and blank the strip
+        if self.status_leds:
+            try:
+                self.status_leds.stop()
+            except Exception:
+                pass
+            self.status_leds = None
 
         # Stop Fire TV setup first
         if self.fire_tv_setup:

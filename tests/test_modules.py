@@ -2231,6 +2231,30 @@ class TestAudioExtended:
         except Exception:
             pass
 
+    def test_watchdog_skips_state_check_after_successful_flush(self):
+        """After `_flush_sync_queue` succeeds the watchdog must `continue` to
+        the next tick instead of falling through to the pipeline state check.
+
+        The flush-start/flush-stop event pair transiently moves GStreamer out
+        of PLAYING. In 12h of production logs this caused a spurious full
+        restart every 45 min because the same watchdog iteration misread the
+        transient PAUSED state as a stall.
+        """
+        import inspect
+        from audio import AudioPassthrough
+
+        src = inspect.getsource(AudioPassthrough._watchdog_loop)
+        flush_idx = src.index("_flush_sync_queue()")
+        post = src[flush_idx:]
+        next_state_check = post.find("get_state")
+        next_continue = post.find("continue")
+        assert next_continue != -1, "watchdog must have a continue after successful flush"
+        assert next_continue < next_state_check, (
+            "watchdog must `continue` after successful flush before re-entering "
+            "the state check — otherwise transient flush-paused state triggers "
+            "a spurious full restart"
+        )
+
     def test_audio_volume_level(self):
         """Test volume level tracking."""
         try:
@@ -2909,6 +2933,23 @@ class TestOverlayExtended:
         from overlay import NotificationOverlay
 
         assert hasattr(NotificationOverlay, 'destroy')
+
+    def test_system_ready_overlay_omits_ad_substring(self):
+        """MINUS READY banner must not embed the substring 'AD' anywhere.
+
+        OCR picks up our own overlay text during HDMI reconnects. If the banner
+        says 'AD BLOCKING ACTIVE', the alphanumeric-normalized form contains
+        'adblockingactive' which matches the AD_KEYWORDS_EXACT entry 'ad' and
+        can self-trigger a block.
+        """
+        import inspect
+        from overlay import SystemNotification
+
+        src = inspect.getsource(SystemNotification.show_system_ready)
+        assert "AD BLOCKING" not in src, (
+            "show_system_ready must not contain 'AD BLOCKING' — OCR reads it"
+        )
+        assert "BLOCKING ACTIVE" in src
 
 
 # ============================================================================

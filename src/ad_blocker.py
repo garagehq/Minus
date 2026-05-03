@@ -37,7 +37,8 @@ gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 
 # Import vocabulary from extracted module
-from vocabulary import SPANISH_VOCABULARY
+from vocabulary import SPANISH_VOCABULARY, VOCABULARY_COMBINED
+from facts import DID_YOU_KNOW
 from config import MinusConfig
 from drm import (
     get_color_format, set_color_format, is_connector_connected,
@@ -114,12 +115,40 @@ class DRMAdBlocker:
         self._total_blocking_time = 0.0
         self._current_block_start = None
         self._total_ads_blocked = 0
+        # Top-right OCR trigger snippet, e.g. `(Ad) 0:30 left`. Populated when
+        # OCR fires the block; rendered only while debug overlay is enabled.
+        # Skipped/cleared for VLM-only blocks. OCR reads /snapshot/raw which
+        # excludes the blocking composite, so this can't recurse.
+        self._ocr_trigger_text = ""
 
         # Preview settings - use actual capture resolution for positioning
         self._preview_enabled = True
+        # When True, the corner preview is desaturated during blocking so the
+        # ad looks less appealing than the Spanish overlay. Toggled via the
+        # web UI (`greyscale_preview` in ~/.minus_system_settings.json).
+        self._preview_grayscale = True
 
-        # Pixelated background - disabled to test if it causes remaining glitches
-        self._pixelated_background_enabled = False  # DISABLED for glitch testing
+        # Ad-remaining countdown state for the stats progress bar. Set from
+        # minus.py when OCR reads an "Ad 0:NN" timer. Decays client-side
+        # between OCR samples so the bar moves even at sub-second resolution.
+        self._ad_seconds_remaining = None
+        self._ad_seconds_anchor = 0.0  # time.time() when we received the value
+        self._ad_seconds_peak = None   # Largest value seen this ad (for bar %)
+
+        # Replacement-mode lock-in: at the start of each ad block we roll once
+        # for a content kind (vocab / fact / haiku) and stick with it for the
+        # whole break, plus a cooldown afterwards. Prevents flip-flopping
+        # between styles mid-ad, which felt visually chaotic in testing.
+        self._locked_content_kind = None
+        self._content_kind_lock_until = 0.0
+        self.CONTENT_KIND_COOLDOWN_SECONDS = 30.0
+
+        # Pixelated pre-ad background — heavy pixelation (20x downscale) plus
+        # 60% darken so the previous content reads as "where I was" without
+        # competing with the Spanish overlay for attention. Kept fully offline
+        # — JPEG comes from the local ustreamer /snapshot poll, not any remote
+        # source. Can be turned off if glitches resurface.
+        self._pixelated_background_enabled = True
         self._frame_width, self._frame_height = self._detect_frame_resolution()
         self._preview_w = int(self._frame_width * 0.20)
         self._preview_h = int(self._frame_height * 0.20)
@@ -451,6 +480,7 @@ class DRMAdBlocker:
                 return False
 
             logger.info("[DRMAdBlocker] Pipeline started")
+            self._set_led_state('idle')
             self._start_watchdog()
 
             # Reset failure counters on fresh start (important after long HDMI outages)
@@ -692,6 +722,16 @@ class DRMAdBlocker:
         logger.info(f"[DRMAdBlocker] External restart requested (hdmi_reconnect={hdmi_reconnect})")
         threading.Thread(target=self._restart_pipeline, args=(hdmi_reconnect,), daemon=True).start()
 
+    def _set_led_state(self, state):
+        """Push a state to the WS2812B status strip if hooked up. Wrapped
+        because LED issues must never break ad blocking."""
+        if self.minus is None:
+            return
+        try:
+            self.minus._set_led_state(state)
+        except Exception:
+            pass
+
     def _attempt_bandwidth_fallback(self) -> bool:
         """
         Attempt to fix display by falling back to lower bandwidth color format.
@@ -790,6 +830,7 @@ class DRMAdBlocker:
         """
         try:
             logger.debug("[DRMAdBlocker] Starting no-signal mode...")
+            self._set_led_state('no_signal')
 
             # Stop the watchdog - we don't want it restarting the normal pipeline
             self._stop_watchdog_thread()
@@ -1150,12 +1191,133 @@ class DRMAdBlocker:
             'last_error': self._last_error_time
         }
 
+    # Content-kind rotation weights. Vocab is the default workhorse but we
+    # sprinkle facts in to keep the overlay from feeling monotonous.
+    # When _locked_content_kind is set (per-ad-break lock-in), we bypass this.
+    _CONTENT_KINDS = ('vocab', 'fact')
+    _CONTENT_KIND_WEIGHTS = (0.7, 0.3)
+    # When the user has enabled 'photos' replacement mode AND uploaded at
+    # least one photo, each ad block has a one-in-N chance of rolling into
+    # photo-cycling mode instead of a text rotation. Lock-in applies the
+    # same way so we don't flip-flop mid-break.
+    _PHOTO_MODE_CHANCE = 0.25
+
+    def _pick_content_kind(self):
+        """Choose which kind of content to show next.
+
+        If a per-block lock is active, return it. Otherwise weighted-random.
+        """
+        if getattr(self, '_locked_content_kind', None):
+            return self._locked_content_kind
+        return random.choices(self._CONTENT_KINDS, weights=self._CONTENT_KIND_WEIGHTS, k=1)[0]
+
+    def _roll_replacement_mode(self):
+        """Pick a content kind at the start of an ad break.
+
+        Honours the user's preferences from ``minus.replacement_modes``:
+          - If only 'vocab' is enabled → always vocab
+          - If 'photos' is enabled AND at least one photo is uploaded, there
+            is a :attr:`_PHOTO_MODE_CHANCE` chance of photo-cycling
+          - Otherwise weighted-random over the currently-enabled text kinds
+        """
+        modes_enabled = self._get_enabled_replacement_modes()
+        # If photos enabled and we have photos on disk, roll the dice.
+        if 'photos' in modes_enabled:
+            try:
+                from photo_library import get_photo_library
+                if get_photo_library().random_photo_id() is not None:
+                    if random.random() < self._PHOTO_MODE_CHANCE or modes_enabled == {'photos'}:
+                        return 'photos'
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] photo pool check failed: {e}")
+        # Filter text kinds to what's enabled; fall back to vocab.
+        text_kinds = tuple(k for k in self._CONTENT_KINDS if k in modes_enabled)
+        if not text_kinds:
+            return 'vocab'
+        weights = tuple(
+            w for k, w in zip(self._CONTENT_KINDS, self._CONTENT_KIND_WEIGHTS) if k in modes_enabled)
+        return random.choices(text_kinds, weights=weights, k=1)[0]
+
+    def _get_enabled_replacement_modes(self):
+        """Read ``replacement_modes`` preferences from the Minus instance.
+
+        Defaults to {'vocab', 'fact', 'haiku'} (text kinds on, photos off).
+        """
+        if self.minus and hasattr(self.minus, 'get_replacement_modes'):
+            try:
+                return set(self.minus.get_replacement_modes())
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] get_replacement_modes failed: {e}")
+        return {'vocab', 'fact', 'haiku'}
+
+    def _render_vocab(self, header):
+        vocab = random.choice(VOCABULARY_COMBINED)
+        self._current_vocab = vocab
+        # 4-tuple -> single example; 5-tuple -> two examples on own lines
+        spanish, pronunciation, english = vocab[0], vocab[1], vocab[2]
+        examples = [ex for ex in vocab[3:] if ex]
+        example_block = "\n".join(f'"{ex}"' for ex in examples)
+        prefix = f"{header}\n\n" if header else ""
+        return f"{prefix}{spanish}\n({pronunciation})\n\n= {english}\n\n{example_block}"
+
+    def _render_fact(self, header):
+        title, body = random.choice(DID_YOU_KNOW)
+        prefix = f"{header}\n\n" if header else ""
+        return f"{prefix}DID YOU KNOW?\n{title}\n\n{body}"
+
+    def _format_ocr_trigger(self, raw, source):
+        """Build the top-right OCR snippet, ~50 chars max, parens around match.
+
+        ``raw`` is either a (matched_keyword, snippet_text) tuple, an already-
+        formatted string, or empty. We wrap the matched substring in parens
+        within the snippet, e.g. ``(Ad) 0:30 left``. For VLM-only blocks or
+        if no trigger is provided, returns ''.
+        """
+        if not raw or source == 'vlm':
+            return ""
+        try:
+            if isinstance(raw, tuple) and len(raw) == 2:
+                keyword, snippet = raw
+                snippet = (snippet or '').strip()
+                keyword = (keyword or '').strip()
+                if keyword and snippet:
+                    idx = snippet.lower().find(keyword.lower())
+                    if idx >= 0:
+                        marked = (
+                            snippet[:idx]
+                            + '(' + snippet[idx:idx + len(keyword)] + ')'
+                            + snippet[idx + len(keyword):]
+                        )
+                    else:
+                        marked = f"({keyword}) {snippet}"
+                else:
+                    marked = snippet or f"({keyword})"
+            else:
+                marked = str(raw).strip()
+        except Exception:
+            return ""
+        marked = ' '.join(marked.split())  # collapse whitespace + newlines
+        if len(marked) > 50:
+            marked = marked[:47] + '...'
+        return marked
+
+    def _render_ocr_text(self):
+        """Return the snippet string ustreamer should render in the top-right.
+
+        Empty when debug overlay is off (so the C side draws nothing).
+        """
+        if not self._debug_overlay_enabled:
+            return ""
+        return self._ocr_trigger_text or ""
+
     def _get_blocking_text(self, source='default'):
         if source == 'hdmi_lost':
             return "[ NO SIGNAL ]\n\nHDMI DISCONNECTED\n\nWaiting for signal..."
         if source == 'no_hdmi_device':
             return "[ NO SIGNAL ]\n\nWAITING FOR HDMI..."
-        if source == 'ocr':
+        if not self._debug_overlay_enabled:
+            header = ""
+        elif source == 'ocr':
             header = "[ BLOCKING // OCR ]"
         elif source == 'vlm':
             header = "[ BLOCKING // VLM ]"
@@ -1163,16 +1325,11 @@ class DRMAdBlocker:
             header = "[ BLOCKING // OCR+VLM ]"
         else:
             header = "[ BLOCKING ]"
-        vocab = random.choice(SPANISH_VOCABULARY)
-        spanish, pronunciation, english, example = vocab
-        self._current_vocab = vocab  # Track current word for API
-        # Layout matching web UI vocabulary card:
-        # - Header (small)
-        # - Spanish word (prominent)
-        # - (pronunciation) in parentheses
-        # - = translation
-        # - "Example sentence" in quotes
-        return f"{header}\n\n{spanish}\n({pronunciation})\n\n= {english}\n\n\"{example}\""
+
+        kind = self._pick_content_kind()
+        if kind == 'fact':
+            return self._render_fact(header)
+        return self._render_vocab(header)
 
     def _get_debug_text(self):
         uptime_str = "N/A"
@@ -1203,15 +1360,105 @@ class DRMAdBlocker:
             time_saved_str = f"{saved_secs}s"
 
         debug_text = f"UPTIME    {uptime_str}\nBLOCKED   {self._total_ads_blocked}\nBLK TIME  {block_time_str}\nSAVED     {time_saved_str}"
+        # Ad countdown bar (YouTube/Netflix "Ad 0:30" -> drains to 0)
+        countdown_bar = self._ad_countdown_bar()
+        if countdown_bar:
+            debug_text += f"\n{countdown_bar}"
+        # Audio-reactive bar (falls silent when we're muted, which is the
+        # whole point — the Spanish overlay steals attention from the ad)
+        if self.audio and hasattr(self.audio, 'get_level_bars'):
+            try:
+                bars = self.audio.get_level_bars(width=12)
+                if bars:
+                    debug_text += f"\nAUDIO     {bars}"
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] audio bars skipped: {e}")
         if self._skip_text:
             debug_text += f"\n> {self._skip_text}"
         return debug_text
 
+    # Palette of Spanish-word colors in YUV (Y=luma, U=blue chroma, V=red
+    # chroma). Picked to stay legible on the dark blocking background and to
+    # read as distinct hues after the ustreamer MPP encoder maps back to
+    # RGB-ish display. Each entry is (name, y, u, v).
+    WORD_COLOR_PALETTE = (
+        ("purple",    140, 175, 145),   # original accent
+        ("magenta",   150, 160, 180),
+        ("cyan",      180, 170, 100),
+        ("lime",      200, 100, 120),
+        ("amber",     200, 100, 160),
+        ("pink",      190, 150, 175),
+        ("mint",      210, 120, 115),
+        ("sky",       175, 180, 115),
+        ("coral",     185, 110, 175),
+        ("teal",      165, 155, 110),
+    )
+
+    def _randomize_word_color(self):
+        """Pick a new Spanish-word color and push it to ustreamer.
+
+        Runs before each vocab rotation so the word cycles through the
+        palette rather than sitting on a single hue. Failures are harmless —
+        the previous color sticks.
+        """
+        try:
+            _name, y, u, v = random.choice(self.WORD_COLOR_PALETTE)
+            self._blocking_api_call(
+                '/blocking/set',
+                {'word_y': str(y), 'word_u': str(u), 'word_v': str(v)},
+            )
+        except Exception as e:
+            logger.debug(f"[DRMAdBlocker] word color randomize skipped: {e}")
+
     def _rotation_loop(self, source):
         while not self._stop_rotation.is_set():
-            text = self._get_blocking_text(source)
-            self._blocking_api_call('/blocking/set', {'text_vocab': text})
-            self._stop_rotation.wait(random.uniform(11.0, 15.0))
+            kind = self._pick_content_kind()
+            # Every rotation re-asserts preview_enabled + preview_grayscale
+            # regardless of mode so no path can accidentally drop the corner
+            # preview. Cheap (one /blocking/set), and makes the UI promise
+            # unconditional: "ad is always visible, desaturated, in the
+            # corner — during facts, vocab, photos, whatever."
+            preview_state = {
+                'preview_enabled': 'true' if self._preview_enabled else 'false',
+                'preview_grayscale': 'true' if self._preview_grayscale else 'false',
+                'text_ocr': self._render_ocr_text(),
+            }
+            if kind == 'photos':
+                # Photo-cycling replacement mode: swap the background image
+                # every ~5s, hide the large text so the photo reads as a
+                # screensaver. Stats + countdown bar stay on top. Preview
+                # window stays (greyscaled) so the user can still peek at
+                # the ad.
+                self._push_photo_background()
+                self._blocking_api_call('/blocking/set', {'text_vocab': '', **preview_state})
+                self._stop_rotation.wait(5.0)
+            else:
+                self._randomize_word_color()
+                text = self._get_blocking_text(source)
+                self._blocking_api_call('/blocking/set', {'text_vocab': text, **preview_state})
+                self._stop_rotation.wait(random.uniform(11.0, 15.0))
+
+    def _push_photo_background(self):
+        """Send a random library photo to ustreamer as the blocking bg.
+
+        The photo is already a re-encoded JPEG on disk so we just read and
+        forward its bytes. No re-encoding here — hot path.
+        """
+        try:
+            from photo_library import get_photo_library
+            lib = get_photo_library()
+            photo_id = lib.random_photo_id()
+            if not photo_id:
+                return False
+            data = lib.get_photo_bytes(photo_id)
+            if not data:
+                return False
+            result = self._blocking_api_call(
+                '/blocking/background', data=data, method='POST', timeout=0.8)
+            return bool(result and result.get('ok', False))
+        except Exception as e:
+            logger.warning(f"[DRMAdBlocker] photo background push failed: {e}")
+            return False
 
     def _start_rotation(self, source):
         self._stop_rotation.clear()
@@ -1270,12 +1517,50 @@ class DRMAdBlocker:
                     logger.debug(f"[DRMAdBlocker] Snapshot buffer fetch failed ({consecutive_failures}x): {e}")
             self._stop_snapshot_buffer.wait(self._snapshot_interval)
 
+    def _generate_fallback_background(self):
+        """Build a dark radial-gradient JPEG for blocks that start before the
+        snapshot buffer has content (e.g. ad in the first ~6s after restart).
+
+        Pure-Python/OpenCV, zero network. Returns JPEG bytes or None.
+        """
+        try:
+            import cv2
+            import numpy as np
+            w, h = 960, 540  # small is fine — ustreamer scales to output
+            yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+            cx, cy = w / 2.0, h / 2.0
+            dist = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+            dist /= dist.max()
+            # Dark matrix-green radial gradient matching the AESTHETICS palette
+            img = np.zeros((h, w, 3), dtype=np.uint8)
+            img[..., 0] = (25 * (1 - dist)).astype(np.uint8)   # B
+            img[..., 1] = (50 * (1 - dist)).astype(np.uint8)   # G
+            img[..., 2] = (20 * (1 - dist)).astype(np.uint8)   # R
+            _, enc = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            return enc.tobytes()
+        except Exception as e:
+            logger.debug(f"[DRMAdBlocker] Fallback gradient generation failed: {e}")
+            return None
+
     def _upload_background(self):
         """Upload pixelated background. Thread-safe for async execution."""
         try:
             # Thread-safe: copy snapshot data atomically to avoid race conditions
             try:
                 if not self._snapshot_buffer:
+                    # Buffer empty (early boot / post-restart). Upload a cheap
+                    # radial gradient as fallback so the overlay isn't flat
+                    # black while we wait for the first capture.
+                    fallback = self._generate_fallback_background()
+                    if fallback:
+                        self._blocking_api_call(
+                            '/blocking/background', data=fallback,
+                            method='POST', timeout=0.5)
+                        logger.info(
+                            "[DRMAdBlocker] Uploaded fallback gradient "
+                            "(snapshot buffer empty)"
+                        )
+                        return True
                     logger.warning("[DRMAdBlocker] No snapshots in buffer for background")
                     return False
                 # Copy data immediately to avoid race with buffer updates
@@ -1428,6 +1713,54 @@ class DRMAdBlocker:
         if self.is_visible:
             self._blocking_api_call('/blocking/set', {'preview_enabled': 'true' if enabled else 'false'})
 
+    def set_ad_seconds_remaining(self, seconds):
+        """Called from the OCR loop when an "Ad N:MM" timer is spotted."""
+        if seconds is None:
+            return
+        try:
+            seconds = int(seconds)
+        except (TypeError, ValueError):
+            return
+        if seconds < 0:
+            return
+        self._ad_seconds_remaining = seconds
+        self._ad_seconds_anchor = time.time()
+        # Peak resets when value goes UP (new ad started or OCR misread low)
+        if self._ad_seconds_peak is None or seconds > self._ad_seconds_peak:
+            self._ad_seconds_peak = seconds
+
+    def _clear_ad_countdown(self):
+        self._ad_seconds_remaining = None
+        self._ad_seconds_anchor = 0.0
+        self._ad_seconds_peak = None
+
+    def _ad_countdown_bar(self, width=10):
+        """Return a `[▓▓▓░░░] 12s` style bar, or '' if no timer known.
+
+        Uses the peak value seen this ad as 100% so the bar drains instead
+        of snapping around. Decays between OCR samples using wall-clock.
+        """
+        if self._ad_seconds_remaining is None or self._ad_seconds_peak is None:
+            return ''
+        if self._ad_seconds_peak <= 0:
+            return ''
+        elapsed = max(0.0, time.time() - self._ad_seconds_anchor)
+        current = max(0.0, self._ad_seconds_remaining - elapsed)
+        frac = max(0.0, min(1.0, current / self._ad_seconds_peak))
+        filled = int(round(frac * width))
+        bar = ('#' * filled) + ('.' * (width - filled))
+        return f"AD LEFT   [{bar}] {int(current):>2d}s"
+
+    def is_preview_grayscale(self):
+        return self._preview_grayscale
+
+    def set_preview_grayscale(self, enabled):
+        """Enable/disable greyscale on the ad preview window (live updates)."""
+        self._preview_grayscale = enabled
+        logger.info(f"[DRMAdBlocker] Preview greyscale {'enabled' if enabled else 'disabled'}")
+        if self.is_visible:
+            self._blocking_api_call('/blocking/set', {'preview_grayscale': 'true' if enabled else 'false'})
+
     def is_debug_overlay_enabled(self):
         return self._debug_overlay_enabled
 
@@ -1435,12 +1768,30 @@ class DRMAdBlocker:
         self._debug_overlay_enabled = enabled
         logger.info(f"[DRMAdBlocker] Debug overlay {'enabled' if enabled else 'disabled'}")
         if self.is_visible:
+            # Re-render the vocab so the [BLOCKING // ...] header appears or
+            # disappears immediately, plus push the top-right OCR text in
+            # whichever direction (filled when on, empty when off).
+            self._blocking_api_call('/blocking/set', {
+                'text_vocab': self._get_blocking_text(self.current_source or 'default'),
+                'text_ocr': self._render_ocr_text(),
+            })
             if enabled:
                 if not self._debug_thread or not self._debug_thread.is_alive():
                     self._start_debug()
             else:
                 self._stop_debug_thread()
                 self._blocking_api_call('/blocking/set', {'text_stats': ''})
+
+    def set_ocr_trigger_text(self, raw, source=None):
+        """Update the top-right OCR snippet during an active block.
+
+        Called when OCR re-fires while a block is already up, e.g. countdown
+        ticking from "Ad 0:30" -> "Ad 0:15". Cheap (one /blocking/set).
+        """
+        eff_source = source if source is not None else (self.current_source or 'default')
+        self._ocr_trigger_text = self._format_ocr_trigger(raw, eff_source)
+        if self.is_visible:
+            self._blocking_api_call('/blocking/set', {'text_ocr': self._render_ocr_text()})
 
     def is_pixelated_background_enabled(self):
         return self._pixelated_background_enabled
@@ -1488,30 +1839,57 @@ class DRMAdBlocker:
     def is_test_mode_active(self) -> bool:
         return self._test_blocking_until > time.time()
 
-    def show(self, source='default'):
+    def show(self, source='default', ocr_trigger_text=''):
         with self._lock:
             # Note: We still enable ustreamer blocking even without display pipeline
             # because blocking overlay works via ustreamer (for web stream) independently
             # of GStreamer display pipeline (for TV output via DRM)
 
+            # Update the snippet only if the caller gave us something fresh, OR if
+            # this is now a VLM-only block (which has no OCR snippet). Otherwise
+            # keep whatever set the block — OCR text often disappears mid-block as
+            # the timer ticks past the model's confidence cutoff and we don't want
+            # the top-right slot to flicker on/off.
+            new_snippet = self._format_ocr_trigger(ocr_trigger_text, source)
+            if new_snippet or source == 'vlm':
+                self._ocr_trigger_text = new_snippet
+
             if self.is_visible and self._animation_direction != 'end':
                 if self.current_source != source:
                     self.current_source = source
                     # Update overlay text to reflect new source (e.g., OCR -> OCR+VLM)
-                    self._blocking_api_call('/blocking/set', {'text_vocab': self._get_blocking_text(source)})
+                    self._blocking_api_call('/blocking/set', {
+                        'text_vocab': self._get_blocking_text(source),
+                        'text_ocr': self._render_ocr_text(),
+                    })
+                else:
+                    # Same source, fresh trigger snippet — push only the OCR text.
+                    self._blocking_api_call('/blocking/set', {'text_ocr': self._render_ocr_text()})
                 return
 
             if self._animating and self._animation_direction == 'start':
                 if self.current_source != source:
                     self.current_source = source
-                    self._blocking_api_call('/blocking/set', {'text_vocab': self._get_blocking_text(source)})
+                    self._blocking_api_call('/blocking/set', {
+                        'text_vocab': self._get_blocking_text(source),
+                        'text_ocr': self._render_ocr_text(),
+                    })
                 return
 
             if self._animating and self._animation_direction == 'end':
                 logger.info(f"[DRMAdBlocker] Reversing end animation ({source})")
                 self._stop_animation_thread()
 
-            logger.info(f"[DRMAdBlocker] Starting blocking ({source})")
+            # Lock a replacement-mode choice for this ad break (unless a
+            # prior lock is still within the cooldown window, in which case
+            # we reuse it — avoids flip-flopping between styles during an
+            # ad cluster). If the user has enabled 'photos' mode and uploaded
+            # at least one photo, we may roll into photo-cycling instead.
+            now = time.time()
+            reused = bool(self._locked_content_kind) and now <= self._content_kind_lock_until
+            if not reused:
+                self._locked_content_kind = self._roll_replacement_mode()
+            logger.info(f"[DRMAdBlocker] Starting blocking ({source}) kind={self._locked_content_kind} {'reused' if reused else 'rolled'} lock_until_in={self._content_kind_lock_until - now:.1f}s")
 
             # Mute audio immediately
             if self.audio:
@@ -1529,7 +1907,8 @@ class DRMAdBlocker:
                 'preview_x': '0', 'preview_y': '0',
                 'preview_w': str(self._frame_width), 'preview_h': str(self._frame_height),
                 'preview_enabled': 'true' if self._preview_enabled else 'false',
-                'text_vocab': '', 'text_stats': '',
+                'preview_grayscale': 'true' if self._preview_grayscale else 'false',
+                'text_vocab': '', 'text_stats': '', 'text_ocr': self._render_ocr_text(),
                 'text_vocab_scale': str(vocab_scale),
                 'text_stats_scale': str(stats_scale),
                 'box_alpha': str(self._box_alpha),
@@ -1540,6 +1919,7 @@ class DRMAdBlocker:
 
             self.is_visible = True
             self.current_source = source
+            self._set_led_state('blocking')
 
             # Write blocking state to file for zero-overhead checks (avoids HTTP)
             try:
@@ -1582,12 +1962,23 @@ class DRMAdBlocker:
             was_visible = self.is_visible
             self.is_visible = False
             self.current_source = None
+            if was_visible:
+                # Pick the right background state — autonomous mode running,
+                # blocking paused, or just plain idle.
+                if self.minus and hasattr(self.minus, '_baseline_led_state'):
+                    self._set_led_state(self.minus._baseline_led_state())
+                else:
+                    self._set_led_state('idle')
 
             if self.minus:
                 self.minus.blocking_active = False
 
             self._stop_rotation_thread()
             self._stop_debug_thread()
+            self._clear_ad_countdown()
+            # Keep the locked content kind valid for the cooldown window so
+            # a fresh ad shortly after this one reuses the same style.
+            self._content_kind_lock_until = time.time() + self.CONTENT_KIND_COOLDOWN_SECONDS
 
             if self._current_block_start:
                 self._total_blocking_time += time.time() - self._current_block_start
