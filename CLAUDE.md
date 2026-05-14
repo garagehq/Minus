@@ -404,6 +404,7 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - When video resumes, 0.5s cooldown (`DYNAMIC_COOLDOWN`) before re-enabling blocking
 - Detection state (OCR/VLM) cleared on cooldown complete to prevent false positives
 - Static ad screenshots saved to `screenshots/static/` for analysis
+- **Strong-ad-signal override (`STRONG_AD_KEYWORD_NAMES`):** suppression refuses to activate, and force-clears mid-suppression, when OCR has matched a keyword that ONLY appears in active video-ad UIs within the last `STRONG_AD_HOLD_SECONDS` (5s). Strong keywords: `skip ad` / `skip ads` / `skip in` / `skip ad (fuzzy*)` / `video will play after ad` / `visit advertiser` / `visitadvertiser` / `ad X of Y` / `ad countdown` / `ad with timestamp` / `ad with timestamp (cross-element)`. Bare `Sponsored` / `Learn more` / `Shop now` stay weak — those can legitimately appear on home screens or paused-on-ad tiles. See *Static Suppression Catches Real Video Ads* under Known Issues for the root-cause investigation.
 
 **OCR Timestamp Pattern Handling:**
 OCR frequently misreads characters in ad timestamps. The detection handles these common confusions:
@@ -1977,6 +1978,50 @@ Both files now carry a `Mirrors src/ocr.py:NNN — keep in sync` comment to make
 **Files modified:**
 - `src/ocr_worker.py` — per-element + cross-element keyword patterns updated; mirror comments added
 - `CLAUDE.md` — *OCR Timestamp Pattern Handling* section now calls out the dual-source requirement
+
+### Static Suppression Catches Real Video Ads (Fixed - May 2026)
+
+**Symptom:** A real ad break was playing (Michelob Ultra "Skip MI 15 Sponsored ZeRo Meo ULTRA USA"). OCR detected every frame correctly — every log line read `[AD DETECTED - STATIC SUPPRESSED]`. But the block never fired. Sequence:
+
+```
+18:36:30  ad starts ("Sponsored | ALENOL | 0.0%")
+18:36:34  OCR matches keywords ('skip in', 'sponsored')
+18:36:39  [Static] Screen static for 2.2s — suppressing blocking
+18:36:46  AD BLOCKING STARTED (OCR) → next frame "[AD DETECTED - STATIC SUPPRESSED]"
+... 102 seconds of suppressed frames ...
+18:38:21  [Static] Screen became dynamic — cooldown 1.5s
+18:38:23  block finally fires
+```
+
+The user paused the ad mid-stream expecting the overlay to be there — it never appeared. From their side it looked like OCR was broken.
+
+**Root cause:** the static-screen suppressor was originally added (CLAUDE.md `Static Screen Suppression` section) to prevent blocking when the user pauses on a YouTube/Netflix home screen that *happens* to show a "Sponsored" tile. The implementation treats any static screen + ad-ish text as "probably paused, don't block." But it can't distinguish:
+
+- Paused-on-home-screen with a sponsored corner tile (don't block — original intent)
+- **Real graphic video ad with low motion** (Michelob's static brand frame + tiny "Skip in 15" countdown — needs to be blocked)
+
+Both look static + have ad-ish text. The 2.5s `STATIC_TIME_THRESHOLD` is too tight for low-motion ad creative to ever beat the suppressor.
+
+**Fix:** add a "strong ad signal" override. Keywords that only appear in *active video-ad UIs* — never on paused home screens or recommendation grids — override the suppressor. Implemented in `minus.py`:
+
+- New class attribute: `STRONG_AD_KEYWORD_NAMES` (frozenset of keyword names) — `skip ad`, `skip ads`, `skip in`, `skip ad (fuzzy*)`, `video will play after ad`, `visit advertiser`, `visitadvertiser`, `ad X of Y`, `ad countdown`, `ad with timestamp`, `ad with timestamp (cross-element)`.
+- New state: `last_strong_ad_time = 0.0` plus `STRONG_AD_HOLD_SECONDS = 5.0`.
+- In the OCR loop, when `check_ad_keywords` returns matched keywords, if any name is in the strong set, update `last_strong_ad_time = time.time()`.
+- In the static suppression check, before activating:
+  - If suppression is currently on AND `(now - last_strong_ad_time) < STRONG_AD_HOLD_SECONDS` → force-clear suppression immediately. Don't wait for a scene change + cooldown; a low-motion ad might never trigger a scene change.
+  - Otherwise, only activate suppression if `not strong_ad_recent` — so the suppressor can't engage while a real video ad is being detected.
+
+**Why "strong" vs "weak" keywords:**
+- `Sponsored`, `Shop now`, `Learn more`, bare `Ad`, bare `Ads` — all legitimately appear on home screens (Fire TV recommendation rows, YouTube home tiles, Roku featured grids). Including them as override would re-introduce the pause-on-home-screen false positive that suppression was built to prevent.
+- `Skip in N`, `Ad N of M`, `0:NN Ad`, `Visit advertiser`, `Send to phone` — only appear during active video-ad playback. A paused home screen never shows "Skip in 14".
+
+**Verified intent preserved:** pausing on a YouTube home screen with a "Sponsored" recommendation tile still suppresses correctly because none of the strong keywords are present.
+
+**Edge case:** pausing on an in-progress video ad (real ad break that the user paused themselves) — the strong keyword is still on screen, so the block fires. Is that the right behavior? Probably yes: if the screen shows a real ad with a Skip button, the user almost certainly wants it blocked regardless of pause state. Better to err toward blocking real ads than away from them.
+
+**Files modified:**
+- `minus.py` — `STRONG_AD_KEYWORD_NAMES` + `STRONG_AD_HOLD_SECONDS` + `last_strong_ad_time` in `__init__`; OCR-loop update at the matched-keywords site; static-suppression check restructured to consult `strong_ad_recent` for both activation gating and mid-suppression lift.
+- `CLAUDE.md` — *Static Screen Suppression* section now documents the override; this Known-Issue entry captures the root cause.
 
 ### Unified Debug Toggle + Top-Right OCR Snippet (Added - Apr 2026)
 

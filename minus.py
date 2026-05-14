@@ -443,6 +443,29 @@ class Minus:
         self.static_blocking_suppressed = False  # Currently suppressing due to static
         self.screen_became_dynamic_time = 0      # When screen went from static to dynamic
 
+        # Strong-ad-signal override for static suppression. Some video ads
+        # (Michelob "Skip MI 15", graphic banner ads, etc.) have so little
+        # motion that the static detector triggers within 2.5s and the block
+        # never gets to run. We can't lower the static threshold without
+        # re-introducing pause-on-home-screen false positives. Instead, when
+        # OCR matches keywords that ONLY appear in active video-ad UIs
+        # (Skip Ad / Skip in / Ad N of M / Ad countdown / Ad with timestamp /
+        # Visit advertiser), we treat the screen as "definitely a real ad"
+        # and skip the suppressor entirely for STRONG_AD_HOLD_SECONDS.
+        # Bare "Sponsored" / "Learn more" / "Shop now" remain weak signals —
+        # those CAN appear on home screens / paused-on-ad tiles, so they
+        # don't override suppression.
+        self.STRONG_AD_KEYWORD_NAMES = frozenset({
+            'skip ad', 'skip ads', 'skip in',
+            'skip ad (fuzzy)', 'skip ad (fuzzy-spad)', 'skip ad (fuzzy-foad)',
+            'video will play after ad',
+            'visit advertiser', 'visitadvertiser',
+            'ad X of Y', 'ad countdown',
+            'ad with timestamp', 'ad with timestamp (cross-element)',
+        })
+        self.STRONG_AD_HOLD_SECONDS = 5.0
+        self.last_strong_ad_time = 0.0
+
         self.vlm_prev_frame = None
         self.vlm_prev_frame_had_ad = False
         self.vlm_scene_skip_count = 0
@@ -2596,8 +2619,25 @@ class Minus:
 
                 # Check if we should suppress blocking due to static screen
                 static_time = (now - self.static_since_time) if self.static_since_time > 0 else 0
+                # Strong-ad-signal override: if OCR has matched a video-ad-only
+                # keyword (Skip in / Skip Ad / Ad N of M / Ad countdown / Ad with
+                # timestamp / Visit advertiser) within the last STRONG_AD_HOLD_SECONDS,
+                # the screen is definitely showing an active video ad and we
+                # should NOT suppress — even if pixels are static (low-motion
+                # graphic ads exist). Also force-clears suppression if it's
+                # already on, so a strong signal arriving mid-suppression
+                # immediately revives blocking instead of waiting for the
+                # next scene change + cooldown.
+                strong_ad_recent = (now - self.last_strong_ad_time) < self.STRONG_AD_HOLD_SECONDS
 
-                if static_time >= self.STATIC_TIME_THRESHOLD or self.static_ocr_count >= self.STATIC_OCR_THRESHOLD:
+                if self.static_blocking_suppressed and strong_ad_recent:
+                    # Strong video-ad signal arrived while suppression was on — clear it
+                    # immediately. Don't wait for scene change + cooldown; a low-motion
+                    # ad might never trigger a scene change in time.
+                    logger.info("[Static] Strong ad signal detected — lifting suppression")
+                    self.static_blocking_suppressed = False
+                    self.screen_became_dynamic_time = 0
+                elif (static_time >= self.STATIC_TIME_THRESHOLD or self.static_ocr_count >= self.STATIC_OCR_THRESHOLD) and not strong_ad_recent:
                     if not self.static_blocking_suppressed:
                         logger.info(f"[Static] Screen static for {static_time:.1f}s / {self.static_ocr_count} OCR cycles - suppressing blocking")
                         self.static_blocking_suppressed = True
@@ -2704,6 +2744,12 @@ class Minus:
                 self.last_ocr_texts = all_texts
                 if matched_keywords:
                     self.last_matched_keywords = matched_keywords
+                    # Record timestamp if any "strong" keyword (Skip in / Skip Ad /
+                    # Ad with timestamp / etc.) was matched — used by the static
+                    # suppressor to keep its hands off active video ads. See
+                    # STRONG_AD_KEYWORD_NAMES in __init__.
+                    if any(kw in self.STRONG_AD_KEYWORD_NAMES for kw, _ in matched_keywords):
+                        self.last_strong_ad_time = time.time()
                 if all_texts:
                     combined_text = ' '.join(all_texts).lower()
 
