@@ -4,7 +4,7 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
-- **FastVLM-0.5B ad-classifier (iter4)** on Axera LLM 8850 NPU — **logit-thresholded, prefill-only, ~0.33s per frame deterministic** (1.5s soft / 3s hard timeout). Replaced FastVLM-1.5B (May 2026): same/better accuracy (holdout F1 94.72) at ~3x the speed. See *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* under Known Issues.
+- **FastVLM-0.5B ad-classifier (iter4)** on Axera LLM 8850 NPU — **logit-thresholded, prefill-only, ~0.33s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-1.5B (May 2026): same/better accuracy (holdout F1 94.72) at ~3x the speed. See *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* under Known Issues.
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -2117,10 +2117,19 @@ iter4, `images` for the 1.5B) so both layouts work unchanged.
 
 **Worker-timeout retune (`src/vlm_worker.py`):** since `detect_ad` is
 now deterministic ~0.33s with no runaway-token failure mode,
-`HARD_TIMEOUT` 5.0→3.0s and `LATENCY_P95_TRIGGER` 3.0→2.0s — a real hang
-is the only thing that can exceed these now, so recovery is faster with
-zero false-restart risk. `SOFT_TIMEOUT` stays 1.5s (shared with
-`query_image`, which still decodes up to 8 tokens).
+`HARD_TIMEOUT` 5.0→3.0→**2.0s** and `LATENCY_P95_TRIGGER` 3.0→2.0s — a
+real hang is the only thing that can exceed these now, so recovery is
+faster with zero false-restart risk. The timeouts are **shared** by
+`detect_ad` and `query_image`, and the floor is set by `query_image`,
+not `detect_ad`: measured `detect_ad` p95 0.33s / max 0.33s (0 events
+>1s over a full day) vs `query_image` (decode-based, autonomous mode)
+typical 1.3s / max 1.5s with `max_new_tokens=8`. So `HARD_TIMEOUT=2.0`
+keeps a 0.5s margin over `query_image`'s observed max; `SOFT_TIMEOUT`
+stays 1.5s — `query_image` legitimately reaches ~1.5s, so a lower soft
+timeout would spuriously time out screen queries and (3 consecutive)
+hard-kill the worker (~15s reload). Going below `HARD_TIMEOUT=2.0`
+would require per-request-type timeouts (not worth the complexity while
+`detect_ad` is this stable).
 
 **Sliding-window retune — the load-bearing fix.** The anti-waffle
 window was built for the 1.5B's ~36% home-screen FP rate. iter4 has

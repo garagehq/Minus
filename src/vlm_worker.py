@@ -161,10 +161,22 @@ class VLMProcess:
     # paragraph pathology in docs/VLM_NPU_DEGRADATION.md). That pathology
     # CANNOT occur without a decode loop, so anything past these bounds now
     # means a genuinely stuck NPU, which we want to catch and recover faster.
-    # SOFT_TIMEOUT stays at 1.5 because it is shared with query_image()
-    # (autonomous mode), which still decodes up to 8 tokens (~1.2s worst case).
+    # These are SHARED by detect_ad and query_image (same worker). The
+    # floor is set by query_image, not detect_ad:
+    #   detect_ad   : prefill-only, measured p50 0.31s / p95 0.33s /
+    #                 max 0.33s, 0 events >1s over a full day.
+    #   query_image : decode-based (autonomous mode), measured typical
+    #                 1.3s, max 1.5s with max_new_tokens=8.
+    # SOFT_TIMEOUT stays 1.5 — query_image legitimately reaches ~1.5s, so
+    # a lower soft timeout would spuriously time out autonomous-mode
+    # screen queries and (3 in a row) trigger a hard worker kill + ~15s
+    # model reload. HARD_TIMEOUT lowered 3.0 -> 2.0: still 0.5s above
+    # query_image's observed max and ~6x detect_ad's, so zero false-kill
+    # risk, but a genuinely stuck NPU is now reaped 1s sooner. Going below
+    # 2.0 would require per-request-type timeouts (detect_ad could take
+    # ~1.0s); not worth the complexity while detect_ad is this stable.
     SOFT_TIMEOUT = 1.5   # Return "timeout" after this, but don't kill
-    HARD_TIMEOUT = 3.0   # Only kill if inference takes longer than this
+    HARD_TIMEOUT = 2.0   # Only kill if inference takes longer than this
     RESTART_THRESHOLD = 3  # Restart after this many consecutive soft timeouts
 
     # Latency-based auto-recovery (defense-in-depth). With the prefill-only
