@@ -77,9 +77,18 @@ if _legacy_llm_dir.exists():
     LLM_MODEL_PATH = _legacy_llm_dir
     VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512.axmodel"
     EMBEDS_PATH = LLM_MODEL_PATH / "model.embed_tokens.weight.npy"
+    # 1.5B decoder K/V cache was compiled for seq-len 1024.
+    LLM_MAX_SEQ_LEN = 1024
 else:
     # Flat 0.5B ad-classifier layout (iter4 etc.)
     LLM_MODEL_PATH = FASTVLM_MODEL_DIR
+    # iter4's qwen2 decoder axmodels expect a K/V cache seq-len of 1023
+    # (the reference test_ad_classifier.py / threshold_sweep.py construct
+    # InferManager with max_seq_len=1023). Passing 1024 makes the decode
+    # path feed a (1,1024,128) K_cache into a [1,1023,128] input → shape
+    # mismatch. detect_ad is prefill-only so it never hit this; query_image
+    # (decode-based, autonomous mode) did.
+    LLM_MAX_SEQ_LEN = 1023
     _vision_candidates = (
         sorted(FASTVLM_MODEL_DIR.glob("image_encoder_*512*.axmodel"))
         or sorted(FASTVLM_MODEL_DIR.glob("image_encoder_*.axmodel"))
@@ -237,7 +246,7 @@ class VLMManager:
             self.imer = InferManager(
                 self.config,
                 str(LLM_MODEL_PATH),
-                max_seq_len=1024
+                max_seq_len=LLM_MAX_SEQ_LEN
             )
 
             # Load vision encoder
@@ -425,11 +434,33 @@ class VLMManager:
                 self._reset_kv_cache()
                 image_features = self._encode_image(image_path)
 
-                full_prompt = "<|im_start|>system\nYou are a helpful assistant that answers questions accurately and concisely.<|im_end|>\n"
+                # Short system prompt: the iter4 LLM is p128 (one 128-token
+                # prefill chunk). The verbose system message used to push
+                # this past 128 → infer_func asks axengine for a 2nd prefill
+                # shape-group that a p128 model doesn't have → IndexError on
+                # every call. Match detect_ad's short system for headroom.
+                full_prompt = (
+                    "<|im_start|>system\n" + self.AD_SYSTEM_PROMPT + "<|im_end|>\n"
+                )
                 full_prompt += "<|im_start|>user\n" + "<image>" * self.TOKEN_LENGTH + "\n"
                 full_prompt += prompt + "<|im_end|>\n<|im_start|>assistant\n"
 
                 token_ids = self.tokenizer.encode(full_prompt)
+
+                # Defensive guard: the p128 model physically cannot prefill
+                # >128 tokens in one chunk and has no multi-chunk shape
+                # group. Rather than crash autonomous mode every cycle on a
+                # too-long caller prompt, fail soft with a clear sentinel
+                # (callers already treat non-category responses as "unknown
+                # screen" and no-op). 128 = single p128 prefill chunk.
+                if len(token_ids) > 128:
+                    logger.warning(
+                        f"query_image prompt is {len(token_ids)} tokens > 128 "
+                        f"(p128 single-chunk limit) — shorten the prompt; "
+                        f"returning PROMPT_TOO_LONG without inference"
+                    )
+                    return "PROMPT_TOO_LONG", time.time() - start_time
+
                 prefill_data = np.take(self.embeds, token_ids, axis=0)
                 prefill_data = prefill_data.astype(bfloat16)
 
@@ -458,7 +489,8 @@ class VLMManager:
                 return response, elapsed
 
             except Exception as e:
-                logger.error(f"VLM query error: {e}")
+                import traceback
+                logger.error(f"VLM query error: {e}\n{traceback.format_exc()}")
                 return str(e), time.time() - start_time
 
     def detect_ad(self, image_path):

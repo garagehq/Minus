@@ -441,6 +441,12 @@ class Minus:
         # overlays makes consecutive misses extremely rare.
         self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
+        # Hard ceiling on one continuous block (any source). Legit ad
+        # breaks — even multi-ad streaming pods — are well under this;
+        # anything longer is a static weak-keyword false positive (see the
+        # [SAFEGUARD] force-stop in _update_blocking_state). env-overridable.
+        self.MAX_BLOCKING_DURATION = float(
+            os.environ.get('MINUS_MAX_BLOCKING_DURATION', '150'))
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
         self._state_lock = threading.Lock()
@@ -2529,10 +2535,50 @@ class Minus:
                         if blocking_elapsed >= 90.0 and not should_stop:
                             logger.warning(f"[VLM] Auto-stopping VLM-only blocking after {blocking_elapsed:.0f}s (safeguard)")
                             should_stop = True
+                    elif self.blocking_source == "both":
+                        # BOTH OCR and VLM detected this ad. Either one
+                        # clearing (2 consecutive no-ad) is a strong, correct
+                        # "ad ended" signal — stop on whichever fires first.
+                        # This decouples recovery from slow OCR snapshot
+                        # capture (observed ~2.5s/frame when the HDMI-OUT
+                        # display is disconnected): VLM clears in ~0.3s + 2
+                        # cadence ticks while OCR's 2 no-ad frames can lag
+                        # ~3s+. Measured: this cut a real ad→content recovery
+                        # from ~3s to ~1.5s. iter4's sharp per-frame
+                        # separation (p_yes≈0.99 ad / ≈0.01 content) makes a
+                        # spurious 2-in-a-row VLM no-ad mid-ad ~0.3% — and
+                        # OCR would still be holding then anyway.
+                        should_stop = ocr_says_stop or vlm_says_stop
                     else:
-                        # OCR triggered (alone or with VLM) - OCR is authoritative for stopping
-                        # This ensures we don't block longer than necessary after ad ends
+                        # OCR triggered alone (VLM dissented / never saw it).
+                        # OCR is authoritative; VLM's opinion is unreliable
+                        # here so it must NOT be allowed to stop early.
                         should_stop = ocr_says_stop
+
+                # UNIVERSAL SAFEGUARD: no single continuous block should ever
+                # exceed MAX_BLOCKING_DURATION regardless of source. Observed
+                # in production: a static "Sponsored · Peel to collect" promo
+                # tile (bare 'sponsored', audio present) held an OCR+VLM block
+                # for 591s because OCR kept matching the weak keyword so
+                # ocr_no_ad_count never reached threshold and there was no cap
+                # on the ocr/both path (only vlm-only had one). Real ad breaks
+                # — even 2-3-ad streaming pods — are well under this. On cap
+                # we clear ALL detection state so a genuinely-ongoing ad
+                # re-detects fresh within ~1-2 cycles (brief, rare) rather
+                # than the screen staying frozen for minutes (catastrophic).
+                if (self.ad_detected and not should_stop
+                        and blocking_elapsed >= self.MAX_BLOCKING_DURATION):
+                    logger.warning(
+                        f"[SAFEGUARD] Force-stopping {self.blocking_source} "
+                        f"block after {blocking_elapsed:.0f}s "
+                        f"(>{self.MAX_BLOCKING_DURATION:.0f}s cap) — likely a "
+                        f"static weak-keyword false positive; clearing state"
+                    )
+                    should_stop = True
+                    self.ocr_ad_detected = False
+                    self.ocr_no_ad_count = 0
+                    self.ocr_ad_detection_count = 0
+                    self.vlm_no_ad_count = 0
 
                 if should_stop:
                     self.ad_detected = False
@@ -2912,38 +2958,60 @@ class Minus:
                     if self.ad_blocker:
                         self.ad_blocker.set_skip_status(False, None)
 
+                # Bare "Sponsored" with no STRONG video-ad keyword (skip in /
+                # visit advertiser / countdown / Ad N of M) seen within
+                # STRONG_AD_HOLD_SECONDS is a home/promo tile, not a video ad
+                # ("Sponsored · Peel to collect", "Sponsored · Date prisa").
+                # The old discriminator was _hdmi_audio_present(), but home
+                # and promo screens DO carry audio (autoplay previews, music),
+                # so it let a static sponsored tile hold a block for ~10 min
+                # in production. strong-ad-recent is the reliable signal:
+                # real video ads show skip/countdown alongside "Sponsored"
+                # within a few seconds (VLM independently covers any genuine
+                # sponsored-only video ad, so OCR can safely stay strict).
+                strong_ad_recent = ((time.time() - self.last_strong_ad_time)
+                                    < self.STRONG_AD_HOLD_SECONDS)
+                sponsored_only = (len(matched_keywords) > 0 and
+                                  all(kw == 'sponsored' for kw, _ in matched_keywords))
+
+                suppress_reason = None
                 if ad_detected and not is_terminal:
                     keywords_found = [kw for kw, txt in matched_keywords]
-                    # "Sponsored" alone without HDMI audio is almost always a home-screen
-                    # tile (Fire TV recommendations row, YouTube home sponsored thumbnail).
-                    # Real video ads transmit audio. We check HDMI-IN audio_present
-                    # directly so this works even when our playback pipeline is down
-                    # (e.g. display disconnected).
-                    sponsored_only = (len(matched_keywords) > 0 and
-                                      all(kw == 'sponsored' for kw, _ in matched_keywords))
-                    # Suppress OCR ad detection if home screen is detected
-                    # (e.g., "Sponsored" content rows on Fire TV home are not video ads)
                     if self.home_screen_detected:
-                        logger.info(f"OCR suppressed - home screen detected. Keywords would have been: {keywords_found}")
-                    elif sponsored_only and not self._hdmi_audio_present():
-                        logger.info(f"OCR suppressed - 'sponsored' without HDMI audio = likely home tile. Texts: {all_texts[:3]}")
-                    else:
-                        self.ocr_ad_detection_count += 1
-                        self.ocr_no_ad_count = 0
-                        self.last_ocr_ad_time = time.time()
+                        suppress_reason = (f"home screen detected "
+                                           f"(would have been {keywords_found})")
+                    elif sponsored_only and not strong_ad_recent:
+                        suppress_reason = (
+                            f"weak 'sponsored'-only, no strong ad keyword in "
+                            f"{self.STRONG_AD_HOLD_SECONDS:.0f}s "
+                            f"(texts {all_texts[:3]})")
 
-                        if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
-                            self.ocr_ad_detected = True
-                        logger.info(f"OCR detected ad keywords: {keywords_found}")
-                        self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
-                        self.add_detection('OCR', all_texts, matched_keywords)
+                real_ad_frame = (ad_detected and not is_terminal
+                                 and suppress_reason is None)
+
+                if real_ad_frame:
+                    self.ocr_ad_detection_count += 1
+                    self.ocr_no_ad_count = 0
+                    self.last_ocr_ad_time = time.time()
+
+                    if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
+                        self.ocr_ad_detected = True
+                    logger.info(f"OCR detected ad keywords: {keywords_found}")
+                    self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
+                    self.add_detection('OCR', all_texts, matched_keywords)
                 else:
-                    # Check if this is a transition frame (black/solid color)
-                    # If we're blocking and see a transition, hold through it
-                    is_transition, transition_type = self._is_transition_frame(frame)
+                    # Suppressed (home/weak-sponsored) OR no ad keyword at all.
+                    # CRITICAL: route this into the no-ad accounting so an
+                    # active block actually DECAYS. The old code only logged
+                    # on suppression and fell through without touching
+                    # ocr_no_ad_count, so a static suppressed 'sponsored'
+                    # screen froze the counters and the block never stopped.
+                    if suppress_reason is not None:
+                        logger.info(f"OCR suppressed - {suppress_reason}")
 
+                    # Transition frame (black/solid) between ads: hold block.
+                    is_transition, transition_type = self._is_transition_frame(frame)
                     if self.ad_detected and is_transition:
-                        # Don't count transition frames as "no ad" - likely between ads
                         logger.info(f"OCR #{self.frame_count}: Transition frame ({transition_type}) - holding block")
                     else:
                         self.ocr_no_ad_count += 1
