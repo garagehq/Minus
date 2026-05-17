@@ -96,6 +96,12 @@ def main():
                    'kw': set(), 'end': None, 'dur': None,
                    'recover': None, 'flags': []}
             kw_seen = set()
+            # Scope recovery to THIS block. last_ad_signal_t is global; if
+            # it carries over from the previous block it produces a bogus
+            # cross-block recovery (e.g. a 5s block "recovering" 9s after
+            # the prior block's last ad frame). Reset so recovery is only
+            # measured from an ad-on-screen marker seen within this block.
+            last_ad_signal_t = None
         if cur is not None and 'OCR detected ad keywords' in ln:
             for kw in re.findall(r"'([^']+)'", ln.split(':')[-1]):
                 cur['kw'].add(kw)
@@ -107,7 +113,14 @@ def main():
             cur['stopped_by'] = (ln.split('stopped by')[-1].strip()
                                  if 'stopped by' in ln else '?')
             if last_ad_signal_t is not None and t is not None:
-                cur['recover'] = max(0.0, t - last_ad_signal_t)
+                rec = max(0.0, t - last_ad_signal_t)
+                # Recovery cannot exceed this block's own duration; if it
+                # does it's residual cross-block bleed → clamp.
+                cur['recover'] = (min(rec, cur['dur'])
+                                  if cur['dur'] else rec)
+            # else: no in-block ad-on-screen marker captured (very short
+            # block / residual-state trigger) → recover stays None and is
+            # NOT flagged SLOW_RECOVER (unmeasurable, not a real problem).
             kws = cur['kw']
             dur = cur['dur'] or 0
             # A short block that self-corrected fast is the system WORKING
@@ -138,10 +151,11 @@ def main():
                                    for f in b['flags'])]
     over = [b for b in blocks if 'OVERLONG' in b['flags']]
     for b in blocks[-12:]:
+        rec = 'N/A' if b['recover'] is None else f"{b['recover']}s"
         lines.append(
             f"  dur={b['dur']}s src={b['src']} kw={sorted(b['kw'])} "
             f"stopped_by={b.get('stopped_by','?')} "
-            f"recover={b['recover']}s flags={b['flags']}")
+            f"recover={rec} flags={b['flags']}")
     verdict = 'OK'
     if query_errs:
         verdict = 'ATTENTION: query_image errors'
