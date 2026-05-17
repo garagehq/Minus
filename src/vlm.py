@@ -1,9 +1,22 @@
 """
 VLM (Vision Language Model) integration for Minus.
 
-Uses FastVLM-1.5B on Axera LLM 8850 NPU for ad detection.
+Uses the FastVLM-0.5B ad-classifier (iter4, native-512 vision) on the
+Axera LLM 8850 NPU for ad detection.
+
+`detect_ad()` uses **logit-based thresholding**: it runs prefill only
+(no autoregressive decode), softmaxes the first-position logits over the
+full vocabulary, and compares the normalized P(Yes) against
+`VLMManager.AD_THRESHOLD`. This is ~33% faster than prefill+decode and
+the threshold is tunable post-hoc from logged scores without re-running
+inference. See /home/radxa/axera_models/LOGIT_THRESHOLD_IMPLEMENTATION.md
+and BENCHMARKS.md (iter4 @ T=0.76: F1=94.72, ~441ms).
+
+`query_image()` is unchanged — it still uses decode-based text
+generation, which is correct for the open-ended autonomous-mode screen
+prompt.
+
 Model is loaded ONCE at startup and kept running for fast inference.
-1.5B model is smarter than 0.5B with fewer false positives.
 """
 
 import os
@@ -31,32 +44,94 @@ from config import VLM_MODEL_DIR
 
 logger = logging.getLogger('Minus.VLM')
 
-# Model paths - FastVLM-1.5B (smarter, fewer false positives than 0.5B)
-# Base directory can be overridden via MINUS_VLM_MODEL_DIR environment variable
+# Model paths. Default points at the FastVLM-0.5B ad-classifier iter4
+# build; override the base dir via MINUS_VLM_MODEL_DIR.
+#
+# Two on-disk layouts are supported transparently:
+#   * 1.5B legacy : <dir>/fastvlm_ax650_context_1k_prefill_640_int4/...
+#   * 0.5B iter*  : flat <dir>/{qwen2_p128_l*_together.axmodel,
+#                                qwen2_post.axmodel,
+#                                image_encoder_*.axmodel,
+#                                model.embed_tokens.weight.npy}
+# The iter* dirs ship no tokenizer/utils of their own, so those fall
+# back to the canonical FastVLM-0.5B copies (tokenizer — must match the
+# model's 896-dim / 24-layer config) and the patched FastVLM-1.5B utils
+# (infer_func carries the max_new_tokens cap; llava_qwen is byte-identical
+# to the 0.5B copy). Each is overridable via env var.
 FASTVLM_MODEL_DIR = Path(VLM_MODEL_DIR)
-LLM_MODEL_PATH = FASTVLM_MODEL_DIR / "fastvlm_ax650_context_1k_prefill_640_int4"
-TOKENIZER_PATH = FASTVLM_MODEL_DIR / "fastvlm_tokenizer"
-VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512.axmodel"
-EMBEDS_PATH = LLM_MODEL_PATH / "model.embed_tokens.weight.npy"
+
+
+def _resolve_existing(env_var, candidates):
+    env = os.environ.get(env_var)
+    if env:
+        return Path(env)
+    for c in candidates:
+        if c.exists():
+            return c
+    return candidates[-1]
+
+
+_legacy_llm_dir = FASTVLM_MODEL_DIR / "fastvlm_ax650_context_1k_prefill_640_int4"
+if _legacy_llm_dir.exists():
+    # FastVLM-1.5B legacy layout
+    LLM_MODEL_PATH = _legacy_llm_dir
+    VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512.axmodel"
+    EMBEDS_PATH = LLM_MODEL_PATH / "model.embed_tokens.weight.npy"
+else:
+    # Flat 0.5B ad-classifier layout (iter4 etc.)
+    LLM_MODEL_PATH = FASTVLM_MODEL_DIR
+    _vision_candidates = (
+        sorted(FASTVLM_MODEL_DIR.glob("image_encoder_*512*.axmodel"))
+        or sorted(FASTVLM_MODEL_DIR.glob("image_encoder_*.axmodel"))
+    )
+    VISION_MODEL_PATH = (
+        _vision_candidates[0] if _vision_candidates
+        else FASTVLM_MODEL_DIR / "image_encoder_512x512_iter4.axmodel"
+    )
+    EMBEDS_PATH = FASTVLM_MODEL_DIR / "model.embed_tokens.weight.npy"
+
+_models_root = FASTVLM_MODEL_DIR.parent
+TOKENIZER_PATH = _resolve_existing("MINUS_VLM_TOKENIZER_DIR", [
+    FASTVLM_MODEL_DIR / "fastvlm_tokenizer",
+    _models_root / "FastVLM-0.5B" / "fastvlm_tokenizer",
+    _models_root / "FastVLM-1.5B" / "fastvlm_tokenizer",
+])
 
 # Add utils path for LlavaConfig and InferManager
-UTILS_PATH = FASTVLM_MODEL_DIR / "utils"
+UTILS_PATH = _resolve_existing("MINUS_VLM_UTILS_DIR", [
+    FASTVLM_MODEL_DIR / "utils",
+    _models_root / "FastVLM-1.5B" / "utils",
+    _models_root / "FastVLM-0.5B" / "utils",
+])
 
 
 class VLMManager:
     """
-    FastVLM-1.5B manager for ad detection on Axera LLM 8850.
+    FastVLM-0.5B ad-classifier manager for ad detection on Axera LLM 8850.
 
     The model is loaded once at initialization and kept running.
-    Uses Python axengine for inference.
-    1.5B model is smarter with fewer false positives than 0.5B.
+    Uses Python axengine for inference. `detect_ad()` uses logit-based
+    thresholding (prefill-only); `query_image()` uses decode.
     """
 
-    # Simple prompt per original benchmark (94.7% accuracy)
-    # False positive reduction done via thresholds and OCR cross-validation
+    # Ad-detection prompt. MUST match the prompt used to calibrate
+    # AD_THRESHOLD (fastvlm-holdout-test/threshold_sweep.py) byte-for-byte
+    # — the threshold is only valid for this exact system + user prompt.
+    AD_SYSTEM_PROMPT = "You are a helpful assistant."
     AD_PROMPT = "Is this an advertisement? Answer Yes or No."
     INPUT_SIZE = 512  # Vision encoder input size
     TOKEN_LENGTH = 64  # Number of image tokens for 512x512 input
+
+    # --- Logit-based ad classification (FastVLM-0.5B iter4) ---
+    # Calibrated on the 800-image holdout (2026-05-15). At T=0.76:
+    # F1=94.72, ad-recall=94.25%, non-ad-recall=95.25%, ~441ms.
+    # Tunable post-hoc from logged p_yes_norm without re-running inference.
+    # Override at runtime via env MINUS_VLM_AD_THRESHOLD.
+    AD_THRESHOLD = float(os.environ.get('MINUS_VLM_AD_THRESHOLD', '0.76'))
+    # Qwen2 tokenizer (shared by 0.5B/1.5B): "Yes","yes"," Yes"," yes"
+    YES_TOKEN_IDS = [7414, 9454, 9693, 9834]
+    # "No","no"," No"," no"
+    NO_TOKEN_IDS = [902, 2152, 2308, 2753]
 
     # Timeout for response rejection (in seconds)
     # Based on benchmark: responses > 1.0s correlate with model uncertainty
@@ -78,7 +153,7 @@ class VLMManager:
 
         # Validate paths
         if not FASTVLM_MODEL_DIR.exists():
-            logger.error(f"FastVLM-1.5B not found at: {FASTVLM_MODEL_DIR}")
+            logger.error(f"FastVLM model dir not found: {FASTVLM_MODEL_DIR}")
             return
 
         if not LLM_MODEL_PATH.exists():
@@ -93,7 +168,7 @@ class VLMManager:
             logger.error(f"Embeddings not found: {EMBEDS_PATH}")
             return
 
-        logger.info(f"VLM using FastVLM-1.5B at: {FASTVLM_MODEL_DIR}")
+        logger.info(f"VLM using FastVLM at: {FASTVLM_MODEL_DIR}")
 
     def load_model(self):
         """Load the model - initializes all components."""
@@ -102,7 +177,7 @@ class VLMManager:
             return True
 
         try:
-            logger.info("Starting FastVLM-1.5B model...")
+            logger.info("Starting FastVLM model...")
             start_time = time.time()
 
             # Add utils path to sys.path for imports
@@ -169,9 +244,11 @@ class VLMManager:
             logger.info("  Loading vision encoder...")
             self.vision_session = ax.InferenceSession(str(VISION_MODEL_PATH))
 
-            # Load embeddings - KEEP AS FLOAT32 per IMPLEMENTATION_GUIDE.md
+            # Load embeddings - KEEP AS FLOAT32 per IMPLEMENTATION_GUIDE.md.
+            # mmap_mode='r' avoids resident-loading the ~520MB table; np.take
+            # in the prefill path copies only the rows it needs.
             logger.info("  Loading embeddings...")
-            self.embeds = np.load(str(EMBEDS_PATH))
+            self.embeds = np.load(str(EMBEDS_PATH), mmap_mode='r')
             logger.info(f"    Loaded embeddings: {self.embeds.shape}, dtype: {self.embeds.dtype}")
 
             # Initialize image processor
@@ -183,12 +260,12 @@ class VLMManager:
             )
 
             load_time = time.time() - start_time
-            logger.info(f"FastVLM-1.5B loaded in {load_time:.1f}s")
+            logger.info(f"FastVLM loaded in {load_time:.1f}s")
             self.is_ready = True
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load FastVLM-1.5B: {e}")
+            logger.error(f"Failed to load FastVLM: {e}")
             import traceback
             tb_str = traceback.format_exc()
             logger.error(f"Traceback:\n{tb_str}")
@@ -216,9 +293,107 @@ class VLMManager:
         input_image = input_image.unsqueeze(0)
         input_image = input_image.numpy().astype(np.uint8).transpose((0, 2, 3, 1))
 
-        # Run vision encoder
-        vit_output = self.vision_session.run(None, {"images": input_image})[0]
+        # Run vision encoder. iter4 names its input "pixel_values"; the
+        # 1.5B legacy encoder used "images". Read the actual name from the
+        # session so this works with either model without a code change.
+        try:
+            vit_input_name = self.vision_session.get_inputs()[0].name
+        except Exception:
+            vit_input_name = "pixel_values"
+        vit_output = self.vision_session.run(None, {vit_input_name: input_image})[0]
         return vit_output
+
+    def _get_first_logits(self, token_ids, prefill_data):
+        """Run prefill only and return raw first-position logits.
+
+        Mirrors fastvlm-holdout-test/threshold_sweep.py exactly so the
+        calibrated AD_THRESHOLD stays valid. ~33% faster than
+        prefill+decode since autoregressive generation is skipped.
+        """
+        from ml_dtypes import bfloat16
+
+        seq_len = len(token_ids)
+        slice_len = 128
+        slice_indices = list(range(seq_len // slice_len + 1))
+
+        data = None
+        for slice_idx in slice_indices:
+            indices = np.arange(
+                slice_idx * slice_len,
+                (slice_idx + 1) * slice_len,
+                dtype=np.uint32,
+            ).reshape((1, slice_len))
+
+            mask = np.zeros((1, slice_len, slice_len * (slice_idx + 1))) - 65536
+            data = np.zeros((1, slice_len, self.config.hidden_size)).astype(bfloat16)
+
+            for i, t in enumerate(
+                range(slice_idx * slice_len, (slice_idx + 1) * slice_len)
+            ):
+                if t < seq_len:
+                    mask[:, i, : slice_idx * slice_len + i + 1] = 0
+                    data[:, i : i + 1, :] = (
+                        prefill_data[t]
+                        .reshape((1, 1, self.config.hidden_size))
+                        .astype(bfloat16)
+                    )
+
+            remain_len = (
+                seq_len - slice_idx * slice_len
+                if slice_idx == slice_indices[-1]
+                else slice_len
+            )
+            mask = mask.astype(bfloat16)
+
+            for layer_idx in range(self.config.num_hidden_layers):
+                input_feed = {
+                    "K_cache": (
+                        self.imer.k_caches[layer_idx][:, 0 : slice_len * slice_idx, :]
+                        if slice_idx
+                        else np.zeros((1, 1, self.config.hidden_size), dtype=bfloat16)
+                    ),
+                    "V_cache": (
+                        self.imer.v_caches[layer_idx][:, 0 : slice_len * slice_idx, :]
+                        if slice_idx
+                        else np.zeros((1, 1, self.config.hidden_size), dtype=bfloat16)
+                    ),
+                    "indices": indices,
+                    "input": data,
+                    "mask": mask,
+                }
+                outputs = self.imer.decoder_sessions[layer_idx].run(
+                    None, input_feed, shape_group=slice_idx + 1
+                )
+                self.imer.k_caches[layer_idx][
+                    :, slice_idx * slice_len : slice_idx * slice_len + remain_len, :
+                ] = outputs[0][:, :remain_len, :]
+                self.imer.v_caches[layer_idx][
+                    :, slice_idx * slice_len : slice_idx * slice_len + remain_len, :
+                ] = outputs[1][:, :remain_len, :]
+                data = outputs[2]
+
+        post_out = self.imer.post_process_session.run(
+            None,
+            {"input": data[:, seq_len - (len(slice_indices) - 1) * slice_len - 1, None, :]},
+        )[0]
+
+        return post_out
+
+    def _compute_ad_score(self, logits):
+        """Full-vocabulary softmax → (p_yes, p_no, p_yes_norm).
+
+        p_yes_norm is the normalized P(model predicts "Yes" / ad).
+        """
+        logits_flat = logits.astype(np.float32).flatten()
+        shifted = logits_flat - logits_flat.max()
+        exp_l = np.exp(shifted)
+        probs = exp_l / exp_l.sum()
+
+        p_yes = float(sum(probs[tid] for tid in self.YES_TOKEN_IDS))
+        p_no = float(sum(probs[tid] for tid in self.NO_TOKEN_IDS))
+        p_yes_norm = p_yes / (p_yes + p_no) if (p_yes + p_no) > 0 else 0.5
+
+        return p_yes, p_no, p_yes_norm
 
     def query_image(self, image_path, prompt, max_new_tokens=8):
         """
@@ -319,10 +494,15 @@ class VLMManager:
                 # Encode image
                 image_features = self._encode_image(image_path)
 
-                # Build prompt - IMAGE FIRST, then question (per IMPLEMENTATION_GUIDE.md)
-                full_prompt = "<|im_start|>system\nYou are a helpful assistant that answers questions accurately and concisely.<|im_end|>\n"
-                full_prompt += "<|im_start|>user\n" + "<image>" * self.TOKEN_LENGTH + "\n"
-                full_prompt += self.AD_PROMPT + "<|im_end|>\n<|im_start|>assistant\n"
+                # Build prompt EXACTLY as calibrated in threshold_sweep.py.
+                # Image tokens first, then the question. The AD_THRESHOLD is
+                # only valid for this byte-for-byte prompt + system message.
+                full_prompt = (
+                    "<|im_start|>system\n" + self.AD_SYSTEM_PROMPT + "<|im_end|>\n"
+                )
+                full_prompt += "<|im_start|>user\n" + "<image>" * self.TOKEN_LENGTH
+                full_prompt += "\n" + self.AD_PROMPT + "<|im_end|>\n"
+                full_prompt += "<|im_start|>assistant\n"
 
                 token_ids = self.tokenizer.encode(full_prompt)
 
@@ -330,59 +510,29 @@ class VLMManager:
                 prefill_data = np.take(self.embeds, token_ids, axis=0)
                 prefill_data = prefill_data.astype(bfloat16)
 
-                # Insert image features (convert to bfloat16 to match prefill_data)
-                # Image token ID is 151646
+                # Splice the 64 vision features over the 64 <image> token
+                # embeddings. Image token ID is 151646. Insert AT the first
+                # image token (no +1 offset) — mirrors threshold_sweep.py.
                 image_token_indices = np.where(np.array(token_ids) == 151646)[0]
                 if len(image_token_indices) > 0:
-                    image_start_index = image_token_indices[0]
-                    image_insert_index = image_start_index + 1
-                    prefill_data[image_insert_index:image_insert_index + self.TOKEN_LENGTH] = \
+                    img_idx = int(image_token_indices[0])
+                    prefill_data[img_idx:img_idx + self.TOKEN_LENGTH] = \
                         image_features[0, :, :].astype(bfloat16)
 
-                # Get EOS token(s)
-                eos_token_id = None
-                if isinstance(self.config.eos_token_id, list) and len(self.config.eos_token_id) > 1:
-                    eos_token_id = self.config.eos_token_id
+                # --- LOGIT-BASED CLASSIFICATION (prefill only, no decode) ---
+                logits = self._get_first_logits(token_ids, prefill_data)
+                p_yes, p_no, p_yes_norm = self._compute_ad_score(logits)
 
-                # Run inference
-                slice_len = 128
-                token_ids = self.imer.prefill(
-                    self.tokenizer,
-                    token_ids,
-                    prefill_data,
-                    slice_len=slice_len
-                )
-                response = self.imer.decode(
-                    self.tokenizer,
-                    token_ids,
-                    self.embeds,
-                    slice_len=slice_len,
-                    eos_token_id=eos_token_id,
-                    stream=False,
-                    # Cap generation. detect_ad only needs the first word
-                    # ("Yes" / "No") plus a token of slack for parsing.
-                    # Without this, certain images make the model emit a
-                    # 30-60-token descriptive paragraph (~10s at ~0.23s/tok)
-                    # instead of the requested short answer. See
-                    # docs/VLM_NPU_DEGRADATION.md for the investigation.
-                    max_new_tokens=5,
-                )
+                is_ad = p_yes_norm > self.AD_THRESHOLD
+                confidence = p_yes_norm if is_ad else (1.0 - p_yes_norm)
+                response = f"{'Yes' if is_ad else 'No'} (p={p_yes_norm:.4f})"
 
                 elapsed = time.time() - start_time
-
-                # Always parse the response — even if it ran long. With
-                # max_new_tokens=5 the worst case is ~1.34s, so a slow
-                # answer still tells us what the model decided. We just
-                # halve the parsed confidence as a soft penalty for
-                # the model going descriptive instead of giving the
-                # one-word answer the prompt asked for.
-                is_ad, confidence = self._is_ad_response(response)
-                if elapsed > self.RESPONSE_TIMEOUT:
-                    logger.debug(
-                        f"VLM response slow ({elapsed:.2f}s > {self.RESPONSE_TIMEOUT}s), "
-                        f"keeping verdict but halving confidence"
-                    )
-                    confidence = confidence * 0.5
+                logger.info(
+                    f"VLM: {'AD' if is_ad else 'NO-AD'} p_yes={p_yes_norm:.4f} "
+                    f"raw_yes={p_yes:.6f} raw_no={p_no:.6f} "
+                    f"T={self.AD_THRESHOLD} lat={elapsed:.3f}s"
+                )
 
                 return is_ad, response, elapsed, confidence
 

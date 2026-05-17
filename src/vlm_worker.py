@@ -152,16 +152,29 @@ class VLMProcess:
     If inference takes longer than timeout, the process is KILLED and restarted.
     """
 
+    # Timeouts retuned for the FastVLM-0.5B iter4 logit path. detect_ad is
+    # now PREFILL-ONLY with a fixed-length prompt (no autoregressive decode),
+    # so its compute is deterministic: ~0.33s mean / ~0.36s p95 measured over
+    # the full 800-image holdout, hard-bounded ~0.5s. The old 1.5B values
+    # (SOFT=1.5/HARD=5.0/P95=3.0) were sized for decode-based inference whose
+    # token count — and thus latency — varied 0.7s..15s (the descriptive-
+    # paragraph pathology in docs/VLM_NPU_DEGRADATION.md). That pathology
+    # CANNOT occur without a decode loop, so anything past these bounds now
+    # means a genuinely stuck NPU, which we want to catch and recover faster.
+    # SOFT_TIMEOUT stays at 1.5 because it is shared with query_image()
+    # (autonomous mode), which still decodes up to 8 tokens (~1.2s worst case).
     SOFT_TIMEOUT = 1.5   # Return "timeout" after this, but don't kill
-    HARD_TIMEOUT = 5.0   # Only kill if inference takes longer than this
+    HARD_TIMEOUT = 3.0   # Only kill if inference takes longer than this
     RESTART_THRESHOLD = 3  # Restart after this many consecutive soft timeouts
 
-    # Latency-based auto-recovery: Axera NPU can drift into a degraded state
-    # (not thermal — observed at same ~70°C temps) where inference runs ~15-18s
-    # instead of ~0.7s, producing descriptive responses to short-answer prompts.
-    # Detect this by tracking rolling inference times and triggering recovery.
+    # Latency-based auto-recovery (defense-in-depth). With the prefill-only
+    # detect_ad path the NPU-drift-to-15s pathology can no longer arise, so
+    # this should never fire in normal operation; it now only guards against
+    # a genuinely hung NPU. Trigger lowered 3.0 -> 2.0 since healthy P95 is
+    # ~0.36s (detect_ad) / ~1.5s (query_image) — 2.0s is unreachable without
+    # a real hang, so faster recovery carries no false-restart risk.
     LATENCY_WINDOW = 10          # Rolling sample size for trend detection
-    LATENCY_P95_TRIGGER = 3.0    # P95 latency (s) that triggers auto-recovery
+    LATENCY_P95_TRIGGER = 2.0    # P95 latency (s) that triggers auto-recovery
     RECOVERY_COOLDOWN = 60.0     # Min seconds between auto-recoveries
     DEEP_RESTART_BACKOFF = 8.0   # Longer NPU-release delay when simple restart didn't help
 

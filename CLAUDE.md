@@ -4,7 +4,7 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
-- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame, 1.5s soft timeout / 5s hard timeout)
+- **FastVLM-0.5B ad-classifier (iter4)** on Axera LLM 8850 NPU — **logit-thresholded, prefill-only, ~0.33s per frame deterministic** (1.5s soft / 3s hard timeout). Replaced FastVLM-1.5B (May 2026): same/better accuracy (holdout F1 94.72) at ~3x the speed. See *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* under Known Issues.
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -48,7 +48,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
      │  ┌───────────┐  │           │  ┌───────────────┐  │
-     │  │ PaddleOCR │  │           │  │ FastVLM-1.5B  │  │
+     │  │ PaddleOCR │  │           │  │ FastVLM-0.5B  │  │
      │  │ RK3588 NPU│  │           │  │ Axera LLM 8850│  │
      │  │ ~400ms    │  │           │  │ ~0.9s         │  │
      │  └───────────┘  │           │  └───────────────┘  │
@@ -81,7 +81,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
 | `src/ocr_worker.py` | Process-based OCR with hard timeout, warmup, and keepalive |
-| `src/vlm.py` | FastVLM-1.5B on Axera NPU (ad detection + custom queries) |
+| `src/vlm.py` | FastVLM-0.5B iter4 on Axera NPU — logit-thresholded `detect_ad` + decode-based `query_image` |
 | `src/vlm_worker.py` | Process-based VLM with hard timeout, warmup, and keepalive |
 | `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
 | `src/health.py` | Unified health monitor for all subsystems |
@@ -187,7 +187,7 @@ sudo systemctl start minus
 ```bash
 # Paths (override defaults for different installations)
 MINUS_USTREAMER_PATH=/path/to/ustreamer     # Default: /home/radxa/ustreamer-patched
-MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-1.5B
+MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4
 MINUS_OCR_MODEL_DIR=/path/to/ocr/models     # Default: /home/radxa/rknn-llm/.../paddleocr
 
 # Timing thresholds
@@ -210,8 +210,8 @@ MINUS_VLM_ALONE_THRESHOLD=5      # Consecutive VLM detections needed to trigger 
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
-| VLM latency | **~0.9-1.1s per frame** (FastVLM-1.5B, process-based with soft/hard timeout) |
-| VLM model load | **~30s** (includes 4 warmup inferences + keepalive thread) |
+| VLM latency | **~0.33s per frame deterministic** (FastVLM-0.5B iter4, prefill-only logit path; p95 0.34s) |
+| VLM model load | **~14-17s** (includes 4 warmup inferences + keepalive thread) |
 | Snapshot capture | **~150ms** (4K JPEG download) |
 | OCR image size | 960x540 (downscaled from 4K for speed) |
 | ustreamer quality | 80% JPEG (MPP encoder) |
@@ -349,19 +349,19 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 - Handles common OCR misreads in ad timestamps (see below)
 
 **VLM (Secondary - Anti-Waffle Protected):**
-- Uses sliding window of last 45 seconds of VLM decisions (`vlm_history_window`)
-- Only triggers blocking alone if 90%+ of recent decisions are "ad" (`vlm_start_agreement`)
-- Hysteresis: needs 100% agreement to START (capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever)
-- Minimum 4 decisions in window before VLM can act (`vlm_min_decisions`)
+- Uses sliding window of last **8 seconds** of VLM decisions (`vlm_history_window`). **Why 8s, not 45s:** a long window keeps stale *content* (no-ad) votes that mathematically prevent a VLM-alone ad from ever reaching the start-agreement ratio until they age out — measured VLM-only detect was ~38s with 81% of VLM-only ads missed. 8s collapses that to ~6-7s with ~0 misses and 0 phantom blocks (swept over 1920 param combos × thousands of holdout-bootstrapped scenarios; see *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* and `tests/test_vlm_decision_sim.py`). Stop responsiveness is governed by the consecutive counter, not the window, so shrinking it has no recovery downside.
+- Only triggers blocking alone if 80%+ effective agreement (`vlm_start_agreement` 70% + `vlm_hysteresis_boost` 10%)
+- Hysteresis: capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever
+- Minimum 3 decisions in window before VLM can act (`vlm_min_decisions`)
 - 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
 - **Sliding window only for starting** - stopping uses simple consecutive count (`VLM_STOP_THRESHOLD=2`)
 
 **Sliding Window Parameters:**
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
-| `vlm_history_window` | 45s | How far back to look at VLM decisions |
-| `vlm_min_decisions` | 4 | Minimum decisions needed before acting |
-| `vlm_start_agreement` | 90% | Agreement threshold to start blocking |
+| `vlm_history_window` | 8s | How far back to look at VLM decisions (was 45s; collapsed for iter4 — see migration note) |
+| `vlm_min_decisions` | 3 | Minimum decisions needed before acting (was 4; lowered for iter4) |
+| `vlm_start_agreement` | 70% | Agreement threshold to start blocking (was 90→80→70; +10% hysteresis = 80% effective) |
 | `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
 | `vlm_start_threshold_cap` | 95% | Maximum effective start threshold (so hysteresis can't make it unreachable) |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
@@ -507,13 +507,31 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 ## VLM Model
 
-**FastVLM-1.5B** on Axera LLM 8850 NPU:
-- Smarter than 0.5B with fewer false positives on streaming interfaces
-- **~0.7s** inference time for ad detection (process-based with 1.5s hard timeout)
-- **~1.0s** for custom queries (structured prompt)
-- **~25s** model load time (includes 2 warmup inferences)
-- Uses Python axengine + transformers tokenizer
-- Home screen detection provides additional safety net
+**FastVLM-0.5B ad-classifier, iter4** on Axera LLM 8850 NPU (logit-thresholded):
+- `detect_ad()` is **prefill-only** (no autoregressive decode): softmax the
+  first-position logits over the full vocab, compare normalized `P(Yes)`
+  (`p_yes_norm`) against `VLMManager.AD_THRESHOLD` (**0.76**, env-overridable
+  via `MINUS_VLM_AD_THRESHOLD`). Calibrated on an 800-image holdout
+  (2026-05-15): **F1 94.72, ad-recall 94.25%, non-ad-recall 95.25%**.
+- **~0.33s** deterministic inference (p95 0.34s) — fixed prompt length, no
+  token-count variance, so the descriptive-paragraph latency pathology that
+  plagued the 1.5B is **structurally impossible** for `detect_ad`.
+- **~1.0s** for custom queries (`query_image`, still decode-based — unchanged,
+  used by autonomous mode).
+- **~14s** model load (smaller than 1.5B's ~27s) + 4 warmup inferences.
+- Uses Python axengine + transformers tokenizer.
+- The classification prompt MUST stay byte-for-byte identical to
+  `fastvlm-holdout-test/threshold_sweep.py` (system = "You are a helpful
+  assistant.") — the threshold is only valid for that exact prompt.
+- `confidence` returned by `detect_ad` is now the calibrated probability
+  (`p_yes_norm` if ad else `1 - p_yes_norm`), which feeds the
+  confidence-weighted sliding window directly.
+- Path resolution in `src/vlm.py` auto-detects flat 0.5B-iter* layout vs the
+  legacy 1.5B subdir layout; tokenizer/utils fall back to the canonical
+  `FastVLM-0.5B` tokenizer (dims must match) and patched `FastVLM-1.5B` utils
+  (`infer_func` max_new_tokens cap; `llava_qwen` byte-identical). Overridable
+  via `MINUS_VLM_TOKENIZER_DIR` / `MINUS_VLM_UTILS_DIR`.
+- Home screen detection provides additional safety net.
 
 **Process-based architecture (`src/vlm_worker.py`):**
 - VLM runs in a separate process for hard timeout capability
@@ -525,33 +543,35 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
   - Late responses are drained on next request and counters reset
 - 4 warmup inferences at startup with varied content (noise, gradients, edges, mixed)
 - Keepalive thread runs dummy inference every 20s during idle to prevent NPU cold-start
-- Worker process loads model once (~27s), processes requests via Queue
+- Worker process loads model once (~14-17s for iter4), processes requests via Queue
 
 **Two inference modes:**
-- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification. Internally hard-caps the model at `max_new_tokens=5`.
+- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification. **Prefill-only logit path** (no decode at all): the descriptive-paragraph latency pathology is structurally impossible here, so no `max_new_tokens` cap is needed; latency is a deterministic ~0.33s.
 - `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification). The `max_new_tokens` default of 8 fits the autonomous-mode multi-choice prompt (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`); raise it explicitly for open-ended prompts knowing latency rises ~0.23 s per allowed token.
 
 Both modes share the same model. Concurrent callers (detection loop calling `detect_ad`, autonomous mode calling `query_image`) are serialized by `VLMProcess._call_lock` so they cannot cross responses on the shared queue or race on the timeout / latency state. See *VLMProcess Cross-Thread Race* under Known Issues for the full rationale.
 
-The `max_new_tokens` cap is the load-bearing reason VLM never enters a sustained "restart cycle" anymore. Without it, certain images (visually busy / ambiguous) make the model emit a 30–60 token descriptive paragraph instead of `"Yes."` / `"No."`, taking 10–15 s and tripping every downstream timeout. See `docs/VLM_NPU_DEGRADATION.md` for the investigation that ruled out NPU/firmware/driver causes and isolated the fix.
+For `detect_ad` the `max_new_tokens` cap is moot — there is no decode loop to run away. For `query_image` (decode-based, autonomous mode) the cap still matters and is retained (default 8). The descriptive-paragraph pathology and its investigation remain documented in `docs/VLM_NPU_DEGRADATION.md` for the `query_image` path and historical context.
 
+iter4 flat on-disk layout (no subdir; tokenizer/utils resolved from the FastVLM-0.5B / patched FastVLM-1.5B trees — see *VLM Model*):
 ```
-/home/radxa/axera_models/FastVLM-1.5B/
-├── fastvlm_ax650_context_1k_prefill_640_int4/  # LLM decoder models
-│   ├── image_encoder_512x512.axmodel           # Vision encoder
-│   ├── llava_qwen2_p128_l*.axmodel             # 28 decoder layers
-│   └── model.embed_tokens.weight.npy           # Embeddings (float32)
-├── fastvlm_tokenizer/                           # Tokenizer files
-└── utils/                                       # LlavaConfig and InferManager
+/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4/
+├── image_encoder_512x512_iter4.axmodel   # Vision encoder (input "pixel_values")
+├── qwen2_p128_l*_together.axmodel        # 24 decoder layers
+├── qwen2_post.axmodel                    # Post/LM-head
+└── model.embed_tokens.weight.npy         # Embeddings (float32, mmap'd)
 ```
 
-**Why FastVLM-1.5B instead of 0.5B?**
-| Aspect | FastVLM-0.5B | FastVLM-1.5B |
-|--------|--------------|--------------|
-| Inference Time | 0.7s | 0.9s |
-| False Positive Rate | ~88% on home screens | ~36% on home screens |
-| Intelligence | Basic | **Much smarter** |
-| Parameters | 0.5B | **1.5B** |
+**Why FastVLM-0.5B iter4 instead of 1.5B?** (server + on-device benchmarks in `/home/radxa/axera_models/BENCHMARKS.md`)
+| Aspect | 0.5B iter4 (logit) | FastVLM-1.5B (decode) |
+|--------|--------------------|-----------------------|
+| Inference time | **~0.33s deterministic** | ~0.9–1.1s (variable) |
+| Holdout F1 / ad-rec / non-ad-rec | **94.72 / 94.25% / 95.25%** | 92.86 (1.5B server iter3) |
+| Latency pathology | **impossible (no decode)** | descriptive-paragraph tail |
+| Tunable w/o retrain | **yes (threshold)** | no |
+| Parameters | 0.5B | 1.5B |
+
+The task saturates at 0.5B — the 1.5B did **not** beat it. The earlier "1.5B is smarter, fewer home-screen FPs" claim was a pre-fine-tune observation; the fine-tuned iter4 classifier resolves home-screen FPs at the model level (95.25% non-ad recall).
 
 ### Latency-based auto-recovery
 
@@ -608,7 +628,7 @@ pip3 install --break-system-packages \
 **Note:** The `rknnlite` package is provided by Rockchip and may need to be installed from their SDK or a custom repository. On the Radxa board with NPU support, it may already be pre-installed.
 
 **Axera NPU (for VLM):**
-The FastVLM-1.5B model runs on the Axera LLM 8850 NPU. Required Python packages:
+The FastVLM-0.5B iter4 model runs on the Axera LLM 8850 NPU. Required Python packages:
 ```bash
 pip3 install --break-system-packages axengine transformers ml_dtypes
 ```
@@ -624,7 +644,7 @@ pkill -9 ustreamer    # Kill orphaned ustreamer
 
 **VLM not loading:**
 - Check Axera card: `axcl_smi`
-- Verify model files exist in `/home/radxa/axera_models/FastVLM-1.5B/`
+- Verify model files exist in `/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4/`
 - Ensure Python dependencies: `pip3 show axengine transformers ml_dtypes`
 
 **OCR not detecting:**
@@ -1414,6 +1434,8 @@ python3 tests/test_modules.py                  # 300+ unit tests
 python3 tests/test_autonomous_mode.py          # Autonomous mode tests
 python3 tests/test_recent_features.py          # Recent feature tests
 python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
+python3 tests/test_vlm_iter4_parity.py         # iter4 logit parity vs 800-img holdout (needs NPU; --full)
+python3 tests/test_vlm_decision_sim.py         # Monte-Carlo sliding-window eval (--sweep to retune; no NPU)
 python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
 python3 tests/test_ir_transmitter.py           # IR transmitter unit tests (mocked sysfs)
 python3 tests/test_ir_ui.py                    # Playwright UI tests for IR remote panel
@@ -2045,3 +2067,103 @@ The blocking overlay grew a third debug element: a top-right `(Ad) 0:30 left` sn
 **Files modified:**
 - `ustreamer-garagehq/src/libs/blocking.{h,c}`, `src/ustreamer/http/server.c` — new `text_ocr` API + top-right render
 - `minus.py`, `src/ad_blocker.py`, `src/webui.py`, `src/templates/index.html`
+
+### FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration (May 2026)
+
+**What changed:** the VLM ad detector was swapped from FastVLM-1.5B
+(decode-based, parse "Yes"/"No" text) to the fine-tuned **FastVLM-0.5B
+ad-classifier iter4** using **logit-based thresholding** — prefill only,
+softmax the first-position logits over the full vocab, compare
+normalized `P(Yes)` to `AD_THRESHOLD=0.76`. Per the implementation guide
+`/home/radxa/axera_models/LOGIT_THRESHOLD_IMPLEMENTATION.md`.
+
+**Why:** iter4 is **same/better accuracy at ~3× the speed** and removes
+an entire failure class:
+- Holdout (800 img, 2026-05-15): **F1 94.72, ad-recall 94.25%,
+  non-ad-recall 95.25%** — beats the 1.5B (the task saturates at 0.5B;
+  the 1.5B never won on device, see `BENCHMARKS.md`).
+- Latency **~0.33s deterministic** (p95 0.34s) vs the 1.5B's ~0.9–1.1s
+  with a 10–15s descriptive-paragraph tail. `detect_ad` has **no decode
+  loop**, so that pathology (the whole reason for `max_new_tokens` caps +
+  aggressive auto-recovery in `docs/VLM_NPU_DEGRADATION.md`) is now
+  *structurally impossible*. `query_image` (autonomous mode) is
+  unchanged — still decode-based, still capped.
+- The threshold is tunable post-hoc from logged `p_yes_norm` without
+  re-running inference.
+
+**Parity proof:** `tests/test_vlm_iter4_parity.py` runs the production
+`VLMManager.detect_ad` over the full 800-image holdout and compares to
+the calibration script's scores: **0/800 classification flips**, max
+|Δ p_yes_norm| = 0.00005, confusion matrix identical to `BENCHMARKS.md`
+(TP=377 TN=381 FP=19 FN=23). The in-app pipeline is byte-faithful, so
+the 0.76 threshold is valid — *provided the prompt stays byte-for-byte
+identical to `threshold_sweep.py`* (system = "You are a helpful
+assistant."). `VLMManager.AD_SYSTEM_PROMPT`/`AD_PROMPT` enforce this;
+do not edit them without recalibrating.
+
+**Path resolution:** iter4 ships a flat dir with no tokenizer/utils.
+`src/vlm.py` auto-detects flat-0.5B vs legacy-1.5B layout; tokenizer
+falls back to the canonical `FastVLM-0.5B/fastvlm_tokenizer` (dims MUST
+match the model: 896 hidden / 24 layers) and utils to the patched
+`FastVLM-1.5B/utils` (`infer_func` has the `max_new_tokens` cap that
+`query_image` needs; `llava_qwen` is byte-identical to the 0.5B copy).
+Overridable via `MINUS_VLM_TOKENIZER_DIR` / `MINUS_VLM_UTILS_DIR`.
+Vision encoder input is read from the session (`pixel_values` for
+iter4, `images` for the 1.5B) so both layouts work unchanged.
+
+**Worker-timeout retune (`src/vlm_worker.py`):** since `detect_ad` is
+now deterministic ~0.33s with no runaway-token failure mode,
+`HARD_TIMEOUT` 5.0→3.0s and `LATENCY_P95_TRIGGER` 3.0→2.0s — a real hang
+is the only thing that can exceed these now, so recovery is faster with
+zero false-restart risk. `SOFT_TIMEOUT` stays 1.5s (shared with
+`query_image`, which still decodes up to 8 tokens).
+
+**Sliding-window retune — the load-bearing fix.** The anti-waffle
+window was built for the 1.5B's ~36% home-screen FP rate. iter4 has
+near-perfect per-frame separation (clean video p_yes≈0.05, ad text
+p_yes≈0.85), so the window is now over-conservative. `tests/test_vlm_
+decision_sim.py` is a Monte-Carlo simulator that drives the faithful
+`DecisionEngine` mirror with a virtual clock and VLM verdicts
+**bootstrapped from the real 800-image holdout scores** (so per-frame
+error rate + calibrated confidence are statistically identical to
+production iter4) across 64 scenario shapes (pre/mid-roll, multi-ad
+breaks, back-to-back, pause-on-ad, content-only, rapid alternation,
+tiny/long ads × OCR strong/absent/delayed/flaky). Sweeping **1920
+param combos** found:
+- **`vlm_history_window` 45→8s is the decisive lever.** A 45s window
+  keeps stale *content* no-ad votes that mathematically prevent a
+  VLM-alone ad from reaching the start ratio until they age out:
+  VLM-only detect **~38s, 81% of VLM-only ads missed**. At 8s:
+  VLM-only detect **~7s, ~0% missed**, with OCR-path metrics unchanged
+  (OCR-triggered detect ~0.9s, 0 miss) and **0 phantom content-blocks**
+  preserved. Stop/recovery uses the consecutive counter, not the
+  window, so shrinking it has no recovery downside.
+- `vlm_start_agreement` 0.90→0.80→**0.70** (+0.10 hysteresis = 0.80
+  effective): with a short window you can't afford a high bar; the
+  sweep's feasible optimum is 0.65–0.70 and 0.70 stays phantom-free.
+- `vlm_min_decisions` 4→**3**, others unchanged.
+
+Validated on the real OCR+VLM rig (`block_latency_harness.py`,
+`tests/harness_iter4_retune_ab.py`): OCR detect/recover and
+false-positive/phantom behaviour unchanged; VLM-only transition sharply
+faster. The earlier-in-this-migration retune (4→3 decisions, 0.90→0.80)
+was validated only on the clean-injection rig which *resets state
+before each VLM-only test* — that masked the stale-vote dilution; the
+simulator (content precedes the ad, as in reality) exposed it.
+
+**New test scripts** (added to the suite):
+- `tests/test_vlm_iter4_parity.py` — 800-image holdout parity/accuracy.
+- `tests/test_vlm_decision_sim.py` — Monte-Carlo sliding-window sweep
+  (`--sweep`) and current-param eval; verdicts bootstrapped from real
+  holdout scores; class-aware feasibility (OCR-present must be perfect;
+  VLM-only is the optimised soft tail; multi-ad-gap flaps tracked
+  separately as a mirror artifact — production holds those via
+  `_is_transition_frame`).
+- `tests/harness_iter4_retune_ab.py` — A/B wrapper over the real rig.
+
+**Files modified:** `src/vlm.py` (logit path, dual-layout resolution,
+calibration-exact prompt, dynamic vision-input name, mmap embeds),
+`src/config.py` (`VLM_MODEL_DIR` → iter4, env-overridable),
+`src/vlm_worker.py` (timeouts), `minus.py` (sliding-window params),
+`tests/block_latency_harness.py` (PARAMS mirror — kept 1:1 with
+production), CLAUDE.md.

@@ -332,11 +332,30 @@ class Minus:
 
         # VLM stability system - sliding window approach to prevent waffling
         # Tracks recent VLM decisions and requires sustained agreement to change state
-        # NOTE: FastVLM-1.5B is smarter, so thresholds can be more relaxed
+        # Retuned for the FastVLM-0.5B iter4 logit classifier. iter4 has
+        # near-perfect per-frame separation on real content (holdout: 95.25%
+        # non-ad recall, 94.25% ad recall; measured clean-video p_yes≈0.05 vs
+        # ad-text p_yes≈0.85) and deterministic ~0.33s latency. The old
+        # 4-decision / 90%-agreement window was sized for the 1.5B's ~36%
+        # home-screen false-positive rate; with iter4 it just adds latency.
+        # min_decisions 4->3 and start_agreement 0.90->0.80 validated via
+        # tests/harness_iter4_retune_ab.py (round5/6/7): VLM-only detect
+        # 6.11s->2.11s, realistic multi-ad first-detect 6.12s->2.05s, with
+        # 0 false positives on clean content and 0 phantom re-blocks.
+        # vlm_history_window 45->8 and start_agreement 0.80->0.70: a 45s
+        # window keeps stale *content* no-ad votes that mathematically
+        # prevent a VLM-alone ad from ever reaching the start-agreement
+        # ratio until they age out — VLM-only detect was ~38s (81% of
+        # VLM-only ads missed). Swept over 1920 param combos × thousands
+        # of holdout-bootstrapped scenarios in tests/test_vlm_decision_sim.py:
+        # an 8s window collapses VLM-only detect to ~6s with 0 misses,
+        # 0 phantom re-blocks, OCR-path metrics unchanged (start/stop
+        # responsiveness is governed by the consecutive counters, not the
+        # window, so shrinking it has no recovery downside).
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
-        self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
-        self.vlm_min_decisions = 4          # Need at least 4 decisions to act
-        self.vlm_start_agreement = 0.90     # Need 90% ad agreement to START blocking (solo; OCR-corroborated uses immediate shortcut at ~line 2778). Raised from 0.80 to tighten VLM-alone triggers.
+        self.vlm_history_window = 8.0       # Look at last 8 seconds of decisions (iter4: was 45.0)
+        self.vlm_min_decisions = 3          # Need at least 3 decisions to act (iter4: was 4)
+        self.vlm_start_agreement = 0.70     # 70% ad agreement to START blocking solo (iter4: was 0.90→0.80→0.70; +0.10 hysteresis → 0.80 effective; OCR-corroborated uses immediate shortcut at ~line 2778)
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
         self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
         self.vlm_start_threshold_cap = 0.95 # Cap on effective start threshold so hysteresis can't push it beyond what real-world noise allows
