@@ -374,6 +374,8 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - Low std deviation across frame → solid color
 - >95% pixels within 20 values of median → uniform/static
 
+**Transition-hold time cap (`_transition_hold_active`, `TRANSITION_HOLD_MAX_SECONDS`=3s, env `MINUS_TRANSITION_HOLD_MAX`):** the hold is only meant to bridge a *brief* (≤~2s) black/solid gap *between* ads. A dark/low-detail lofi music video (very common in autonomous YouTube, e.g. "WYS | Comforting You") reads as "uniform" *indefinitely*, so an uncapped hold froze `ocr_no_ad_count` / `vlm_no_ad_count` and a block never recovered — observed: a 46.9s VLM-source block held ~10s of benign content after the ad ended while VLM was firmly NO-AD. The hold is now capped: after `TRANSITION_HOLD_MAX_SECONDS` of *continuous* transition frames the no-ad counters resume so the block stops. Shared by the OCR and VLM loops; the timer resets on any non-transition or ad frame (so each real inter-ad gap gets a fresh full window). A true >3s black gap (rare) at worst causes a brief flicker — far better than multi-second false holds on uniform content. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
+
 **Starting Blocking:**
 1. OCR detects ad → blocking starts immediately (unless home screen detected)
 2. VLM detects ad (no OCR) → needs 80%+ agreement in sliding window (4+ decisions)

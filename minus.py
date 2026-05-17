@@ -441,6 +441,17 @@ class Minus:
         # overlays makes consecutive misses extremely rare.
         self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
+        # Transition-frame hold bridges a BRIEF black/solid screen between
+        # two ads in a real break so the overlay doesn't flicker. But a
+        # dark/low-detail lofi music video reads as "uniform" forever, so
+        # an uncapped hold freezes ocr_no_ad_count / vlm_no_ad_count and a
+        # block never recovers (observed: a 46.9s VLM block held ~10s on
+        # "WYS | Comforting You" after the ad ended). Real inter-ad gaps
+        # are ≤~2s; cap the continuous hold so benign uniform content
+        # can't defeat the no-ad stop. env-overridable.
+        self.TRANSITION_HOLD_MAX_SECONDS = float(
+            os.environ.get('MINUS_TRANSITION_HOLD_MAX', '3'))
+        self.transition_hold_start = 0.0
         # Hard ceiling on one continuous block (any source). Legit ad
         # breaks — even multi-ad streaming pods — are well under this;
         # anything longer is a static weak-keyword false positive (see the
@@ -1761,6 +1772,25 @@ class Minus:
             if entry[0] >= cutoff
         ]
 
+    def _transition_hold_active(self, is_transition: bool) -> bool:
+        """Whether to hold a block through a 'transition' frame.
+
+        Only bridges a BRIEF inter-ad gap. `_is_transition_frame` also
+        fires on benign uniform content (dark lofi music videos), which
+        would otherwise freeze the no-ad counters forever and prevent
+        recovery. Cap the continuous hold at TRANSITION_HOLD_MAX_SECONDS;
+        past that, treat frames normally so the block can stop.
+        Shared by the OCR and VLM loops (a real gap both see resets/extends
+        the same window); reset on any non-transition / ad frame.
+        """
+        if not is_transition:
+            self.transition_hold_start = 0.0
+            return False
+        now = time.time()
+        if self.transition_hold_start == 0.0:
+            self.transition_hold_start = now
+        return (now - self.transition_hold_start) <= self.TRANSITION_HOLD_MAX_SECONDS
+
     def _is_transition_frame(self, frame, threshold=15, black_threshold=30, uniformity_threshold=0.95) -> tuple:
         """
         Detect if a frame is a transition screen (mostly black or single solid color).
@@ -3044,6 +3074,7 @@ class Minus:
                                  and suppress_reason is None)
 
                 if real_ad_frame:
+                    self.transition_hold_start = 0.0  # ad present → reset gap timer
                     self.ocr_ad_detection_count += 1
                     self.ocr_no_ad_count = 0
                     self.last_ocr_ad_time = time.time()
@@ -3065,7 +3096,7 @@ class Minus:
 
                     # Transition frame (black/solid) between ads: hold block.
                     is_transition, transition_type = self._is_transition_frame(frame)
-                    if self.ad_detected and is_transition:
+                    if self.ad_detected and self._transition_hold_active(is_transition):
                         logger.info(f"OCR #{self.frame_count}: Transition frame ({transition_type}) - holding block")
                     else:
                         self.ocr_no_ad_count += 1
@@ -3199,12 +3230,13 @@ class Minus:
 
                 # Update legacy counters (for logging and spastic detection)
                 if is_ad:
+                    self.transition_hold_start = 0.0  # ad present → reset gap timer
                     self.vlm_consecutive_ad_count += 1
                     self.vlm_no_ad_count = 0
                 else:
                     # Check for transition frame - don't count as "no ad" if blocking
                     is_transition, transition_type = self._is_transition_frame(frame)
-                    if self.ad_detected and is_transition:
+                    if self.ad_detected and self._transition_hold_active(is_transition):
                         logger.info(f"VLM #{self.vlm_frame_count}: Transition frame ({transition_type}) - holding block")
                     else:
                         self.vlm_no_ad_count += 1
