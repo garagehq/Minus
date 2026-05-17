@@ -490,6 +490,23 @@ class Minus:
         })
         self.STRONG_AD_HOLD_SECONDS = 5.0
         self.last_strong_ad_time = 0.0
+        # WEAK keywords legitimately appear on static home / promo /
+        # masthead screens (YouTube "Sponsored · Learn more / Shop now"
+        # tiles), NOT exclusively in active video-ad UIs. If the matched
+        # set is ENTIRELY weak and no STRONG keyword was seen within
+        # STRONG_AD_HOLD_SECONDS, the frame is suppressed (routed to
+        # no-ad accounting so a block decays and cannot start/sustain).
+        # Real video ads always also surface a strong keyword (skip in /
+        # countdown / visit advertiser) within that window, and VLM
+        # independently catches genuine ad video, so OCR can stay strict.
+        # Generalised from the original bare-'sponsored'-only check after
+        # a 150s VLM+OCR hold on a static "Learn more · Sponsored" promo
+        # (the pair evaded the sponsored-only test). Names must match what
+        # OCRProcess.check_ad_keywords emits.
+        self.WEAK_AD_KEYWORD_NAMES = frozenset({
+            'sponsored', 'learn more', 'shop now', 'buy now',
+            'shop now (fuzzy)', 'shop now (fuzzy-shan)',
+        })
 
         self.vlm_prev_frame = None
         self.vlm_prev_frame_had_ad = False
@@ -2995,8 +3012,9 @@ class Minus:
                 # sponsored-only video ad, so OCR can safely stay strict).
                 strong_ad_recent = ((time.time() - self.last_strong_ad_time)
                                     < self.STRONG_AD_HOLD_SECONDS)
-                sponsored_only = (len(matched_keywords) > 0 and
-                                  all(kw == 'sponsored' for kw, _ in matched_keywords))
+                weak_only = (len(matched_keywords) > 0 and
+                             all(kw in self.WEAK_AD_KEYWORD_NAMES
+                                 for kw, _ in matched_keywords))
 
                 since_skip = time.time() - self.last_skip_success_time
                 in_skip_grace = (self.last_skip_success_time > 0
@@ -3016,10 +3034,10 @@ class Minus:
                     elif self.home_screen_detected:
                         suppress_reason = (f"home screen detected "
                                            f"(would have been {keywords_found})")
-                    elif sponsored_only and not strong_ad_recent:
+                    elif weak_only and not strong_ad_recent:
                         suppress_reason = (
-                            f"weak 'sponsored'-only, no strong ad keyword in "
-                            f"{self.STRONG_AD_HOLD_SECONDS:.0f}s "
+                            f"weak-only {keywords_found}, no strong ad "
+                            f"keyword in {self.STRONG_AD_HOLD_SECONDS:.0f}s "
                             f"(texts {all_texts[:3]})")
 
                 real_ad_frame = (ad_detected and not is_terminal
