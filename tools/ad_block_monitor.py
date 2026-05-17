@@ -136,7 +136,16 @@ def main():
                 pass
             if cur['dur'] and cur['dur'] >= 150:
                 cur['flags'].append('OVERLONG')
-            if cur['recover'] is not None and cur['recover'] > RECOVER_GOAL_S:
+            # Only meaningful for blocks long enough to HAVE a sustained
+            # ad phase + a laggy tail. For short blocks (<=6s total) the
+            # recovery proxy ≈ block duration (the only in-block ad marker
+            # is near the start, clamped to dur) — a 4.7s block cannot
+            # have a user-relevant "4s slow recovery"; the whole block is
+            # within the acceptable envelope. Gate like WEAK_FP/NO_KW so
+            # the autonomous signal flags real slow tails, not brief
+            # self-correcting blocks.
+            if (cur['recover'] is not None and cur['recover'] > RECOVER_GOAL_S
+                    and dur > 6):
                 cur['flags'].append(f"SLOW_RECOVER({cur['recover']:.1f}s)")
             blocks.append(cur)
             cur = None
