@@ -106,6 +106,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
 | `ir_transmit.py` | Standalone CLI for the IR transmitter (`sudo python3 ir_transmit.py <button>`) |
 | `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
+| `tools/ad_block_monitor.py` | Log-driven ad-block health monitor (recovery latency, weak-FP / overlong / query-error triage); run periodically/by a recurring agent |
 | `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
 | `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
@@ -380,10 +381,12 @@ When blocking is active, black/solid-color frames are detected as transitions be
 4. Home screen detection suppresses both OCR and VLM blocking on streaming interfaces
 
 **Stopping Blocking:**
-1. **If OCR triggered** (source=ocr or both): OCR says stop (4 no-ads) → ends immediately (~2-3s)
-2. **If VLM triggered alone** (source=vlm): VLM says stop (2 no-ads) → ends (~4s after ad ends)
-3. VLM history cleared on stop → prevents immediate re-trigger
-4. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
+1. **If OCR triggered alone** (source=ocr): OCR says stop (`OCR_STOP_THRESHOLD=2` no-ads) → ends (~1s). VLM dissent must NOT stop early here (OCR is authoritative).
+2. **If BOTH triggered** (source=both): stop on whichever clears first — `ocr_says_stop OR vlm_says_stop` (2 consecutive no-ad). Both detected the ad, so either clearing is a correct "ad ended" signal; this decouples recovery from slow OCR snapshot capture (~2.5s/frame headless) so recovery is ~1s instead of ~3s. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
+3. **If VLM triggered alone** (source=vlm): VLM says stop (`VLM_STOP_THRESHOLD=2` no-ads) → ends (~1-2s); 90s VLM-only safeguard.
+4. **Universal cap:** any source, `MAX_BLOCKING_DURATION` (150s, env `MINUS_MAX_BLOCKING_DURATION`) force-stops and clears all detection state — bounds the worst-case static-weak-keyword false positive.
+5. VLM history cleared on stop → prevents immediate re-trigger
+6. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
 
 **Why This Design:**
 - VLM sliding window prevents erratic false-positive blocking when acting alone
@@ -405,6 +408,7 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - Detection state (OCR/VLM) cleared on cooldown complete to prevent false positives
 - Static ad screenshots saved to `screenshots/static/` for analysis
 - **Strong-ad-signal override (`STRONG_AD_KEYWORD_NAMES`):** suppression refuses to activate, and force-clears mid-suppression, when OCR has matched a keyword that ONLY appears in active video-ad UIs within the last `STRONG_AD_HOLD_SECONDS` (5s). Strong keywords: `skip ad` / `skip ads` / `skip in` / `skip ad (fuzzy*)` / `video will play after ad` / `visit advertiser` / `visitadvertiser` / `ad X of Y` / `ad countdown` / `ad with timestamp` / `ad with timestamp (cross-element)`. Bare `Sponsored` / `Learn more` / `Shop now` stay weak — those can legitimately appear on home screens or paused-on-ad tiles. See *Static Suppression Catches Real Video Ads* under Known Issues for the root-cause investigation.
+- **Bare-`'sponsored'`-only OCR suppression (detection layer, not just static):** if the *only* matched keyword is `'sponsored'` and no `STRONG_AD_KEYWORD` was seen within `STRONG_AD_HOLD_SECONDS`, the frame is suppressed AND routed into no-ad accounting so it neither starts nor sustains an OCR block, and an active block decays. Replaced the old `_hdmi_audio_present()` discriminator (home/promo screens carry audio → it failed, holding a 591s block on a static "Sponsored · Peel to collect" promo). VLM still independently catches genuine sponsored-only video ads. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
 
 **OCR Timestamp Pattern Handling:**
 OCR frequently misreads characters in ad timestamps. The detection handles these common confusions:
@@ -547,7 +551,7 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 **Two inference modes:**
 - `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification. **Prefill-only logit path** (no decode at all): the descriptive-paragraph latency pathology is structurally impossible here, so no `max_new_tokens` cap is needed; latency is a deterministic ~0.33s.
-- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification). The `max_new_tokens` default of 8 fits the autonomous-mode multi-choice prompt (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`); raise it explicitly for open-ended prompts knowing latency rises ~0.23 s per allowed token.
+- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification). The `max_new_tokens` default of 8 fits the autonomous-mode multi-choice prompt (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`); raise it explicitly for open-ended prompts knowing latency rises ~0.23 s per allowed token. **Hard p128 constraint:** the full tokenised prompt (short system + 64 image tokens + question + chat template) MUST stay ≤128 tokens — iter4 is a single-prefill-chunk model with no 2nd shape-group. `query_image` enforces this with a `PROMPT_TOO_LONG` fail-soft guard; keep `SCREEN_QUERY_PROMPT` minimal. See *iter4 query_image p128 Overflow* under Known Issues.
 
 Both modes share the same model. Concurrent callers (detection loop calling `detect_ad`, autonomous mode calling `query_image`) are serialized by `VLMProcess._call_lock` so they cannot cross responses on the shared queue or race on the timeout / latency state. See *VLMProcess Cross-Thread Race* under Known Issues for the full rationale.
 
@@ -2167,3 +2171,75 @@ calibration-exact prompt, dynamic vision-input name, mmap embeds),
 `src/vlm_worker.py` (timeouts), `minus.py` (sliding-window params),
 `tests/block_latency_harness.py` (PARAMS mirror — kept 1:1 with
 production), CLAUDE.md.
+
+### iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes (May 2026)
+
+Found by live monitoring on minus-2 (autonomous mode + Roku-driven ad
+tests) right after the iter4 migration deployed. Four coupled defects:
+
+**1. `query_image` crashed every call → autonomous mode fully blind.**
+Symptom: `[AutonomousMode] VLM screen query: list index out of range`
+every ~20s. Root cause: the iter4 LLM is **p128 — a single 128-token
+prefill chunk** (`qwen2_p128_l*` axmodels expose only shape-group 0
+=decode and 1=p128). `detect_ad`'s calibrated prompt is ~94 tokens
+(fits). `query_image` built a verbose system message *plus* the verbose
+`SCREEN_QUERY_PROMPT` (per-category descriptions) = **187 tokens** →
+`infer_func.prefill` needs `slice_idx=1` → asks axengine for
+`shape_group=2` → `self._outputs[2]` IndexError on every call.
+`detect_ad` is prefill-only-logit and short so it never hit this.
+Fixes: `src/autonomous_mode.py` `SCREEN_QUERY_PROMPT` reverted to the
+minimal form (≈119 tok with the short system prompt — **do not
+re-expand; the p128 budget is image-64 + ~64 text**); `src/vlm.py`
+`query_image` uses the short `AD_SYSTEM_PROMPT` and a hard guard that
+returns `PROMPT_TOO_LONG` (fail-soft, callers already treat non-category
+replies as "unknown screen") instead of crashing if any caller exceeds
+128 tokens again.
+
+**2. `query_image` decode shape mismatch (surfaced after fix 1).**
+`K_cache expect [1,1023,128], got [1,1024,128]`. iter4's decoder K/V
+cache is compiled for **seq-len 1023**, not the 1.5B's 1024 (the
+reference `test_ad_classifier.py` / `threshold_sweep.py` build
+`InferManager(max_seq_len=1023)`). `src/vlm.py` now sets a layout-aware
+`LLM_MAX_SEQ_LEN` (1023 for the flat 0.5B-iter* layout, 1024 for the
+legacy 1.5B subdir layout). `detect_ad` is prefill-only so it never hit
+this; only `query_image`'s decode path did.
+
+**3. Multi-minute false-positive blocks (observed: 591s).** A static
+"Sponsored · Peel to collect" promo held an OCR+VLM block for ~10 min.
+Three causes: (a) bare `'sponsored'` (a *weak* keyword) was triggering
+**and sustaining** OCR blocking whenever HDMI-IN audio was present — but
+home/promo screens carry audio (autoplay previews, music), so the
+`_hdmi_audio_present()` discriminator was wrong; (b) suppressed
+`'sponsored'` frames fell through *without* feeding the no-ad counters,
+so an active block's `ocr_no_ad_count` froze and it never decayed; (c)
+the only max-duration safeguard was on `source=="vlm"` (90s) — `ocr` and
+`both` had **no cap**. Fixes in `minus.py`: bare-`'sponsored'`-only is
+suppressed unless a `STRONG_AD_KEYWORD` was seen within
+`STRONG_AD_HOLD_SECONDS` (VLM still independently catches genuine
+sponsored-only video ads); suppressed frames now route into the same
+no-ad accounting so blocks **decay**; new universal
+`MAX_BLOCKING_DURATION` (150s, env `MINUS_MAX_BLOCKING_DURATION`) clears
+all detection state on cap.
+
+**4. Slow ad→content recovery (~3s, over the 1.5–2s target).** OCR
+snapshot capture runs ~2.5s/frame on a headless box (HDMI-OUT
+disconnected). A `both`-source block waited on OCR's 2 consecutive
+no-ad frames (~3s+) even though VLM had already cleared in ~0.3s. Fix:
+for `source=="both"` (both signals detected the ad) stop on whichever
+clears first — `ocr_says_stop OR vlm_says_stop`. Pure `source=="ocr"`
+still requires OCR (VLM dissent must not stop early); `source=="vlm"`
+unchanged. Measured live: recovery ~3s → **~1s** across Target / Ford /
+HBS / Acura / `skip in` / `ads` ad breaks, 0 multi-minute holds, 0
+`query_image` errors, 0 safeguard fires.
+
+**Monitoring:** `tools/ad_block_monitor.py` parses `journalctl -u minus`
+and reports per-block source / duration / recovery-latency / trigger
+keywords and flags `WEAK_FP` (sponsored-only/no-keyword block lingering
+>20s), `OVERLONG`, `SLOW_RECOVER(>3.5s)`, `query_errs`. Self-elevates
+via `sudo -n journalctl` when not root. Run periodically (a recurring
+agent re-runs it, root-causes any flag, tunes, restarts, commits) —
+target: zero false-positive blocks, zero multi-minute holds, recovery
+≤1.5–2s.
+
+**Files modified:** `src/autonomous_mode.py`, `src/vlm.py`, `minus.py`,
+`tools/ad_block_monitor.py` (new), CLAUDE.md.
