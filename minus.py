@@ -566,6 +566,18 @@ class Minus:
         self.last_skip_attempt_time = 0  # When we last attempted a skip
         self.last_skip_success_time = 0  # When we last successfully skipped an ad
         self.SKIP_ATTEMPT_COOLDOWN = 10.0  # Don't try again for 10s after ANY attempt (prevents pause spam)
+        # After a successful skip the ad is ending, but its sponsored
+        # end-card / transition lingers for several seconds and still
+        # OCR-matches ('Sponsored ... skip', and 'skip in' was recent so
+        # weak-'sponsored' suppression won't engage). Without a grace
+        # window the _unblock_after_skip reset is instantly undone by the
+        # next OCR frame and the block re-arms for ~10s (observed: skip at
+        # T, block didn't actually clear until T+12s). During this window
+        # OCR/VLM ad frames are routed to no-ad accounting so the block
+        # DECAYS and cannot re-arm — content returns ~1.5s after the skip
+        # and stays. env-overridable.
+        self.SKIP_UNBLOCK_GRACE_SECONDS = float(
+            os.environ.get('MINUS_SKIP_UNBLOCK_GRACE', '8'))
 
         # Accidental pause detection
         self.blocking_end_time = 0  # When blocking last ended
@@ -2487,6 +2499,18 @@ class Minus:
                     )
                     should_start = False
 
+                # Don't re-arm a block on the dying ad's end-card right
+                # after we skipped it (covers the VLM-source path too —
+                # the OCR-accounting site handles OCR/both).
+                if should_start and self.last_skip_success_time > 0:
+                    since_skip = time.time() - self.last_skip_success_time
+                    if since_skip < self.SKIP_UNBLOCK_GRACE_SECONDS:
+                        logger.info(
+                            f"Blocking suppressed - post-skip grace "
+                            f"({since_skip:.1f}s of "
+                            f"{self.SKIP_UNBLOCK_GRACE_SECONDS:.0f}s)")
+                        should_start = False
+
                 if should_start:
                     self.ad_detected = True
                     self.blocking_start_time = now
@@ -2974,10 +2998,22 @@ class Minus:
                 sponsored_only = (len(matched_keywords) > 0 and
                                   all(kw == 'sponsored' for kw, _ in matched_keywords))
 
+                since_skip = time.time() - self.last_skip_success_time
+                in_skip_grace = (self.last_skip_success_time > 0
+                                 and since_skip < self.SKIP_UNBLOCK_GRACE_SECONDS)
+
                 suppress_reason = None
                 if ad_detected and not is_terminal:
                     keywords_found = [kw for kw, txt in matched_keywords]
-                    if self.home_screen_detected:
+                    if in_skip_grace:
+                        # Just skipped — this is the dying ad's end-card /
+                        # transition. Route to no-ad so the block decays and
+                        # cannot re-arm (don't let stale 'skip in' on the
+                        # end-card keep it alive).
+                        suppress_reason = (
+                            f"post-skip grace ({since_skip:.1f}s of "
+                            f"{self.SKIP_UNBLOCK_GRACE_SECONDS:.0f}s)")
+                    elif self.home_screen_detected:
                         suppress_reason = (f"home screen detected "
                                            f"(would have been {keywords_found})")
                     elif sponsored_only and not strong_ad_recent:
