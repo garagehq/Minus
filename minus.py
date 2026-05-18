@@ -594,18 +594,21 @@ class Minus:
         self.last_skip_attempt_time = 0  # When we last attempted a skip
         self.last_skip_success_time = 0  # When we last successfully skipped an ad
         self.SKIP_ATTEMPT_COOLDOWN = 10.0  # Don't try again for 10s after ANY attempt (prevents pause spam)
-        # After a successful skip the ad is ending, but its sponsored
-        # end-card / transition lingers for several seconds and still
-        # OCR-matches ('Sponsored ... skip', and 'skip in' was recent so
-        # weak-'sponsored' suppression won't engage). Without a grace
-        # window the _unblock_after_skip reset is instantly undone by the
-        # next OCR frame and the block re-arms for ~10s (observed: skip at
-        # T, block didn't actually clear until T+12s). During this window
-        # OCR/VLM ad frames are routed to no-ad accounting so the block
-        # DECAYS and cannot re-arm — content returns ~1.5s after the skip
-        # and stays. env-overridable.
+        # After a successful skip the skipped ad's end-card / transition
+        # lingers briefly and still OCR-matches; during this window OCR ad
+        # frames are routed to no-ad so the block decays and the
+        # _unblock_after_skip reset isn't instantly undone.
+        # 8s was TOO LONG: ad pods (skip ad 1 → ad 2 starts ~1-2s later)
+        # are extremely common, and an 8s grace suppressed detection of
+        # the NEXT ad for several seconds (observed: VLM flags ad 2 at
+        # 100%/3 but AD BLOCKING STARTED withheld 2-3s by this grace).
+        # 3s covers the typical skipped-ad end-card; the multi-minute
+        # backstop the 8s was sized for is now redundant — the universal
+        # MAX_BLOCKING_DURATION cap, weak-keyword suppression and the
+        # transition-hold cap independently prevent long false holds.
+        # env-overridable.
         self.SKIP_UNBLOCK_GRACE_SECONDS = float(
-            os.environ.get('MINUS_SKIP_UNBLOCK_GRACE', '8'))
+            os.environ.get('MINUS_SKIP_UNBLOCK_GRACE', '3'))
 
         # Accidental pause detection
         self.blocking_end_time = 0  # When blocking last ended
@@ -2546,10 +2549,16 @@ class Minus:
                     )
                     should_start = False
 
-                # Don't re-arm a block on the dying ad's end-card right
-                # after we skipped it (covers the VLM-source path too —
-                # the OCR-accounting site handles OCR/both).
-                if should_start and self.last_skip_success_time > 0:
+                # Don't re-arm on the dying skipped ad's end-card — BUT a
+                # VLM sliding-window-confirmed detection (self.vlm_ad_detected:
+                # 3+ decisions ≥80% agreement) right after a skip is a real
+                # NEW ad in a pod, NOT the end-card (a transitioning end-card
+                # cannot sustain that). Suppressing it delayed pod ad #2 by
+                # 2-3s. The OCR-accounting-site grace still neutralises the
+                # lingering end-card text, so only block an *uncertain*
+                # (non-VLM-confirmed) re-arm here.
+                if (should_start and not self.vlm_ad_detected
+                        and self.last_skip_success_time > 0):
                     since_skip = time.time() - self.last_skip_success_time
                     if since_skip < self.SKIP_UNBLOCK_GRACE_SECONDS:
                         logger.info(

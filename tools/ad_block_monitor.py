@@ -32,6 +32,9 @@ STRONG_KW = ('skip in', 'skip ad', 'visit advertiser', 'ad countdown',
              'ad with timestamp', 'ad x of y', 'ad of', 'send to phone',
              'video will play after ad')
 LOGF = '/tmp/ad_block_monitor.log'
+# Markdown baseline log: one appended section per check-in so there's a
+# durable, reviewable history to baseline regressions against.
+MDLOG = '/home/radxa/Minus/tools/ad_block_baseline.md'
 TS = re.compile(r'(\d\d:\d\d:\d\d)')
 
 
@@ -46,6 +49,8 @@ def _t(line):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--minutes', type=int, default=10)
+    ap.add_argument('--md', default=MDLOG,
+                    help='markdown baseline log path ("" to disable)')
     args = ap.parse_args()
 
     import os
@@ -178,14 +183,50 @@ def main():
     lines.append(f"VERDICT: {verdict}")
     report = '\n'.join(lines)
     print(report)
+    import os
     try:
-        import os
         if os.path.exists(LOGF) and os.path.getsize(LOGF) > 512 * 1024:
             os.replace(LOGF, LOGF + '.1')
         with open(LOGF, 'a') as f:
             f.write(report + '\n\n')
     except Exception:
         pass
+
+    # Markdown baseline: one table row per check-in (durable history to
+    # baseline regressions against). Anomalous ticks get the flagged
+    # blocks inlined; clean ticks stay one line so the doc is readable.
+    if args.md:
+        try:
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            flagged = [b for b in blocks if b['flags']]
+            longest = max((b['dur'] or 0 for b in blocks), default=0)
+            recs = [b['recover'] for b in blocks
+                    if isinstance(b['recover'], (int, float))]
+            rec_max = max(recs) if recs else 0
+            status = 'OK' if verdict == 'OK' else 'ATTN'
+            note = 'clean' if not flagged else '; '.join(
+                f"{b['src']} dur={b['dur']}s rec={b['recover']}s "
+                f"{','.join(b['flags'])}" for b in flagged[:4])
+            row = (f"| {ts} | {args.minutes}m | {len(blocks)} | "
+                   f"{query_errs} | {safeguard_fires} | {longest:.0f}s | "
+                   f"{rec_max}s | {status} | {note} |\n")
+            if os.path.exists(args.md) and os.path.getsize(args.md) > 1_000_000:
+                os.replace(args.md, args.md + '.1')
+            new = not os.path.exists(args.md)
+            with open(args.md, 'a') as f:
+                if new:
+                    f.write(
+                        "# Minus ad-block monitor baseline\n\n"
+                        "Auto-appended one row per check-in by "
+                        "`tools/ad_block_monitor.py`. `OK` = zero "
+                        "false-positive / multi-minute-hold / query-error "
+                        "anomalies. Use as the regression baseline.\n\n"
+                        "| time | window | blocks | q_err | safeg | "
+                        "longest | max_rec | status | notes |\n"
+                        "|---|---|---|---|---|---|---|---|---|\n")
+                f.write(row)
+        except Exception:
+            pass
     return 0
 
 
