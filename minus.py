@@ -458,6 +458,10 @@ class Minus:
         # [SAFEGUARD] force-stop in _update_blocking_state). env-overridable.
         self.MAX_BLOCKING_DURATION = float(
             os.environ.get('MINUS_MAX_BLOCKING_DURATION', '150'))
+        # Set when the MAX safeguard fires; suppresses re-blocking the
+        # SAME frozen frame (stuck upstream stream) until a real scene
+        # change. Prevents the 150s→150s churn on a frozen ad frame.
+        self._safeguard_freeze_active = False
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
         self._state_lock = threading.Lock()
@@ -2567,6 +2571,16 @@ class Minus:
                             f"{self.SKIP_UNBLOCK_GRACE_SECONDS:.0f}s)")
                         should_start = False
 
+                # Upstream stream is frozen on an ad frame (MAX safeguard
+                # already fired once on it). Don't churn 150s→150s on a
+                # stuck source — wait for the stream to actually resume
+                # (scene change clears this in the OCR loop).
+                if should_start and self._safeguard_freeze_active:
+                    logger.info(
+                        "Blocking suppressed - post-safeguard freeze "
+                        "(stream frozen on ad frame; awaiting scene change)")
+                    should_start = False
+
                 if should_start:
                     self.ad_detected = True
                     self.blocking_start_time = now
@@ -2659,6 +2673,18 @@ class Minus:
                     self.ocr_no_ad_count = 0
                     self.ocr_ad_detection_count = 0
                     self.vlm_no_ad_count = 0
+                    # If the safeguard fired because the upstream video
+                    # FROZE on an ad frame (observed: stream stuck on
+                    # "Sponsored…31 Skip in", countdown frozen, OCR text
+                    # byte-identical for 150s), do NOT immediately re-block
+                    # the same frozen frame — that produced a 150s→150s
+                    # churn. It's a stuck source, not a playing ad. Suppress
+                    # re-start until the stream actually resumes (a real
+                    # scene change), which also lets autonomous mode see the
+                    # frozen screen and recover it. Cleared on scene change
+                    # in the OCR loop. A real long ad pod is unaffected: its
+                    # frames change, so the flag clears within one cycle.
+                    self._safeguard_freeze_active = True
 
                 if should_stop:
                     self.ad_detected = False
@@ -2746,6 +2772,13 @@ class Minus:
                 # Scene change detection (with max skip cap to catch missed ads)
                 scene_changed = self.is_scene_changed(frame)
                 now = time.time()
+
+                # Upstream stream resumed after a frozen-frame safeguard →
+                # clear the freeze suppression so normal blocking resumes.
+                if scene_changed and self._safeguard_freeze_active:
+                    logger.info("[SAFEGUARD] Stream resumed (scene change) — "
+                                "clearing post-safeguard freeze suppression")
+                    self._safeguard_freeze_active = False
 
                 # Track static screen state for suppression of still-ad blocking
                 if scene_changed:
