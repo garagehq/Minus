@@ -102,6 +102,7 @@ import threading
 import subprocess
 import re
 import json
+import difflib
 from pathlib import Path
 from datetime import datetime
 # Process-based OCR/VLM workers handle timeouts internally (no ThreadPoolExecutor needed)
@@ -120,6 +121,13 @@ SYSTEM_SETTINGS_FILE = Path.home() / '.minus_system_settings.json'
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from console import blank_console, restore_console
+
+
+def _norm_alnum(s: str) -> str:
+    """Lowercase alphanumeric-only — robust OCR-text identity key
+    (drops the spacing/punctuation jitter OCR adds frame-to-frame)."""
+    return ''.join(c.lower() for c in s if c.isalnum())
+
 
 # Blank the console immediately on import (before any output)
 blank_console()
@@ -459,9 +467,11 @@ class Minus:
         self.MAX_BLOCKING_DURATION = float(
             os.environ.get('MINUS_MAX_BLOCKING_DURATION', '150'))
         # Set when the MAX safeguard fires; suppresses re-blocking the
-        # SAME frozen frame (stuck upstream stream) until a real scene
-        # change. Prevents the 150s→150s churn on a frozen ad frame.
+        # SAME frozen frame (stuck upstream stream) until the OCR text
+        # meaningfully changes. Prevents the 150s→150s churn on a frozen
+        # ad frame. (_safeguard_freeze_text = the frozen frame's OCR text.)
         self._safeguard_freeze_active = False
+        self._safeguard_freeze_text = ''
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
         self._state_lock = threading.Lock()
@@ -2678,13 +2688,19 @@ class Minus:
                     # "Sponsored…31 Skip in", countdown frozen, OCR text
                     # byte-identical for 150s), do NOT immediately re-block
                     # the same frozen frame — that produced a 150s→150s
-                    # churn. It's a stuck source, not a playing ad. Suppress
-                    # re-start until the stream actually resumes (a real
-                    # scene change), which also lets autonomous mode see the
-                    # frozen screen and recover it. Cleared on scene change
-                    # in the OCR loop. A real long ad pod is unaffected: its
-                    # frames change, so the flag clears within one cycle.
+                    # churn. Snapshot the frozen OCR text; the freeze is
+                    # cleared in the OCR loop only when the text MEANINGFULLY
+                    # changes (stream actually resumed). NOTE: pixel
+                    # is_scene_changed() is NOT a reliable "resumed" signal
+                    # here — a frozen stream still pixel-jitters (buffering
+                    # spinner / compression noise) and tripped it ~1s after
+                    # the cap, defeating the guard. A real ad/content shows
+                    # different OCR text, so text-change clears it within a
+                    # cycle; a stuck source keeps identical text → stays
+                    # suppressed (and autonomous mode can recover it).
                     self._safeguard_freeze_active = True
+                    self._safeguard_freeze_text = _norm_alnum(
+                        ' '.join(self.last_ocr_texts or []))
 
                 if should_stop:
                     self.ad_detected = False
@@ -2773,12 +2789,26 @@ class Minus:
                 scene_changed = self.is_scene_changed(frame)
                 now = time.time()
 
-                # Upstream stream resumed after a frozen-frame safeguard →
-                # clear the freeze suppression so normal blocking resumes.
-                if scene_changed and self._safeguard_freeze_active:
-                    logger.info("[SAFEGUARD] Stream resumed (scene change) — "
-                                "clearing post-safeguard freeze suppression")
-                    self._safeguard_freeze_active = False
+                # Clear the post-safeguard freeze ONLY when the OCR text
+                # meaningfully changes — i.e. the stream actually resumed.
+                # A frozen stream pixel-jitters (so is_scene_changed is
+                # unreliable) but its OCR text stays ~identical; a real
+                # ad/content shows clearly different text. difflib ratio
+                # tolerates OCR's frame-to-frame char jitter on the SAME
+                # frozen frame (stays >0.9) while a genuine change is <0.7.
+                if self._safeguard_freeze_active:
+                    _cur_txt = _norm_alnum(' '.join(self.last_ocr_texts or []))
+                    if _cur_txt and self._safeguard_freeze_text:
+                        _sim = difflib.SequenceMatcher(
+                            None, _cur_txt,
+                            self._safeguard_freeze_text).ratio()
+                    else:
+                        _sim = 1.0  # no text yet → treat as still frozen
+                    if _sim < 0.7:
+                        logger.info(
+                            f"[SAFEGUARD] Stream resumed (OCR text changed, "
+                            f"sim={_sim:.2f}) — clearing freeze suppression")
+                        self._safeguard_freeze_active = False
 
                 # Track static screen state for suppression of still-ad blocking
                 if scene_changed:
