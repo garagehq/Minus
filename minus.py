@@ -102,6 +102,7 @@ import threading
 import subprocess
 import re
 import json
+import difflib
 from pathlib import Path
 from datetime import datetime
 # Process-based OCR/VLM workers handle timeouts internally (no ThreadPoolExecutor needed)
@@ -120,6 +121,13 @@ SYSTEM_SETTINGS_FILE = Path.home() / '.minus_system_settings.json'
 sys.path.insert(0, str(Path(__file__).parent / 'src'))
 
 from console import blank_console, restore_console
+
+
+def _norm_alnum(s: str) -> str:
+    """Lowercase alphanumeric-only — robust OCR-text identity key
+    (drops the spacing/punctuation jitter OCR adds frame-to-frame)."""
+    return ''.join(c.lower() for c in s if c.isalnum())
+
 
 # Blank the console immediately on import (before any output)
 blank_console()
@@ -332,11 +340,42 @@ class Minus:
 
         # VLM stability system - sliding window approach to prevent waffling
         # Tracks recent VLM decisions and requires sustained agreement to change state
-        # NOTE: FastVLM-1.5B is smarter, so thresholds can be more relaxed
+        # Retuned for the FastVLM-0.5B iter4 logit classifier. iter4 has
+        # near-perfect per-frame separation on real content (holdout: 95.25%
+        # non-ad recall, 94.25% ad recall; measured clean-video p_yes≈0.05 vs
+        # ad-text p_yes≈0.85) and deterministic ~0.33s latency. The old
+        # 4-decision / 90%-agreement window was sized for the 1.5B's ~36%
+        # home-screen false-positive rate; with iter4 it just adds latency.
+        # min_decisions 4->3 and start_agreement 0.90->0.80 validated via
+        # tests/harness_iter4_retune_ab.py (round5/6/7): VLM-only detect
+        # 6.11s->2.11s, realistic multi-ad first-detect 6.12s->2.05s, with
+        # 0 false positives on clean content and 0 phantom re-blocks.
+        # vlm_history_window 45->8 and start_agreement 0.80->0.70: a 45s
+        # window keeps stale *content* no-ad votes that mathematically
+        # prevent a VLM-alone ad from ever reaching the start-agreement
+        # ratio until they age out — VLM-only detect was ~38s (81% of
+        # VLM-only ads missed). Swept over 1920 param combos × thousands
+        # of holdout-bootstrapped scenarios in tests/test_vlm_decision_sim.py:
+        # an 8s window collapses VLM-only detect to ~6s with 0 misses,
+        # 0 phantom re-blocks, OCR-path metrics unchanged (start/stop
+        # responsiveness is governed by the consecutive counters, not the
+        # window, so shrinking it has no recovery downside).
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
-        self.vlm_history_window = 45.0      # Look at last 45 seconds of decisions
-        self.vlm_min_decisions = 4          # Need at least 4 decisions to act
-        self.vlm_start_agreement = 0.90     # Need 90% ad agreement to START blocking (solo; OCR-corroborated uses immediate shortcut at ~line 2778). Raised from 0.80 to tighten VLM-alone triggers.
+        self.vlm_history_window = 8.0       # Look at last 8 seconds of decisions (iter4: was 45.0)
+        # VLM-ONLY trigger deliberately hardened ~50%+ after real
+        # frustration: VLM kept false-triggering mid-Netflix-show (no OCR
+        # ad text → pure VLM-alone path). Require 5 agreeing decisions
+        # (was 3 → +67%: ~5s of sustained ad-agreement in the 8s window,
+        # not a ~3s transient burst) AND 0.80 base agreement (+0.10
+        # hysteresis = 0.90 effective, was 0.80). OCR-corroborated ads are
+        # UNAFFECTED — they take the immediate shortcut (~line 2778) and
+        # never reach the sliding window, so real YouTube ads (skip in /
+        # sponsored) still block fast. This only makes VLM-acting-ALONE
+        # (e.g. on a Netflix show with no ad UI) much harder to fire; the
+        # lowered VLM-only min-blocking-duration below limits the cost of
+        # the rare residual false VLM-only block.
+        self.vlm_min_decisions = 5          # Need 5 decisions to act solo (iter4: was 4→3→5, hardened)
+        self.vlm_start_agreement = 0.80     # 80% ad agreement to START blocking solo (+0.10 hysteresis → 0.90 effective; iter4: 0.90→0.80→0.70→0.80 hardened; OCR-corroborated uses immediate shortcut at ~line 2778)
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
         self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
         self.vlm_start_threshold_cap = 0.95 # Cap on effective start threshold so hysteresis can't push it beyond what real-world noise allows
@@ -413,6 +452,13 @@ class Minus:
         self.MIN_BLOCKING_DURATION_STEP = 0.5
         self.MIN_BLOCKING_DURATION_FLOOR_OCR = 1.0
         self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
+        # VLM-only blocks get a very low minimum hold: the hardened
+        # VLM-only trigger above makes a false solo block rare, and when
+        # one does slip through (e.g. mid-show) it should clear the
+        # instant VLM flips to no-ad (gated only by VLM_STOP_THRESHOLD,
+        # ~1-2s) rather than being artificially held the 3.0s base.
+        # OCR/both keep their anti-flicker floors (real ads with UI text).
+        self.MIN_BLOCKING_DURATION_FLOOR_VLM = 0.5
         self.MIN_DURATION_RESET_GAP = 30.0  # seconds
         self.consecutive_ad_count = 0  # 0 = first ad, 1 = second, ...
         # 2 cycles ≈ 1.0s recovery (down from 4 = 2.0s). Tuned via the
@@ -422,6 +468,47 @@ class Minus:
         # overlays makes consecutive misses extremely rare.
         self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
+        # Transition-frame hold bridges a BRIEF black/solid screen between
+        # two ads in a real break so the overlay doesn't flicker. But a
+        # dark/low-detail lofi music video reads as "uniform" forever, so
+        # an uncapped hold freezes ocr_no_ad_count / vlm_no_ad_count and a
+        # block never recovers (observed: a 46.9s VLM block held ~10s on
+        # "WYS | Comforting You" after the ad ended). Real inter-ad gaps
+        # are ≤~2s; cap the continuous hold so benign uniform content
+        # can't defeat the no-ad stop. env-overridable.
+        self.TRANSITION_HOLD_MAX_SECONDS = float(
+            os.environ.get('MINUS_TRANSITION_HOLD_MAX', '3'))
+        self.transition_hold_start = 0.0
+        # Hard ceiling on one continuous block (any source). Legit ad
+        # breaks — even multi-ad streaming pods — are well under this;
+        # anything longer is a static weak-keyword false positive (see the
+        # [SAFEGUARD] force-stop in _update_blocking_state). env-overridable.
+        self.MAX_BLOCKING_DURATION = float(
+            os.environ.get('MINUS_MAX_BLOCKING_DURATION', '150'))
+        # Set when the MAX safeguard fires; suppresses re-blocking the
+        # SAME frozen frame (stuck upstream stream) until the OCR text
+        # meaningfully changes. Prevents the 150s→150s churn on a frozen
+        # ad frame. (_safeguard_freeze_text = the frozen frame's OCR text.)
+        self._safeguard_freeze_active = False
+        self._safeguard_freeze_text = ''
+        # EARLY frozen-stream detection. The MAX cap bounds a frozen
+        # upstream stream to a single ~150s hold (no churn — the freeze
+        # guard handles that), but a 150s hold still violates the
+        # zero-multi-minute-holds goal and recurs (~daily). Signature is
+        # unambiguous: OCR text byte-identical for tens of seconds WHILE
+        # blocking, incl. a stuck "Skip in N" countdown. A real skippable
+        # ad's countdown decrements every ≤3s, so its OCR text never
+        # stays identical this long; real bumpers end well before 30s.
+        # When OCR text is unchanged for FROZEN_EARLY_SECONDS while a
+        # block is active, fire the SAME proven force-stop+freeze path as
+        # the 150s cap — just earlier. Reuses _norm_alnum/difflib and the
+        # validated _safeguard_freeze_* mechanism (only the trigger time
+        # is new). env-overridable.
+        self.FROZEN_EARLY_SECONDS = float(
+            os.environ.get('MINUS_FROZEN_EARLY_SECONDS', '30'))
+        self._ocr_text_stable_since = 0.0   # when OCR text last changed
+        self._ocr_text_stable_norm = ''     # normalised text at that time
+        self._ocr_text_frozen_for = 0.0     # seconds OCR text unchanged
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
         self._state_lock = threading.Lock()
@@ -465,6 +552,23 @@ class Minus:
         })
         self.STRONG_AD_HOLD_SECONDS = 5.0
         self.last_strong_ad_time = 0.0
+        # WEAK keywords legitimately appear on static home / promo /
+        # masthead screens (YouTube "Sponsored · Learn more / Shop now"
+        # tiles), NOT exclusively in active video-ad UIs. If the matched
+        # set is ENTIRELY weak and no STRONG keyword was seen within
+        # STRONG_AD_HOLD_SECONDS, the frame is suppressed (routed to
+        # no-ad accounting so a block decays and cannot start/sustain).
+        # Real video ads always also surface a strong keyword (skip in /
+        # countdown / visit advertiser) within that window, and VLM
+        # independently catches genuine ad video, so OCR can stay strict.
+        # Generalised from the original bare-'sponsored'-only check after
+        # a 150s VLM+OCR hold on a static "Learn more · Sponsored" promo
+        # (the pair evaded the sponsored-only test). Names must match what
+        # OCRProcess.check_ad_keywords emits.
+        self.WEAK_AD_KEYWORD_NAMES = frozenset({
+            'sponsored', 'learn more', 'shop now', 'buy now',
+            'shop now (fuzzy)', 'shop now (fuzzy-shan)',
+        })
 
         self.vlm_prev_frame = None
         self.vlm_prev_frame_had_ad = False
@@ -541,6 +645,21 @@ class Minus:
         self.last_skip_attempt_time = 0  # When we last attempted a skip
         self.last_skip_success_time = 0  # When we last successfully skipped an ad
         self.SKIP_ATTEMPT_COOLDOWN = 10.0  # Don't try again for 10s after ANY attempt (prevents pause spam)
+        # After a successful skip the skipped ad's end-card / transition
+        # lingers briefly and still OCR-matches; during this window OCR ad
+        # frames are routed to no-ad so the block decays and the
+        # _unblock_after_skip reset isn't instantly undone.
+        # 8s was TOO LONG: ad pods (skip ad 1 → ad 2 starts ~1-2s later)
+        # are extremely common, and an 8s grace suppressed detection of
+        # the NEXT ad for several seconds (observed: VLM flags ad 2 at
+        # 100%/3 but AD BLOCKING STARTED withheld 2-3s by this grace).
+        # 3s covers the typical skipped-ad end-card; the multi-minute
+        # backstop the 8s was sized for is now redundant — the universal
+        # MAX_BLOCKING_DURATION cap, weak-keyword suppression and the
+        # transition-hold cap independently prevent long false holds.
+        # env-overridable.
+        self.SKIP_UNBLOCK_GRACE_SECONDS = float(
+            os.environ.get('MINUS_SKIP_UNBLOCK_GRACE', '3'))
 
         # Accidental pause detection
         self.blocking_end_time = 0  # When blocking last ended
@@ -1707,6 +1826,25 @@ class Minus:
             if entry[0] >= cutoff
         ]
 
+    def _transition_hold_active(self, is_transition: bool) -> bool:
+        """Whether to hold a block through a 'transition' frame.
+
+        Only bridges a BRIEF inter-ad gap. `_is_transition_frame` also
+        fires on benign uniform content (dark lofi music videos), which
+        would otherwise freeze the no-ad counters forever and prevent
+        recovery. Cap the continuous hold at TRANSITION_HOLD_MAX_SECONDS;
+        past that, treat frames normally so the block can stop.
+        Shared by the OCR and VLM loops (a real gap both see resets/extends
+        the same window); reset on any non-transition / ad frame.
+        """
+        if not is_transition:
+            self.transition_hold_start = 0.0
+            return False
+        now = time.time()
+        if self.transition_hold_start == 0.0:
+            self.transition_hold_start = now
+        return (now - self.transition_hold_start) <= self.TRANSITION_HOLD_MAX_SECONDS
+
     def _is_transition_frame(self, frame, threshold=15, black_threshold=30, uniformity_threshold=0.95) -> tuple:
         """
         Detect if a frame is a transition screen (mostly black or single solid color).
@@ -1770,6 +1908,11 @@ class Minus:
         When falloff is disabled via the settings toggle, the base 3.0s is held
         regardless of how many ads fired in a row.
         """
+        # VLM-only false blocks are the frustrating case — let them clear
+        # as soon as VLM says no-ad (VLM_STOP_THRESHOLD), not after the
+        # 3.0s base. Applied regardless of the falloff toggle.
+        if self.blocking_source == "vlm":
+            return self.MIN_BLOCKING_DURATION_FLOOR_VLM
         if not self.block_falloff_enabled:
             return self.MIN_BLOCKING_DURATION_BASE
         floor = (
@@ -2462,6 +2605,34 @@ class Minus:
                     )
                     should_start = False
 
+                # Don't re-arm on the dying skipped ad's end-card — BUT a
+                # VLM sliding-window-confirmed detection (self.vlm_ad_detected:
+                # 3+ decisions ≥80% agreement) right after a skip is a real
+                # NEW ad in a pod, NOT the end-card (a transitioning end-card
+                # cannot sustain that). Suppressing it delayed pod ad #2 by
+                # 2-3s. The OCR-accounting-site grace still neutralises the
+                # lingering end-card text, so only block an *uncertain*
+                # (non-VLM-confirmed) re-arm here.
+                if (should_start and not self.vlm_ad_detected
+                        and self.last_skip_success_time > 0):
+                    since_skip = time.time() - self.last_skip_success_time
+                    if since_skip < self.SKIP_UNBLOCK_GRACE_SECONDS:
+                        logger.info(
+                            f"Blocking suppressed - post-skip grace "
+                            f"({since_skip:.1f}s of "
+                            f"{self.SKIP_UNBLOCK_GRACE_SECONDS:.0f}s)")
+                        should_start = False
+
+                # Upstream stream is frozen on an ad frame (MAX safeguard
+                # already fired once on it). Don't churn 150s→150s on a
+                # stuck source — wait for the stream to actually resume
+                # (scene change clears this in the OCR loop).
+                if should_start and self._safeguard_freeze_active:
+                    logger.info(
+                        "Blocking suppressed - post-safeguard freeze "
+                        "(stream frozen on ad frame; awaiting scene change)")
+                    should_start = False
+
                 if should_start:
                     self.ad_detected = True
                     self.blocking_start_time = now
@@ -2510,10 +2681,80 @@ class Minus:
                         if blocking_elapsed >= 90.0 and not should_stop:
                             logger.warning(f"[VLM] Auto-stopping VLM-only blocking after {blocking_elapsed:.0f}s (safeguard)")
                             should_stop = True
+                    elif self.blocking_source == "both":
+                        # BOTH OCR and VLM detected this ad. Either one
+                        # clearing (2 consecutive no-ad) is a strong, correct
+                        # "ad ended" signal — stop on whichever fires first.
+                        # This decouples recovery from slow OCR snapshot
+                        # capture (observed ~2.5s/frame when the HDMI-OUT
+                        # display is disconnected): VLM clears in ~0.3s + 2
+                        # cadence ticks while OCR's 2 no-ad frames can lag
+                        # ~3s+. Measured: this cut a real ad→content recovery
+                        # from ~3s to ~1.5s. iter4's sharp per-frame
+                        # separation (p_yes≈0.99 ad / ≈0.01 content) makes a
+                        # spurious 2-in-a-row VLM no-ad mid-ad ~0.3% — and
+                        # OCR would still be holding then anyway.
+                        should_stop = ocr_says_stop or vlm_says_stop
                     else:
-                        # OCR triggered (alone or with VLM) - OCR is authoritative for stopping
-                        # This ensures we don't block longer than necessary after ad ends
+                        # OCR triggered alone (VLM dissented / never saw it).
+                        # OCR is authoritative; VLM's opinion is unreliable
+                        # here so it must NOT be allowed to stop early.
                         should_stop = ocr_says_stop
+
+                # UNIVERSAL SAFEGUARD: no single continuous block should ever
+                # exceed MAX_BLOCKING_DURATION regardless of source. Observed
+                # in production: a static "Sponsored · Peel to collect" promo
+                # tile (bare 'sponsored', audio present) held an OCR+VLM block
+                # for 591s because OCR kept matching the weak keyword so
+                # ocr_no_ad_count never reached threshold and there was no cap
+                # on the ocr/both path (only vlm-only had one). Real ad breaks
+                # — even 2-3-ad streaming pods — are well under this. On cap
+                # we clear ALL detection state so a genuinely-ongoing ad
+                # re-detects fresh within ~1-2 cycles (brief, rare) rather
+                # than the screen staying frozen for minutes (catastrophic).
+                _hit_max = blocking_elapsed >= self.MAX_BLOCKING_DURATION
+                _hit_frozen = (self._ocr_text_frozen_for
+                               >= self.FROZEN_EARLY_SECONDS)
+                if (self.ad_detected and not should_stop
+                        and (_hit_max or _hit_frozen)):
+                    if _hit_frozen and not _hit_max:
+                        logger.warning(
+                            f"[SAFEGUARD] Force-stopping {self.blocking_source}"
+                            f" block after {blocking_elapsed:.0f}s — OCR text "
+                            f"frozen {self._ocr_text_frozen_for:.0f}s "
+                            f"(>{self.FROZEN_EARLY_SECONDS:.0f}s); stuck "
+                            f"upstream stream, not a live ad; clearing state"
+                        )
+                    else:
+                        logger.warning(
+                            f"[SAFEGUARD] Force-stopping {self.blocking_source} "
+                            f"block after {blocking_elapsed:.0f}s "
+                            f"(>{self.MAX_BLOCKING_DURATION:.0f}s cap) — likely a "
+                            f"static weak-keyword false positive; clearing state"
+                        )
+                    should_stop = True
+                    self.ocr_ad_detected = False
+                    self.ocr_no_ad_count = 0
+                    self.ocr_ad_detection_count = 0
+                    self.vlm_no_ad_count = 0
+                    # If the safeguard fired because the upstream video
+                    # FROZE on an ad frame (observed: stream stuck on
+                    # "Sponsored…31 Skip in", countdown frozen, OCR text
+                    # byte-identical for 150s), do NOT immediately re-block
+                    # the same frozen frame — that produced a 150s→150s
+                    # churn. Snapshot the frozen OCR text; the freeze is
+                    # cleared in the OCR loop only when the text MEANINGFULLY
+                    # changes (stream actually resumed). NOTE: pixel
+                    # is_scene_changed() is NOT a reliable "resumed" signal
+                    # here — a frozen stream still pixel-jitters (buffering
+                    # spinner / compression noise) and tripped it ~1s after
+                    # the cap, defeating the guard. A real ad/content shows
+                    # different OCR text, so text-change clears it within a
+                    # cycle; a stuck source keeps identical text → stays
+                    # suppressed (and autonomous mode can recover it).
+                    self._safeguard_freeze_active = True
+                    self._safeguard_freeze_text = _norm_alnum(
+                        ' '.join(self.last_ocr_texts or []))
 
                 if should_stop:
                     self.ad_detected = False
@@ -2601,6 +2842,27 @@ class Minus:
                 # Scene change detection (with max skip cap to catch missed ads)
                 scene_changed = self.is_scene_changed(frame)
                 now = time.time()
+
+                # Clear the post-safeguard freeze ONLY when the OCR text
+                # meaningfully changes — i.e. the stream actually resumed.
+                # A frozen stream pixel-jitters (so is_scene_changed is
+                # unreliable) but its OCR text stays ~identical; a real
+                # ad/content shows clearly different text. difflib ratio
+                # tolerates OCR's frame-to-frame char jitter on the SAME
+                # frozen frame (stays >0.9) while a genuine change is <0.7.
+                if self._safeguard_freeze_active:
+                    _cur_txt = _norm_alnum(' '.join(self.last_ocr_texts or []))
+                    if _cur_txt and self._safeguard_freeze_text:
+                        _sim = difflib.SequenceMatcher(
+                            None, _cur_txt,
+                            self._safeguard_freeze_text).ratio()
+                    else:
+                        _sim = 1.0  # no text yet → treat as still frozen
+                    if _sim < 0.7:
+                        logger.info(
+                            f"[SAFEGUARD] Stream resumed (OCR text changed, "
+                            f"sim={_sim:.2f}) — clearing freeze suppression")
+                        self._safeguard_freeze_active = False
 
                 # Track static screen state for suppression of still-ad blocking
                 if scene_changed:
@@ -2742,6 +3004,29 @@ class Minus:
 
                 # Store OCR texts and check for home screen / video interface keywords
                 self.last_ocr_texts = all_texts
+
+                # Track OCR-text stability for EARLY frozen-stream
+                # detection. Non-empty text only (empty OCR = content /
+                # transition, not a frozen ad frame). difflib ratio
+                # tolerates OCR's per-frame char jitter on the SAME frame
+                # (>0.93) while a real change (incl. a decrementing
+                # countdown) drops it well below.
+                _now_fs = time.time()
+                _cur_norm = _norm_alnum(' '.join(all_texts or []))
+                if not _cur_norm:
+                    self._ocr_text_stable_since = 0.0
+                    self._ocr_text_stable_norm = ''
+                    self._ocr_text_frozen_for = 0.0
+                else:
+                    if (not self._ocr_text_stable_norm or difflib.SequenceMatcher(
+                            None, _cur_norm, self._ocr_text_stable_norm
+                            ).ratio() < 0.93):
+                        self._ocr_text_stable_norm = _cur_norm
+                        self._ocr_text_stable_since = _now_fs
+                        self._ocr_text_frozen_for = 0.0
+                    else:
+                        self._ocr_text_frozen_for = (
+                            _now_fs - self._ocr_text_stable_since)
                 if matched_keywords:
                     self.last_matched_keywords = matched_keywords
                     # Record timestamp if any "strong" keyword (Skip in / Skip Ad /
@@ -2893,38 +3178,74 @@ class Minus:
                     if self.ad_blocker:
                         self.ad_blocker.set_skip_status(False, None)
 
+                # Bare "Sponsored" with no STRONG video-ad keyword (skip in /
+                # visit advertiser / countdown / Ad N of M) seen within
+                # STRONG_AD_HOLD_SECONDS is a home/promo tile, not a video ad
+                # ("Sponsored · Peel to collect", "Sponsored · Date prisa").
+                # The old discriminator was _hdmi_audio_present(), but home
+                # and promo screens DO carry audio (autoplay previews, music),
+                # so it let a static sponsored tile hold a block for ~10 min
+                # in production. strong-ad-recent is the reliable signal:
+                # real video ads show skip/countdown alongside "Sponsored"
+                # within a few seconds (VLM independently covers any genuine
+                # sponsored-only video ad, so OCR can safely stay strict).
+                strong_ad_recent = ((time.time() - self.last_strong_ad_time)
+                                    < self.STRONG_AD_HOLD_SECONDS)
+                weak_only = (len(matched_keywords) > 0 and
+                             all(kw in self.WEAK_AD_KEYWORD_NAMES
+                                 for kw, _ in matched_keywords))
+
+                since_skip = time.time() - self.last_skip_success_time
+                in_skip_grace = (self.last_skip_success_time > 0
+                                 and since_skip < self.SKIP_UNBLOCK_GRACE_SECONDS)
+
+                suppress_reason = None
                 if ad_detected and not is_terminal:
                     keywords_found = [kw for kw, txt in matched_keywords]
-                    # "Sponsored" alone without HDMI audio is almost always a home-screen
-                    # tile (Fire TV recommendations row, YouTube home sponsored thumbnail).
-                    # Real video ads transmit audio. We check HDMI-IN audio_present
-                    # directly so this works even when our playback pipeline is down
-                    # (e.g. display disconnected).
-                    sponsored_only = (len(matched_keywords) > 0 and
-                                      all(kw == 'sponsored' for kw, _ in matched_keywords))
-                    # Suppress OCR ad detection if home screen is detected
-                    # (e.g., "Sponsored" content rows on Fire TV home are not video ads)
-                    if self.home_screen_detected:
-                        logger.info(f"OCR suppressed - home screen detected. Keywords would have been: {keywords_found}")
-                    elif sponsored_only and not self._hdmi_audio_present():
-                        logger.info(f"OCR suppressed - 'sponsored' without HDMI audio = likely home tile. Texts: {all_texts[:3]}")
-                    else:
-                        self.ocr_ad_detection_count += 1
-                        self.ocr_no_ad_count = 0
-                        self.last_ocr_ad_time = time.time()
+                    if in_skip_grace:
+                        # Just skipped — this is the dying ad's end-card /
+                        # transition. Route to no-ad so the block decays and
+                        # cannot re-arm (don't let stale 'skip in' on the
+                        # end-card keep it alive).
+                        suppress_reason = (
+                            f"post-skip grace ({since_skip:.1f}s of "
+                            f"{self.SKIP_UNBLOCK_GRACE_SECONDS:.0f}s)")
+                    elif self.home_screen_detected:
+                        suppress_reason = (f"home screen detected "
+                                           f"(would have been {keywords_found})")
+                    elif weak_only and not strong_ad_recent:
+                        suppress_reason = (
+                            f"weak-only {keywords_found}, no strong ad "
+                            f"keyword in {self.STRONG_AD_HOLD_SECONDS:.0f}s "
+                            f"(texts {all_texts[:3]})")
 
-                        if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
-                            self.ocr_ad_detected = True
-                        logger.info(f"OCR detected ad keywords: {keywords_found}")
-                        self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
-                        self.add_detection('OCR', all_texts, matched_keywords)
+                real_ad_frame = (ad_detected and not is_terminal
+                                 and suppress_reason is None)
+
+                if real_ad_frame:
+                    self.transition_hold_start = 0.0  # ad present → reset gap timer
+                    self.ocr_ad_detection_count += 1
+                    self.ocr_no_ad_count = 0
+                    self.last_ocr_ad_time = time.time()
+
+                    if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
+                        self.ocr_ad_detected = True
+                    logger.info(f"OCR detected ad keywords: {keywords_found}")
+                    self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
+                    self.add_detection('OCR', all_texts, matched_keywords)
                 else:
-                    # Check if this is a transition frame (black/solid color)
-                    # If we're blocking and see a transition, hold through it
-                    is_transition, transition_type = self._is_transition_frame(frame)
+                    # Suppressed (home/weak-sponsored) OR no ad keyword at all.
+                    # CRITICAL: route this into the no-ad accounting so an
+                    # active block actually DECAYS. The old code only logged
+                    # on suppression and fell through without touching
+                    # ocr_no_ad_count, so a static suppressed 'sponsored'
+                    # screen froze the counters and the block never stopped.
+                    if suppress_reason is not None:
+                        logger.info(f"OCR suppressed - {suppress_reason}")
 
-                    if self.ad_detected and is_transition:
-                        # Don't count transition frames as "no ad" - likely between ads
+                    # Transition frame (black/solid) between ads: hold block.
+                    is_transition, transition_type = self._is_transition_frame(frame)
+                    if self.ad_detected and self._transition_hold_active(is_transition):
                         logger.info(f"OCR #{self.frame_count}: Transition frame ({transition_type}) - holding block")
                     else:
                         self.ocr_no_ad_count += 1
@@ -3058,12 +3379,13 @@ class Minus:
 
                 # Update legacy counters (for logging and spastic detection)
                 if is_ad:
+                    self.transition_hold_start = 0.0  # ad present → reset gap timer
                     self.vlm_consecutive_ad_count += 1
                     self.vlm_no_ad_count = 0
                 else:
                     # Check for transition frame - don't count as "no ad" if blocking
                     is_transition, transition_type = self._is_transition_frame(frame)
-                    if self.ad_detected and is_transition:
+                    if self.ad_detected and self._transition_hold_active(is_transition):
                         logger.info(f"VLM #{self.vlm_frame_count}: Transition frame ({transition_type}) - holding block")
                     else:
                         self.vlm_no_ad_count += 1

@@ -108,5 +108,8 @@ class MinusConfig:
 
 # External paths (configurable via environment variables)
 USTREAMER_PATH = _get_env_path('MINUS_USTREAMER_PATH', '/home/radxa/ustreamer-patched')
-VLM_MODEL_DIR = _get_env_path('MINUS_VLM_MODEL_DIR', '/home/radxa/axera_models/FastVLM-1.5B')
+# FastVLM-0.5B ad-classifier iter4 (native-512 vision, logit-thresholded).
+# On-device F1=94.72 @ T=0.76, ~441ms. Recommended in BENCHMARKS.md.
+# Override with MINUS_VLM_MODEL_DIR (1.5B legacy layout still supported).
+VLM_MODEL_DIR = _get_env_path('MINUS_VLM_MODEL_DIR', '/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4')
 OCR_MODEL_DIR = _get_env_path('MINUS_OCR_MODEL_DIR', '/home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/install/demo_Linux_aarch64/models/paddleocr')

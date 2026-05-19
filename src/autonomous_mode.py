@@ -604,15 +604,18 @@ class AutonomousMode:
         return any(pkg in app_lower for pkg in YOUTUBE_PACKAGES)
 
     # VLM prompt that returns a structured, single-word answer for reliable parsing
+    # MUST stay short: the FastVLM-0.5B iter4 LLM is p128 (single 128-token
+    # prefill chunk). 64 of those tokens are image tokens, so the system +
+    # question must fit in the ~64 remaining. The verbose per-category
+    # variant tokenised to 187 (>128) → the model has no 2nd prefill
+    # shape-group → `list index out of range` on EVERY call (autonomous
+    # mode went fully blind). This minimal form tokenises to ~119 with the
+    # short system prompt. See the p128 note in BENCHMARKS.md / CLAUDE.md
+    # "FastVLM-1.5B → 0.5B iter4" migration entry. Do not re-expand it.
     SCREEN_QUERY_PROMPT = (
-        "Look at this TV screen and classify it into exactly one category. "
+        "Look at this TV screen and classify it into exactly one category.\n"
         "Answer with ONLY one of these words:\n"
-        "PLAYING - a video is actively playing\n"
-        "PAUSED - a video is paused (play bar visible, frozen frame)\n"
-        "DIALOG - a popup or dialog is showing (like 'Are you still watching?')\n"
-        "MENU - a home screen, browse screen, or video selection menu\n"
-        "SCREENSAVER - a screensaver or blank/black screen\n"
-        "Answer with one word only."
+        "PLAYING, PAUSED, DIALOG, MENU, SCREENSAVER"
     )
 
     def _query_screen(self) -> Optional[str]:
