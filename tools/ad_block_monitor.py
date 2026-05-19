@@ -132,10 +132,18 @@ def main():
             # (real ad started on a strong keyword, then we suppressed the
             # trailing bare-sponsored masthead). Only flag a weak/no-keyword
             # block as a suspected false positive if it actually lingered
-            # (>20s) — that's the symptom that matters.
-            if kws and kws.issubset({'sponsored'}) and dur > 20:
+            # (>20s) — that's the symptom that matters. ALSO scope to
+            # OCR-source blocks: a VLM-source block has independent VLM
+            # corroboration (sliding-window 5+ decisions ≥80%); the
+            # trailing weak 'sponsored' OCR text is incidental and not the
+            # trigger. Observed: 38s Mederma video ad with VLM p_yes=0.999+
+            # sustained throughout, OCR captured 'skip in' early then only
+            # 'sponsored' once the skip prompt scrolled — that's a real
+            # ad, not a weak-keyword FP.
+            if (kws and kws.issubset({'sponsored'}) and dur > 20
+                    and cur['src'] == 'OCR'):
                 cur['flags'].append('WEAK_FP(sponsored-only)')
-            if not kws and cur['src'] != 'VLM' and dur > 20:
+            if not kws and cur['src'] == 'OCR' and dur > 20:
                 cur['flags'].append('NO_KW')
             if '[SAFEGUARD]' in ' '.join(b['start_s'] for b in []):
                 pass
