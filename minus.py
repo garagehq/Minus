@@ -472,6 +472,24 @@ class Minus:
         # ad frame. (_safeguard_freeze_text = the frozen frame's OCR text.)
         self._safeguard_freeze_active = False
         self._safeguard_freeze_text = ''
+        # EARLY frozen-stream detection. The MAX cap bounds a frozen
+        # upstream stream to a single ~150s hold (no churn — the freeze
+        # guard handles that), but a 150s hold still violates the
+        # zero-multi-minute-holds goal and recurs (~daily). Signature is
+        # unambiguous: OCR text byte-identical for tens of seconds WHILE
+        # blocking, incl. a stuck "Skip in N" countdown. A real skippable
+        # ad's countdown decrements every ≤3s, so its OCR text never
+        # stays identical this long; real bumpers end well before 30s.
+        # When OCR text is unchanged for FROZEN_EARLY_SECONDS while a
+        # block is active, fire the SAME proven force-stop+freeze path as
+        # the 150s cap — just earlier. Reuses _norm_alnum/difflib and the
+        # validated _safeguard_freeze_* mechanism (only the trigger time
+        # is new). env-overridable.
+        self.FROZEN_EARLY_SECONDS = float(
+            os.environ.get('MINUS_FROZEN_EARLY_SECONDS', '30'))
+        self._ocr_text_stable_since = 0.0   # when OCR text last changed
+        self._ocr_text_stable_norm = ''     # normalised text at that time
+        self._ocr_text_frozen_for = 0.0     # seconds OCR text unchanged
         self.SKIP_DELAY_SECONDS = 4.5  # Wait 4s after ad starts before attempting skip (skip buttons rarely appear sooner)
 
         self._state_lock = threading.Lock()
@@ -2670,14 +2688,26 @@ class Minus:
                 # we clear ALL detection state so a genuinely-ongoing ad
                 # re-detects fresh within ~1-2 cycles (brief, rare) rather
                 # than the screen staying frozen for minutes (catastrophic).
+                _hit_max = blocking_elapsed >= self.MAX_BLOCKING_DURATION
+                _hit_frozen = (self._ocr_text_frozen_for
+                               >= self.FROZEN_EARLY_SECONDS)
                 if (self.ad_detected and not should_stop
-                        and blocking_elapsed >= self.MAX_BLOCKING_DURATION):
-                    logger.warning(
-                        f"[SAFEGUARD] Force-stopping {self.blocking_source} "
-                        f"block after {blocking_elapsed:.0f}s "
-                        f"(>{self.MAX_BLOCKING_DURATION:.0f}s cap) — likely a "
-                        f"static weak-keyword false positive; clearing state"
-                    )
+                        and (_hit_max or _hit_frozen)):
+                    if _hit_frozen and not _hit_max:
+                        logger.warning(
+                            f"[SAFEGUARD] Force-stopping {self.blocking_source}"
+                            f" block after {blocking_elapsed:.0f}s — OCR text "
+                            f"frozen {self._ocr_text_frozen_for:.0f}s "
+                            f"(>{self.FROZEN_EARLY_SECONDS:.0f}s); stuck "
+                            f"upstream stream, not a live ad; clearing state"
+                        )
+                    else:
+                        logger.warning(
+                            f"[SAFEGUARD] Force-stopping {self.blocking_source} "
+                            f"block after {blocking_elapsed:.0f}s "
+                            f"(>{self.MAX_BLOCKING_DURATION:.0f}s cap) — likely a "
+                            f"static weak-keyword false positive; clearing state"
+                        )
                     should_stop = True
                     self.ocr_ad_detected = False
                     self.ocr_no_ad_count = 0
@@ -2950,6 +2980,29 @@ class Minus:
 
                 # Store OCR texts and check for home screen / video interface keywords
                 self.last_ocr_texts = all_texts
+
+                # Track OCR-text stability for EARLY frozen-stream
+                # detection. Non-empty text only (empty OCR = content /
+                # transition, not a frozen ad frame). difflib ratio
+                # tolerates OCR's per-frame char jitter on the SAME frame
+                # (>0.93) while a real change (incl. a decrementing
+                # countdown) drops it well below.
+                _now_fs = time.time()
+                _cur_norm = _norm_alnum(' '.join(all_texts or []))
+                if not _cur_norm:
+                    self._ocr_text_stable_since = 0.0
+                    self._ocr_text_stable_norm = ''
+                    self._ocr_text_frozen_for = 0.0
+                else:
+                    if (not self._ocr_text_stable_norm or difflib.SequenceMatcher(
+                            None, _cur_norm, self._ocr_text_stable_norm
+                            ).ratio() < 0.93):
+                        self._ocr_text_stable_norm = _cur_norm
+                        self._ocr_text_stable_since = _now_fs
+                        self._ocr_text_frozen_for = 0.0
+                    else:
+                        self._ocr_text_frozen_for = (
+                            _now_fs - self._ocr_text_stable_since)
                 if matched_keywords:
                     self.last_matched_keywords = matched_keywords
                     # Record timestamp if any "strong" keyword (Skip in / Skip Ad /
