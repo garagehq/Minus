@@ -351,9 +351,9 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 **VLM (Secondary - Anti-Waffle Protected):**
 - Uses sliding window of last **8 seconds** of VLM decisions (`vlm_history_window`). **Why 8s, not 45s:** a long window keeps stale *content* (no-ad) votes that mathematically prevent a VLM-alone ad from ever reaching the start-agreement ratio until they age out — measured VLM-only detect was ~38s with 81% of VLM-only ads missed. 8s collapses that to ~6-7s with ~0 misses and 0 phantom blocks (swept over 1920 param combos × thousands of holdout-bootstrapped scenarios; see *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* and `tests/test_vlm_decision_sim.py`). Stop responsiveness is governed by the consecutive counter, not the window, so shrinking it has no recovery downside.
-- Only triggers blocking alone if 80%+ effective agreement (`vlm_start_agreement` 70% + `vlm_hysteresis_boost` 10%)
+- Only triggers blocking alone if **90%+ effective agreement** (`vlm_start_agreement` 80% + `vlm_hysteresis_boost` 10%) — hardened from 80% after real mid-Netflix-show false VLM-only triggers
 - Hysteresis: capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever
-- Minimum 3 decisions in window before VLM can act (`vlm_min_decisions`)
+- Minimum **5 decisions** in window before VLM can act (`vlm_min_decisions`; hardened from 3 — ~5s of sustained ad-agreement, not a ~3s transient burst)
 - 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
 - **Sliding window only for starting** - stopping uses simple consecutive count (`VLM_STOP_THRESHOLD=2`)
 
@@ -361,8 +361,8 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `vlm_history_window` | 8s | How far back to look at VLM decisions (was 45s; collapsed for iter4 — see migration note) |
-| `vlm_min_decisions` | 3 | Minimum decisions needed before acting (was 4; lowered for iter4) |
-| `vlm_start_agreement` | 70% | Agreement threshold to start blocking (was 90→80→70; +10% hysteresis = 80% effective) |
+| `vlm_min_decisions` | 5 | Min decisions before VLM-only acts (4→3→**5**: hardened ~50%+ vs mid-show false triggers) |
+| `vlm_start_agreement` | 80% | VLM-only start agreement (90→80→70→**80**; +10% hysteresis = **90% effective**) |
 | `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
 | `vlm_start_threshold_cap` | 95% | Maximum effective start threshold (so hysteresis can't make it unreachable) |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
@@ -398,7 +398,7 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - VLM stopping uses simple consecutive count (not sliding window) for responsiveness
 
 **Anti-flicker:**
-- Minimum blocking duration starts at 3.0s (`MIN_BLOCKING_DURATION_BASE`) and falls off by `MIN_BLOCKING_DURATION_STEP` (0.5s) on each consecutive ad: 3.0 → 2.5 → 2.0 → 1.5 → 1.0s. Floor is 1.0s for OCR-only, 1.5s for OCR+VLM both agreeing. Counter resets after `MIN_DURATION_RESET_GAP` (30s) without a block. Toggleable via Settings → Blocking Optimizations → *Block-duration Falloff*.
+- Minimum blocking duration starts at 3.0s (`MIN_BLOCKING_DURATION_BASE`) and falls off by `MIN_BLOCKING_DURATION_STEP` (0.5s) on each consecutive ad: 3.0 → 2.5 → 2.0 → 1.5 → 1.0s. Floor is 1.0s for OCR-only, 1.5s for OCR+VLM both agreeing, and **0.5s for VLM-only** (`MIN_BLOCKING_DURATION_FLOOR_VLM`, applied regardless of the falloff toggle) so the rare residual false VLM-only block clears the instant VLM flips to no-ad (~1-2s) instead of being held the 3.0s base. Counter resets after `MIN_DURATION_RESET_GAP` (30s) without a block. Toggleable via Settings → Blocking Optimizations → *Block-duration Falloff*.
 - VLM history cleared on stop prevents false re-triggers
 - Transition frame detection holds blocking through black screens between ads
 - After TV reconnect, ad blocking is suppressed for `HDMI_RECONNECT_GRACE_SECONDS` (90s) so the user can navigate without overlays jumping in. The health monitor calls `Minus.notify_hdmi_reconnect()` when it sees the HDMI-TX link return. Toggleable via Settings → Blocking Optimizations → *HDMI Reconnect Grace*.

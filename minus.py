@@ -362,8 +362,20 @@ class Minus:
         # window, so shrinking it has no recovery downside).
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
         self.vlm_history_window = 8.0       # Look at last 8 seconds of decisions (iter4: was 45.0)
-        self.vlm_min_decisions = 3          # Need at least 3 decisions to act (iter4: was 4)
-        self.vlm_start_agreement = 0.70     # 70% ad agreement to START blocking solo (iter4: was 0.90→0.80→0.70; +0.10 hysteresis → 0.80 effective; OCR-corroborated uses immediate shortcut at ~line 2778)
+        # VLM-ONLY trigger deliberately hardened ~50%+ after real
+        # frustration: VLM kept false-triggering mid-Netflix-show (no OCR
+        # ad text → pure VLM-alone path). Require 5 agreeing decisions
+        # (was 3 → +67%: ~5s of sustained ad-agreement in the 8s window,
+        # not a ~3s transient burst) AND 0.80 base agreement (+0.10
+        # hysteresis = 0.90 effective, was 0.80). OCR-corroborated ads are
+        # UNAFFECTED — they take the immediate shortcut (~line 2778) and
+        # never reach the sliding window, so real YouTube ads (skip in /
+        # sponsored) still block fast. This only makes VLM-acting-ALONE
+        # (e.g. on a Netflix show with no ad UI) much harder to fire; the
+        # lowered VLM-only min-blocking-duration below limits the cost of
+        # the rare residual false VLM-only block.
+        self.vlm_min_decisions = 5          # Need 5 decisions to act solo (iter4: was 4→3→5, hardened)
+        self.vlm_start_agreement = 0.80     # 80% ad agreement to START blocking solo (+0.10 hysteresis → 0.90 effective; iter4: 0.90→0.80→0.70→0.80 hardened; OCR-corroborated uses immediate shortcut at ~line 2778)
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
         self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
         self.vlm_start_threshold_cap = 0.95 # Cap on effective start threshold so hysteresis can't push it beyond what real-world noise allows
@@ -440,6 +452,13 @@ class Minus:
         self.MIN_BLOCKING_DURATION_STEP = 0.5
         self.MIN_BLOCKING_DURATION_FLOOR_OCR = 1.0
         self.MIN_BLOCKING_DURATION_FLOOR_BOTH = 1.5
+        # VLM-only blocks get a very low minimum hold: the hardened
+        # VLM-only trigger above makes a false solo block rare, and when
+        # one does slip through (e.g. mid-show) it should clear the
+        # instant VLM flips to no-ad (gated only by VLM_STOP_THRESHOLD,
+        # ~1-2s) rather than being artificially held the 3.0s base.
+        # OCR/both keep their anti-flicker floors (real ads with UI text).
+        self.MIN_BLOCKING_DURATION_FLOOR_VLM = 0.5
         self.MIN_DURATION_RESET_GAP = 30.0  # seconds
         self.consecutive_ad_count = 0  # 0 = first ad, 1 = second, ...
         # 2 cycles ≈ 1.0s recovery (down from 4 = 2.0s). Tuned via the
@@ -1889,6 +1908,11 @@ class Minus:
         When falloff is disabled via the settings toggle, the base 3.0s is held
         regardless of how many ads fired in a row.
         """
+        # VLM-only false blocks are the frustrating case — let them clear
+        # as soon as VLM says no-ad (VLM_STOP_THRESHOLD), not after the
+        # 3.0s base. Applied regardless of the falloff toggle.
+        if self.blocking_source == "vlm":
+            return self.MIN_BLOCKING_DURATION_FLOOR_VLM
         if not self.block_falloff_enabled:
             return self.MIN_BLOCKING_DURATION_BASE
         floor = (
