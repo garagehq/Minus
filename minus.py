@@ -6,7 +6,7 @@ Architecture:
 - ustreamer captures from HDMI-RX and serves MJPEG stream + HTTP snapshot
 - GStreamer with input-selector for instant video/blocking switching
 - PaddleOCR on RKNN NPU detects ad-related text (~400ms)
-- FastVLM-1.5B on Axera NPU provides visual understanding (~0.9s)
+- LFM2.5-VL-450M on Axera NPU provides visual understanding (~0.37s, prefill-only)
 - Spanish vocabulary practice during ad blocks!
 
 Key insight: Using GStreamer input-selector allows instant switching between
@@ -16,7 +16,7 @@ Performance:
 - Display: 30fps via GStreamer kmssink (NV12 → DRM plane 72)
 - Snapshot: ~150ms non-blocking HTTP capture
 - OCR: ~400-500ms per frame on RKNN NPU
-- VLM: ~0.9s per frame on Axera NPU
+- VLM: ~0.37s per frame on Axera NPU (LFM2.5-VL, prefill-only)
 - Ad blocking: INSTANT switching via input-selector
 """
 
@@ -339,43 +339,37 @@ class Minus:
         self.vlm_no_ad_count = 0
 
         # VLM stability system - sliding window approach to prevent waffling
-        # Tracks recent VLM decisions and requires sustained agreement to change state
-        # Retuned for the FastVLM-0.5B iter4 logit classifier. iter4 has
-        # near-perfect per-frame separation on real content (holdout: 95.25%
-        # non-ad recall, 94.25% ad recall; measured clean-video p_yes≈0.05 vs
-        # ad-text p_yes≈0.85) and deterministic ~0.33s latency. The old
-        # 4-decision / 90%-agreement window was sized for the 1.5B's ~36%
-        # home-screen false-positive rate; with iter4 it just adds latency.
-        # min_decisions 4->3 and start_agreement 0.90->0.80 validated via
-        # tests/harness_iter4_retune_ab.py (round5/6/7): VLM-only detect
-        # 6.11s->2.11s, realistic multi-ad first-detect 6.12s->2.05s, with
-        # 0 false positives on clean content and 0 phantom re-blocks.
-        # vlm_history_window 45->8 and start_agreement 0.80->0.70: a 45s
-        # window keeps stale *content* no-ad votes that mathematically
-        # prevent a VLM-alone ad from ever reaching the start-agreement
-        # ratio until they age out — VLM-only detect was ~38s (81% of
-        # VLM-only ads missed). Swept over 1920 param combos × thousands
-        # of holdout-bootstrapped scenarios in tests/test_vlm_decision_sim.py:
-        # an 8s window collapses VLM-only detect to ~6s with 0 misses,
-        # 0 phantom re-blocks, OCR-path metrics unchanged (start/stop
-        # responsiveness is governed by the consecutive counters, not the
-        # window, so shrinking it has no recovery downside).
+        # Re-retuned for LFM2.5-VL-450M-ft-v2-fused-v2 (May 2026). LFM2 has
+        # structurally tighter per-frame separation than FastVLM iter4:
+        # holdout non-ad-recall 99.2% vs iter4's 95.25% (≈4× lower per-frame
+        # FP rate), with clean-video p_yes ≈ 0.001–0.01 and confident-ad
+        # p_yes ≈ 0.97–0.99. The iter4-era hardening to 5 decisions / 0.80
+        # agreement was added to absorb iter4's mid-show VLM-only FPs — a
+        # failure class LFM2 mostly does not produce. With those iter4
+        # params, the LFM2 simulator (tests/test_vlm_decision_sim_lfm2.py,
+        # 2560-combo sweep, 64 scenarios × 30 seeds, holdout-bootstrapped)
+        # measures V_det mean 9.3s / p95 20s and 7.5% VLM-only miss rate —
+        # the start gate cannot accumulate enough votes fast enough on
+        # genuine ads.
+        # min_decisions 5→3 and start_agreement 0.80→0.70 are the iter4-era
+        # SWEEP WINNER's shape, picked here as the middle ground between the
+        # LFM2 sweep's most-aggressive winner (min_dec=2 / agree=0.60) and
+        # iter4-hardened defaults. Math: at min_dec=3 / 0.70+0.10hyst=0.80
+        # effective, P(phantom from 3 consecutive non-ad frames at LFM2's
+        # 0.8% per-frame FP) ≈ 5e-7 per window → ~0.1 phantoms/day on
+        # holdout-bootstrapped content (vs ~8/hour at the same params on
+        # iter4's noisier distribution — that's why iter4 needed 5/0.80).
+        # vlm_history_window=8s stays (validated via the iter4 sim sweep
+        # — collapses stale-content-vote dilution; LFM2 sweep agrees).
+        # Sim metrics on the new params: V_det mean ~4.5s / p95 ~6s,
+        # V_miss ~0%, phantom 0. Rollback to 5 / 0.80 if real-world
+        # mid-show VLM-only false triggers reappear (the iter4 failure
+        # mode); the comment block at the rollback point should document
+        # whatever LFM2-era regression motivated it.
         self.vlm_decision_history = []      # List of (timestamp, is_ad) tuples
-        self.vlm_history_window = 8.0       # Look at last 8 seconds of decisions (iter4: was 45.0)
-        # VLM-ONLY trigger deliberately hardened ~50%+ after real
-        # frustration: VLM kept false-triggering mid-Netflix-show (no OCR
-        # ad text → pure VLM-alone path). Require 5 agreeing decisions
-        # (was 3 → +67%: ~5s of sustained ad-agreement in the 8s window,
-        # not a ~3s transient burst) AND 0.80 base agreement (+0.10
-        # hysteresis = 0.90 effective, was 0.80). OCR-corroborated ads are
-        # UNAFFECTED — they take the immediate shortcut (~line 2778) and
-        # never reach the sliding window, so real YouTube ads (skip in /
-        # sponsored) still block fast. This only makes VLM-acting-ALONE
-        # (e.g. on a Netflix show with no ad UI) much harder to fire; the
-        # lowered VLM-only min-blocking-duration below limits the cost of
-        # the rare residual false VLM-only block.
-        self.vlm_min_decisions = 5          # Need 5 decisions to act solo (iter4: was 4→3→5, hardened)
-        self.vlm_start_agreement = 0.80     # 80% ad agreement to START blocking solo (+0.10 hysteresis → 0.90 effective; iter4: 0.90→0.80→0.70→0.80 hardened; OCR-corroborated uses immediate shortcut at ~line 2778)
+        self.vlm_history_window = 8.0       # Look at last 8 seconds of decisions (iter4 sweep + LFM2 sweep agree)
+        self.vlm_min_decisions = 3          # Need 3 decisions to act solo (iter4 hardened 4→3→5 against iter4-FPs; LFM2 retune 5→3 — see comment block above)
+        self.vlm_start_agreement = 0.70     # 70% ad agreement to START blocking solo (+0.10 hysteresis → 0.80 effective; LFM2 retune 0.80→0.70 — see comment block above; OCR-corroborated uses immediate shortcut at ~line 2778)
         self.vlm_stop_agreement = 0.75      # Need 75% no-ad agreement to STOP blocking
         self.vlm_hysteresis_boost = 0.10    # Extra agreement needed to change current state
         self.vlm_start_threshold_cap = 0.95 # Cap on effective start threshold so hysteresis can't push it beyond what real-world noise allows

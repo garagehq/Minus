@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import block_latency_harness as H  # noqa: E402
 
-HOLDOUT = '/home/radxa/axera_models/fastvlm-holdout-test/threshold_sweep_raw.json'
+HOLDOUT = '/home/radxa/axera_models/FastVLM/FastVLM-0.5B-ad-classifier-iter4/threshold_sweep_raw.json'
 
 # ---- virtual clock: DecisionEngine.on_vlm calls module time.time() ----
 _VT = [0.0]

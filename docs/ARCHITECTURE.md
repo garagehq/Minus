@@ -17,9 +17,9 @@
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
      │  ┌───────────┐  │           │  ┌───────────────┐  │
-     │  │ PaddleOCR │  │           │  │ FastVLM-1.5B  │  │
+     │  │ PaddleOCR │  │           │  │  LFM2.5-VL    │  │
      │  │ RK3588 NPU│  │           │  │ Axera LLM 8850│  │
-     │  │ ~400ms    │  │           │  │ ~0.9s         │  │
+     │  │ ~400ms    │  │           │  │ ~0.37s        │  │
      │  └───────────┘  │           │  └───────────────┘  │
      └────────┬────────┘           └──────────┬──────────┘
               │                               │
@@ -41,10 +41,10 @@
 - **Memory**: 8GB+ recommended
 
 ### Secondary NPU: Axera LLM 8850
-- **Purpose**: FastVLM-1.5B inference
+- **Purpose**: LFM2.5-VL-450M (ft-v2-fused-v2) inference — prefill-only, no decode
 - **Connection**: USB/PCIe to RK3588
 - **Memory**: Dedicated NPU memory
-- **Performance**: ~0.9s per inference
+- **Performance**: ~0.37s per inference (deterministic)
 
 ## Software Components
 
@@ -57,8 +57,8 @@
 | Audio | `src/audio.py` | Audio passthrough, mute control |
 | OCR Client | `src/ocr.py` | PaddleOCR model + `AD_EXCLUSIONS`, keyword scan |
 | OCR Worker | `src/ocr_worker.py` | Process-based OCR with hard 1.0s timeout, warmup, keepalive |
-| VLM Client | `src/vlm.py` | FastVLM-1.5B inference wrapper with `max_new_tokens` cap |
-| VLM Worker | `src/vlm_worker.py` | Process-based VLM with soft/hard timeout, P95 latency auto-recovery, `_call_lock` serializing detect_ad and query_image |
+| VLM Client | `src/vlm.py` | LFM2.5-VL inference wrapper — argmax logit thresholding for `detect_ad`, first-token logit lookup for `query_image`; both prefill-only on 16 fused decoder layers |
+| VLM Worker | `src/vlm_worker.py` | Process-based VLM with soft (1.5s) / hard (2.0s) timeout, P95 latency auto-recovery, `_call_lock` serializing detect_ad and query_image |
 | Health | `src/health.py` | Health monitoring, recovery, ALSA zombie detection, HDMI DPMS reinit |
 | Web UI | `src/webui.py` | Flask web interface |
 
@@ -90,13 +90,17 @@ a long-lived child process:
 - `OCRProcess` (`src/ocr_worker.py`) loads the RKNN model once, processes
   requests via a `multiprocessing.Queue`, and has a **hard 1.0s timeout**
   backed by worker-process kill-and-restart with exponential backoff.
-- `VLMProcess` (`src/vlm_worker.py`) loads FastVLM-1.5B once, and uses a
-  **soft/hard timeout** split: soft (1.5s) returns `"TIMEOUT"` to the
-  caller while letting the worker keep finishing; hard (5.0s) kills the
-  worker. In parallel, a rolling 10-sample P95 latency check triggers an
-  auto-recovery restart when variance creeps above 3.0s. If a recent
-  restart did not clear the state, the next trigger escalates to a *deep*
-  restart with a longer NPU-release backoff.
+- `VLMProcess` (`src/vlm_worker.py`) loads LFM2.5-VL-450M once (17
+  axengine sessions: 1 vision + 16 fused decoder layers + 1 post, plus
+  a 256MB mmap of the embedding table), and uses a **soft/hard timeout**
+  split: soft (1.5s) returns `"TIMEOUT"` to the caller while letting the
+  worker keep finishing; hard (2.0s) kills the worker. In parallel, a
+  rolling 10-sample P95 latency check triggers an auto-recovery restart
+  when variance creeps above 2.0s. If a recent restart did not clear the
+  state, the next trigger escalates to a *deep* restart with a longer
+  NPU-release backoff. Inference is prefill-only (~0.37s deterministic);
+  the runaway-decode pathology that drove FastVLM's auto-recovery
+  thresholds is structurally impossible here.
 - Both processes run warmup inferences at start and a periodic keepalive
   to avoid NPU cold-start penalties on the first real frame.
 - `VLMProcess._call_lock` serializes `detect_ad` and `query_image` so the

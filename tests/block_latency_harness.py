@@ -56,8 +56,8 @@ PARAMS = {
     # 1.5B's ~1s, so the production VLM loop's real cadence is ~1s, not ~2s.
     'VLM_INTERVAL_S': 1.0,         # was 2.0 — models iter4 real loop cadence
     'vlm_history_window': 8.0,     # was 45.0 — kills stale-content-vote dilution
-    'vlm_min_decisions': 3,        # was 4 — iter4 per-frame signal is decisive
-    'vlm_start_agreement': 0.70,   # was 0.90→0.80→0.70 (swept; +0.10 hyst=0.80 eff)
+    'vlm_min_decisions': 3,        # LFM2 retune 5→3 — LFM2's ~4× lower per-frame FP rate vs iter4 makes the iter4-era hardening unnecessary
+    'vlm_start_agreement': 0.70,   # LFM2 retune 0.80→0.70 (+0.10 hyst = 0.80 eff). See minus.py comment block for math.
     'vlm_stop_agreement': 0.75,
     'vlm_hysteresis_boost': 0.10,
     'vlm_start_threshold_cap': 0.95,

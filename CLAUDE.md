@@ -361,8 +361,8 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
 | `vlm_history_window` | 8s | How far back to look at VLM decisions (was 45s; collapsed for iter4 — see migration note) |
-| `vlm_min_decisions` | 5 | Min decisions before VLM-only acts (4→3→**5**: hardened ~50%+ vs mid-show false triggers) |
-| `vlm_start_agreement` | 80% | VLM-only start agreement (90→80→70→**80**; +10% hysteresis = **90% effective**) |
+| `vlm_min_decisions` | 3 | Min decisions before VLM-only acts (4→3→5→**3**; iter4 hardened to 5 vs iter4-era mid-show FPs, LFM2 reverted to 3 because LFM2's ~4× lower per-frame FP rate makes that hardening unnecessary — see *FastVLM iter4 → LFM2.5-VL Migration*) |
+| `vlm_start_agreement` | 70% | VLM-only start agreement (90→80→70→80→**70**; +10% hysteresis = **80% effective**. Same LFM2 retune rationale as `vlm_min_decisions`) |
 | `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
 | `vlm_start_threshold_cap` | 95% | Maximum effective start threshold (so hysteresis can't make it unreachable) |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
@@ -2345,22 +2345,33 @@ either cached prompt overflows; `query_image` returns
 prompt was committed and quietly broken until the load-time check
 caught it during this migration.
 
-**Sliding-window / decision-engine retune (NOT yet done):** the
-existing anti-waffle parameters (`vlm_history_window=8s`,
-`vlm_min_decisions=5`, `vlm_start_agreement=0.80`,
-`vlm_hysteresis_boost=0.10`, `VLM_STOP_THRESHOLD=2`) were calibrated
-for FastVLM iter4's confidence distribution against the 800-image
-holdout. LFM2 has **structurally higher non-ad-recall (99.2% vs
-95.25%)** and tighter logit-margin distributions on confident cases
-(observed: clean video p_yes ≈ 0.001–0.01, confident ads p_yes ≈
-0.97–0.99). The current params are likely now over-conservative —
-specifically, `vlm_min_decisions=5` and `vlm_start_agreement=0.80`
-were sized to suppress iter4's home-screen FPs that LFM2 mostly no
-longer produces. Re-tune via `tests/test_vlm_decision_sim.py`
-(Monte-Carlo holdout-bootstrapped sweep) once an LFM2 holdout score
-dump exists. Until then the FastVLM-era params are conservative and
-correct; they just may sit on more ad-detection latency than
-necessary.
+**Sliding-window / decision-engine retune (DONE, middle-ground):**
+`vlm_min_decisions: 5 → 3` and `vlm_start_agreement: 0.80 → 0.70`
+(+0.10 hysteresis → 0.80 effective). `vlm_history_window=8s` kept.
+The iter4-era hardening to 5 / 0.80 was sized against iter4's
+mid-show VLM-only FPs — a failure class LFM2 mostly does not produce
+(non-ad-recall 99.2% vs 95.25% → ~4× lower per-frame FP rate, with
+tighter logit margins on confident cases: clean p_yes ≈ 0.001–0.01,
+ad p_yes ≈ 0.97–0.99). At the iter4-hardened params, the LFM2
+holdout-bootstrapped simulator (`tests/test_vlm_decision_sim_lfm2.py`,
+2560-combo sweep × 64 scenarios × 30 seeds) measured the old params
+as **infeasible**: O_rec p95 = 18s, V_det mean 9.3s / p95 20s,
+V_miss 7.5%, Vs_miss 76% — the start gate could not accumulate
+enough votes fast enough on real ads. New params: **O_rec p95
+18s → 3.2s** (5.6× better), **V_det mean 9.3s → 7.4s, p95
+20s → 9s**, **V_miss 7.5% → 0.3%**, phantom blocks remain **0**.
+Middle-ground vs the sweep's most-aggressive winner (`min_dec=2,
+agree=0.60`): the winner halves V_det further (4.5s mean) and cuts
+Vs_miss to 29%, but pushes phantom-block math closer to the edge
+(~0.7/day estimated on holdout-bootstrapped content vs ~0.1/day at
+the middle ground). Chose the middle ground — it captures the
+biggest wins (recovery tail + VLM-only miss rate) without crowding
+the phantom margin. **Rollback path** if real-world VLM-only
+mid-show false triggers reappear: revert to `min_dec=5, agree=0.80`
+(see `minus.py` comment block around `self.vlm_min_decisions` — keep
+the iter4 hardening rationale documented for whoever does the
+rollback). Sweep raw log: `/tmp/lfm2_sweep.log` (until reboot);
+rerun via `python3 tests/test_vlm_decision_sim_lfm2.py --sweep`.
 
 **Gotchas (from the integration guide, kept here):**
 - Vision preprocessing is direct bilinear-resize + `(x/255 - 0.5)/0.5`
