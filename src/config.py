@@ -108,8 +108,11 @@ class MinusConfig:
 
 # External paths (configurable via environment variables)
 USTREAMER_PATH = _get_env_path('MINUS_USTREAMER_PATH', '/home/radxa/ustreamer-patched')
-# FastVLM-0.5B ad-classifier iter4 (native-512 vision, logit-thresholded).
-# On-device F1=94.72 @ T=0.76, ~441ms. Recommended in BENCHMARKS.md.
-# Override with MINUS_VLM_MODEL_DIR (1.5B legacy layout still supported).
-VLM_MODEL_DIR = _get_env_path('MINUS_VLM_MODEL_DIR', '/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4')
+# LFM2.5-VL-450M-ft-v2-fused-v2 ad-classifier (fused-layer NPU3 prefill,
+# logit-argmax). On-device 97.0% accuracy / 99.2% non-ad-recall / ~370ms
+# (see ~/axera_models/LFM2/MINUS_INTEGRATION_GUIDE.md and
+# ~/axera_models/BENCHMARKS.md). detect_ad AND autonomous-mode query_image
+# both share this single model — there is no FastVLM dependency anymore.
+# Override with MINUS_VLM_MODEL_DIR.
+VLM_MODEL_DIR = _get_env_path('MINUS_VLM_MODEL_DIR', '/home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2')
 OCR_MODEL_DIR = _get_env_path('MINUS_OCR_MODEL_DIR', '/home/radxa/rknn-llm/examples/multimodal_model_demo/deploy/install/demo_Linux_aarch64/models/paddleocr')

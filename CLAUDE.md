@@ -4,7 +4,7 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
-- **FastVLM-0.5B ad-classifier (iter4)** on Axera LLM 8850 NPU — **logit-thresholded, prefill-only, ~0.33s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-1.5B (May 2026): same/better accuracy (holdout F1 94.72) at ~3x the speed. See *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* under Known Issues.
+- **LFM2.5-VL-450M (ft-v2-fused-v2)** on Axera LLM 8850 NPU — **prefill-only on 16 fused decoder layers, ~0.37s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-0.5B iter4 (May 2026): 97.0% holdout accuracy / 99.2% non-ad-recall vs iter4's 94.75% / 95.25%, structurally simpler (no KV cache, no autoregressive decode for `detect_ad` OR autonomous-mode `query_image`, no ml_dtypes bfloat16 ceremony). Both inference paths share one model — no FastVLM dependency anymore. See *FastVLM iter4 → LFM2.5-VL Migration* under Known Issues.
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -211,8 +211,8 @@ MINUS_VLM_ALONE_THRESHOLD=5      # Consecutive VLM detections needed to trigger 
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
-| VLM latency | **~0.33s per frame deterministic** (FastVLM-0.5B iter4, prefill-only logit path; p95 0.34s) |
-| VLM model load | **~14-17s** (includes 4 warmup inferences + keepalive thread) |
+| VLM latency | **~0.37s per frame deterministic** (LFM2.5-VL fused-prefill; vision ~185ms + 16 fused layers ~185ms; no decode) |
+| VLM model load | **~9-11s** (17 axengine sessions + 256MB embeds mmap + 4 warmup inferences + keepalive thread) |
 | Snapshot capture | **~150ms** (4K JPEG download) |
 | OCR image size | 960x540 (downscaled from 4K for speed) |
 | ustreamer quality | 80% JPEG (MPP encoder) |
@@ -513,71 +513,94 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 ## VLM Model
 
-**FastVLM-0.5B ad-classifier, iter4** on Axera LLM 8850 NPU (logit-thresholded):
-- `detect_ad()` is **prefill-only** (no autoregressive decode): softmax the
-  first-position logits over the full vocab, compare normalized `P(Yes)`
-  (`p_yes_norm`) against `VLMManager.AD_THRESHOLD` (**0.76**, env-overridable
-  via `MINUS_VLM_AD_THRESHOLD`). Calibrated on an 800-image holdout
-  (2026-05-15): **F1 94.72, ad-recall 94.25%, non-ad-recall 95.25%**.
-- **~0.33s** deterministic inference (p95 0.34s) — fixed prompt length, no
-  token-count variance, so the descriptive-paragraph latency pathology that
-  plagued the 1.5B is **structurally impossible** for `detect_ad`.
-- **~1.0s** for custom queries (`query_image`, still decode-based — unchanged,
-  used by autonomous mode).
-- **~14s** model load (smaller than 1.5B's ~27s) + 4 warmup inferences.
-- Uses Python axengine + transformers tokenizer.
-- The classification prompt MUST stay byte-for-byte identical to
-  `fastvlm-holdout-test/threshold_sweep.py` (system = "You are a helpful
-  assistant.") — the threshold is only valid for that exact prompt.
-- `confidence` returned by `detect_ad` is now the calibrated probability
-  (`p_yes_norm` if ad else `1 - p_yes_norm`), which feeds the
-  confidence-weighted sliding window directly.
-- Path resolution in `src/vlm.py` auto-detects flat 0.5B-iter* layout vs the
-  legacy 1.5B subdir layout; tokenizer/utils fall back to the canonical
-  `FastVLM-0.5B` tokenizer (dims must match) and patched `FastVLM-1.5B` utils
-  (`infer_func` max_new_tokens cap; `llava_qwen` byte-identical). Overridable
-  via `MINUS_VLM_TOKENIZER_DIR` / `MINUS_VLM_UTILS_DIR`.
-- Home screen detection provides additional safety net.
+**LFM2.5-VL-450M-ft-v2-fused-v2** on Axera LLM 8850 NPU (fused-layer prefill, no decode):
+- `detect_ad()` is **prefill-only**: vision encoder (~185ms) → 16 fused
+  decoder layers (~185ms) → post (LM head) → last-token vocab logits.
+  Decision is `argmax of max(YES_logits) vs max(NO_logits)` over the 4
+  spelling variants each (`Yes`/`yes`/` Yes`/` yes` etc.). Calibrated on
+  an 800-image holdout: **97.0% accuracy, 94.8% ad-recall, 99.2% non-ad-recall**.
+  Also exposes a softmax-normalized `p_yes_norm` over the {YES,NO}
+  subspace for an optional tunable threshold via env
+  `MINUS_VLM_AD_THRESHOLD` (default `0.5` ≡ argmax; gain from tuning is
+  small since argmax is already at 97%).
+- `query_image()` is **also prefill-only** — autonomous-mode screen
+  classification (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`)
+  uses the same prefill loop and looks up the first-token logit for
+  each class (max over no-leading-space and leading-space spellings),
+  returns the class with the highest logit. The `max_new_tokens`
+  parameter is kept for API compatibility but **ignored** — there is
+  no decode loop and per-layer decode axmodels are not shipped with
+  this v2 build (only `post_d.axmodel`). Latency ~370ms, same as
+  `detect_ad`.
+- **~0.37s** deterministic inference (vision ~185ms + prefill ~185ms;
+  the descriptive-paragraph latency pathology that plagued the 1.5B
+  is structurally impossible — both inference paths are fixed-length
+  prefill, no decode).
+- **~9-11s** model load: 17 axengine sessions (1 vision + 16 fused
+  layers + 1 post) + 256MB embed.npy mmap + tokenizer.json. Faster
+  than FastVLM iter4's ~14s.
+- Uses Python axengine + `PreTrainedTokenizerFast` (no transformers
+  AutoTokenizer / CLIPImageProcessor / ml_dtypes — those FastVLM
+  dependencies are gone).
+- Vision preprocessing: direct bilinear resize to 512×512, normalize
+  `(x/255 - 0.5)/0.5`, patchify into `(1, 1024, 768)` for the vision
+  encoder. DO NOT substitute FastVLM's `expand2square` + CLIPImageProcessor —
+  the fine-tune was on this exact preprocessing.
+- The classification prompt MUST stay byte-exact (LFM chat template
+  with BOS + IM_START + system + IM_END):
+  `"Is this an advertisement? Answer Yes or No."` with system
+  `"You are a helpful multimodal assistant by Liquid AI."`. Likewise
+  for the screen prompt — see the comment block on `SCREEN_QUERY_PROMPT`
+  in `src/autonomous_mode.py`.
+- `confidence` returned by `detect_ad` is `p_yes_norm` if ad else
+  `1 - p_yes_norm`, feeding the existing confidence-weighted sliding
+  window directly.
 
 **Process-based architecture (`src/vlm_worker.py`):**
 - VLM runs in a separate process for hard timeout capability
 - Uses 'spawn' multiprocessing method to avoid "can only join a child process" errors from axengine
 - **Soft/Hard timeout strategy** to avoid unnecessary restarts:
   - Soft timeout (1.5s): Returns immediately with "TIMEOUT", but worker keeps running
-  - Hard timeout (5.0s): Only kills worker if inference is truly stuck
+  - Hard timeout (2.0s): Only kills worker if inference is truly stuck
   - Restart threshold: 3 consecutive soft timeouts trigger a hard kill
   - Late responses are drained on next request and counters reset
 - 4 warmup inferences at startup with varied content (noise, gradients, edges, mixed)
 - Keepalive thread runs dummy inference every 20s during idle to prevent NPU cold-start
-- Worker process loads model once (~14-17s for iter4), processes requests via Queue
+- Worker process loads model once (~9-11s for LFM2), processes requests via Queue
 
-**Two inference modes:**
-- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification. **Prefill-only logit path** (no decode at all): the descriptive-paragraph latency pathology is structurally impossible here, so no `max_new_tokens` cap is needed; latency is a deterministic ~0.33s.
-- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification). The `max_new_tokens` default of 8 fits the autonomous-mode multi-choice prompt (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`); raise it explicitly for open-ended prompts knowing latency rises ~0.23 s per allowed token. **Hard p128 constraint:** the full tokenised prompt (short system + 64 image tokens + question + chat template) MUST stay ≤128 tokens — iter4 is a single-prefill-chunk model with no 2nd shape-group. `query_image` enforces this with a `PROMPT_TOO_LONG` fail-soft guard; keep `SCREEN_QUERY_PROMPT` minimal. See *iter4 query_image p128 Overflow* under Known Issues.
+**Two inference modes (both prefill-only on the same model):**
+- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification via `argmax(max(YES_logits), max(NO_logits))` (with optional `MINUS_VLM_AD_THRESHOLD` on `p_yes_norm`). ~370ms deterministic.
+- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — autonomous-mode screen classification. Same prefill, but the last-position logits are looked up at the FIRST-TOKEN of each of `PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER` (max over no-leading-space and leading-space variants), argmax over the 5 classes returns the class name. `max_new_tokens` ignored. **Hard 320-token prefill window:** the full tokenised prompt (chat template + 256 image tokens + question) MUST stay ≤320 tokens — the axmodels were compiled for `PREFILL_LEN=320` and the prompt is right-padded; overflow silently truncates the `[IM_START] assistant\n` suffix → garbage last-position logits. `load_model()` fails loud if either cached prompt overflows; `query_image` returns `"PROMPT_TOO_LONG"` for on-the-fly oversized prompts. The current screen prompt tokenises to 312 — 8 tokens of headroom; do not lengthen `SCREEN_QUERY_PROMPT` without re-measuring.
 
 Both modes share the same model. Concurrent callers (detection loop calling `detect_ad`, autonomous mode calling `query_image`) are serialized by `VLMProcess._call_lock` so they cannot cross responses on the shared queue or race on the timeout / latency state. See *VLMProcess Cross-Thread Race* under Known Issues for the full rationale.
 
-For `detect_ad` the `max_new_tokens` cap is moot — there is no decode loop to run away. For `query_image` (decode-based, autonomous mode) the cap still matters and is retained (default 8). The descriptive-paragraph pathology and its investigation remain documented in `docs/VLM_NPU_DEGRADATION.md` for the `query_image` path and historical context.
-
-iter4 flat on-disk layout (no subdir; tokenizer/utils resolved from the FastVLM-0.5B / patched FastVLM-1.5B trees — see *VLM Model*):
+LFM2.5-VL fused-v2 on-disk layout:
 ```
-/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4/
-├── image_encoder_512x512_iter4.axmodel   # Vision encoder (input "pixel_values")
-├── qwen2_p128_l*_together.axmodel        # 24 decoder layers
-├── qwen2_post.axmodel                    # Post/LM-head
-└── model.embed_tokens.weight.npy         # Embeddings (float32, mmap'd)
+/home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/
+├── vision_encoder_512.axmodel              # Vision encoder (input "pixel_values")
+├── fused_models/
+│   ├── l0_conv_fused.axmodel               # 10× conv layers (l0,l1,l3,l4,l6,l7,l9,l11,l13,l15)
+│   └── l2_attn_fused.axmodel               # 6× attn layers  (l2,l5,l8,l10,l12,l14)
+├── decode_models/
+│   └── post_d.axmodel                      # Post/LM-head (no per-layer decode models shipped)
+├── embed.npy                               # Embedding table (FP32, mmap'd, 256MB)
+└── tokenizer.json                          # PreTrainedTokenizerFast format
 ```
 
-**Why FastVLM-0.5B iter4 instead of 1.5B?** (server + on-device benchmarks in `/home/radxa/axera_models/BENCHMARKS.md`)
-| Aspect | 0.5B iter4 (logit) | FastVLM-1.5B (decode) |
-|--------|--------------------|-----------------------|
-| Inference time | **~0.33s deterministic** | ~0.9–1.1s (variable) |
-| Holdout F1 / ad-rec / non-ad-rec | **94.72 / 94.25% / 95.25%** | 92.86 (1.5B server iter3) |
-| Latency pathology | **impossible (no decode)** | descriptive-paragraph tail |
-| Tunable w/o retrain | **yes (threshold)** | no |
-| Parameters | 0.5B | 1.5B |
+**Why LFM2.5-VL instead of FastVLM-0.5B iter4?** (benchmarks in `/home/radxa/axera_models/BENCHMARKS.md`)
+| Aspect | LFM2.5-VL fused-v2 | FastVLM-0.5B iter4 |
+|--------|--------------------|---------------------|
+| Inference time | **~0.37s deterministic** | ~0.44s |
+| Holdout accuracy / ad-rec / non-ad-rec | **97.0% / 94.8% / 99.2%** | 94.75% / 94.25% / 95.25% |
+| Decoder architecture | 16 fused-layer axmodels (10 conv + 6 attn) | 24 separate p128 layers + KV cache |
+| KV-cache management | **none — no decode loop** | required (max_seq_len=1023 hard constraint) |
+| Custom utils dir / bfloat16 | **none** | `LlavaConfig`/`InferManager`/`expand2square` + ml_dtypes |
+| Image tokens | 256 (16×16 grid) | 64 (8×8 grid) |
+| `query_image` (autonomous mode) | **same model, prefill-only logit lookup** | decode-based, ~1.0s, p128-limited |
+| Prefill window | 320 (axmodel-locked) | 128 (p128 single-chunk) |
+| Parameters | 0.45B | 0.5B |
 
-The task saturates at 0.5B — the 1.5B did **not** beat it. The earlier "1.5B is smarter, fewer home-screen FPs" claim was a pre-fine-tune observation; the fine-tuned iter4 classifier resolves home-screen FPs at the model level (95.25% non-ad recall).
+Non-ad-recall jumped from 95.25% → 99.2% — the iter4 home-screen false-positive class is essentially eliminated at the model level. `query_image` no longer needs decode infrastructure, so there is no longer a separate FastVLM model loaded for autonomous mode — one model serves both paths.
 
 ### Latency-based auto-recovery
 
@@ -2258,3 +2281,125 @@ target: zero false-positive blocks, zero multi-minute holds, recovery
 
 **Files modified:** `src/autonomous_mode.py`, `src/vlm.py`, `minus.py`,
 `tools/ad_block_monitor.py` (new), CLAUDE.md.
+
+### FastVLM iter4 → LFM2.5-VL Migration (May 2026)
+
+**What changed:** the ad-detection VLM was swapped from FastVLM-0.5B
+iter4 (Qwen2-decoder, p128 prefill + KV-cache decode) to
+**LFM2.5-VL-450M-ft-v2-fused-v2** (16 fused-layer axmodels,
+prefill-only, no KV cache). Autonomous-mode `query_image` was also
+moved off FastVLM — there is now **no FastVLM dependency anywhere**.
+Per `/home/radxa/axera_models/LFM2/MINUS_INTEGRATION_GUIDE.md`.
+
+**Why:**
+- **Accuracy:** holdout 97.0% / 94.8% ad-rec / **99.2% non-ad-rec** vs
+  iter4's 94.75% / 94.25% / 95.25%. The remaining home-screen-FP class
+  is essentially eliminated at the model layer (-3.95% FP rate).
+- **Latency:** ~0.37s deterministic (vision 185ms + 16 fused layers
+  185ms) vs iter4's ~0.44s. Both prefill-only, both immune to the
+  descriptive-paragraph latency pathology that plagued the 1.5B.
+- **Code simplification:** no `LlavaConfig` / `InferManager` /
+  `expand2square` / `CLIPImageProcessor` / `ml_dtypes.bfloat16` /
+  `llava_qwen.py` / `infer_func.py`. No `_reset_kv_cache()` work
+  between inferences (conv state is per-call, freshly allocated). The
+  `sys.path.insert` to a `utils/` dir is gone. ~590 lines of
+  FastVLM-specific code in `src/vlm.py` collapsed to ~340 LOC for the
+  full LFM2 implementation.
+- **One model serves both paths.** FastVLM iter4 was p128 — a
+  single 128-token prefill chunk — which forced `query_image` to use
+  decode-based generation (~1.0s) with a 5-class chat prompt that
+  flirted with the 128-token ceiling. LFM2's 320-token prefill window
+  + first-token logit-lookup multi-class classification lets the same
+  prefill loop serve `detect_ad` and the autonomous-mode screen query.
+
+**Architecture:**
+- `detect_ad` returns `(is_ad, response, elapsed, p_yes_norm-derived
+  confidence)`. Decision is `argmax(max(YES_logits), max(NO_logits))`
+  over the 4 spelling variants each (Yes/yes/ Yes/ yes) — matches
+  `infer_vlm_fused.py:classify_image` exactly. `MINUS_VLM_AD_THRESHOLD`
+  (default 0.5 ≡ argmax) gates `p_yes_norm` instead if set != 0.5;
+  argmax already gives 97% holdout accuracy so the threshold knob is
+  rarely useful.
+- `query_image` does the same prefill, then looks up the first-token
+  logit for each of the 5 screen-state classes (max over the
+  no-leading-space and leading-space spellings of each) and returns
+  the argmax. `max_new_tokens` parameter retained for API compat but
+  IGNORED — there is no decode loop. Per-layer decode axmodels are not
+  shipped with v2-fused; only `post_d.axmodel` is.
+- Both paths use a single `VLMManager._lock` for serialisation. The
+  outer `VLMProcess._call_lock` is unchanged.
+
+**Hard 320-token prefill window:** the axmodels were compiled for a
+fixed `[1, 320, 1024]` input shape. The chat-template + 256-image-token
+overhead is ~37 text tokens (BOS, IM_START × 3, IM_END × 2, system =
+"You are a helpful multimodal assistant by Liquid AI.", `user\n`,
+`assistant\n`, etc.); the user question can be max ~30 tokens. The
+`ad-prompt` ("Is this an advertisement? Answer Yes or No.") tokenises
+to 293 total; `screen-prompt` ("Classify this TV screen: PLAYING,
+PAUSED, DIALOG, MENU, or SCREENSAVER?") tokenises to 312. **An earlier
+draft of the screen prompt tokenised to 326 — over by 6** — and
+silently truncated the `[IM_START] assistant\n` suffix → the
+last-position logits were garbage. `load_model()` now fails loud if
+either cached prompt overflows; `query_image` returns
+`"PROMPT_TOO_LONG"` for on-the-fly oversized prompts. The 326-token
+prompt was committed and quietly broken until the load-time check
+caught it during this migration.
+
+**Sliding-window / decision-engine retune (NOT yet done):** the
+existing anti-waffle parameters (`vlm_history_window=8s`,
+`vlm_min_decisions=5`, `vlm_start_agreement=0.80`,
+`vlm_hysteresis_boost=0.10`, `VLM_STOP_THRESHOLD=2`) were calibrated
+for FastVLM iter4's confidence distribution against the 800-image
+holdout. LFM2 has **structurally higher non-ad-recall (99.2% vs
+95.25%)** and tighter logit-margin distributions on confident cases
+(observed: clean video p_yes ≈ 0.001–0.01, confident ads p_yes ≈
+0.97–0.99). The current params are likely now over-conservative —
+specifically, `vlm_min_decisions=5` and `vlm_start_agreement=0.80`
+were sized to suppress iter4's home-screen FPs that LFM2 mostly no
+longer produces. Re-tune via `tests/test_vlm_decision_sim.py`
+(Monte-Carlo holdout-bootstrapped sweep) once an LFM2 holdout score
+dump exists. Until then the FastVLM-era params are conservative and
+correct; they just may sit on more ad-detection latency than
+necessary.
+
+**Gotchas (from the integration guide, kept here):**
+- Vision preprocessing is direct bilinear-resize + `(x/255 - 0.5)/0.5`
+  + patchify into `(1, 1024, 768)`. **Do not** reuse FastVLM's
+  `expand2square` + CLIPImageProcessor — the fine-tune is on the
+  patchify path, accuracy degrades otherwise.
+- `indices` input to the attention layers must be `int32` at runtime
+  (axengine asserts shape + dtype).
+- After running the vision encoder you get 256 feature vectors. The
+  prompt has 256 copies of `IMG_TOKEN_ID = 396` inserted at the
+  image slot; the `_prefill_last_logits` step then OVERWRITES those
+  256 prefill-data positions with the actual vision features. Forgetting
+  the splice leaves the model with the embedding for token 396 — garbage.
+- All axmodel I/O is FP32. The `ml_dtypes.bfloat16` casts from
+  FastVLM are gone.
+- NPU3 mode is baked into the axmodel files (Pulsar2 build flag) —
+  no runtime flag needed. If a rebuild loses NPU3, latency rises ~40%.
+
+**Files modified:**
+- `src/vlm.py` — full rewrite around `VLMManager` with LFM2 prefill,
+  fused-layer loop, multi-class logit lookup. `FASTVLM_MODEL_DIR`
+  kept as a backwards-compat alias pointing at the new model dir.
+- `src/config.py` — `VLM_MODEL_DIR` default → LFM2 dir, env var
+  `MINUS_VLM_MODEL_DIR` unchanged.
+- `src/autonomous_mode.py` — `SCREEN_QUERY_PROMPT` shortened from
+  the verbose 326-token form to 312-token "Classify this TV screen:
+  PLAYING, PAUSED, DIALOG, MENU, or SCREENSAVER?". Comment refreshed.
+- `minus.py` — VLM-loading log line "FastVLM-1.5B" → "LFM2.5-VL-450M".
+- CLAUDE.md — *Overview*, *Performance*, *VLM Model* sections and
+  this Known Issues entry.
+
+**Verification:** `sudo python3 minus.py` boot-to-ready in ~11s
+(model load 9.3s + 4 warmup inferences). Sustained inference at
+~360-400ms per frame. Live ad pods classified with `p_yes` 0.97-0.99
+(confident ad) and content `p_yes` 0.0009-0.01 (confident no-ad).
+Autonomous-mode `query_image` returns one of the 5 class names with
+clean logit margins (e.g. MENU=22.74 vs second-best 14.26).
+Zero `PROMPT_TOO_LONG`, zero IndexError, zero VLM-side hard-kills
+over the first ~70 inferences. Parity with the standalone
+`infer_vlm_fused.py` confirmed: on ad_0001 / nonad_0001 the
+in-process VLMManager produces logits identical to the standalone
+script (yes/no logits match to 3 decimals).

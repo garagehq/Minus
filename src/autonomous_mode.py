@@ -603,19 +603,20 @@ class AutonomousMode:
         app_lower = app_name.lower()
         return any(pkg in app_lower for pkg in YOUTUBE_PACKAGES)
 
-    # VLM prompt that returns a structured, single-word answer for reliable parsing
-    # MUST stay short: the FastVLM-0.5B iter4 LLM is p128 (single 128-token
-    # prefill chunk). 64 of those tokens are image tokens, so the system +
-    # question must fit in the ~64 remaining. The verbose per-category
-    # variant tokenised to 187 (>128) → the model has no 2nd prefill
-    # shape-group → `list index out of range` on EVERY call (autonomous
-    # mode went fully blind). This minimal form tokenises to ~119 with the
-    # short system prompt. See the p128 note in BENCHMARKS.md / CLAUDE.md
-    # "FastVLM-1.5B → 0.5B iter4" migration entry. Do not re-expand it.
+    # VLM prompt for screen-state classification. The LFM2.5-VL model
+    # in `vlm.py` has a fixed 320-token prefill window, and after the
+    # chat template + 256 image tokens there is only ~40 tokens of
+    # headroom for the user question. The previous, longer phrasing
+    # tokenised to 326 (over by 6) and silently truncated the
+    # [IM_START] assistant\n suffix → garbage logits.
+    # `vlm.py.query_image` runs prefill-only and picks the class whose
+    # first-token logit is highest (max over no-leading-space and
+    # leading-space spellings); there is no autoregressive decode, so
+    # only the FIRST emitted token's logits matter. The prompt prefix
+    # "Classify this TV screen" is also used by query_image to reuse a
+    # cached token-id sequence — keep that prefix intact when editing.
     SCREEN_QUERY_PROMPT = (
-        "Look at this TV screen and classify it into exactly one category.\n"
-        "Answer with ONLY one of these words:\n"
-        "PLAYING, PAUSED, DIALOG, MENU, SCREENSAVER"
+        "Classify this TV screen: PLAYING, PAUSED, DIALOG, MENU, or SCREENSAVER?"
     )
 
     def _query_screen(self) -> Optional[str]:
