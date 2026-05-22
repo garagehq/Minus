@@ -335,3 +335,5 @@ Auto-appended one row per check-in by `tools/ad_block_monitor.py`. `OK` = zero f
 | 2026-05-20 21:01:07 | 15m | 6 | 0 | 0 | 20s | 3s | OK | clean |
 | 2026-05-20 21:14:03 | 15m | 3 | 0 | 2 | 30s | 1s | OK | clean |
 | 2026-05-20 21:27:04 | 15m | 4 | 0 | 1 | 30s | 1s | OK | clean |
+| 2026-05-22 22:03:05 | 30m | 10 | 0 | 0 | 34s | 2s | OK | clean |
+| 2026-05-22 22:05:14 | 30m | 11 | 0 | 0 | 43s | 2s | OK | clean |
