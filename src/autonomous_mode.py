@@ -1704,7 +1704,21 @@ class AutonomousMode:
             self._log_event(f"VLM action: {action}")
 
             if action == "play":
-                # Video is paused - use play_pause (works on all devices)
+                # Video is paused per VLM - normally use play_pause.
+                # AUDIO GUARD: if HDMI-RX is receiving audio from the
+                # streaming device, the video is actually PLAYING and VLM
+                # misclassified the frame. Sending play_pause here would
+                # PAUSE the playing video. Skip and let the next iteration
+                # re-check. (Same kind of audio-aware bypass that
+                # _is_screen_static() already does for the PLAYING-but-
+                # static branch — extends it to the PAUSED-but-actually-
+                # playing branch.)
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] PAUSED verdict vetoed: "
+                                "audio flowing — video is actually playing")
+                    self._log_event("PAUSED vetoed: audio flowing")
+                    self._last_screen_state = 'playing'
+                    return False
                 self._device_controller.send_command("play_pause")
                 logger.info("[AutonomousMode] Sent play_pause command (video was paused)")
 
@@ -1723,6 +1737,21 @@ class AutonomousMode:
 
             elif action == "select":
                 # On home/menu screen - navigate to a video.
+                # AUDIO GUARD: if HDMI-RX is receiving audio from the
+                # streaming device, the video is actually PLAYING (lo-fi
+                # music with static album art, talking-head video, slow
+                # scene, etc. all defeat VLM and the overlay-keyword
+                # check, but audio is authoritative). Skip every
+                # interrupting action (down+select AND the overlay-veto
+                # tier-2 `back`, which on Roku/YouTube TV can exit the
+                # playing video). Let the next iteration re-check.
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] MENU vetoed: audio "
+                                "flowing — video is playing")
+                    self._log_event("MENU vetoed: audio flowing")
+                    self._overlay_veto_count = 0
+                    self._last_screen_state = 'playing'
+                    return False
                 # VETO: if the YouTube video player overlay is visible
                 # (Description / cc / Subscribe / Up next + a time marker),
                 # the video is actually PLAYING and VLM misclassified it as
