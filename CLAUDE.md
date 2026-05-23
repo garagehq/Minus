@@ -985,9 +985,12 @@ Autonomous Mode keeps YouTube playing on streaming devices during scheduled hour
 | VLM: PLAYING + frames changing | None | Video is fine |
 | VLM: PLAYING + static + no audio | Play | `play_pause` (paused video VLM missed) |
 | VLM: PLAYING + static + audio flowing | None | Music stream with static image (lo-fi) |
-| VLM: PAUSED | Play | `play_pause` key |
-| VLM: DIALOG | Dismiss | `select` + `play_pause` |
-| VLM: MENU | Select video | `down` + `select` |
+| VLM: PAUSED + **audio flowing** | **None (audio veto)** | VLM misclassified — see *Autonomous Mode VLM-Misclassification Traps* in Known Issues |
+| VLM: PAUSED + no audio | Play | `play_pause` key |
+| VLM: DIALOG | Dismiss | `back` (avoids selecting Sign in / toggling play_pause) |
+| VLM: MENU + **audio flowing** | **None (audio veto)** | Video is playing, refuses to interrupt — see Known Issues |
+| VLM: MENU + no audio + **player overlay visible** | **`play_pause`** | Paused video showing player overlay (Description/cc/Up next + `\d+:\d{2}`) → resume with play_pause (NOT `down+select`, would land on Sign in; NOT `back`, would exit). See Known Issues. |
+| VLM: MENU + no audio + no overlay | Select video | `down` + `select` (real menu) |
 | VLM: SCREENSAVER | Wake + launch | `wakeup` + launch YouTube |
 | Roku: screensaver overlay | Dismiss | `select` (wake from screensaver) |
 | Roku: not on YouTube | Relaunch | `launch_app('youtube')` |
@@ -2414,3 +2417,113 @@ over the first ~70 inferences. Parity with the standalone
 `infer_vlm_fused.py` confirmed: on ad_0001 / nonad_0001 the
 in-process VLMManager produces logits identical to the standalone
 script (yes/no logits match to 3 decimals).
+
+### Autonomous Mode VLM-Misclassification Traps (May 2026)
+
+LFM2 classifies any screen showing the YouTube TV / Roku player overlay
+(Description / Subscribe / cc / Up next buttons + a `\d+:\d{2}` time
+marker) as **MENU**, regardless of whether the underlying video is
+playing, paused, or stuck. This drove three production bugs in a
+single 24-hour window. All three share a root cause — the
+**MENU-action branch was acting on VLM alone, ignoring authoritative
+playback signals (audio, screen activity, player-overlay markers)** —
+and the fixes are layered on top of each other. Documented together
+because the layering is non-obvious and easy to break.
+
+**Pitfall #1 — Sign-in trap via `down + select`.**
+Original code: `MENU → down + select`. On a video player with the
+overlay visible, `down` navigates from the play button to the "Sign
+in" CTA at the bottom of the overlay (always visible on Roku
+YouTube), and `select` confirms it. That opens the Google sign-in
+flow (keyboard / QR code / yt.be/activate code) — an unrecoverable
+trap that costs ~2 min per occurrence before the keyboard-stuck
+detector escapes. Observed loop: dozens of times per hour during
+ad-data collection runs.
+
+Fix: `_is_video_player_overlay()` veto BEFORE the down+select. Requires
+BOTH an overlay-only keyword (`description` / `up next` / `autoplay` /
+whole-token `cc`) AND a `\b\d{1,2}:\d{2}\b` time marker. All real menus
+(home page, account picker, settings, signed-out prompt) lack the time
+marker, so they pass through to the legitimate select action.
+
+**Pitfall #2 — `back` escalation exits paused videos.**
+First version of the overlay-veto used a 3-tier escalation:
+veto-wait → veto-wait → **`back`** → veto-wait × 3 → full reset. `back`
+on Roku/YouTube TV during a paused video EXITS to the recommendations
+page — the opposite of what the user wants when a video is paused.
+User reported live: "still fully paused. Autonomous mode was working
+before we made the last few commits ... audio not playing and being on
+Menu is a HUGE clue we are paused."
+
+Fix: replace `back` escalation with `play_pause`. play_pause is
+universally safe:
+- Paused video → resumes (the case the user reported).
+- Playing-but-silent video → pauses; next iteration's overlay-veto
+  re-toggles. Self-correcting flap rather than permanent EXIT.
+- Real menu → no-op (play_pause does nothing on a menu UI).
+- Crucially: play_pause does NOT navigate UI, so the Sign-in trap
+  from Pitfall #1 is structurally impossible from this action.
+
+The 3-tier wait/back/reset ladder collapsed to a single decision based
+on the audio + overlay signals.
+
+**Pitfall #3 — audio-blind interruption of playing videos.**
+With Pitfall #1 fixed but the audio guard absent, the MENU branch's
+down+select still interrupted videos that were genuinely playing —
+just because VLM misclassified the screen as MENU. Symptom: user
+selects a music video / talking-head / lo-fi stream, ~30s later
+autonomous mode selects a different video, repeat. The screen
+content was changing under the visible-but-not-overlay UI, so the
+overlay-veto didn't fire either. Same regression risk for the
+PAUSED → play_pause branch when VLM misclassifies a playing frame
+as PAUSED.
+
+Fix: `_is_audio_flowing()` guard at the top of BOTH the `select`
+and `play` branches. If HDMI-RX (`card4`) is receiving audio buffers
+within the last 3s, the video is genuinely playing — veto every
+interrupting action. Mirrors the precedent in `_is_screen_static()`
+("static frames + audio flowing = music stream = don't pause").
+
+**The full Action matrix that emerged from the three fixes:**
+
+| Signal | Action |
+|---|---|
+| audio flowing | none (always wins) |
+| no audio + overlay visible | `play_pause` (likely paused, resume) |
+| no audio + no overlay (VLM PAUSED) | `play_pause` (normal pause-recovery) |
+| no audio + no overlay (VLM MENU) | `down + select` (real menu) |
+
+**Architectural invariant to preserve:** any action that could
+interrupt or change playback (`down+select`, `back`, `play_pause`,
+`launch`) MUST consult an authoritative playback signal first. The
+hierarchy is:
+1. `_is_audio_flowing()` — HDMI-RX audio is ground truth when
+   HDMI-TX is connected.
+2. `_is_video_player_overlay()` — disambiguates overlay-on-video
+   vs real menu when audio is unavailable.
+3. `_is_screen_static()` — the slow (3s sleep) frame-change check,
+   used by the PLAYING-static branch but too expensive for the
+   select/play branches.
+
+VLM verdicts alone are not sufficient. The 99.2% non-ad-recall of
+LFM2 is for the ad/non-ad classifier; the screen-state classifier
+(`query_image`) is markedly noisier on overlay-heavy frames because
+its training signal was the visible UI, which on YouTube TV is
+indistinguishable from a menu by appearance alone.
+
+**Files:** `src/autonomous_mode.py` — `_is_video_player_overlay`,
+`_is_audio_flowing`, action dispatch in `_handle_screen_state`.
+
+**OCR-dynamics guard (`_ocr_text_active`) — tried and rejected.**
+An interim attempt to detect "screen is actively changing" via
+difflib similarity between consecutive OCR-text snapshots was added
+during Pitfall #3 debugging on the dev box (where audio guard can't
+fire because HDMI-TX is disconnected and the audio pipeline never
+opens). It worked on the music-video scenario but vetoed every
+legitimate MENU verdict on any slight OCR drift — including paused
+videos with timer ticks in the overlay — *exactly the regression
+Pitfall #2 documented*. Removed in the play_pause-escalation
+commit. If a future case demands a similar signal, the OCR
+similarity check is structurally OK but it MUST be combined with a
+positive-pause signal so it doesn't suppress recovery from real
+pauses.

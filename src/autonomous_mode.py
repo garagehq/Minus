@@ -1700,6 +1700,23 @@ class AutonomousMode:
             _prev_overlay_veto = self._overlay_veto_count
             self._overlay_veto_count = 0
 
+            # ARCHITECTURAL INVARIANT (see "Autonomous Mode VLM-
+            # Misclassification Traps" in CLAUDE.md Known Issues):
+            # any action below that interrupts playback (down+select,
+            # back, play_pause, launch) MUST consult an authoritative
+            # playback signal BEFORE acting. The hierarchy is:
+            #   1. _is_audio_flowing() — HDMI-RX audio is ground truth
+            #      when HDMI-TX is connected.
+            #   2. _is_video_player_overlay() — disambiguates overlay-
+            #      on-video from real menu when audio is unavailable.
+            # VLM verdicts alone are NOT sufficient. The screen-state
+            # classifier (query_image) regularly misclassifies playing
+            # videos with overlay UI as MENU, and paused videos with
+            # overlay as MENU as well. Acting on the verdict alone
+            # produces the three production traps documented in
+            # CLAUDE.md (Sign-in trap, exit-paused-video, audio-blind
+            # interruption). Future actions added below must follow the
+            # same pattern.
             logger.info(f"[AutonomousMode] Action needed: {action} (screen: {screen_desc})")
             self._log_event(f"VLM action: {action}")
 
