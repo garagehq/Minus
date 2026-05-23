@@ -1704,15 +1704,11 @@ class AutonomousMode:
             self._log_event(f"VLM action: {action}")
 
             if action == "play":
-                # Video is paused per VLM - normally use play_pause.
-                # AUDIO GUARD: if HDMI-RX is receiving audio from the
-                # streaming device, the video is actually PLAYING and VLM
-                # misclassified the frame. Sending play_pause here would
-                # PAUSE the playing video. Skip and let the next iteration
-                # re-check. (Same kind of audio-aware bypass that
-                # _is_screen_static() already does for the PLAYING-but-
-                # static branch — extends it to the PAUSED-but-actually-
-                # playing branch.)
+                # Video is paused per VLM - send play_pause to resume.
+                # AUDIO GUARD: if HDMI-RX is receiving audio, the video
+                # is genuinely playing and VLM misclassified. Skip.
+                # (Same precedent as _is_screen_static's
+                # PLAYING-static-no-audio branch.)
                 if self._is_audio_flowing():
                     logger.info("[AutonomousMode] PAUSED verdict vetoed: "
                                 "audio flowing — video is actually playing")
@@ -1738,13 +1734,11 @@ class AutonomousMode:
             elif action == "select":
                 # On home/menu screen - navigate to a video.
                 # AUDIO GUARD: if HDMI-RX is receiving audio from the
-                # streaming device, the video is actually PLAYING (lo-fi
-                # music with static album art, talking-head video, slow
-                # scene, etc. all defeat VLM and the overlay-keyword
-                # check, but audio is authoritative). Skip every
-                # interrupting action (down+select AND the overlay-veto
-                # tier-2 `back`, which on Roku/YouTube TV can exit the
-                # playing video). Let the next iteration re-check.
+                # streaming device, the video is genuinely playing. Never
+                # interrupt — VLM misclassified the frame (lo-fi music,
+                # talking-head, slow scene, player overlay during
+                # playback all confuse it). Audio is authoritative when
+                # it's available.
                 if self._is_audio_flowing():
                     logger.info("[AutonomousMode] MENU vetoed: audio "
                                 "flowing — video is playing")
@@ -1752,50 +1746,38 @@ class AutonomousMode:
                     self._overlay_veto_count = 0
                     self._last_screen_state = 'playing'
                     return False
-                # VETO: if the YouTube video player overlay is visible
-                # (Description / cc / Subscribe / Up next + a time marker),
-                # the video is actually PLAYING and VLM misclassified it as
-                # MENU. Acting here walks focus into the overlay UI and
-                # reliably lands on "Sign in" → trapped in the Google
-                # sign-in flow.
+
+                # No audio + VLM says MENU. Per the user's diagnostic
+                # ("audio not playing and being on Menu is a HUGE clue
+                # we are paused", 2026-05-23): this is most likely a
+                # PAUSED video showing its player overlay. Send
+                # play_pause — universally safe:
+                #   - paused video → resumes (the case we want to handle)
+                #   - playing-but-silent video → pauses (recoverable next
+                #     iteration; vanishingly rare in practice — VLM
+                #     virtually never says MENU on a playing-no-overlay
+                #     video, and a real such case will get re-toggled)
+                #   - real menu → no harm (play_pause does nothing on a
+                #     menu; the next iteration will retry select)
+                # play_pause does NOT navigate UI, so the Sign-in trap
+                # the overlay-veto was built to prevent is structurally
+                # impossible from this action. The overlay-veto `back`
+                # path was removed because `back` EXITS the paused
+                # video on Roku/YouTube TV — the opposite of resume.
                 if self._is_video_player_overlay():
-                    self._overlay_veto_count = _prev_overlay_veto + 1
-                    # Tier 1: usually the overlay auto-dismisses in a few
-                    # seconds; the first couple of vetoes just wait it out.
-                    if self._overlay_veto_count < self._OVERLAY_VETO_BACK_AT:
-                        self._log_event(
-                            f"MENU vetoed: overlay visible "
-                            f"({self._overlay_veto_count}/"
-                            f"{self._OVERLAY_VETO_BACK_AT})")
-                        self._last_screen_state = 'playing'
-                        return False
-                    # Tier 2: overlay still here — send a single 'back' to
-                    # dismiss it. 'back' is safe (no Sign-in selection
-                    # possible) and reliably closes player overlays.
-                    if self._overlay_veto_count < self._OVERLAY_VETO_RESET_AT:
-                        logger.info(
-                            f"[AutonomousMode] Overlay persists "
-                            f"({self._overlay_veto_count}× vetoed) — "
-                            f"sending back to dismiss")
-                        self._log_event(
-                            f"Overlay persists × {self._overlay_veto_count}"
-                            f" — sending back")
-                        self._device_controller.send_command("back")
-                        return True
-                    # Tier 3: 'back' did not help — relaunch YouTube to
-                    # reset state. This is the same recovery used for
-                    # auth-screen and keyboard-stuck states.
-                    logger.warning(
-                        f"[AutonomousMode] Overlay stuck "
-                        f"({self._overlay_veto_count}× vetoed) — full reset")
+                    logger.info("[AutonomousMode] MENU + no audio + "
+                                "overlay visible → likely paused; "
+                                "sending play_pause to resume")
                     self._log_event(
-                        f"Overlay stuck × {self._overlay_veto_count} — "
-                        f"full reset")
+                        "MENU + overlay (likely paused) → play_pause")
                     self._overlay_veto_count = 0
-                    self._full_reset_to_youtube()
+                    self._device_controller.send_command("play_pause")
                     return True
-                # Not an overlay veto — taking the real MENU action.
-                # (_overlay_veto_count already zeroed at action-dispatch top.)
+
+                # No overlay, no audio: most likely a real menu screen
+                # (home page, settings, etc.). Original down+select path.
+                # No Sign-in trap risk because Sign-in only appears in
+                # the player overlay UI, which we just ruled out.
                 self._device_controller.send_command("down")
                 time.sleep(0.5)
                 self._device_controller.send_command("select")
