@@ -11,6 +11,7 @@ Device-agnostic design supports any streaming device with remote control capabil
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -185,6 +186,14 @@ class AutonomousMode:
         self._STUCK_THRESHOLD = 3                      # After N stuck detections, reset with Home
         self._last_action_time: Optional[float] = None # Track when we last took an action
         self._ACTION_TIMEOUT = 45.0                    # If no progress in N seconds, consider stuck
+
+        # Consecutive MENU verdicts vetoed by _is_video_player_overlay().
+        # Reset when any other action runs or the overlay disappears.
+        # Escalation: 3 vetoes -> single 'back' press to dismiss overlay,
+        # 6 vetoes -> full YouTube relaunch.
+        self._overlay_veto_count: int = 0
+        self._OVERLAY_VETO_BACK_AT = 3
+        self._OVERLAY_VETO_RESET_AT = 6
 
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
@@ -906,6 +915,32 @@ class AutonomousMode:
         'add your google',   # Google account addition
     ]
 
+    # Keywords that indicate the YouTube VIDEO PLAYER overlay is visible
+    # (the floating UI that appears over a *playing* video — Description /
+    # Subscribe / cc / Up next / "Sign in" CTA, alongside time markers like
+    # "0:42 | 0:12"). VLM misclassifies these frames as MENU because the
+    # overlay buttons look like a menu, but the underlying video is actually
+    # PLAYING and the overlay auto-dismisses in a few seconds.
+    #
+    # If we treat this as a MENU and send `down + select`, focus walks
+    # through the overlay buttons and reliably lands on "Sign in" — which
+    # opens the Google sign-in flow (keyboard / QR code / yt.be/activate),
+    # an unrecoverable trap for autonomous mode. Observed live on minus-2
+    # 2026-05-23: OCR text "Sign in | Description | cc | Subscribe | 0:42 |
+    # 0:12 | ... 875K views · 3d ago" → MENU verdict → down+select → sign-in
+    # flow → ~2 min before stuck-detection escapes.
+    #
+    # Veto signature: at least TWO of these terms present in OCR text.
+    # Single-term match (e.g. just "subscribe") is too weak — YouTube
+    # Shorts and other states show it alone.
+    VIDEO_PLAYER_OVERLAY_KEYWORDS = [
+        'description',       # Player overlay "Description" button
+        'up next',           # Right-side "Up next" panel header
+        'upnext',            # OCR-merged variant
+        'autoplay',          # Autoplay toggle in player overlay
+        'cc',                # Closed-captions toggle (very short — see check)
+    ]
+
     # Keywords that indicate YouTube home/browse screen (need to select a video)
     # NOTE: "subscribe" and "description" removed - they appear on paused videos too
     HOME_SCREEN_KEYWORDS = [
@@ -1010,6 +1045,65 @@ class AutonomousMode:
 
         except Exception as e:
             logger.debug(f"[AutonomousMode] Home screen check failed: {e}")
+            return False
+
+    def _is_video_player_overlay(self) -> bool:
+        """Detect that the YouTube video player overlay is visible on a
+        *playing* video — the floating UI with Description / Subscribe / cc /
+        Up next, plus a time marker like "0:42 | 0:12".
+
+        This veto exists because VLM classifies these frames as MENU and the
+        downstream `down + select` MENU action navigates the overlay UI and
+        lands on "Sign in", trapping autonomous mode in the Google sign-in
+        flow. See VIDEO_PLAYER_OVERLAY_KEYWORDS comment block for the live
+        incident that prompted this.
+
+        Signature requires BOTH:
+          - at least one overlay-specific keyword (description / up next /
+            autoplay / cc-as-whole-token)
+          - a time marker like "0:42" or "10:23" (current-time / duration
+            display — never present on a static menu or home screen)
+
+        Requiring both prevents false positives from the home page (which
+        also has "subscribe" sometimes), Shorts, and other UI states.
+        """
+        try:
+            if not self._ad_blocker or not hasattr(self._ad_blocker, 'last_ocr_texts'):
+                return False
+            texts = self._ad_blocker.last_ocr_texts
+            if not texts:
+                return False
+            combined = ' '.join(str(t) for t in texts).lower()
+
+            # Ad blocker actively blocking — definitely not a benign overlay.
+            if getattr(self._ad_blocker, 'is_visible', False):
+                return False
+
+            # 1) at least one overlay-specific keyword
+            overlay_hits = []
+            for kw in self.VIDEO_PLAYER_OVERLAY_KEYWORDS:
+                if kw == 'cc':
+                    # 'cc' is short and substring-matches in countless words
+                    # (e.g. "accept", "success"). Require whole-token form.
+                    if re.search(r'\bcc\b', combined):
+                        overlay_hits.append('cc')
+                elif kw in combined:
+                    overlay_hits.append(kw)
+            if not overlay_hits:
+                return False
+
+            # 2) time marker like "0:42" or "10:23". \b\d{1,2}:\d{2}\b is
+            # tight enough to avoid OCR garbage (single colons in normal text)
+            # while catching both current-time and duration tokens.
+            if not re.search(r'\b\d{1,2}:\d{2}\b', combined):
+                return False
+
+            logger.info(f"[AutonomousMode] Video player overlay visible "
+                        f"(keywords={overlay_hits}) — vetoing MENU action")
+            return True
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Overlay check failed: {e}")
             return False
 
     def _is_youtube_shorts(self) -> bool:
@@ -1599,6 +1693,13 @@ class AutonomousMode:
             # Taking an action - reset static counter
             self._consecutive_static = 0
 
+            # Snapshot overlay-veto count: any non-veto action resets it
+            # (handled by `self._overlay_veto_count = 0` below). The veto
+            # path itself re-installs prev+1 so consecutive vetoes still
+            # escalate as intended.
+            _prev_overlay_veto = self._overlay_veto_count
+            self._overlay_veto_count = 0
+
             logger.info(f"[AutonomousMode] Action needed: {action} (screen: {screen_desc})")
             self._log_event(f"VLM action: {action}")
 
@@ -1621,7 +1722,51 @@ class AutonomousMode:
                 logger.info("[AutonomousMode] Dismissed dialog with back")
 
             elif action == "select":
-                # On home/menu screen - navigate to a video
+                # On home/menu screen - navigate to a video.
+                # VETO: if the YouTube video player overlay is visible
+                # (Description / cc / Subscribe / Up next + a time marker),
+                # the video is actually PLAYING and VLM misclassified it as
+                # MENU. Acting here walks focus into the overlay UI and
+                # reliably lands on "Sign in" → trapped in the Google
+                # sign-in flow.
+                if self._is_video_player_overlay():
+                    self._overlay_veto_count = _prev_overlay_veto + 1
+                    # Tier 1: usually the overlay auto-dismisses in a few
+                    # seconds; the first couple of vetoes just wait it out.
+                    if self._overlay_veto_count < self._OVERLAY_VETO_BACK_AT:
+                        self._log_event(
+                            f"MENU vetoed: overlay visible "
+                            f"({self._overlay_veto_count}/"
+                            f"{self._OVERLAY_VETO_BACK_AT})")
+                        self._last_screen_state = 'playing'
+                        return False
+                    # Tier 2: overlay still here — send a single 'back' to
+                    # dismiss it. 'back' is safe (no Sign-in selection
+                    # possible) and reliably closes player overlays.
+                    if self._overlay_veto_count < self._OVERLAY_VETO_RESET_AT:
+                        logger.info(
+                            f"[AutonomousMode] Overlay persists "
+                            f"({self._overlay_veto_count}× vetoed) — "
+                            f"sending back to dismiss")
+                        self._log_event(
+                            f"Overlay persists × {self._overlay_veto_count}"
+                            f" — sending back")
+                        self._device_controller.send_command("back")
+                        return True
+                    # Tier 3: 'back' did not help — relaunch YouTube to
+                    # reset state. This is the same recovery used for
+                    # auth-screen and keyboard-stuck states.
+                    logger.warning(
+                        f"[AutonomousMode] Overlay stuck "
+                        f"({self._overlay_veto_count}× vetoed) — full reset")
+                    self._log_event(
+                        f"Overlay stuck × {self._overlay_veto_count} — "
+                        f"full reset")
+                    self._overlay_veto_count = 0
+                    self._full_reset_to_youtube()
+                    return True
+                # Not an overlay veto — taking the real MENU action.
+                # (_overlay_veto_count already zeroed at action-dispatch top.)
                 self._device_controller.send_command("down")
                 time.sleep(0.5)
                 self._device_controller.send_command("select")
