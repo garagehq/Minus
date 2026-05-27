@@ -122,17 +122,83 @@ Override paths via env: `MINUS_WHISPER_BIN`, `MINUS_WHISPER_MODEL`.
 ## Cost on RK3588
 
 Bench: `tests/asr_corpus/bench.py` against 10-sample synthesized corpus.
+**Measured on RK3588 with `minus` service stopped** so each engine got
+all 8 cores to itself (no contention with OCR/VLM workers). 3 threads
+each for direct comparison. Re-run from the repo root:
 
-| Engine | Pass rate | Avg latency / 5s window | Threads |
-|---|---|---|---|
-| whisper.cpp tiny.en | 10/10 | **1.67 s** | 3 (mixed A76/A55) |
-| faster-whisper tiny.en | (not yet installed) | TBD | 3 |
-| moonshine tiny | (not yet installed) | TBD | 3 |
+```
+python3 tests/asr_corpus/bench.py
+```
 
-3× real-time on 3 threads → 2-second inference cadence has 50%+ idle
-margin. Negligible impact on OCR (RK3588 NPU) and VLM (Axera NPU),
-which use different compute resources. Memory: tiny.en model ~75 MB +
-ring buffer ~256 KB.
+| Engine | Pass | Total | Avg / 5 s window | Notes |
+|---|---|---|---|---|
+| **faster-whisper tiny.en** (CTranslate2 int8) | **10/10** | 11.45 s | **1.14 s** | Fastest at 10/10. Best transcripts. |
+| moonshine tiny (ONNX) | 8/10 | 11.25 s | 1.13 s | Tied on speed; missed 2 subtle ads (`narcissism`-style hallucinations dropped one marker each). |
+| **whisper.cpp tiny.en** *(current)* | 10/10 | 15.15 s | 1.52 s | Production baseline. |
+| moonshine small-streaming (ONNX) | 9/10 | 19.55 s | 1.95 s | Cleaner transcripts than tiny; one ad-pharma miss. |
+| moonshine medium-streaming (ONNX) | 10/10 | 26.31 s | 2.63 s | Best transcription quality of any tested model. |
+
+**Findings:**
+
+1. **faster-whisper tiny.en is the winner**: 25% faster than whisper.cpp
+   at identical pass rate (10/10), and slightly better transcript quality
+   (correct punctuation, retains `$` in phone numbers like `$15`,
+   captures `1-800-555-1234` shape). CTranslate2 int8 quantization
+   does heavy lifting.
+2. **Moonshine tiny (ONNX) is competitive with faster-whisper on speed**,
+   but loses 2 subtle-ad cases in this corpus. The streaming variants
+   exist primarily for *streaming* use (live audio chunks); we're using
+   them as non-streaming transcribers which probably understates their
+   real strength.
+3. **Moonshine medium-streaming** has the cleanest transcripts of any
+   model tested — "Now only 999. Free shipping on orders over $25.
+   Order yours today" is basically perfect. 10/10 pass, but 2.3×
+   slower than faster-whisper.
+
+**The first install attempt did NOT use the right Moonshine package.**
+We initially installed `useful-moonshine` from PyPI which is the
+deprecated Keras+Torch implementation — that gave us ~9 s/sample,
+orders of magnitude slower than the published Pi 5 benchmarks. The
+correct package is `moonshine-voice` which ships ONNX models and the
+optimized C++/ONNX runtime. The numbers above are from `moonshine-voice
+0.1.0`.
+
+**Trade-off vs whisper.cpp (the architectural angle):**
+- whisper.cpp invokes a separate binary subprocess per inference.
+  Hard timeout is straightforward (subprocess.run with `timeout=`).
+  If whisper.cpp hangs, the OS reaps the child. Zero risk of Python-
+  memory leak through repeated runs.
+- faster-whisper runs in-process. Hard timeout requires either
+  threading (with kill via `_thread.interrupt_main()` — messy) or
+  subprocess-wrapping the Python invocation. We'd need to match the
+  OCR/VLM worker pattern (multiprocessing.Process + Queue) for
+  parity with the existing safety story.
+- Moonshine `Transcriber` is a Python-wrapped C++ library; in-process
+  with native code under the hood. Same Python-side timeout issue as
+  faster-whisper, plus a less battle-tested project (younger than
+  whisper.cpp).
+
+Sample transcripts (ad_cta_strong.wav, real text: "Call now! 1-800-555-1234. Save up to 50 percent..."):
+- whisper.cpp tiny: `"Call now 85551234. Same up to 50%. Available now on our website..."`
+- faster-whisper tiny: `"Call now, 1-800-555-1234  Same up to 50%  Available now at our website..."` ← clean toll-free
+- moonshine tiny: `"Cold power. 1800 555 1234 Same up to 50%..."` ← "Cold power" hallucination from "Call now"
+- moonshine small-streaming: `"Call now. 1800-555-1234. Save up to 50%  Limited time only."`
+- moonshine medium-streaming: `"Call now. 18551234 Save up to 50 percent Available now at our website..."` ← best
+
+Memory: tiny.en model + ring buffer + ONNX/CT2 runtime ≈ 200-300 MB
+depending on engine. Plenty of headroom (~12 GB free).
+
+3× real-time on 3 threads (current whisper.cpp) → 2-second inference
+cadence has 50%+ idle margin. faster-whisper at 1.14s/5s-window would
+push that to ~75% idle. Either way, no audio backpressure concern.
+
+**Recommendation**: faster-whisper tiny.en is a credible upgrade path
+(25% faster, slightly better quality, same accuracy on this corpus)
+but the swap requires migrating to a Python-subprocess worker pattern
+to preserve the hard-timeout safety guarantee. Defer the engine swap
+until we've validated real-world TV audio for ~24h on the current
+whisper.cpp build. The keyword module is engine-agnostic, so the
+future swap is a localized change in `src/asr.py` only.
 
 ## Keyword set design (`src/asr_keywords.py`)
 

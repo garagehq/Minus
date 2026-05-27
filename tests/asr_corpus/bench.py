@@ -72,28 +72,48 @@ except ImportError:
     pass
 
 
-def _engine_moonshine(wav_path):
-    """Moonshine tiny. Loaded lazily."""
-    global _moonshine_model
-    try:
-        _moonshine_model
-    except NameError:
-        import moonshine
-        _moonshine_model = moonshine.load_model('moonshine/tiny')
-    import wave
-    import numpy as np
-    with wave.open(wav_path, 'rb') as wf:
-        n = wf.getnframes()
-        data = wf.readframes(n)
-        audio = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-    start = time.time()
-    result = _moonshine_model(audio)
-    return str(result).strip(), time.time() - start
+# moonshine-voice (the current upstream package): ONNX-runtime backed,
+# Pi 5 benchmark numbers are 237ms for tiny / 527ms for small. The
+# `useful-moonshine` package on PyPI is the deprecated Keras+Torch
+# implementation and is orders of magnitude slower (~9 s/sample we
+# measured on first attempt). Only use moonshine-voice here.
+
+
+def _moonshine_engine(arch_name):
+    """Build a transcribe function for the given moonshine-voice arch.
+    Loads the Transcriber lazily and caches it per arch name."""
+    _cache = {}
+    def transcribe_fn(wav_path):
+        import moonshine_voice as mv
+        from moonshine_voice import download as mv_dl
+        if arch_name not in _cache:
+            arch = mv.string_to_model_arch(arch_name)
+            info = mv_dl.find_model_info(language='en', model_arch=arch)
+            path, _arch = mv_dl.download_model_from_info(info)
+            _cache[arch_name] = mv.Transcriber(model_path=path, model_arch=arch)
+        transcriber = _cache[arch_name]
+        # Load WAV and convert to float32 PCM in [-1, 1]
+        import wave, numpy as np
+        with wave.open(wav_path, 'rb') as wf:
+            assert wf.getsampwidth() == 2
+            assert wf.getnchannels() == 1
+            sr = wf.getframerate()
+            data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+        audio = (data.astype(np.float32) / 32768.0).tolist()
+        start = time.time()
+        result = transcriber.transcribe_without_streaming(audio, sample_rate=sr)
+        elapsed = time.time() - start
+        # Transcript object has .lines, each line has .text
+        text = ' '.join(line.text for line in result.lines).strip()
+        return text, elapsed
+    return transcribe_fn
 
 
 try:
-    import moonshine  # noqa: F401
-    ENGINES['moonshine tiny'] = _engine_moonshine
+    import moonshine_voice as _mv_probe  # noqa: F401
+    ENGINES['moonshine tiny'] = _moonshine_engine('tiny')
+    ENGINES['moonshine small-streaming'] = _moonshine_engine('small-streaming')
+    ENGINES['moonshine medium-streaming'] = _moonshine_engine('medium-streaming')
 except ImportError:
     pass
 
