@@ -497,6 +497,46 @@ class Minus:
         # overlays makes consecutive misses extremely rare.
         self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
+
+        # OCR transience guard. OCR is normally fast-fire (1 frame → block
+        # starts). But a single-frame OCR misread — a movie billboard with
+        # "SKIP" visible briefly, a sign held by an actor reading
+        # "Sponsored", a caption containing an ad-keyword word — should
+        # NOT trigger blocking. Real ad UIs keep the keyword visible
+        # continuously, so requiring 2 consecutive OCR-matched frames
+        # before firing the first block rejects single-frame artifacts
+        # at a ~500-1000ms latency cost on legitimate ads (OCR cadence
+        # ~500ms/frame). Triangulation override: if VLM-ad-detected OR
+        # ASR-confirms in the same window, fast-fire on 1 frame —
+        # all three signals agreeing makes the artifact case
+        # vanishingly rare. env-overridable.
+        self.OCR_TRANSIENCE_MIN_FRAMES = int(
+            os.environ.get('MINUS_OCR_TRANSIENCE_MIN_FRAMES', '2'))
+
+        # OCR triangulation veto. OCR is normally authoritative for
+        # stopping its own block, but when both VLM and ASR have firmly
+        # disagreed for several seconds, OCR is probably misreading a
+        # TV-show artifact (sign in a scene, news-ticker text, captions
+        # mentioning brands). Force-stop the block in that case. Gated
+        # on minimum block duration so the system has time to gather
+        # VLM+ASR evidence before vetoing.
+        self.OCR_TRIANGULATION_MIN_BLOCK_S = float(
+            os.environ.get('MINUS_OCR_TRIANGULATION_MIN_BLOCK_S', '4.0'))
+        # VLM "clearly says no-ad" threshold (sliding-window no_ad_ratio).
+        # Higher than the start threshold (0.70) — we want HIGH confidence
+        # before overriding OCR.
+        self.OCR_TRIANGULATION_VLM_NOAD_RATIO = float(
+            os.environ.get('MINUS_OCR_TRIANGULATION_VLM_NOAD_RATIO', '0.80'))
+        # Sustained OCR overpowers the triangulation veto. If OCR has been
+        # matching an ad keyword for ≥OCR_TRUSTED_DWELL_FRAMES consecutive
+        # cycles, that's a STRONG indicator it really IS an ad — the ad UI
+        # has been visible continuously for ~1.5s+ at OCR's ~500ms cadence.
+        # In that case VLM saying no-ad (transient frame-classification
+        # noise) and ASR saying veto (a quiet moment in the ad copy) are
+        # NOT enough to override OCR. Prevents the veto from killing a
+        # legitimate "Skip in 15" ad block when VLM/ASR briefly disagree.
+        self.OCR_TRUSTED_DWELL_FRAMES = int(
+            os.environ.get('MINUS_OCR_TRUSTED_DWELL_FRAMES', '3'))
         # Transition-frame hold bridges a BRIEF black/solid screen between
         # two ads in a real break so the overlay doesn't flicker. But a
         # dark/low-detail lofi music video reads as "uniform" forever, so
@@ -2925,6 +2965,74 @@ class Minus:
                         # here so it must NOT be allowed to stop early.
                         should_stop = ocr_says_stop
 
+                # TRIANGULATION VETO: OCR-source block can be force-stopped
+                # when BOTH VLM and ASR firmly disagree. The motivating
+                # failure case: OCR picks up an ad-keyword word from a
+                # TV-show artifact — a billboard with "SKIP" in a movie
+                # scene, a news ticker passing through "BUY", a movie
+                # title containing "Sponsored". OCR's start-side
+                # transience guard catches the 1-frame version of this,
+                # but a multi-frame artifact (e.g. a sign held by an
+                # actor for 2-3 seconds) can survive. If during the
+                # resulting block VLM clearly sees show content AND ASR
+                # clearly hears show dialog, the block is almost
+                # certainly an OCR FP and should release.
+                #
+                # Gated on:
+                #   - source in {ocr, both}: VLM agreeing at start
+                #     ("both") doesn't preclude later disagreement —
+                #     a transient ad-text overlay can match BOTH OCR
+                #     and VLM briefly. Keeping both eligible.
+                #   - blocking_elapsed >= MIN_BLOCK_S: give VLM/ASR
+                #     time to gather sliding-window evidence after the
+                #     block starts. Without this, we'd veto a real ad
+                #     within the first OCR/VLM cycle before signals settle.
+                #   - VLM agreement >= 80% no-ad over ≥ vlm_min_decisions:
+                #     a strong, sustained "I don't see an ad" signal.
+                #   - ASR verdict == 'veto': clear show dialog, no
+                #     marketing markers in the 8s rolling window.
+                #   - OCR has NOT been sustained: if OCR has been
+                #     matching consecutively for ≥OCR_TRUSTED_DWELL_FRAMES
+                #     cycles, OCR has "earned" its authority and the
+                #     veto is DISABLED. A persistent on-screen ad UI
+                #     (Skip in 15, Ad 2 of 3) cannot be overridden by
+                #     transient VLM/ASR noise. The artifact case the
+                #     veto targets is by definition NOT sustained —
+                #     a sign passes through the scene then leaves.
+                #
+                # OCR-only "skip in" countdown tail-end: as the ad ends
+                # the player hides the countdown but the still-visible
+                # "Sponsored" text can keep OCR firing for a few cycles
+                # while VLM has already flipped. The existing "both"
+                # branch handles that (vlm_says_stop OR ocr_says_stop).
+                # This veto adds the "OCR-only but in a TV show"
+                # recovery path that the standard logic never reached.
+                _ocr_strongly_trusted = (
+                    self.ocr_ad_detection_count >= self.OCR_TRUSTED_DWELL_FRAMES
+                )
+                if (not should_stop
+                        and not _ocr_strongly_trusted
+                        and self.blocking_source in ('ocr', 'both')
+                        and blocking_elapsed >= self.OCR_TRIANGULATION_MIN_BLOCK_S):
+                    _ad_ratio, _no_ad_ratio, _total = self._get_vlm_agreement()
+                    _vlm_says_clean = (_total >= self.vlm_min_decisions
+                                       and _no_ad_ratio
+                                       >= self.OCR_TRIANGULATION_VLM_NOAD_RATIO)
+                    _asr_says_clean = (self._asr_verdict() == 'veto')
+                    if _vlm_says_clean and _asr_says_clean:
+                        _transcript = (self.asr.last_transcript[:60]
+                                       if self.asr is not None else '')
+                        logger.warning(
+                            f"[Triangulation] Force-stopping "
+                            f"{self.blocking_source} block "
+                            f"({blocking_elapsed:.1f}s): VLM "
+                            f"no_ad={_no_ad_ratio*100:.0f}% of {_total}, "
+                            f"ASR=veto, OCR dwell="
+                            f"{self.ocr_ad_detection_count}. Suspect OCR "
+                            f"FP on TV-show artifact. "
+                            f"Transcript: '{_transcript}'")
+                        should_stop = True
+
                 # UNIVERSAL SAFEGUARD: no single continuous block should ever
                 # exceed MAX_BLOCKING_DURATION regardless of source. Observed
                 # in production: a static "Sponsored · Peel to collect" promo
@@ -3457,8 +3565,44 @@ class Minus:
                     self.ocr_no_ad_count = 0
                     self.last_ocr_ad_time = time.time()
 
-                    if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
+                    # Transience guard: require ≥OCR_TRANSIENCE_MIN_FRAMES
+                    # consecutive OCR-matched frames before firing the
+                    # FIRST block. Rejects single-frame OCR misreads
+                    # (movie billboard with "SKIP", a sign in a scene
+                    # reading "Sponsored", caption text that contains an
+                    # ad-keyword word). Real ad UIs keep the keyword
+                    # visible continuously so they clear the threshold
+                    # within 1-2 OCR cycles (~500-1000ms penalty).
+                    #
+                    # Triangulation override — fast-fire on 1 frame when
+                    # VLM is also asserting ad OR ASR confirms marketing
+                    # language in audio. All three signals agreeing
+                    # makes the single-frame-artifact case vanishingly
+                    # rare; the latency penalty isn't worth paying when
+                    # we have corroboration.
+                    fast_fire = (self.vlm_ad_detected
+                                 or self._asr_verdict() == 'confirm')
+                    required_frames = (1 if fast_fire
+                                       else self.OCR_TRANSIENCE_MIN_FRAMES)
+
+                    if (self.ocr_ad_detection_count >= required_frames
+                            and not self.ocr_ad_detected):
                         self.ocr_ad_detected = True
+                        if required_frames > 1:
+                            logger.info(
+                                f"OCR ad-detection confirmed after "
+                                f"{self.ocr_ad_detection_count}-frame "
+                                f"dwell (transience guard)")
+                    elif (self.ocr_ad_detection_count < required_frames
+                            and not self.ocr_ad_detected):
+                        # Logged at INFO so the user can see why blocking
+                        # didn't fire — a single-frame OCR hit awaiting
+                        # confirmation from the next cycle.
+                        logger.info(
+                            f"OCR ad-detection pending dwell "
+                            f"({self.ocr_ad_detection_count}/"
+                            f"{required_frames} frames, keywords="
+                            f"{keywords_found})")
                     logger.info(f"OCR detected ad keywords: {keywords_found}")
                     self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
                     self.add_detection('OCR', all_texts, matched_keywords)
