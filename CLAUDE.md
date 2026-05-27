@@ -5,7 +5,7 @@
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs + CPU ASR:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
 - **LFM2.5-VL-450M (ft-v2-fused-v2)** on Axera LLM 8850 NPU — **prefill-only on 16 fused decoder layers, ~0.37s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-0.5B iter4 (May 2026): 97.0% holdout accuracy / 99.2% non-ad-recall vs iter4's 94.75% / 95.25%, structurally simpler (no KV cache, no autoregressive decode for `detect_ad` OR autonomous-mode `query_image`, no ml_dtypes bfloat16 ceremony). Both inference paths share one model — no FastVLM dependency anymore. See *FastVLM iter4 → LFM2.5-VL Migration* under Known Issues.
-- **whisper.cpp tiny.en** on 3 CPU threads (~1.7s per 5s audio window, ~3× real-time on RK3588's A76/A55 mix). Audio-channel confirmation/veto on top of OCR+VLM — gates VLM-alone blocking against product placements in TV shows (brand on screen but no marketing language in audio). Never fires blocking alone; never affects OCR-driven blocking. Audio pipeline playback latency unchanged. See [docs/ASR.md](docs/ASR.md).
+- **faster-whisper tiny.en (CTranslate2 int8)** on 3 CPU threads (~1.1s per 5s audio window, ~4× real-time on RK3588's A76/A55 mix). Runs in a multiprocessing worker subprocess (mirrors OCR/VLM worker pattern) for hard-timeout safety. Audio-channel confirmation/veto on top of OCR+VLM — gates VLM-alone blocking against product placements in TV shows (brand on screen but no marketing language in audio). Never fires blocking alone; never affects OCR-driven blocking. Audio pipeline playback latency unchanged. Was whisper.cpp tiny.en initially (1.52s/window); migrated to faster-whisper after corpus benchmark (`tests/asr_corpus/bench.py`) showed 25% speedup at identical accuracy. See [docs/ASR.md](docs/ASR.md).
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -19,7 +19,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/DEBUG_GLITCHES.md](docs/DEBUG_GLITCHES.md) | Video glitch debugging notes |
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
-| [docs/ASR.md](docs/ASR.md) | whisper.cpp ASR — audio-based ad confirmation/veto on top of OCR+VLM |
+| [docs/ASR.md](docs/ASR.md) | faster-whisper ASR — audio-based ad confirmation/veto on top of OCR+VLM (worker process, hard timeout) |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
 | [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
 | [docs/IR_RECEIVER.md](docs/IR_RECEIVER.md) | IR receiver eval on pin 3 (`gpiochip4 11`) — bench-tested decode of NEC remotes, gotchas, sketch for a future `IRReceiver` module |

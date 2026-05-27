@@ -154,9 +154,17 @@ class TestASRManager(unittest.TestCase):
         self.ASRManager = ASRManager
 
     def _make(self, **kwargs):
-        # Default constructor — uses real whisper paths but we never call
-        # _run_whisper directly in these tests (we feed _record_result).
-        return self.ASRManager(_FakeTap(), **kwargs)
+        """Build an ASRManager with a mocked ASRProcess (so tests don't
+        actually spawn a faster-whisper worker subprocess)."""
+        m = self.ASRManager(_FakeTap(), **kwargs)
+        # Replace the real ASRProcess with a MagicMock — tests feed
+        # _record_result directly, so the process isn't actually invoked.
+        from unittest.mock import MagicMock
+        m._process = MagicMock()
+        m._process.get_latency_stats.return_value = {
+            'samples': 0, 'p50_s': 0.0, 'p95_s': 0.0, 'max_s': 0.0
+        }
+        return m
 
     def test_verdict_unknown_when_not_running(self):
         m = self._make()
@@ -176,7 +184,7 @@ class TestASRManager(unittest.TestCase):
     def test_verdict_confirm_on_marker_hit(self):
         m = self._make()
         m.is_running = True
-        m._record_result('Call now! Available at brand dot com.', 0.5, 'ok')
+        m._record_result('ok', 'Call now! Available at brand dot com.', 0.5)
         self.assertEqual(m.verdict(), 'confirm')
 
     def test_verdict_veto_on_clear_show_dialog(self):
@@ -185,8 +193,9 @@ class TestASRManager(unittest.TestCase):
         # Multiple zero-hit transcripts with plenty of speech
         for _ in range(3):
             m._record_result(
+                'ok',
                 "She walked into the room and sat down. Her brother was already there.",
-                0.5, 'ok')
+                0.5)
         self.assertEqual(m.verdict(), 'veto')
 
     def test_verdict_unknown_on_silence_window(self):
@@ -196,7 +205,7 @@ class TestASRManager(unittest.TestCase):
         m = self._make()
         m.is_running = True
         for _ in range(3):
-            m._record_result('Thank you.', 0.5, 'ok')
+            m._record_result('ok', 'Thank you.', 0.5)
         # Only a few alpha words per window — total < 10 over window
         self.assertEqual(m.verdict(), 'unknown')
 
@@ -205,7 +214,7 @@ class TestASRManager(unittest.TestCase):
         m = self._make()
         m.is_running = True
         # Inject a hit, then time-travel forward beyond the window.
-        m._record_result('Call now! Available at brand dot com.', 0.5, 'ok')
+        m._record_result('ok', 'Call now! Available at brand dot com.', 0.5)
         old_ts = time.time() - (m.HISTORY_WINDOW_S + 1)
         # Replace the lone entry's timestamp
         with m._lock:
@@ -217,23 +226,150 @@ class TestASRManager(unittest.TestCase):
         """API stability: /api/status reads these keys."""
         m = self._make()
         s = m.get_status()
-        for key in ('available', 'enabled', 'running', 'inference_count',
-                    'timeout_count', 'failure_count', 'verdict',
+        for key in ('available', 'enabled', 'running', 'engine', 'model',
+                    'inference_count', 'timeout_count', 'killed_count',
+                    'failure_count', 'verdict',
                     'last_transcript', 'last_marker_hits',
                     'p50_latency_s', 'p95_latency_s'):
             self.assertIn(key, s)
+        # engine label tells the UI which backend is in use
+        self.assertEqual(s['engine'], 'faster-whisper')
 
     def test_record_result_timeouts_increment_counter(self):
         m = self._make()
-        m._record_result('', 2.5, 'timeout')
+        m._record_result('timeout', '', 2.5)
         self.assertEqual(m.timeout_count, 1)
-        # No transcript recorded
         self.assertEqual(m.last_transcript, '')
 
     def test_record_result_errors_increment_counter(self):
         m = self._make()
-        m._record_result('', 0.1, 'error')
+        m._record_result('error', '', 0.1)
         self.assertEqual(m.failure_count, 1)
+
+    def test_record_result_killed_increments_counter(self):
+        """The 'killed' status (hard timeout → process kill) is a new
+        outcome under the worker-subprocess architecture and gets its
+        own counter so we can spot worker thrashing in /api/status."""
+        m = self._make()
+        m._record_result('killed', '', 3.0)
+        self.assertEqual(m.killed_count, 1)
+        self.assertEqual(m.last_transcript, '')
+
+
+# =============================================================================
+# ASRProcess worker — hard timeout + restart machinery (no real worker spawn)
+# =============================================================================
+
+
+class TestASRProcessTimeouts(unittest.TestCase):
+    """Tests the parent-side ASRProcess controller. The worker process
+    spawn is NOT exercised — we mock the queues / process so the timeout
+    + restart bookkeeping logic is testable without a 3+ s model load.
+
+    The actual end-to-end worker spawn + transcribe is covered by
+    tests/asr_corpus/bench_worker.py (runs the real faster-whisper)."""
+
+    def _make(self):
+        from asr_worker import ASRProcess
+        proc = ASRProcess(model_name='tiny.en', cpu_threads=3)
+        # Replace process internals with mocks so transcribe() doesn't
+        # spawn or talk to a real worker.
+        from unittest.mock import MagicMock
+        import queue as q_mod
+        proc.process = MagicMock()
+        proc.process.is_alive.return_value = True
+        proc.process.pid = 12345
+        proc.request_queue = MagicMock()
+        proc.response_queue = MagicMock()
+        # CRITICAL: default get_nowait to raise queue.Empty (matching
+        # multiprocessing.Queue semantics when the queue is empty). A
+        # naive MagicMock returns a MagicMock object which is truthy
+        # AND non-raising, so _drain_stale_responses_locked() would
+        # infinite-loop. Individual tests that need to exercise the
+        # drain path override this with side_effect.
+        proc.response_queue.get_nowait.side_effect = q_mod.Empty()
+        proc.is_ready = True
+        return proc
+
+    def test_constants_documented(self):
+        """If someone changes the timeout constants, this catches an
+        accidental zero or negative — they're load-bearing for the
+        decision-engine timing budget."""
+        from asr_worker import ASRProcess
+        self.assertGreater(ASRProcess.SOFT_TIMEOUT, 0)
+        self.assertGreater(ASRProcess.HARD_TIMEOUT, ASRProcess.SOFT_TIMEOUT)
+        self.assertGreaterEqual(ASRProcess.RESTART_THRESHOLD, 1)
+
+    def test_transcribe_returns_error_when_not_running(self):
+        from asr_worker import ASRProcess
+        proc = ASRProcess()
+        # No start() called — should return error, not block or crash
+        status, text, lat = proc.transcribe('/tmp/whatever.wav')
+        self.assertEqual(status, 'error')
+
+    def test_transcribe_passes_ok_response_through(self):
+        proc = self._make()
+        proc.response_queue.get.return_value = ('ok', 'hello world', 1.2)
+        status, text, lat = proc.transcribe('/tmp/x.wav')
+        self.assertEqual(status, 'ok')
+        self.assertEqual(text, 'hello world')
+        self.assertEqual(lat, 1.2)
+        # Latency recorded for stats
+        self.assertIn(1.2, list(proc._recent_latencies))
+
+    def test_transcribe_soft_timeout_returns_timeout(self):
+        """A single soft-timeout sets pending_response but does NOT
+        restart the worker."""
+        import queue as q_mod
+        proc = self._make()
+        proc.response_queue.get.side_effect = q_mod.Empty()
+        proc.process.kill = MagicMock()
+
+        status, text, lat = proc.transcribe('/tmp/x.wav')
+        self.assertEqual(status, 'timeout')
+        self.assertTrue(proc._pending_response)
+        self.assertEqual(proc._consecutive_timeouts, 1)
+        # Process must NOT have been killed yet
+        proc.process.kill.assert_not_called()
+
+    def test_transcribe_drains_stale_responses(self):
+        """If a previous soft-timeout's response arrives late, the next
+        call must drain it before queueing a new request. Otherwise
+        the next caller would get the wrong transcript (the old
+        inference's result paired with the new wav path)."""
+        proc = self._make()
+        proc._pending_response = True
+        import queue as q_mod
+        # First get_nowait() returns the stale response; second raises Empty
+        proc.response_queue.get_nowait.side_effect = [
+            ('ok', 'stale-result', 1.0),
+            q_mod.Empty(),
+        ]
+        proc.response_queue.get.return_value = ('ok', 'fresh-result', 0.8)
+
+        status, text, lat = proc.transcribe('/tmp/x.wav')
+        self.assertEqual(status, 'ok')
+        self.assertEqual(text, 'fresh-result')
+        # After successful drain + fresh result, pending is cleared
+        self.assertFalse(proc._pending_response)
+
+    def test_get_latency_stats_empty(self):
+        from asr_worker import ASRProcess
+        proc = ASRProcess()
+        s = proc.get_latency_stats()
+        self.assertEqual(s['samples'], 0)
+        self.assertEqual(s['p50_s'], 0.0)
+        self.assertEqual(s['max_s'], 0.0)
+
+    def test_get_latency_stats_populated(self):
+        proc = self._make()
+        for lat in [0.9, 1.0, 1.1, 1.2, 1.5]:
+            proc._recent_latencies.append(lat)
+        s = proc.get_latency_stats()
+        self.assertEqual(s['samples'], 5)
+        # median of 5 values is the middle one
+        self.assertEqual(s['p50_s'], 1.1)
+        self.assertEqual(s['max_s'], 1.5)
 
 
 # =============================================================================

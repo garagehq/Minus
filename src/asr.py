@@ -1,5 +1,5 @@
 """
-ASR-based ad-content confirmation/veto via whisper.cpp.
+ASR-based ad-content confirmation/veto via faster-whisper.
 
 Role in the detection stack:
   OCR  → reads text *on the screen*           — authoritative for blocking
@@ -19,43 +19,47 @@ ASR is intentionally NOT a primary trigger. It only:
 The OCR-driven paths (`blocking_source` "ocr" / "both") are NOT consulted
 against ASR. OCR text on the screen is authoritative.
 
-Design (matches OCR/VLM worker patterns):
-  - Audio comes from a parallel branch on the existing AudioPassthrough
-    GStreamer pipeline (see AudioASRTap in src/audio.py). The tap branch
-    has its own leaky queue so a slow ASR can never backpressure the
-    passthrough to the TV — the playback latency is unchanged.
-  - This module runs a Python *thread* (not subprocess). whisper.cpp's
-    inference releases the GIL (it's mostly time in optimized C kernels),
-    so a thread is enough — and we still get a hard timeout because we
-    invoke `whisper-cli` as a *subprocess* with subprocess.run timeout.
-    A hung whisper-cli is killed, the thread continues, no model reload
-    needed (the next call reloads the model — ~150ms).
-  - Rolling 8-second history of (timestamp, marker_hits, transcript)
-    feeds the `verdict()` decision.
+Engine: faster-whisper tiny.en (CTranslate2 int8). See
+docs/ASR.md for the benchmark that drove this choice — 25% faster than
+whisper.cpp at the same 10/10 corpus accuracy with cleaner transcripts.
 
-Cost on RK3588 (measured): tiny.en transcribes a 5-second window in
-~1.1-1.3s on 3 threads (mostly A55 cores via scheduler). Wall-clock
-period between inferences is 2s, giving ~70% CPU headroom on the ASR
-worker thread. 0% impact on the existing OCR/VLM pipelines (different
-cores, different NPUs).
+Safety architecture (matches OCR/VLM worker pattern):
+  - Audio comes from a parallel `tee` branch on the existing
+    AudioPassthrough GStreamer pipeline (see AudioASRTap in src/audio.py).
+    The tap is leaky so a slow ASR can never backpressure the audio
+    passthrough to the TV.
+  - faster-whisper runs in a CHILD PROCESS (src/asr_worker.py
+    ASRProcess), not in this thread. This restores the hard-timeout
+    safety story we previously got "for free" from invoking whisper.cpp
+    as a binary subprocess: if the worker hangs, we kill the OS process.
+  - This module runs a Python *thread* that pulls snapshots, calls the
+    worker, and updates the rolling history.
 
-Whisper-tiny mis-transcribes like OCR mis-reads. The keyword set in
+Cost on RK3588 (measured, see docs/ASR.md):
+  - faster-whisper tiny.en, 3 threads, 5-second window: ~1.14 s
+    inference latency. With a 2-second snapshot cadence that leaves
+    ~75% CPU idle margin in the ASR worker.
+  - Model load: ~1 s for cached, ~3 s on first HF download.
+  - Memory: model + CT2 runtime + ring buffer ≈ 250 MB.
+
+whisper-tiny mis-transcribes like OCR mis-reads. The keyword set in
 `asr_keywords.py` is designed for that constraint: phrase-level
 matching with multiple variants per phrase, regex shape-matchers for
 prices/URLs/phone numbers, and an exclusion list for show-dialog
 mentions of money. If quality is insufficient with tiny.en, swap the
-model file (env MINUS_WHISPER_MODEL) — keyword module needs no change.
+model via MINUS_ASR_MODEL=base.en — keyword module needs no change.
 """
 
 import logging
 import os
-import subprocess
+import re
 import threading
 import time
 from collections import deque
 from typing import Optional
 
 from asr_keywords import count_marker_hits, explain_hits
+from asr_worker import ASRProcess
 
 logger = logging.getLogger(__name__)
 
@@ -63,31 +67,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Defaults — overridable via env vars matching the existing MINUS_* pattern.
 # ---------------------------------------------------------------------------
-DEFAULT_WHISPER_BIN = '/home/radxa/whisper.cpp/build/bin/whisper-cli'
-DEFAULT_WHISPER_MODEL = '/home/radxa/whisper.cpp/models/ggml-tiny.en.bin'
-
-WHISPER_BIN = os.environ.get('MINUS_WHISPER_BIN', DEFAULT_WHISPER_BIN)
-WHISPER_MODEL = os.environ.get('MINUS_WHISPER_MODEL', DEFAULT_WHISPER_MODEL)
+# Model name accepted by faster_whisper.WhisperModel(). Built-in sizes
+# include 'tiny.en', 'base.en', 'small.en', 'medium.en', and 'large'.
+# Can also be a path to a local model directory.
+DEFAULT_ASR_MODEL = 'tiny.en'
+ASR_MODEL = os.environ.get('MINUS_ASR_MODEL', DEFAULT_ASR_MODEL)
 
 
 def is_asr_available() -> bool:
-    """Whether whisper.cpp is installed at the configured paths.
-    Used by Minus to decide whether to enable the audio tap branch.
-    Returning False keeps the existing audio pipeline byte-identical to
-    the pre-ASR shape — important for installs that don't have whisper."""
-    return os.path.isfile(WHISPER_BIN) and os.access(WHISPER_BIN, os.X_OK) \
-        and os.path.isfile(WHISPER_MODEL)
+    """Whether the ASR backend is importable. Installs without
+    faster-whisper installed will skip the tap branch entirely,
+    keeping the audio pipeline byte-identical to pre-ASR shape."""
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 class ASRManager:
-    """whisper.cpp-driven ad-content confirmation/veto.
+    """faster-whisper-driven ad-content confirmation/veto.
 
     Public API used by Minus:
-      start()              → spawn background inference thread
+      start()              → spawn worker + start background inference thread
       stop()               → signal shutdown
       verdict()            → 'confirm' / 'veto' / 'unknown'
       get_status()         → dict for /api/status surface
-      is_enabled           → bool
+      is_enabled           → bool (set externally)
       enabled              → settable; False short-circuits verdict to 'unknown'
 
     Thread safety: `_history`, `last_*` attributes are guarded by `_lock`.
@@ -111,43 +117,31 @@ class ASRManager:
     # fit in 4-5s of speech.
     WINDOW_SECONDS = 5.0
 
-    # Whisper subprocess timeout. Healthy tiny.en p95 is ~1.3s on this
-    # box; >2.5s means something's wrong (or model is too large). The
-    # timeout is BELOW the inference interval so we can't pile up a
-    # backlog of stuck processes.
-    WHISPER_TIMEOUT_S = 2.5
-
-    # Number of whisper threads. RK3588 has 4×A76 + 4×A55. 3 threads
-    # leaves the rest of the system breathing room. Whisper scales
-    # near-linearly up to ~4 threads on this chip; past that the
-    # marginal return drops.
-    WHISPER_THREADS = 3
-
-    def __init__(self, audio_tap, *, whisper_bin: str = None,
-                 model_path: str = None):
+    def __init__(self, audio_tap, *, model_name: str = None, cpu_threads: int = 3):
         """audio_tap must be an AudioASRTap (see src/audio.py).
         It exposes `snapshot_to_wav(seconds)` returning True on success.
         """
         self._tap = audio_tap
-        self._whisper_bin = whisper_bin or WHISPER_BIN
-        self._model_path = model_path or WHISPER_MODEL
-        self._wav_path = '/dev/shm/minus_asr_window.wav'
+        self._model_name = model_name or ASR_MODEL
+        self._cpu_threads = cpu_threads
+
+        # Worker process (hard-timeout via process kill — see asr_worker.py)
+        self._process = ASRProcess(model_name=self._model_name,
+                                   cpu_threads=self._cpu_threads)
 
         # Runtime state
         self.is_running = False
-        self.enabled = True  # When False, verdict() short-circuits to 'unknown'
+        self.enabled = True
         self.inference_count = 0
         self.timeout_count = 0
         self.failure_count = 0
+        self.killed_count = 0
         self.last_transcript = ''
         self.last_marker_hits = 0
         self.last_inference_time = 0.0
         self.last_inference_latency = 0.0
-        self._recent_latencies = deque(maxlen=20)
 
-        # Rolling history: (timestamp, marker_hits, transcript_len)
-        # Transcript length is kept (not full text) for the "veto only
-        # when there's enough transcribed speech" rule.
+        # Rolling history: (timestamp, marker_hits, transcript_alpha_word_count)
         self._history = deque(maxlen=32)
         self._lock = threading.RLock()
 
@@ -159,20 +153,21 @@ class ASRManager:
     def start(self):
         if self.is_running:
             return
-        if not os.path.isfile(self._whisper_bin):
-            logger.warning(f"[ASR] whisper-cli not found at {self._whisper_bin} — ASR disabled")
+        if not is_asr_available():
+            logger.warning("[ASR] faster-whisper not installed — ASR disabled")
             return
-        if not os.path.isfile(self._model_path):
-            logger.warning(f"[ASR] model not found at {self._model_path} — ASR disabled")
+
+        if not self._process.start():
+            logger.warning("[ASR] worker process failed to start — ASR disabled")
             return
 
         self._stop_event.clear()
         self.is_running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name='ASR')
         self._thread.start()
-        logger.info(f"[ASR] started (model={os.path.basename(self._model_path)}, "
+        logger.info(f"[ASR] started (model={self._model_name}, "
                     f"window={self.WINDOW_SECONDS}s, interval={self.INFERENCE_INTERVAL_S}s, "
-                    f"threads={self.WHISPER_THREADS})")
+                    f"threads={self._cpu_threads})")
 
     def stop(self):
         if not self.is_running:
@@ -181,8 +176,14 @@ class ASRManager:
         if self._thread:
             self._thread.join(timeout=5)
         self.is_running = False
+        # Stop the worker process
+        try:
+            self._process.stop()
+        except Exception as e:
+            logger.debug(f"[ASR] worker stop error: {e}")
         logger.info(f"[ASR] stopped after {self.inference_count} inferences "
-                    f"(timeouts={self.timeout_count}, failures={self.failure_count})")
+                    f"(timeouts={self.timeout_count}, killed={self.killed_count}, "
+                    f"failures={self.failure_count})")
 
     # ----- main loop -----
 
@@ -195,89 +196,46 @@ class ASRManager:
 
         while not self._stop_event.is_set():
             try:
-                # Skip when disabled by user (still keep audio tap running
-                # so the buffer stays current — re-enabling resumes
-                # without a cold start).
                 if not self.enabled:
                     self._stop_event.wait(self.INFERENCE_INTERVAL_S)
                     continue
 
-                # Pull a fresh snapshot from the tap.
                 if not self._tap.snapshot_to_wav(self.WINDOW_SECONDS):
                     # Tap not ready (not enough audio yet, or stalled).
                     self._stop_event.wait(self.INFERENCE_INTERVAL_S)
                     continue
 
-                transcript, latency, status = self._run_whisper(self._wav_path)
-                self._record_result(transcript, latency, status)
+                status, transcript, latency = self._process.transcribe(
+                    self._tap.wav_path)
+                self._record_result(status, transcript, latency)
             except Exception as e:
                 logger.error(f"[ASR] loop iteration failed: {e}")
                 self.failure_count += 1
 
             self._stop_event.wait(self.INFERENCE_INTERVAL_S)
 
-    def _run_whisper(self, wav_path: str):
-        """Returns (transcript, elapsed_seconds, status).
-        status ∈ {'ok', 'timeout', 'error'}.
-        """
-        start = time.time()
-        try:
-            result = subprocess.run(
-                [
-                    self._whisper_bin,
-                    '-m', self._model_path,
-                    '-f', wav_path,
-                    '-t', str(self.WHISPER_THREADS),
-                    '-np',  # no debug prints
-                    '-nt',  # no timestamps in output
-                    '-l', 'en',
-                ],
-                capture_output=True, text=True,
-                timeout=self.WHISPER_TIMEOUT_S,
-            )
-            elapsed = time.time() - start
-            if result.returncode != 0:
-                logger.warning(f"[ASR] whisper-cli returned {result.returncode}: "
-                               f"{result.stderr[:120] if result.stderr else ''}")
-                return '', elapsed, 'error'
-            text = (result.stdout or '').strip()
-            return text, elapsed, 'ok'
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - start
-            return '', elapsed, 'timeout'
-        except FileNotFoundError as e:
-            logger.error(f"[ASR] whisper-cli missing: {e}")
-            return '', time.time() - start, 'error'
-
-    def _record_result(self, transcript: str, latency: float, status: str):
+    def _record_result(self, status: str, transcript: str, latency: float):
         hits = count_marker_hits(transcript) if status == 'ok' else 0
         now = time.time()
         with self._lock:
             self.inference_count += 1
             if status == 'timeout':
                 self.timeout_count += 1
+            elif status == 'killed':
+                self.killed_count += 1
             elif status == 'error':
                 self.failure_count += 1
-            self._recent_latencies.append(latency)
             self.last_inference_time = now
             self.last_inference_latency = latency
             if status == 'ok':
                 self.last_transcript = transcript
                 self.last_marker_hits = hits
-                # Track transcript length (number of alpha words) — used
-                # by verdict() to distinguish "no marketing language"
-                # from "no transcribed speech at all".
-                import re
                 alpha_word_count = len(re.findall(r'[a-z]{2,}', transcript.lower()))
                 self._history.append((now, hits, alpha_word_count))
-                # Trim history to window
                 cutoff = now - self.HISTORY_WINDOW_S
                 while self._history and self._history[0][0] < cutoff:
                     self._history.popleft()
 
-        # Log only when something useful happened (signal hit OR notable
-        # transcript length). Avoids spamming the journal with empty
-        # "..." results when the source has been silent.
         if status == 'ok' and (hits > 0 or len(transcript) >= 20):
             preview = transcript[:80].replace('\n', ' ')
             if hits > 0:
@@ -315,9 +273,6 @@ class ASRManager:
         total_hits = sum(h[1] for h in recent)
         if total_hits > 0:
             return 'confirm'
-        # No hits — only veto if we actually transcribed enough speech.
-        # Sum of alpha-word counts across recent windows; 10+ words over
-        # the rolling window means "there was real speech we processed."
         total_words = sum(h[2] for h in recent)
         if total_words >= 10:
             return 'veto'
@@ -327,22 +282,18 @@ class ASRManager:
 
     def get_status(self) -> dict:
         with self._lock:
-            recent_lat = list(self._recent_latencies)
             history_len = len(self._history)
             recent_hits_sum = sum(h[1] for h in self._history)
-        if recent_lat:
-            import statistics
-            p50 = statistics.median(recent_lat)
-            p95 = (sorted(recent_lat)[max(0, int(0.95 * len(recent_lat)) - 1)]
-                   if recent_lat else 0.0)
-        else:
-            p50 = p95 = 0.0
+        latency_stats = self._process.get_latency_stats() if self._process else {}
         return {
             'available': is_asr_available(),
             'enabled': self.enabled,
             'running': self.is_running,
+            'engine': 'faster-whisper',
+            'model': self._model_name,
             'inference_count': self.inference_count,
             'timeout_count': self.timeout_count,
+            'killed_count': self.killed_count,
             'failure_count': self.failure_count,
             'verdict': self.verdict(),
             'history_window_s': self.HISTORY_WINDOW_S,
@@ -351,6 +302,8 @@ class ASRManager:
             'last_transcript': self.last_transcript[:200],
             'last_marker_hits': self.last_marker_hits,
             'last_latency_s': round(self.last_inference_latency, 3),
-            'p50_latency_s': round(p50, 3),
-            'p95_latency_s': round(p95, 3),
+            'p50_latency_s': latency_stats.get('p50_s', 0.0),
+            'p95_latency_s': latency_stats.get('p95_s', 0.0),
+            'max_latency_s': latency_stats.get('max_s', 0.0),
+            'latency_samples': latency_stats.get('samples', 0),
         }

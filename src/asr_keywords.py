@@ -1,5 +1,7 @@
 """
-ASR (whisper.cpp) ad-marker keyword detection.
+ASR ad-marker keyword detection (backend-agnostic: works with whisper.cpp,
+faster-whisper, or Moonshine — see docs/ASR.md for the benchmark that
+chose faster-whisper as the current backend).
 
 whisper-tiny.en is small and fast (~4× real-time on 3 cores of RK3588's
 A76+A55) but it WILL make transcription errors — similar shape to OCR

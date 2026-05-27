@@ -21,10 +21,10 @@ Architecture:
                         │
                         └─► leaky queue -> audioresample 48kHz/2ch -> 16kHz/1ch
                                           -> appsink -> AudioASRTap ring buffer
-                                          -> snapshot_to_wav() for whisper.cpp
+                                          -> snapshot_to_wav() for the ASR worker
 
     Tap branch is non-blocking: its queue is `leaky=downstream` so a slow
-    consumer (whisper.cpp falling behind) drops the oldest buffers rather
+    consumer (the ASR worker falling behind) drops the oldest buffers rather
     than backpressuring the tee. Playback latency is identical with or
     without the tap branch present. See `_init_pipeline` for the exact
     pipeline string + the safety properties asserted by
@@ -105,11 +105,11 @@ class AudioPassthrough:
             playback_device: ALSA playback device (HDMI-TX)
             asr_tap: optional AudioASRTap instance. If passed, the pipeline
                 will include a parallel `tee` branch that feeds 16kHz mono
-                S16LE audio into the tap's ring buffer for whisper.cpp ASR.
+                S16LE audio into the tap's ring buffer for ASR.
                 The playback branch is unchanged whether asr_tap is set or
                 not — same elements, same parameters, same latency budget.
                 Passing None keeps the pre-ASR pipeline shape byte-identical
-                (used by installs without whisper.cpp present).
+                (used by installs without faster-whisper present).
         """
         # Auto-detect capture device if not specified or set to "auto"
         if capture_device is None or capture_device == "auto":
@@ -255,7 +255,7 @@ class AudioPassthrough:
         Same elements, same names, same parameters. Latency budget
         (~500ms to match video) is unchanged. The tap is added as a
         parallel `tee` branch with its own leaky queue so a slow
-        whisper.cpp consumer cannot backpressure the playback side.
+        ASR consumer cannot backpressure the playback side.
         """
         try:
             # Audio passthrough pipeline with A/V sync delay
@@ -284,7 +284,7 @@ class AudioPassthrough:
                 f"alsasink device={self.playback_device} buffer-time=50000 latency-time=10000 sync=false"
             )
             if self.asr_tap is not None:
-                # ASR tap branch is leaky: if whisper.cpp falls behind, the
+                # ASR tap branch is leaky: if the ASR worker falls behind, the
                 # tap queue drops the oldest buffers rather than blocking
                 # the tee. max-size-buffers=40 at 48kHz with ~1024-sample
                 # buffers ≈ 850ms of headroom; more than enough for the
@@ -308,7 +308,7 @@ class AudioPassthrough:
                 )
             else:
                 # No tap configured — keep the original linear pipeline so
-                # behaviour on installs without whisper.cpp is identical
+                # behaviour on installs without faster-whisper is identical
                 # to pre-ASR Minus. No tee, no risk of pipeline-shape
                 # regressions on those installs.
                 pipeline_str = (
@@ -1128,7 +1128,7 @@ class AudioPassthrough:
 
 
 # ===========================================================================
-# Audio ASR Tap — ring buffer for whisper.cpp consumption
+# Audio ASR Tap — ring buffer for ASR worker consumption
 # ===========================================================================
 
 
@@ -1141,7 +1141,7 @@ class AudioASRTap:
     Python thread). Writes them into a fixed-size numpy ring buffer.
     Exposes `snapshot_to_wav(seconds)` for the ASR worker to atomically
     grab the most recent N seconds as a WAV file on disk for
-    whisper.cpp.
+    the ASR worker (faster-whisper).
 
     Threading model:
       - GStreamer streaming thread: holds _lock briefly to append samples

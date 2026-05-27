@@ -228,9 +228,10 @@ except ImportError as e:
     logger.warning(f"Audio module not available: {e}")
     HAS_AUDIO = False
 
-# Import ASR module (whisper.cpp-driven). Optional — installs without
-# whisper.cpp built will skip the audio-tap branch and the ASR thread,
-# leaving the audio pipeline byte-identical to the pre-ASR shape.
+# Import ASR module (faster-whisper-driven, runs in a subprocess worker
+# for hard-timeout safety — see src/asr_worker.py). Optional — installs
+# without faster-whisper will skip the audio-tap branch and the ASR
+# thread, leaving the audio pipeline byte-identical to the pre-ASR shape.
 try:
     from asr import ASRManager, is_asr_available
     HAS_ASR = True
@@ -774,25 +775,29 @@ class Minus:
                 logger.warning(f"VLM init failed: {e}")
                 self.vlm = None
 
-        # Initialize ASR (whisper.cpp ad-content confirmation/veto) — must
-        # be created BEFORE the audio passthrough so the tap can be wired
-        # into the audio pipeline at construction time. The audio tap is
-        # only created if whisper.cpp is actually installed (otherwise we
-        # leave the audio pipeline shape unchanged, no tee branch).
+        # Initialize ASR (faster-whisper ad-content confirmation/veto) —
+        # must be created BEFORE the audio passthrough so the tap can be
+        # wired into the audio pipeline at construction time. The audio
+        # tap is only created if faster-whisper is installed (otherwise
+        # we leave the audio pipeline shape unchanged, no tee branch).
         self.asr_tap = None
         self.asr = None
         if HAS_ASR and is_asr_available():
             try:
                 self.asr_tap = AudioASRTap()
                 self.asr = ASRManager(self.asr_tap)
-                logger.info("ASR initialized (whisper.cpp tiny.en + audio tap)")
+                # ASRManager.get_status() exposes the engine + model name,
+                # but it isn't ready yet at construction; read from the
+                # manager attrs for the boot log line instead.
+                logger.info(f"ASR initialized (faster-whisper "
+                            f"{self.asr._model_name} + audio tap)")
             except Exception as e:
                 logger.warning(f"ASR init failed: {e} — running without ASR")
                 self.asr_tap = None
                 self.asr = None
         elif HAS_ASR:
-            logger.info("ASR module loaded but whisper.cpp not found at "
-                        "configured paths — running without ASR")
+            logger.info("ASR module loaded but faster-whisper not "
+                        "available — running without ASR")
 
         # Initialize Audio passthrough
         if HAS_AUDIO:
@@ -1749,7 +1754,7 @@ class Minus:
           'unknown' — no ASR signal yet (cold start, music only, ASR disabled)
 
         Always returns 'unknown' when ASR is unavailable so blocking
-        decisions degrade gracefully on installs without whisper.cpp.
+        decisions degrade gracefully on installs without faster-whisper.
         """
         if self.asr is None:
             return 'unknown'

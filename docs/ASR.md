@@ -1,9 +1,19 @@
 # ASR (audio-based ad confirmation)
 
-whisper.cpp tiny.en running on 3 CPU threads, fed from a parallel
-`tee` branch of the existing GStreamer audio pipeline, used as a
-**confirmation + veto signal** for VLM-alone ad blocking. Does not
-trigger blocking alone; does not affect OCR-driven blocking.
+**faster-whisper tiny.en** (CTranslate2 int8) running on 3 CPU threads
+in a dedicated multiprocessing worker subprocess (`src/asr_worker.py`).
+Fed from a parallel `tee` branch of the existing GStreamer audio
+pipeline, used as a **confirmation + veto signal** for VLM-alone ad
+blocking. Does not trigger blocking alone; does not affect OCR-driven
+blocking.
+
+**Engine history:** initial implementation used whisper.cpp (binary
+subprocess invocation), swapped to faster-whisper after the corpus
+benchmark in `tests/asr_corpus/bench.py` showed 25% speedup (1.14s vs
+1.52s per 5s window) at identical 10/10 corpus accuracy with cleaner
+transcripts. The multiprocessing worker pattern restores the
+hard-timeout safety we previously got "for free" from whisper.cpp's
+binary subprocess invocation.
 
 ## Why it exists
 
@@ -104,20 +114,26 @@ Notes:
   blocks that ASR has been listening to for ≥4s with zero markers are
   almost certainly false positives on visual brand content.
 
-## Whisper.cpp build
+## Install
 
 ```bash
-git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git /home/radxa/whisper.cpp
-cd /home/radxa/whisper.cpp
-bash ./models/download-ggml-model.sh tiny.en  # ~75 MB; pulls from huggingface.co/ggerganov/whisper.cpp
-cmake -B build -DGGML_NATIVE=ON -DBUILD_SHARED_LIBS=OFF
-cmake --build build -j4 --config Release
+pip3 install --break-system-packages --user faster-whisper
 ```
 
-The CMake auto-detection picks up `-mcpu=cortex-a76.cortex-a55+crypto+dotprod`
-on RK3588, so we get NEON + dotprod kernels without manual flags.
+Model files auto-download from HuggingFace to `~/.cache/huggingface/`
+on first use (~75 MB for tiny.en). Subsequent loads are local.
 
-Override paths via env: `MINUS_WHISPER_BIN`, `MINUS_WHISPER_MODEL`.
+Override the model via `MINUS_ASR_MODEL` env var. Built-in sizes:
+`tiny.en` (default), `base.en`, `small.en`, `medium.en`, `large`.
+Can also be a path to a local model directory.
+
+CTranslate2 (the inference engine under faster-whisper) auto-detects
+ARM NEON kernels on RK3588 — no manual flags needed.
+
+**whisper.cpp (legacy):** the original implementation lives at
+`/home/radxa/whisper.cpp`. Kept on disk for reference + the
+`tests/asr_corpus/bench.py` baseline comparison. No longer
+loaded at runtime.
 
 ## Cost on RK3588
 
