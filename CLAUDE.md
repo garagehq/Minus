@@ -48,9 +48,9 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
      │  ┌───────────┐  │           │  ┌───────────────┐  │
-     │  │ PaddleOCR │  │           │  │ FastVLM-0.5B  │  │
+     │  │ PaddleOCR │  │           │  │  LFM2.5-VL    │  │
      │  │ RK3588 NPU│  │           │  │ Axera LLM 8850│  │
-     │  │ ~400ms    │  │           │  │ ~0.9s         │  │
+     │  │ ~400ms    │  │           │  │ ~0.37s        │  │
      │  └───────────┘  │           │  └───────────────┘  │
      └────────┬────────┘           └──────────┬──────────┘
               │                               │
@@ -81,7 +81,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
 | `src/ocr_worker.py` | Process-based OCR with hard timeout, warmup, and keepalive |
-| `src/vlm.py` | FastVLM-0.5B iter4 on Axera NPU — logit-thresholded `detect_ad` + decode-based `query_image` |
+| `src/vlm.py` | LFM2.5-VL-450M on Axera NPU — prefill-only `detect_ad` (argmax YES/NO logits) + prefill-only `query_image` (first-token class logit) |
 | `src/vlm_worker.py` | Process-based VLM with hard timeout, warmup, and keepalive |
 | `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
 | `src/health.py` | Unified health monitor for all subsystems |
@@ -188,7 +188,7 @@ sudo systemctl start minus
 ```bash
 # Paths (override defaults for different installations)
 MINUS_USTREAMER_PATH=/path/to/ustreamer     # Default: /home/radxa/ustreamer-patched
-MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4
+MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2
 MINUS_OCR_MODEL_DIR=/path/to/ocr/models     # Default: /home/radxa/rknn-llm/.../paddleocr
 
 # Timing thresholds
@@ -657,11 +657,11 @@ pip3 install --break-system-packages \
 **Note:** The `rknnlite` package is provided by Rockchip and may need to be installed from their SDK or a custom repository. On the Radxa board with NPU support, it may already be pre-installed.
 
 **Axera NPU (for VLM):**
-The FastVLM-0.5B iter4 model runs on the Axera LLM 8850 NPU. Required Python packages:
+The LFM2.5-VL-450M model runs on the Axera LLM 8850 NPU. Required Python packages:
 ```bash
-pip3 install --break-system-packages axengine transformers ml_dtypes
+pip3 install --break-system-packages axengine
 ```
-The `axengine` package requires the Axera AXCL runtime to be installed - see the Axera documentation.
+The `axengine` package requires the Axera AXCL runtime to be installed - see the Axera documentation. LFM2.5-VL does **not** need `transformers` or `ml_dtypes` (it uses `PreTrainedTokenizerFast` direct from `tokenizer.json` and FP32 throughout) — those were FastVLM-era dependencies.
 
 ## Troubleshooting
 
@@ -673,8 +673,8 @@ pkill -9 ustreamer    # Kill orphaned ustreamer
 
 **VLM not loading:**
 - Check Axera card: `axcl_smi`
-- Verify model files exist in `/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4/`
-- Ensure Python dependencies: `pip3 show axengine transformers ml_dtypes`
+- Verify model files exist in `/home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/`
+- Ensure Python dependencies: `pip3 show axengine`
 
 **OCR not detecting:**
 - Test snapshot: `curl http://localhost:9090/snapshot -o test.jpg`
@@ -1466,8 +1466,9 @@ python3 tests/test_modules.py                  # 300+ unit tests
 python3 tests/test_autonomous_mode.py          # Autonomous mode tests
 python3 tests/test_recent_features.py          # Recent feature tests
 python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
-python3 tests/test_vlm_iter4_parity.py         # iter4 logit parity vs 800-img holdout (needs NPU; --full)
-python3 tests/test_vlm_decision_sim.py         # Monte-Carlo sliding-window eval (--sweep to retune; no NPU)
+python3 tests/test_vlm_decision_sim_lfm2.py    # Monte-Carlo sliding-window eval (LFM2.5-VL; --sweep to retune; no NPU)
+python3 tests/test_vlm_iter4_parity.py         # HISTORICAL: iter4 logit parity vs 800-img holdout — kept for reference, iter4 model no longer shipped
+python3 tests/test_vlm_decision_sim.py         # HISTORICAL: iter4-bootstrapped sim, superseded by test_vlm_decision_sim_lfm2.py
 python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
 python3 tests/test_ir_transmitter.py           # IR transmitter unit tests (mocked sysfs)
 python3 tests/test_ir_ui.py                    # Playwright UI tests for IR remote panel

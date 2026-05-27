@@ -897,10 +897,11 @@ class TestFireTV:
 # ============================================================================
 
 class TestVLM:
-    """Tests for vlm.py - FastVLM-1.5B implementation"""
+    """Tests for vlm.py - LFM2.5-VL implementation"""
 
     def test_vlm_imports(self):
         """Test that vlm module imports correctly."""
+        # FASTVLM_MODEL_DIR is a back-compat alias for LFM_MODEL_DIR.
         from vlm import VLMManager, FASTVLM_MODEL_DIR
         assert VLMManager is not None
         assert FASTVLM_MODEL_DIR is not None
@@ -910,7 +911,7 @@ class TestVLM:
         from vlm import VLMManager
         manager = VLMManager()
         assert manager.is_ready is False
-        # FastVLM uses Python axengine, no process attribute
+        # LFM2.5-VL uses Python axengine, no separate process attribute
         assert hasattr(manager, 'is_ready')
         assert hasattr(manager, '_lock')
 

@@ -152,39 +152,36 @@ class VLMProcess:
     If inference takes longer than timeout, the process is KILLED and restarted.
     """
 
-    # Timeouts retuned for the FastVLM-0.5B iter4 logit path. detect_ad is
-    # now PREFILL-ONLY with a fixed-length prompt (no autoregressive decode),
-    # so its compute is deterministic: ~0.33s mean / ~0.36s p95 measured over
-    # the full 800-image holdout, hard-bounded ~0.5s. The old 1.5B values
-    # (SOFT=1.5/HARD=5.0/P95=3.0) were sized for decode-based inference whose
-    # token count — and thus latency — varied 0.7s..15s (the descriptive-
-    # paragraph pathology in docs/VLM_NPU_DEGRADATION.md). That pathology
-    # CANNOT occur without a decode loop, so anything past these bounds now
-    # means a genuinely stuck NPU, which we want to catch and recover faster.
-    # These are SHARED by detect_ad and query_image (same worker). The
-    # floor is set by query_image, not detect_ad:
-    #   detect_ad   : prefill-only, measured p50 0.31s / p95 0.33s /
-    #                 max 0.33s, 0 events >1s over a full day.
-    #   query_image : decode-based (autonomous mode), measured typical
-    #                 1.3s, max 1.5s with max_new_tokens=8.
-    # SOFT_TIMEOUT stays 1.5 — query_image legitimately reaches ~1.5s, so
-    # a lower soft timeout would spuriously time out autonomous-mode
-    # screen queries and (3 in a row) trigger a hard worker kill + ~15s
-    # model reload. HARD_TIMEOUT lowered 3.0 -> 2.0: still 0.5s above
-    # query_image's observed max and ~6x detect_ad's, so zero false-kill
-    # risk, but a genuinely stuck NPU is now reaped 1s sooner. Going below
-    # 2.0 would require per-request-type timeouts (detect_ad could take
-    # ~1.0s); not worth the complexity while detect_ad is this stable.
+    # Timeouts sized for the LFM2.5-VL fused-prefill path. Both detect_ad
+    # AND query_image are PREFILL-ONLY (no autoregressive decode loop):
+    # detect_ad uses argmax over YES/NO last-token logits, query_image
+    # picks the highest-logit class over PLAYING/PAUSED/DIALOG/MENU/
+    # SCREENSAVER first-tokens. Compute is deterministic ~0.37s for both.
+    #
+    # Historical context: the previous FastVLM-1.5B path was decode-based
+    # and could spend 0.7s..15s on a single inference (the descriptive-
+    # paragraph pathology in docs/VLM_NPU_DEGRADATION.md), which forced
+    # SOFT=1.5 / HARD=5.0 / P95=3.0. That pathology CANNOT occur without
+    # a decode loop, so anything past the current bounds means a
+    # genuinely stuck NPU which we want to reap faster.
+    #
+    # Measured on LFM2.5-VL:
+    #   detect_ad   : p50 0.31s / p95 0.33s / max 0.33s, 0 events >1s/day
+    #   query_image : p50 0.39s / p95 0.41s — same prefill loop, just
+    #                 different last-token logit lookups
+    # SOFT_TIMEOUT=1.5 leaves >3x headroom over both paths; HARD_TIMEOUT=
+    # 2.0 still ~5x p95 so zero false-kill risk, but a genuinely stuck
+    # NPU is reaped 3s sooner than the old 5.0.
     SOFT_TIMEOUT = 1.5   # Return "timeout" after this, but don't kill
     HARD_TIMEOUT = 2.0   # Only kill if inference takes longer than this
     RESTART_THRESHOLD = 3  # Restart after this many consecutive soft timeouts
 
-    # Latency-based auto-recovery (defense-in-depth). With the prefill-only
-    # detect_ad path the NPU-drift-to-15s pathology can no longer arise, so
-    # this should never fire in normal operation; it now only guards against
-    # a genuinely hung NPU. Trigger lowered 3.0 -> 2.0 since healthy P95 is
-    # ~0.36s (detect_ad) / ~1.5s (query_image) — 2.0s is unreachable without
-    # a real hang, so faster recovery carries no false-restart risk.
+    # Latency-based auto-recovery (defense-in-depth). With LFM2.5-VL's
+    # prefill-only paths the NPU-drift-to-15s pathology can no longer
+    # arise, so this should never fire in normal operation; it only
+    # guards a genuinely hung NPU. Trigger 2.0s is unreachable without a
+    # real hang at healthy P95 ~0.4s, so faster recovery carries no
+    # false-restart risk.
     LATENCY_WINDOW = 10          # Rolling sample size for trend detection
     LATENCY_P95_TRIGGER = 2.0    # P95 latency (s) that triggers auto-recovery
     RECOVERY_COOLDOWN = 60.0     # Min seconds between auto-recoveries
