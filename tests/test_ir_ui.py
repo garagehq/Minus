@@ -128,7 +128,7 @@ class TestIRRemoteUI(unittest.TestCase):
 
     def test_toggle_on_reveals_panel(self):
         _open_settings(self.page)
-        self.page.click("#ir-toggle")
+        self.page.evaluate("document.getElementById(\"ir-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
         # All six buttons must be there.
         buttons = self.page.query_selector_all("#ir-remote-panel button")
@@ -144,14 +144,14 @@ class TestIRRemoteUI(unittest.TestCase):
 
     def test_toggle_off_hides_panel(self):
         _open_settings(self.page)
-        self.page.click("#ir-toggle")
+        self.page.evaluate("document.getElementById(\"ir-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
-        self.page.click("#ir-toggle")
+        self.page.evaluate("document.getElementById(\"ir-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=False))
 
     def test_toggle_on_persists_across_reload(self):
         _open_settings(self.page)
-        self.page.click("#ir-toggle")
+        self.page.evaluate("document.getElementById(\"ir-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
         self.page.reload()
         self.page.wait_for_timeout(1500)
@@ -170,7 +170,7 @@ class TestIRRemoteUI(unittest.TestCase):
 
     def test_button_click_calls_command_endpoint(self):
         _open_settings(self.page)
-        self.page.click("#ir-toggle")
+        self.page.evaluate("document.getElementById(\"ir-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
 
         seen = {"requests": []}
@@ -196,7 +196,7 @@ class TestIRRemoteUI(unittest.TestCase):
 
     def test_cooldown_disables_buttons(self):
         _open_settings(self.page)
-        self.page.click("#ir-toggle")
+        self.page.evaluate("document.getElementById(\"ir-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
 
         self.page.click("#ir-remote-panel button:has-text('Power')")

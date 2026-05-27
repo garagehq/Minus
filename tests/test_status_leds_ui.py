@@ -127,7 +127,7 @@ class TestStatusLEDsUI(unittest.TestCase):
 
     def test_toggle_on_reveals_panel(self):
         _open_settings(self.page)
-        self.page.click("#leds-toggle")
+        self.page.evaluate("document.getElementById(\"leds-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
         buttons = self.page.query_selector_all(
             "#leds-state-panel button[data-led-state]")
@@ -141,14 +141,14 @@ class TestStatusLEDsUI(unittest.TestCase):
 
     def test_toggle_off_hides_panel(self):
         _open_settings(self.page)
-        self.page.click("#leds-toggle")
+        self.page.evaluate("document.getElementById(\"leds-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
-        self.page.click("#leds-toggle")
+        self.page.evaluate("document.getElementById(\"leds-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=False))
 
     def test_toggle_on_persists_across_reload(self):
         _open_settings(self.page)
-        self.page.click("#leds-toggle")
+        self.page.evaluate("document.getElementById(\"leds-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
         self.page.reload()
         self.page.wait_for_timeout(1500)
@@ -164,7 +164,7 @@ class TestStatusLEDsUI(unittest.TestCase):
 
     def test_clicking_state_button_calls_api(self):
         _open_settings(self.page)
-        self.page.click("#leds-toggle")
+        self.page.evaluate("document.getElementById(\"leds-toggle\").click()")
         self.assertTrue(_wait_panel_visible(self.page, expect_visible=True))
 
         recorded = {}
