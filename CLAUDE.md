@@ -123,7 +123,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `stop.sh` | Graceful shutdown script |
 | `minus.service` | systemd service file |
 | `screenshots/ads/` | OCR-detected ads (for training) |
-| `screenshots/non_ads/` | User paused = false positives (for training) |
+| `screenshots/non_ads/` | User paused = false positives (for training). For VLM-only blocks, the saved frame is the *VLM-triggering frame* (cached on each `is_ad=True` verdict) rather than the current frame at pause time. |
 | `screenshots/vlm_spastic/` | VLM uncertainty cases (for analysis) |
 | `screenshots/static/` | Static screen suppression (still frames) |
 
@@ -857,7 +857,7 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 
 **Key API Routes:**
 - `GET /`, `/api/status`, `/api/detections`, `/api/logs`
-- `POST /api/pause/N`, `/api/resume`
+- `POST /api/pause/N`, `/api/resume` — pause/resume all blocking. **Special case for VLM-only blocks**: a pause issued while `blocking_source == "vlm"` is treated as a VLM-misclassification signal (the user is saying "this isn't an ad") and triggers two additional actions: (a) the VLM-triggering frame (the last `is_ad=True` frame cached by the dispatch loop) is saved to `screenshots/non_ads/` as training data, (b) VLM inference is paused for **5 min** (`VLM_FALSE_POSITIVE_COOLDOWN`) independently of the general pause timer — so even if the user clicks Resume early, VLM stays cold until the cooldown expires. OCR keeps running. `/api/status` exposes `vlm_user_paused` + `vlm_user_pause_remaining`. Scope is strict: `"ocr"` and `"both"` blocks fall through to the standard "save current frame, no VLM cooldown" path.
 - `GET/POST /api/preview/*`, `/api/debug-overlay/*` (the debug-overlay route is the unified *Debug* toggle: header + bottom-left stats + top-right OCR snippet, persisted to `~/.minus_system_settings.json` as `debug_overlay`)
 - `POST /api/test/trigger-block`, `/api/test/stop-block`
 - `GET /stream`, `/snapshot` - Proxy to ustreamer
@@ -923,9 +923,22 @@ Minus automatically collects training data for future VLM improvements, organize
 
 **Screenshot directories:**
 - `screenshots/ads/` - OCR-detected ads
-- `screenshots/non_ads/` - User paused = false positives
+- `screenshots/non_ads/` - User paused = false positives. **VLM-only blocks** save the *VLM-triggering frame* (the last `is_ad=True` frame cached by the dispatch loop), not the current frame at pause time — see *User-Pause Feedback Loop for VLM Misclassifications* below. OCR-only and OCR+VLM-both blocks save the current frame (unchanged behaviour).
 - `screenshots/vlm_spastic/` - VLM uncertainty cases (detected 2-5x then changed)
 - `screenshots/static/` - Static screen suppression
+
+**User-Pause Feedback Loop for VLM Misclassifications:**
+
+When the user pauses ad blocking *during a VLM-only block* (`blocking_source == "vlm"`), Minus reads that as an explicit "this isn't actually an ad" signal and reacts with two coordinated actions:
+
+1. **Save the trigger frame as training data.** The VLM dispatch loop caches the most recent frame that produced an `is_ad=True` verdict (`last_vlm_ad_frame`, cleared when a block ends). On pause-during-VLM-block, that cached frame goes to `screenshots/non_ads/`. The current frame is *not* used because by the time the user clicks pause the underlying video may have advanced past the misclassified moment — the trigger frame is what VLM actually got wrong.
+2. **5-min VLM cooldown** (`VLM_FALSE_POSITIVE_COOLDOWN = 300s`). The VLM dispatch loop skips inference entirely while paused, so the same misclassified content can't immediately re-trigger if the user clicks Resume before the cooldown expires. OCR keeps running normally — the cooldown is VLM-only. The general blocking-paused timer is independent of this and uses the duration the user picked (1/2/5/10 min).
+
+Scope is strict: only `blocking_source == "vlm"` triggers the feedback path. `"ocr"` (OCR detected alone) and `"both"` (OCR + VLM agreed) fall through to the existing "save current frame, no VLM cooldown" behaviour — those aren't VLM-alone misclassifications. Window is the entire block: works at any point from start to end of a VLM-only block.
+
+Falls back to the current frame if no VLM-AD frame was cached (defensive — would require a block to fire without any `is_ad=True` verdict in the dispatch loop, which shouldn't happen in practice but is logged at WARN if it does).
+
+`/api/status` exposes `vlm_user_paused` and `vlm_user_pause_remaining` so the UI can surface the cooldown state. See `tests/test_recent_features.py::TestVLMFalsePositiveFeedback` for the 9 unit tests covering trigger-frame save, cooldown duration, VLM state clearing, source-scope guards, accessor edge cases, and the missing-frame fallback.
 
 **Screenshot Quality Filtering (all categories):**
 
