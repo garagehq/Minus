@@ -338,6 +338,28 @@ class Minus:
         self.vlm_consecutive_ad_count = 0
         self.vlm_no_ad_count = 0
 
+        # VLM false-positive feedback loop.
+        # When the user pauses during a VLM-only block (blocking_source ==
+        # "vlm"), that's an explicit signal that VLM misclassified the
+        # frame — they're saying "this is not actually an ad". Two
+        # responses: (1) save the VLM-triggering frame to screenshots/
+        # non_ads/ as training data so a future retrain has the example;
+        # (2) put VLM contribution to blocking on a 5-min cooldown so the
+        # same misclassified content doesn't immediately re-trigger if
+        # the user resumes early. Only applies when blocking_source is
+        # exactly "vlm" — if OCR also confirmed (source "both"), the
+        # block wasn't a VLM-alone misclassification and we use the
+        # existing pause behaviour. OCR-only blocks (source "ocr") are
+        # also unaffected.
+        self.vlm_paused_until = 0.0
+        self.VLM_FALSE_POSITIVE_COOLDOWN = 300.0  # 5 minutes
+        # The frame that most-recently caused a VLM AD verdict. Updated
+        # in the VLM dispatch loop every time `detect_ad` returns True,
+        # cleared when a block ends. This is the frame we save as non_ad
+        # when the user signals misclassification.
+        self.last_vlm_ad_frame = None
+        self.last_vlm_ad_frame_time = 0.0
+
         # VLM stability system - sliding window approach to prevent waffling
         # Re-retuned for LFM2.5-VL-450M-ft-v2-fused-v2 (May 2026). LFM2 has
         # structurally tighter per-frame separation than FastVLM iter4:
@@ -1572,14 +1594,33 @@ class Minus:
     # ===== Web UI Methods =====
 
     def pause_blocking(self, duration_seconds: int = 120):
-        """Pause ad blocking for specified duration."""
+        """Pause ad blocking for specified duration.
+
+        Special case — user paused during a VLM-only block: routes to
+        `_handle_vlm_false_positive_feedback` which (a) saves the
+        VLM-triggering frame (not the current frame) as non_ad training
+        data and (b) sets a 5-min VLM-specific cooldown. See the
+        VLM_FALSE_POSITIVE_COOLDOWN block in __init__.
+        """
+        # Snapshot whether this is a VLM-only block BEFORE clearing state.
+        # Use the active blocking_source — if OCR is also confirming
+        # ("both"), the block isn't a VLM-alone misclassification, so the
+        # standard pause-and-save-current-frame behaviour applies.
+        was_vlm_only_block = (
+            self.ad_detected and self.blocking_source == "vlm"
+        )
+
         with self._state_lock:
             self.blocking_paused_until = time.time() + duration_seconds
             logger.info(f"[WebUI] Blocking paused for {duration_seconds}s")
 
-        # Capture non-ad screenshot for future VLM training
-        # This helps collect examples of content that should NOT be classified as ads
-        if self.frame_capture:
+        if was_vlm_only_block:
+            # VLM-misclassification path: save the trigger frame + start
+            # 5-min VLM cooldown.
+            self._handle_vlm_false_positive_feedback()
+        elif self.frame_capture:
+            # Default path: save the current frame as non_ad training data
+            # (this is what the user is looking at and signalling "not an ad").
             frame = self.frame_capture.capture()
             self.screenshot_manager.save_non_ad_screenshot(frame)
 
@@ -1592,6 +1633,79 @@ class Minus:
         # ad_blocker.hide() will have set state=idle; override with paused
         # so the LED visually distinguishes "user-paused" from "running clean".
         self._set_led_state('paused')
+
+    def _handle_vlm_false_positive_feedback(self):
+        """User paused during a VLM-only block — treat as explicit
+        misclassification feedback.
+
+        Two actions:
+          1. Save the frame that most-recently caused VLM to verdict AD
+             (cached in `last_vlm_ad_frame` by the VLM dispatch loop) to
+             screenshots/non_ads/. This becomes training data showing
+             content that should NOT be classified as an ad.
+          2. Set `vlm_paused_until = now + VLM_FALSE_POSITIVE_COOLDOWN`
+             (5 min). The VLM dispatch loop skips inference entirely while
+             paused, so the same misclassified content can't immediately
+             re-trigger if the user resumes blocking before the cooldown
+             expires. OCR keeps running normally.
+
+        Falls back to the current frame if no VLM-AD frame was cached
+        (vanishingly rare — would mean the block fired without any
+        is_ad=True VLM verdict, which shouldn't happen).
+        """
+        now = time.time()
+        cooldown_seconds = self.VLM_FALSE_POSITIVE_COOLDOWN
+
+        with self._state_lock:
+            self.vlm_paused_until = now + cooldown_seconds
+            # Clear VLM state so a fresh evaluation happens after cooldown
+            self.vlm_ad_detected = False
+            self.vlm_decision_history.clear()
+            self.vlm_no_ad_count = 0
+            # Snapshot the frame we'll save (under the lock so the
+            # dispatch loop can't overwrite it mid-read).
+            frame_to_save = self.last_vlm_ad_frame
+            # frame_age is only meaningful if we actually have a timestamp.
+            # Tests can seed `last_vlm_ad_frame` without setting the time,
+            # which would produce a bogus 56-year "age" in the log line.
+            frame_age = (
+                now - self.last_vlm_ad_frame_time
+                if frame_to_save is not None and self.last_vlm_ad_frame_time > 0
+                else None
+            )
+
+        logger.warning(
+            f"[Feedback] User paused during VLM-only block — treating "
+            f"as misclassification. VLM blocking paused for "
+            f"{cooldown_seconds:.0f}s ({cooldown_seconds/60:.0f} min)."
+        )
+
+        if frame_to_save is not None:
+            self.screenshot_manager.save_non_ad_screenshot(frame_to_save)
+            age_str = f"{frame_age:.1f}s" if frame_age is not None else "unknown age"
+            logger.info(
+                f"[Feedback] Saved VLM-triggering frame as non_ad "
+                f"(frame was {age_str} at pause time)"
+            )
+        elif self.frame_capture:
+            # Fallback: no cached frame, use current. Shouldn't normally
+            # happen — log it so we notice if it does.
+            logger.warning(
+                "[Feedback] No cached VLM-trigger frame — falling back "
+                "to current frame for non_ad training capture"
+            )
+            frame = self.frame_capture.capture()
+            if frame is not None:
+                self.screenshot_manager.save_non_ad_screenshot(frame)
+
+    def is_vlm_user_paused(self) -> bool:
+        """True if VLM inference is on a user-feedback cooldown."""
+        return time.time() < self.vlm_paused_until
+
+    def get_vlm_pause_remaining(self) -> int:
+        """Seconds remaining in the VLM user-feedback cooldown."""
+        remaining = self.vlm_paused_until - time.time()
+        return max(0, int(remaining))
 
     def resume_blocking(self):
         """Resume ad blocking immediately."""
@@ -1697,6 +1811,8 @@ class Minus:
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
+            'vlm_user_paused': self.is_vlm_user_paused(),
+            'vlm_user_pause_remaining': self.get_vlm_pause_remaining(),
             'hdmi_reconnect_grace': self.is_in_hdmi_reconnect_grace(),
             'hdmi_reconnect_grace_remaining': self.get_hdmi_reconnect_grace_remaining(),
             'static_suppressed': self.static_blocking_suppressed,
@@ -2761,6 +2877,11 @@ class Minus:
                     # Also clear VLM state so it doesn't immediately re-trigger
                     self.vlm_ad_detected = False
                     self.vlm_decision_history.clear()
+                    # Clear cached VLM-trigger frame: a pause AFTER the block
+                    # ends is not "during a VLM ad block" — don't act on a
+                    # stale frame from a block that already cleared cleanly.
+                    self.last_vlm_ad_frame = None
+                    self.last_vlm_ad_frame_time = 0.0
                     # Track when blocking ended (for accidental pause detection)
                     self.blocking_end_time = time.time()
                     # Reset skip state for next ad
@@ -3314,6 +3435,23 @@ class Minus:
                     time.sleep(1.0)
                     continue
 
+                # VLM false-positive cooldown: user paused during a
+                # VLM-only block recently → don't run VLM inference at
+                # all for 5 min. Stops repeat-trigger on the same misclassified
+                # content even if it stays on screen. OCR keeps running.
+                if self.is_vlm_user_paused():
+                    # vlm_frame_count doesn't increment in this branch, so
+                    # gate the log on wall-clock time instead.
+                    now = time.time()
+                    if (now - getattr(self, '_vlm_pause_last_log', 0)) >= 30:
+                        self._vlm_pause_last_log = now
+                        logger.info(
+                            f"VLM: skipping inference — user-feedback "
+                            f"cooldown ({self.vlm_paused_until - now:.0f}s "
+                            f"remaining)")
+                    time.sleep(1.0)
+                    continue
+
                 start_time = time.time()
                 frame = self.frame_capture.capture()
 
@@ -3361,6 +3499,16 @@ class Minus:
                 # Add decision to sliding window history with confidence
                 now = time.time()
                 self._add_vlm_decision(is_ad, confidence)
+
+                # Cache the most-recent VLM-AD-verdict frame for user
+                # feedback (see VLM_FALSE_POSITIVE_COOLDOWN block in
+                # __init__). If the user later pauses during a VLM-only
+                # block, this is the frame we save to non_ads/ as the
+                # misclassification example.
+                if is_ad:
+                    with self._state_lock:
+                        self.last_vlm_ad_frame = frame.copy()
+                        self.last_vlm_ad_frame_time = now
 
                 # Track state changes for waffle detection and logging
                 current_state = 'ad' if is_ad else 'no-ad'
