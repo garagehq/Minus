@@ -108,6 +108,7 @@ class WebUI:
 
         # Screenshot review state
         self._reviewed = set()
+        self._reviewed_lock = threading.Lock()
         self._undo_stack = []  # [{action, filename, source, target}]
         self._load_reviewed()
 
@@ -2454,7 +2455,7 @@ class WebUI:
         def api_vlm_enable():
             """Enable VLM and load the model to the Axera NPU.
 
-            This loads the FastVLM-1.5B model which takes ~13 seconds.
+            This loads the LFM2.5-VL-450M model which takes ~9-11 seconds.
             An overlay notification will show loading progress.
             """
             try:
@@ -3110,10 +3111,18 @@ class WebUI:
             self._reviewed = set()
 
     def _save_reviewed(self):
-        """Save reviewed screenshots set to disk."""
+        """Save reviewed screenshots set to disk (atomic, thread-safe).
+
+        Holds a lock across the full snapshot+write+rename so concurrent
+        review requests can't race on the JSON file. Atomic rename via a
+        tmp file prevents readers from ever seeing a partial write.
+        """
         try:
-            with open(REVIEWED_FILE, 'w') as f:
-                json.dump(sorted(self._reviewed), f)
+            with self._reviewed_lock:
+                tmp = REVIEWED_FILE.with_suffix('.tmp')
+                with open(tmp, 'w') as f:
+                    json.dump(sorted(self._reviewed), f)
+                tmp.replace(REVIEWED_FILE)
         except Exception as e:
             logger.warning(f"[WebUI] Could not save reviewed screenshots: {e}")
 

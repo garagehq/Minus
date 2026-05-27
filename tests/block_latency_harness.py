@@ -50,11 +50,14 @@ PARAMS = {
     # OCR
     'OCR_INTERVAL_S': 0.5,         # how often the OCR worker is invoked
     'OCR_STOP_THRESHOLD': 2,       # tuned: was 4. consecutive no-ad cycles to clear
-    # VLM
-    'VLM_INTERVAL_S': 2.0,         # how often a frame is dispatched to VLM
-    'vlm_history_window': 45.0,
-    'vlm_min_decisions': 4,
-    'vlm_start_agreement': 0.90,
+    # VLM — retuned for FastVLM-0.5B iter4 (validated in
+    # tests/harness_iter4_retune_ab.py: VLM-only detect 6.11s->2.11s,
+    # 0 false-pos, 0 phantom re-blocks). iter4 inference is ~0.33s vs the
+    # 1.5B's ~1s, so the production VLM loop's real cadence is ~1s, not ~2s.
+    'VLM_INTERVAL_S': 1.0,         # was 2.0 — models iter4 real loop cadence
+    'vlm_history_window': 8.0,     # was 45.0 — kills stale-content-vote dilution
+    'vlm_min_decisions': 3,        # LFM2 retune 5→3 — LFM2's ~4× lower per-frame FP rate vs iter4 makes the iter4-era hardening unnecessary
+    'vlm_start_agreement': 0.70,   # LFM2 retune 0.80→0.70 (+0.10 hyst = 0.80 eff). See minus.py comment block for math.
     'vlm_stop_agreement': 0.75,
     'vlm_hysteresis_boost': 0.10,
     'vlm_start_threshold_cap': 0.95,

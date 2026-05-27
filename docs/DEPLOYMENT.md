@@ -79,14 +79,14 @@ cp ustreamer /home/radxa/ustreamer-patched
 
 ### 5. Install VLM Models (Optional)
 
-For ad detection using FastVLM-1.5B on Axera NPU:
+For ad detection using LFM2.5-VL-450M on Axera NPU:
 
 ```bash
 # Install Axera runtime
-pip3 install --break-system-packages axengine transformers ml_dtypes
+pip3 install --break-system-packages axengine
 
 # Copy model files to expected location
-# Models should be at: /home/radxa/axera_models/FastVLM-1.5B/
+# Models should be at: /home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/
 ```
 
 ---
@@ -100,7 +100,7 @@ All configuration can be done via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MINUS_USTREAMER_PATH` | `/home/radxa/ustreamer-patched` | Path to ustreamer binary |
-| `MINUS_VLM_MODEL_DIR` | `/home/radxa/axera_models/FastVLM-1.5B` | VLM model directory |
+| `MINUS_VLM_MODEL_DIR` | `/home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2` | VLM model directory |
 | `MINUS_OCR_MODEL_DIR` | `/home/radxa/rknn-llm/.../paddleocr` | OCR model directory |
 | `MINUS_ANIMATION_START` | `0.3` | Blocking animation duration (seconds) |
 | `MINUS_ANIMATION_END` | `0.25` | Unblocking animation duration (seconds) |
@@ -254,8 +254,8 @@ sudo systemctl restart minus
 ### VLM Not Working
 
 1. Check Axera card: `axcl_smi`
-2. Check model files: `ls /home/radxa/axera_models/FastVLM-1.5B/`
-3. Check dependencies: `pip3 show axengine transformers ml_dtypes`
+2. Check model files: `ls /home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/`
+3. Check dependencies: `pip3 show axengine`
 
 ### Audio Issues
 

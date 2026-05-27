@@ -11,6 +11,7 @@ Device-agnostic design supports any streaming device with remote control capabil
 import json
 import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -185,6 +186,14 @@ class AutonomousMode:
         self._STUCK_THRESHOLD = 3                      # After N stuck detections, reset with Home
         self._last_action_time: Optional[float] = None # Track when we last took an action
         self._ACTION_TIMEOUT = 45.0                    # If no progress in N seconds, consider stuck
+
+        # Consecutive MENU verdicts vetoed by _is_video_player_overlay().
+        # Reset when any other action runs or the overlay disappears.
+        # Escalation: 3 vetoes -> single 'back' press to dismiss overlay,
+        # 6 vetoes -> full YouTube relaunch.
+        self._overlay_veto_count: int = 0
+        self._OVERLAY_VETO_BACK_AT = 3
+        self._OVERLAY_VETO_RESET_AT = 6
 
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
@@ -603,16 +612,20 @@ class AutonomousMode:
         app_lower = app_name.lower()
         return any(pkg in app_lower for pkg in YOUTUBE_PACKAGES)
 
-    # VLM prompt that returns a structured, single-word answer for reliable parsing
+    # VLM prompt for screen-state classification. The LFM2.5-VL model
+    # in `vlm.py` has a fixed 320-token prefill window, and after the
+    # chat template + 256 image tokens there is only ~40 tokens of
+    # headroom for the user question. The previous, longer phrasing
+    # tokenised to 326 (over by 6) and silently truncated the
+    # [IM_START] assistant\n suffix → garbage logits.
+    # `vlm.py.query_image` runs prefill-only and picks the class whose
+    # first-token logit is highest (max over no-leading-space and
+    # leading-space spellings); there is no autoregressive decode, so
+    # only the FIRST emitted token's logits matter. The prompt prefix
+    # "Classify this TV screen" is also used by query_image to reuse a
+    # cached token-id sequence — keep that prefix intact when editing.
     SCREEN_QUERY_PROMPT = (
-        "Look at this TV screen and classify it into exactly one category. "
-        "Answer with ONLY one of these words:\n"
-        "PLAYING - a video is actively playing\n"
-        "PAUSED - a video is paused (play bar visible, frozen frame)\n"
-        "DIALOG - a popup or dialog is showing (like 'Are you still watching?')\n"
-        "MENU - a home screen, browse screen, or video selection menu\n"
-        "SCREENSAVER - a screensaver or blank/black screen\n"
-        "Answer with one word only."
+        "Classify this TV screen: PLAYING, PAUSED, DIALOG, MENU, or SCREENSAVER?"
     )
 
     def _query_screen(self) -> Optional[str]:
@@ -902,6 +915,32 @@ class AutonomousMode:
         'add your google',   # Google account addition
     ]
 
+    # Keywords that indicate the YouTube VIDEO PLAYER overlay is visible
+    # (the floating UI that appears over a *playing* video — Description /
+    # Subscribe / cc / Up next / "Sign in" CTA, alongside time markers like
+    # "0:42 | 0:12"). VLM misclassifies these frames as MENU because the
+    # overlay buttons look like a menu, but the underlying video is actually
+    # PLAYING and the overlay auto-dismisses in a few seconds.
+    #
+    # If we treat this as a MENU and send `down + select`, focus walks
+    # through the overlay buttons and reliably lands on "Sign in" — which
+    # opens the Google sign-in flow (keyboard / QR code / yt.be/activate),
+    # an unrecoverable trap for autonomous mode. Observed live on minus-2
+    # 2026-05-23: OCR text "Sign in | Description | cc | Subscribe | 0:42 |
+    # 0:12 | ... 875K views · 3d ago" → MENU verdict → down+select → sign-in
+    # flow → ~2 min before stuck-detection escapes.
+    #
+    # Veto signature: at least TWO of these terms present in OCR text.
+    # Single-term match (e.g. just "subscribe") is too weak — YouTube
+    # Shorts and other states show it alone.
+    VIDEO_PLAYER_OVERLAY_KEYWORDS = [
+        'description',       # Player overlay "Description" button
+        'up next',           # Right-side "Up next" panel header
+        'upnext',            # OCR-merged variant
+        'autoplay',          # Autoplay toggle in player overlay
+        'cc',                # Closed-captions toggle (very short — see check)
+    ]
+
     # Keywords that indicate YouTube home/browse screen (need to select a video)
     # NOTE: "subscribe" and "description" removed - they appear on paused videos too
     HOME_SCREEN_KEYWORDS = [
@@ -1006,6 +1045,65 @@ class AutonomousMode:
 
         except Exception as e:
             logger.debug(f"[AutonomousMode] Home screen check failed: {e}")
+            return False
+
+    def _is_video_player_overlay(self) -> bool:
+        """Detect that the YouTube video player overlay is visible on a
+        *playing* video — the floating UI with Description / Subscribe / cc /
+        Up next, plus a time marker like "0:42 | 0:12".
+
+        This veto exists because VLM classifies these frames as MENU and the
+        downstream `down + select` MENU action navigates the overlay UI and
+        lands on "Sign in", trapping autonomous mode in the Google sign-in
+        flow. See VIDEO_PLAYER_OVERLAY_KEYWORDS comment block for the live
+        incident that prompted this.
+
+        Signature requires BOTH:
+          - at least one overlay-specific keyword (description / up next /
+            autoplay / cc-as-whole-token)
+          - a time marker like "0:42" or "10:23" (current-time / duration
+            display — never present on a static menu or home screen)
+
+        Requiring both prevents false positives from the home page (which
+        also has "subscribe" sometimes), Shorts, and other UI states.
+        """
+        try:
+            if not self._ad_blocker or not hasattr(self._ad_blocker, 'last_ocr_texts'):
+                return False
+            texts = self._ad_blocker.last_ocr_texts
+            if not texts:
+                return False
+            combined = ' '.join(str(t) for t in texts).lower()
+
+            # Ad blocker actively blocking — definitely not a benign overlay.
+            if getattr(self._ad_blocker, 'is_visible', False):
+                return False
+
+            # 1) at least one overlay-specific keyword
+            overlay_hits = []
+            for kw in self.VIDEO_PLAYER_OVERLAY_KEYWORDS:
+                if kw == 'cc':
+                    # 'cc' is short and substring-matches in countless words
+                    # (e.g. "accept", "success"). Require whole-token form.
+                    if re.search(r'\bcc\b', combined):
+                        overlay_hits.append('cc')
+                elif kw in combined:
+                    overlay_hits.append(kw)
+            if not overlay_hits:
+                return False
+
+            # 2) time marker like "0:42" or "10:23". \b\d{1,2}:\d{2}\b is
+            # tight enough to avoid OCR garbage (single colons in normal text)
+            # while catching both current-time and duration tokens.
+            if not re.search(r'\b\d{1,2}:\d{2}\b', combined):
+                return False
+
+            logger.info(f"[AutonomousMode] Video player overlay visible "
+                        f"(keywords={overlay_hits}) — vetoing MENU action")
+            return True
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Overlay check failed: {e}")
             return False
 
     def _is_youtube_shorts(self) -> bool:
@@ -1595,11 +1693,45 @@ class AutonomousMode:
             # Taking an action - reset static counter
             self._consecutive_static = 0
 
+            # Snapshot overlay-veto count: any non-veto action resets it
+            # (handled by `self._overlay_veto_count = 0` below). The veto
+            # path itself re-installs prev+1 so consecutive vetoes still
+            # escalate as intended.
+            _prev_overlay_veto = self._overlay_veto_count
+            self._overlay_veto_count = 0
+
+            # ARCHITECTURAL INVARIANT (see "Autonomous Mode VLM-
+            # Misclassification Traps" in CLAUDE.md Known Issues):
+            # any action below that interrupts playback (down+select,
+            # back, play_pause, launch) MUST consult an authoritative
+            # playback signal BEFORE acting. The hierarchy is:
+            #   1. _is_audio_flowing() — HDMI-RX audio is ground truth
+            #      when HDMI-TX is connected.
+            #   2. _is_video_player_overlay() — disambiguates overlay-
+            #      on-video from real menu when audio is unavailable.
+            # VLM verdicts alone are NOT sufficient. The screen-state
+            # classifier (query_image) regularly misclassifies playing
+            # videos with overlay UI as MENU, and paused videos with
+            # overlay as MENU as well. Acting on the verdict alone
+            # produces the three production traps documented in
+            # CLAUDE.md (Sign-in trap, exit-paused-video, audio-blind
+            # interruption). Future actions added below must follow the
+            # same pattern.
             logger.info(f"[AutonomousMode] Action needed: {action} (screen: {screen_desc})")
             self._log_event(f"VLM action: {action}")
 
             if action == "play":
-                # Video is paused - use play_pause (works on all devices)
+                # Video is paused per VLM - send play_pause to resume.
+                # AUDIO GUARD: if HDMI-RX is receiving audio, the video
+                # is genuinely playing and VLM misclassified. Skip.
+                # (Same precedent as _is_screen_static's
+                # PLAYING-static-no-audio branch.)
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] PAUSED verdict vetoed: "
+                                "audio flowing — video is actually playing")
+                    self._log_event("PAUSED vetoed: audio flowing")
+                    self._last_screen_state = 'playing'
+                    return False
                 self._device_controller.send_command("play_pause")
                 logger.info("[AutonomousMode] Sent play_pause command (video was paused)")
 
@@ -1617,7 +1749,52 @@ class AutonomousMode:
                 logger.info("[AutonomousMode] Dismissed dialog with back")
 
             elif action == "select":
-                # On home/menu screen - navigate to a video
+                # On home/menu screen - navigate to a video.
+                # AUDIO GUARD: if HDMI-RX is receiving audio from the
+                # streaming device, the video is genuinely playing. Never
+                # interrupt — VLM misclassified the frame (lo-fi music,
+                # talking-head, slow scene, player overlay during
+                # playback all confuse it). Audio is authoritative when
+                # it's available.
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] MENU vetoed: audio "
+                                "flowing — video is playing")
+                    self._log_event("MENU vetoed: audio flowing")
+                    self._overlay_veto_count = 0
+                    self._last_screen_state = 'playing'
+                    return False
+
+                # No audio + VLM says MENU. Per the user's diagnostic
+                # ("audio not playing and being on Menu is a HUGE clue
+                # we are paused", 2026-05-23): this is most likely a
+                # PAUSED video showing its player overlay. Send
+                # play_pause — universally safe:
+                #   - paused video → resumes (the case we want to handle)
+                #   - playing-but-silent video → pauses (recoverable next
+                #     iteration; vanishingly rare in practice — VLM
+                #     virtually never says MENU on a playing-no-overlay
+                #     video, and a real such case will get re-toggled)
+                #   - real menu → no harm (play_pause does nothing on a
+                #     menu; the next iteration will retry select)
+                # play_pause does NOT navigate UI, so the Sign-in trap
+                # the overlay-veto was built to prevent is structurally
+                # impossible from this action. The overlay-veto `back`
+                # path was removed because `back` EXITS the paused
+                # video on Roku/YouTube TV — the opposite of resume.
+                if self._is_video_player_overlay():
+                    logger.info("[AutonomousMode] MENU + no audio + "
+                                "overlay visible → likely paused; "
+                                "sending play_pause to resume")
+                    self._log_event(
+                        "MENU + overlay (likely paused) → play_pause")
+                    self._overlay_veto_count = 0
+                    self._device_controller.send_command("play_pause")
+                    return True
+
+                # No overlay, no audio: most likely a real menu screen
+                # (home page, settings, etc.). Original down+select path.
+                # No Sign-in trap risk because Sign-in only appears in
+                # the player overlay UI, which we just ruled out.
                 self._device_controller.send_command("down")
                 time.sleep(0.5)
                 self._device_controller.send_command("select")

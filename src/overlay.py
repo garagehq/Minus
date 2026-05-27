@@ -635,7 +635,7 @@ class SystemNotification(NotificationOverlay):
 
     def show_vlm_loading(self):
         """Show VLM loading notification."""
-        text = "[ LOADING VLM ]\n\nFastVLM-1.5B"
+        text = "[ LOADING VLM ]\n\nLFM2.5-VL-450M"
         self.show(text, duration=None)
 
     def show_vlm_ready(self):

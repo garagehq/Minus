@@ -4,7 +4,7 @@
 
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
-- **FastVLM-1.5B** on Axera LLM 8850 NPU (~0.9s per frame, 1.5s soft timeout / 5s hard timeout)
+- **LFM2.5-VL-450M (ft-v2-fused-v2)** on Axera LLM 8850 NPU — **prefill-only on 16 fused decoder layers, ~0.37s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-0.5B iter4 (May 2026): 97.0% holdout accuracy / 99.2% non-ad-recall vs iter4's 94.75% / 95.25%, structurally simpler (no KV cache, no autoregressive decode for `detect_ad` OR autonomous-mode `query_image`, no ml_dtypes bfloat16 ceremony). Both inference paths share one model — no FastVLM dependency anymore. See *FastVLM iter4 → LFM2.5-VL Migration* under Known Issues.
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -48,7 +48,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
      │  ┌───────────┐  │           │  ┌───────────────┐  │
-     │  │ PaddleOCR │  │           │  │ FastVLM-1.5B  │  │
+     │  │ PaddleOCR │  │           │  │ FastVLM-0.5B  │  │
      │  │ RK3588 NPU│  │           │  │ Axera LLM 8850│  │
      │  │ ~400ms    │  │           │  │ ~0.9s         │  │
      │  └───────────┘  │           │  └───────────────┘  │
@@ -81,7 +81,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
 | `src/ocr_worker.py` | Process-based OCR with hard timeout, warmup, and keepalive |
-| `src/vlm.py` | FastVLM-1.5B on Axera NPU (ad detection + custom queries) |
+| `src/vlm.py` | FastVLM-0.5B iter4 on Axera NPU — logit-thresholded `detect_ad` + decode-based `query_image` |
 | `src/vlm_worker.py` | Process-based VLM with hard timeout, warmup, and keepalive |
 | `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
 | `src/health.py` | Unified health monitor for all subsystems |
@@ -106,6 +106,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `test_fire_tv.py` | Fire TV controller test and interactive remote |
 | `ir_transmit.py` | Standalone CLI for the IR transmitter (`sudo python3 ir_transmit.py <button>`) |
 | `tests/test_modules.py` | Comprehensive test suite (300+ tests) |
+| `tools/ad_block_monitor.py` | Log-driven ad-block health monitor (recovery latency, weak-FP / overlong / query-error triage); run periodically/by a recurring agent |
 | `tests/test_autonomous_mode.py` | Autonomous mode unit tests |
 | `tests/test_review_ui.py` | Playwright UI tests for screenshot review |
 | `tests/test_ir_transmitter.py` | Unit tests for IR transmitter (mocked sysfs, 20 tests) |
@@ -187,7 +188,7 @@ sudo systemctl start minus
 ```bash
 # Paths (override defaults for different installations)
 MINUS_USTREAMER_PATH=/path/to/ustreamer     # Default: /home/radxa/ustreamer-patched
-MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-1.5B
+MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4
 MINUS_OCR_MODEL_DIR=/path/to/ocr/models     # Default: /home/radxa/rknn-llm/.../paddleocr
 
 # Timing thresholds
@@ -210,8 +211,8 @@ MINUS_VLM_ALONE_THRESHOLD=5      # Consecutive VLM detections needed to trigger 
 | Audio mute/unmute | **INSTANT** (volume element mute property) |
 | ustreamer MJPEG stream | **~60fps** (MPP hardware encoding at 4K) |
 | OCR latency | **100-200ms** capture + **250-400ms** inference |
-| VLM latency | **~0.9-1.1s per frame** (FastVLM-1.5B, process-based with soft/hard timeout) |
-| VLM model load | **~30s** (includes 4 warmup inferences + keepalive thread) |
+| VLM latency | **~0.37s per frame deterministic** (LFM2.5-VL fused-prefill; vision ~185ms + 16 fused layers ~185ms; no decode) |
+| VLM model load | **~9-11s** (17 axengine sessions + 256MB embeds mmap + 4 warmup inferences + keepalive thread) |
 | Snapshot capture | **~150ms** (4K JPEG download) |
 | OCR image size | 960x540 (downscaled from 4K for speed) |
 | ustreamer quality | 80% JPEG (MPP encoder) |
@@ -349,19 +350,19 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 - Handles common OCR misreads in ad timestamps (see below)
 
 **VLM (Secondary - Anti-Waffle Protected):**
-- Uses sliding window of last 45 seconds of VLM decisions (`vlm_history_window`)
-- Only triggers blocking alone if 90%+ of recent decisions are "ad" (`vlm_start_agreement`)
-- Hysteresis: needs 100% agreement to START (capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever)
-- Minimum 4 decisions in window before VLM can act (`vlm_min_decisions`)
+- Uses sliding window of last **8 seconds** of VLM decisions (`vlm_history_window`). **Why 8s, not 45s:** a long window keeps stale *content* (no-ad) votes that mathematically prevent a VLM-alone ad from ever reaching the start-agreement ratio until they age out — measured VLM-only detect was ~38s with 81% of VLM-only ads missed. 8s collapses that to ~6-7s with ~0 misses and 0 phantom blocks (swept over 1920 param combos × thousands of holdout-bootstrapped scenarios; see *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* and `tests/test_vlm_decision_sim.py`). Stop responsiveness is governed by the consecutive counter, not the window, so shrinking it has no recovery downside.
+- Only triggers blocking alone if **90%+ effective agreement** (`vlm_start_agreement` 80% + `vlm_hysteresis_boost` 10%) — hardened from 80% after real mid-Netflix-show false VLM-only triggers
+- Hysteresis: capped at 95% via `vlm_start_threshold_cap` so a few stragglers can't block forever
+- Minimum **5 decisions** in window before VLM can act (`vlm_min_decisions`; hardened from 3 — ~5s of sustained ad-agreement, not a ~3s transient burst)
 - 8-second cooldown after state changes prevents rapid flip-flopping (`vlm_min_state_duration`)
 - **Sliding window only for starting** - stopping uses simple consecutive count (`VLM_STOP_THRESHOLD=2`)
 
 **Sliding Window Parameters:**
 | Parameter | Value | Purpose |
 |-----------|-------|---------|
-| `vlm_history_window` | 45s | How far back to look at VLM decisions |
-| `vlm_min_decisions` | 4 | Minimum decisions needed before acting |
-| `vlm_start_agreement` | 90% | Agreement threshold to start blocking |
+| `vlm_history_window` | 8s | How far back to look at VLM decisions (was 45s; collapsed for iter4 — see migration note) |
+| `vlm_min_decisions` | 3 | Min decisions before VLM-only acts (4→3→5→**3**; iter4 hardened to 5 vs iter4-era mid-show FPs, LFM2 reverted to 3 because LFM2's ~4× lower per-frame FP rate makes that hardening unnecessary — see *FastVLM iter4 → LFM2.5-VL Migration*) |
+| `vlm_start_agreement` | 70% | VLM-only start agreement (90→80→70→80→**70**; +10% hysteresis = **80% effective**. Same LFM2 retune rationale as `vlm_min_decisions`) |
 | `vlm_hysteresis_boost` | 10% | Extra agreement needed to change state |
 | `vlm_start_threshold_cap` | 95% | Maximum effective start threshold (so hysteresis can't make it unreachable) |
 | `vlm_min_state_duration` | 8s | Cooldown after VLM state change |
@@ -373,6 +374,8 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - Low std deviation across frame → solid color
 - >95% pixels within 20 values of median → uniform/static
 
+**Transition-hold time cap (`_transition_hold_active`, `TRANSITION_HOLD_MAX_SECONDS`=3s, env `MINUS_TRANSITION_HOLD_MAX`):** the hold is only meant to bridge a *brief* (≤~2s) black/solid gap *between* ads. A dark/low-detail lofi music video (very common in autonomous YouTube, e.g. "WYS | Comforting You") reads as "uniform" *indefinitely*, so an uncapped hold froze `ocr_no_ad_count` / `vlm_no_ad_count` and a block never recovered — observed: a 46.9s VLM-source block held ~10s of benign content after the ad ended while VLM was firmly NO-AD. The hold is now capped: after `TRANSITION_HOLD_MAX_SECONDS` of *continuous* transition frames the no-ad counters resume so the block stops. Shared by the OCR and VLM loops; the timer resets on any non-transition or ad frame (so each real inter-ad gap gets a fresh full window). A true >3s black gap (rare) at worst causes a brief flicker — far better than multi-second false holds on uniform content. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
+
 **Starting Blocking:**
 1. OCR detects ad → blocking starts immediately (unless home screen detected)
 2. VLM detects ad (no OCR) → needs 80%+ agreement in sliding window (4+ decisions)
@@ -380,10 +383,12 @@ When blocking is active, black/solid-color frames are detected as transitions be
 4. Home screen detection suppresses both OCR and VLM blocking on streaming interfaces
 
 **Stopping Blocking:**
-1. **If OCR triggered** (source=ocr or both): OCR says stop (4 no-ads) → ends immediately (~2-3s)
-2. **If VLM triggered alone** (source=vlm): VLM says stop (2 no-ads) → ends (~4s after ad ends)
-3. VLM history cleared on stop → prevents immediate re-trigger
-4. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
+1. **If OCR triggered alone** (source=ocr): OCR says stop (`OCR_STOP_THRESHOLD=2` no-ads) → ends (~1s). VLM dissent must NOT stop early here (OCR is authoritative).
+2. **If BOTH triggered** (source=both): stop on whichever clears first — `ocr_says_stop OR vlm_says_stop` (2 consecutive no-ad). Both detected the ad, so either clearing is a correct "ad ended" signal; this decouples recovery from slow OCR snapshot capture (~2.5s/frame headless) so recovery is ~1s instead of ~3s. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
+3. **If VLM triggered alone** (source=vlm): VLM says stop (`VLM_STOP_THRESHOLD=2` no-ads) → ends (~1-2s); 90s VLM-only safeguard.
+4. **Universal cap:** any source, `MAX_BLOCKING_DURATION` (150s, env `MINUS_MAX_BLOCKING_DURATION`) force-stops and clears all detection state — bounds the worst-case static-weak-keyword false positive. **Frozen-stream guard:** when the cap fires it sets `_safeguard_freeze_active` + snapshots the frozen OCR text (`_safeguard_freeze_text`), which suppresses *re-blocking* until the OCR text **meaningfully changes** (difflib ratio <0.7 vs the snapshot). This handles the upstream stream freezing on an ad frame (observed: stuck on "Sponsored…31 Skip in", countdown frozen, OCR byte-identical for 150s → it's a genuine ad frame so OCR+VLM correctly keep flagging it and `skip in` correctly disables static-suppression, but capping then immediately re-blocking the *same frozen frame* produced a 150s→150s churn). **Note:** the first implementation cleared on pixel `is_scene_changed()` and failed — a frozen stream still pixel-jitters (buffering spinner / compression noise) so scene-change tripped ~1s after the cap and the churn continued; the reliable "stream resumed" signal is the OCR *text* changing. A real long ad pod is unaffected (its text changes, clearing within a cycle); a stuck source keeps ~identical text → stays suppressed so autonomous mode can recover it. **Early frozen-stream detection (`FROZEN_EARLY_SECONDS`=30s, env `MINUS_FROZEN_EARLY_SECONDS`):** the 150s cap bounds a freeze but a single ~150s hold still violates the zero-multi-minute-holds goal and recurred ~daily. The OCR loop tracks text stability (`_ocr_text_frozen_for`: seconds the normalised OCR text has been unchanged, difflib >0.93, non-empty only); when a block has been active with frozen OCR text for ≥30s, the SAME proven force-stop+freeze path fires early (only the trigger time is new — reuses `_norm_alnum`/difflib/`_safeguard_freeze_*`). A real skippable ad's "Skip in N" countdown decrements every ≤3s so its text never stays identical 30s; bumpers end well before 30s — so real ads don't trip it. Worst-case rare ≥30s fully-static-text no-countdown ad unblocks at 30s (vs 150s), an acceptable trade for eliminating the multi-minute hold.
+5. VLM history cleared on stop → prevents immediate re-trigger
+6. VLM stop uses simple consecutive count, NOT sliding window (for responsiveness)
 
 **Why This Design:**
 - VLM sliding window prevents erratic false-positive blocking when acting alone
@@ -393,7 +398,7 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - VLM stopping uses simple consecutive count (not sliding window) for responsiveness
 
 **Anti-flicker:**
-- Minimum blocking duration starts at 3.0s (`MIN_BLOCKING_DURATION_BASE`) and falls off by `MIN_BLOCKING_DURATION_STEP` (0.5s) on each consecutive ad: 3.0 → 2.5 → 2.0 → 1.5 → 1.0s. Floor is 1.0s for OCR-only, 1.5s for OCR+VLM both agreeing. Counter resets after `MIN_DURATION_RESET_GAP` (30s) without a block. Toggleable via Settings → Blocking Optimizations → *Block-duration Falloff*.
+- Minimum blocking duration starts at 3.0s (`MIN_BLOCKING_DURATION_BASE`) and falls off by `MIN_BLOCKING_DURATION_STEP` (0.5s) on each consecutive ad: 3.0 → 2.5 → 2.0 → 1.5 → 1.0s. Floor is 1.0s for OCR-only, 1.5s for OCR+VLM both agreeing, and **0.5s for VLM-only** (`MIN_BLOCKING_DURATION_FLOOR_VLM`, applied regardless of the falloff toggle) so the rare residual false VLM-only block clears the instant VLM flips to no-ad (~1-2s) instead of being held the 3.0s base. Counter resets after `MIN_DURATION_RESET_GAP` (30s) without a block. Toggleable via Settings → Blocking Optimizations → *Block-duration Falloff*.
 - VLM history cleared on stop prevents false re-triggers
 - Transition frame detection holds blocking through black screens between ads
 - After TV reconnect, ad blocking is suppressed for `HDMI_RECONNECT_GRACE_SECONDS` (90s) so the user can navigate without overlays jumping in. The health monitor calls `Minus.notify_hdmi_reconnect()` when it sees the HDMI-TX link return. Toggleable via Settings → Blocking Optimizations → *HDMI Reconnect Grace*.
@@ -405,6 +410,7 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - Detection state (OCR/VLM) cleared on cooldown complete to prevent false positives
 - Static ad screenshots saved to `screenshots/static/` for analysis
 - **Strong-ad-signal override (`STRONG_AD_KEYWORD_NAMES`):** suppression refuses to activate, and force-clears mid-suppression, when OCR has matched a keyword that ONLY appears in active video-ad UIs within the last `STRONG_AD_HOLD_SECONDS` (5s). Strong keywords: `skip ad` / `skip ads` / `skip in` / `skip ad (fuzzy*)` / `video will play after ad` / `visit advertiser` / `visitadvertiser` / `ad X of Y` / `ad countdown` / `ad with timestamp` / `ad with timestamp (cross-element)`. Bare `Sponsored` / `Learn more` / `Shop now` stay weak — those can legitimately appear on home screens or paused-on-ad tiles. See *Static Suppression Catches Real Video Ads* under Known Issues for the root-cause investigation.
+- **Weak-keyword-only OCR suppression (detection layer, not just static):** if *every* matched keyword is in `WEAK_AD_KEYWORD_NAMES` (`sponsored`, `learn more`, `shop now` (+fuzzy), `buy now`) and no `STRONG_AD_KEYWORD` was seen within `STRONG_AD_HOLD_SECONDS`, the frame is suppressed AND routed into no-ad accounting so it neither starts nor sustains a block, and an active block decays. Replaced the old `_hdmi_audio_present()` discriminator (home/promo screens carry audio → it failed, holding a 591s block on a static "Sponsored · Peel to collect" promo). Originally a bare-`'sponsored'`-only check; **generalised to the full weak set** after a 150s VLM+OCR hold on a static "Learn more · Sponsored" promo — the keyword *pair* evaded the sponsored-only test (each weak keyword alone is suppressed but two together wasn't). Real video ads always also surface a strong keyword within the hold window, and VLM independently catches genuine ad video, so OCR can stay strict. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
 
 **OCR Timestamp Pattern Handling:**
 OCR frequently misreads characters in ad timestamps. The detection handles these common confusions:
@@ -507,51 +513,94 @@ Unlike the old GStreamer approach (limited to ~4fps), the ustreamer blocking mod
 
 ## VLM Model
 
-**FastVLM-1.5B** on Axera LLM 8850 NPU:
-- Smarter than 0.5B with fewer false positives on streaming interfaces
-- **~0.7s** inference time for ad detection (process-based with 1.5s hard timeout)
-- **~1.0s** for custom queries (structured prompt)
-- **~25s** model load time (includes 2 warmup inferences)
-- Uses Python axengine + transformers tokenizer
-- Home screen detection provides additional safety net
+**LFM2.5-VL-450M-ft-v2-fused-v2** on Axera LLM 8850 NPU (fused-layer prefill, no decode):
+- `detect_ad()` is **prefill-only**: vision encoder (~185ms) → 16 fused
+  decoder layers (~185ms) → post (LM head) → last-token vocab logits.
+  Decision is `argmax of max(YES_logits) vs max(NO_logits)` over the 4
+  spelling variants each (`Yes`/`yes`/` Yes`/` yes` etc.). Calibrated on
+  an 800-image holdout: **97.0% accuracy, 94.8% ad-recall, 99.2% non-ad-recall**.
+  Also exposes a softmax-normalized `p_yes_norm` over the {YES,NO}
+  subspace for an optional tunable threshold via env
+  `MINUS_VLM_AD_THRESHOLD` (default `0.5` ≡ argmax; gain from tuning is
+  small since argmax is already at 97%).
+- `query_image()` is **also prefill-only** — autonomous-mode screen
+  classification (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`)
+  uses the same prefill loop and looks up the first-token logit for
+  each class (max over no-leading-space and leading-space spellings),
+  returns the class with the highest logit. The `max_new_tokens`
+  parameter is kept for API compatibility but **ignored** — there is
+  no decode loop and per-layer decode axmodels are not shipped with
+  this v2 build (only `post_d.axmodel`). Latency ~370ms, same as
+  `detect_ad`.
+- **~0.37s** deterministic inference (vision ~185ms + prefill ~185ms;
+  the descriptive-paragraph latency pathology that plagued the 1.5B
+  is structurally impossible — both inference paths are fixed-length
+  prefill, no decode).
+- **~9-11s** model load: 17 axengine sessions (1 vision + 16 fused
+  layers + 1 post) + 256MB embed.npy mmap + tokenizer.json. Faster
+  than FastVLM iter4's ~14s.
+- Uses Python axengine + `PreTrainedTokenizerFast` (no transformers
+  AutoTokenizer / CLIPImageProcessor / ml_dtypes — those FastVLM
+  dependencies are gone).
+- Vision preprocessing: direct bilinear resize to 512×512, normalize
+  `(x/255 - 0.5)/0.5`, patchify into `(1, 1024, 768)` for the vision
+  encoder. DO NOT substitute FastVLM's `expand2square` + CLIPImageProcessor —
+  the fine-tune was on this exact preprocessing.
+- The classification prompt MUST stay byte-exact (LFM chat template
+  with BOS + IM_START + system + IM_END):
+  `"Is this an advertisement? Answer Yes or No."` with system
+  `"You are a helpful multimodal assistant by Liquid AI."`. Likewise
+  for the screen prompt — see the comment block on `SCREEN_QUERY_PROMPT`
+  in `src/autonomous_mode.py`.
+- `confidence` returned by `detect_ad` is `p_yes_norm` if ad else
+  `1 - p_yes_norm`, feeding the existing confidence-weighted sliding
+  window directly.
 
 **Process-based architecture (`src/vlm_worker.py`):**
 - VLM runs in a separate process for hard timeout capability
 - Uses 'spawn' multiprocessing method to avoid "can only join a child process" errors from axengine
 - **Soft/Hard timeout strategy** to avoid unnecessary restarts:
   - Soft timeout (1.5s): Returns immediately with "TIMEOUT", but worker keeps running
-  - Hard timeout (5.0s): Only kills worker if inference is truly stuck
+  - Hard timeout (2.0s): Only kills worker if inference is truly stuck
   - Restart threshold: 3 consecutive soft timeouts trigger a hard kill
   - Late responses are drained on next request and counters reset
 - 4 warmup inferences at startup with varied content (noise, gradients, edges, mixed)
 - Keepalive thread runs dummy inference every 20s during idle to prevent NPU cold-start
-- Worker process loads model once (~27s), processes requests via Queue
+- Worker process loads model once (~9-11s for LFM2), processes requests via Queue
 
-**Two inference modes:**
-- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification. Internally hard-caps the model at `max_new_tokens=5`.
-- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — custom prompt for any question about the image (used by Autonomous Mode for screen state classification). The `max_new_tokens` default of 8 fits the autonomous-mode multi-choice prompt (`PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER`); raise it explicitly for open-ended prompts knowing latency rises ~0.23 s per allowed token.
+**Two inference modes (both prefill-only on the same model):**
+- `detect_ad(image_path)` → `(is_ad, response_text, elapsed, confidence)` — ad/not-ad classification via `argmax(max(YES_logits), max(NO_logits))` (with optional `MINUS_VLM_AD_THRESHOLD` on `p_yes_norm`). ~370ms deterministic.
+- `query_image(image_path, prompt, max_new_tokens=8)` → `(response_text, elapsed)` — autonomous-mode screen classification. Same prefill, but the last-position logits are looked up at the FIRST-TOKEN of each of `PLAYING / PAUSED / DIALOG / MENU / SCREENSAVER` (max over no-leading-space and leading-space variants), argmax over the 5 classes returns the class name. `max_new_tokens` ignored. **Hard 320-token prefill window:** the full tokenised prompt (chat template + 256 image tokens + question) MUST stay ≤320 tokens — the axmodels were compiled for `PREFILL_LEN=320` and the prompt is right-padded; overflow silently truncates the `[IM_START] assistant\n` suffix → garbage last-position logits. `load_model()` fails loud if either cached prompt overflows; `query_image` returns `"PROMPT_TOO_LONG"` for on-the-fly oversized prompts. The current screen prompt tokenises to 312 — 8 tokens of headroom; do not lengthen `SCREEN_QUERY_PROMPT` without re-measuring.
 
 Both modes share the same model. Concurrent callers (detection loop calling `detect_ad`, autonomous mode calling `query_image`) are serialized by `VLMProcess._call_lock` so they cannot cross responses on the shared queue or race on the timeout / latency state. See *VLMProcess Cross-Thread Race* under Known Issues for the full rationale.
 
-The `max_new_tokens` cap is the load-bearing reason VLM never enters a sustained "restart cycle" anymore. Without it, certain images (visually busy / ambiguous) make the model emit a 30–60 token descriptive paragraph instead of `"Yes."` / `"No."`, taking 10–15 s and tripping every downstream timeout. See `docs/VLM_NPU_DEGRADATION.md` for the investigation that ruled out NPU/firmware/driver causes and isolated the fix.
-
+LFM2.5-VL fused-v2 on-disk layout:
 ```
-/home/radxa/axera_models/FastVLM-1.5B/
-├── fastvlm_ax650_context_1k_prefill_640_int4/  # LLM decoder models
-│   ├── image_encoder_512x512.axmodel           # Vision encoder
-│   ├── llava_qwen2_p128_l*.axmodel             # 28 decoder layers
-│   └── model.embed_tokens.weight.npy           # Embeddings (float32)
-├── fastvlm_tokenizer/                           # Tokenizer files
-└── utils/                                       # LlavaConfig and InferManager
+/home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/
+├── vision_encoder_512.axmodel              # Vision encoder (input "pixel_values")
+├── fused_models/
+│   ├── l0_conv_fused.axmodel               # 10× conv layers (l0,l1,l3,l4,l6,l7,l9,l11,l13,l15)
+│   └── l2_attn_fused.axmodel               # 6× attn layers  (l2,l5,l8,l10,l12,l14)
+├── decode_models/
+│   └── post_d.axmodel                      # Post/LM-head (no per-layer decode models shipped)
+├── embed.npy                               # Embedding table (FP32, mmap'd, 256MB)
+└── tokenizer.json                          # PreTrainedTokenizerFast format
 ```
 
-**Why FastVLM-1.5B instead of 0.5B?**
-| Aspect | FastVLM-0.5B | FastVLM-1.5B |
-|--------|--------------|--------------|
-| Inference Time | 0.7s | 0.9s |
-| False Positive Rate | ~88% on home screens | ~36% on home screens |
-| Intelligence | Basic | **Much smarter** |
-| Parameters | 0.5B | **1.5B** |
+**Why LFM2.5-VL instead of FastVLM-0.5B iter4?** (benchmarks in `/home/radxa/axera_models/BENCHMARKS.md`)
+| Aspect | LFM2.5-VL fused-v2 | FastVLM-0.5B iter4 |
+|--------|--------------------|---------------------|
+| Inference time | **~0.37s deterministic** | ~0.44s |
+| Holdout accuracy / ad-rec / non-ad-rec | **97.0% / 94.8% / 99.2%** | 94.75% / 94.25% / 95.25% |
+| Decoder architecture | 16 fused-layer axmodels (10 conv + 6 attn) | 24 separate p128 layers + KV cache |
+| KV-cache management | **none — no decode loop** | required (max_seq_len=1023 hard constraint) |
+| Custom utils dir / bfloat16 | **none** | `LlavaConfig`/`InferManager`/`expand2square` + ml_dtypes |
+| Image tokens | 256 (16×16 grid) | 64 (8×8 grid) |
+| `query_image` (autonomous mode) | **same model, prefill-only logit lookup** | decode-based, ~1.0s, p128-limited |
+| Prefill window | 320 (axmodel-locked) | 128 (p128 single-chunk) |
+| Parameters | 0.45B | 0.5B |
+
+Non-ad-recall jumped from 95.25% → 99.2% — the iter4 home-screen false-positive class is essentially eliminated at the model level. `query_image` no longer needs decode infrastructure, so there is no longer a separate FastVLM model loaded for autonomous mode — one model serves both paths.
 
 ### Latency-based auto-recovery
 
@@ -608,7 +657,7 @@ pip3 install --break-system-packages \
 **Note:** The `rknnlite` package is provided by Rockchip and may need to be installed from their SDK or a custom repository. On the Radxa board with NPU support, it may already be pre-installed.
 
 **Axera NPU (for VLM):**
-The FastVLM-1.5B model runs on the Axera LLM 8850 NPU. Required Python packages:
+The FastVLM-0.5B iter4 model runs on the Axera LLM 8850 NPU. Required Python packages:
 ```bash
 pip3 install --break-system-packages axengine transformers ml_dtypes
 ```
@@ -624,7 +673,7 @@ pkill -9 ustreamer    # Kill orphaned ustreamer
 
 **VLM not loading:**
 - Check Axera card: `axcl_smi`
-- Verify model files exist in `/home/radxa/axera_models/FastVLM-1.5B/`
+- Verify model files exist in `/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4/`
 - Ensure Python dependencies: `pip3 show axengine transformers ml_dtypes`
 
 **OCR not detecting:**
@@ -936,9 +985,12 @@ Autonomous Mode keeps YouTube playing on streaming devices during scheduled hour
 | VLM: PLAYING + frames changing | None | Video is fine |
 | VLM: PLAYING + static + no audio | Play | `play_pause` (paused video VLM missed) |
 | VLM: PLAYING + static + audio flowing | None | Music stream with static image (lo-fi) |
-| VLM: PAUSED | Play | `play_pause` key |
-| VLM: DIALOG | Dismiss | `select` + `play_pause` |
-| VLM: MENU | Select video | `down` + `select` |
+| VLM: PAUSED + **audio flowing** | **None (audio veto)** | VLM misclassified — see *Autonomous Mode VLM-Misclassification Traps* in Known Issues |
+| VLM: PAUSED + no audio | Play | `play_pause` key |
+| VLM: DIALOG | Dismiss | `back` (avoids selecting Sign in / toggling play_pause) |
+| VLM: MENU + **audio flowing** | **None (audio veto)** | Video is playing, refuses to interrupt — see Known Issues |
+| VLM: MENU + no audio + **player overlay visible** | **`play_pause`** | Paused video showing player overlay (Description/cc/Up next + `\d+:\d{2}`) → resume with play_pause (NOT `down+select`, would land on Sign in; NOT `back`, would exit). See Known Issues. |
+| VLM: MENU + no audio + no overlay | Select video | `down` + `select` (real menu) |
 | VLM: SCREENSAVER | Wake + launch | `wakeup` + launch YouTube |
 | Roku: screensaver overlay | Dismiss | `select` (wake from screensaver) |
 | Roku: not on YouTube | Relaunch | `launch_app('youtube')` |
@@ -1414,6 +1466,8 @@ python3 tests/test_modules.py                  # 300+ unit tests
 python3 tests/test_autonomous_mode.py          # Autonomous mode tests
 python3 tests/test_recent_features.py          # Recent feature tests
 python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
+python3 tests/test_vlm_iter4_parity.py         # iter4 logit parity vs 800-img holdout (needs NPU; --full)
+python3 tests/test_vlm_decision_sim.py         # Monte-Carlo sliding-window eval (--sweep to retune; no NPU)
 python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
 python3 tests/test_ir_transmitter.py           # IR transmitter unit tests (mocked sysfs)
 python3 tests/test_ir_ui.py                    # Playwright UI tests for IR remote panel
@@ -1620,6 +1674,10 @@ This caused the new pipeline to fail with "device in use" because the old pipeli
 **Symptom:** After successfully skipping an ad, the blocking overlay stayed for 2-3+ seconds waiting for OCR to detect the ad was gone.
 
 **Solution:** After a successful skip command (auto or manual via web UI), blocking is now removed after a 1.5s delay instead of waiting for 3 OCR cycles. The delay allows the skip animation to complete, then force-unblocks by resetting all detection state. Skip command is device-agnostic — routes to Fire TV (`skip_ad()`), Roku (`send_command('select')`), or Google TV based on the configured device type.
+
+**Follow-up — post-skip re-arm (Fixed - May 2026):** the 1.5s force-unblock above reset detection state but had **no grace window**, so the very next OCR frame re-read the skipped ad's lingering sponsored end-card / transition and *immediately re-armed the block*. Observed on minus-2: skip sent at T, `[SKIP] Forcing unblock` at T+1s, but OCR still `[BLOCKING OCR]` at T+2s and the block did not actually clear until **T+12s** (a Mint Mobile "Sponsored ·$15/Month … skip" end-card kept matching; `'skip in'` was recent so weak-`'sponsored'` suppression didn't engage). Root cause: the reset is a one-shot; nothing stops the lingering end-card from re-triggering. Fix: `SKIP_UNBLOCK_GRACE_SECONDS` (env `MINUS_SKIP_UNBLOCK_GRACE`). For that window after a successful skip, OCR ad frames are routed into no-ad accounting (so the block **decays and cannot re-arm**, not merely reset once) and the `_update_blocking_state` start gate refuses to (re)start — mirrors the `is_in_hdmi_reconnect_grace()` pattern.
+
+**Follow-up 2 — grace was too long, delayed pod ad #2 (Fixed - May 2026):** at 8s the grace caused a **detection-latency regression**: ad pods (skip ad 1 → ad 2 starts ~1-2s later) are extremely common, and the grace suppressed the *next* ad's start for up to 8s — logs showed VLM flagging ad 2 at `agreement: 100% of 3` but `AD BLOCKING STARTED` withheld 2-3s by the grace. Root cause: the 8s was sized as a multi-minute backstop, now redundant (the universal `MAX_BLOCKING_DURATION` cap + weak-keyword suppression + transition-hold cap independently prevent long false holds). Fix: (1) grace **8s → 3s** (covers the typical skipped-ad end-card only); (2) the `_update_blocking_state` post-skip gate now bypasses suppression when `self.vlm_ad_detected` is set — a VLM sliding-window-confirmed detection (3+ decisions ≥80%) right after a skip is a real new pod ad, not the dying end-card (which can't sustain that); the OCR-accounting-site grace still neutralises the lingering end-card text. Files: `minus.py` (`SKIP_UNBLOCK_GRACE_SECONDS`, OCR-accounting `suppress_reason`, `_update_blocking_state` gate).
 
 ### GStreamer Bus Signal Watch FD Leak (Fixed - Apr 2026)
 
@@ -2045,3 +2103,427 @@ The blocking overlay grew a third debug element: a top-right `(Ad) 0:30 left` sn
 **Files modified:**
 - `ustreamer-garagehq/src/libs/blocking.{h,c}`, `src/ustreamer/http/server.c` — new `text_ocr` API + top-right render
 - `minus.py`, `src/ad_blocker.py`, `src/webui.py`, `src/templates/index.html`
+
+### FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration (May 2026)
+
+**What changed:** the VLM ad detector was swapped from FastVLM-1.5B
+(decode-based, parse "Yes"/"No" text) to the fine-tuned **FastVLM-0.5B
+ad-classifier iter4** using **logit-based thresholding** — prefill only,
+softmax the first-position logits over the full vocab, compare
+normalized `P(Yes)` to `AD_THRESHOLD=0.76`. Per the implementation guide
+`/home/radxa/axera_models/LOGIT_THRESHOLD_IMPLEMENTATION.md`.
+
+**Why:** iter4 is **same/better accuracy at ~3× the speed** and removes
+an entire failure class:
+- Holdout (800 img, 2026-05-15): **F1 94.72, ad-recall 94.25%,
+  non-ad-recall 95.25%** — beats the 1.5B (the task saturates at 0.5B;
+  the 1.5B never won on device, see `BENCHMARKS.md`).
+- Latency **~0.33s deterministic** (p95 0.34s) vs the 1.5B's ~0.9–1.1s
+  with a 10–15s descriptive-paragraph tail. `detect_ad` has **no decode
+  loop**, so that pathology (the whole reason for `max_new_tokens` caps +
+  aggressive auto-recovery in `docs/VLM_NPU_DEGRADATION.md`) is now
+  *structurally impossible*. `query_image` (autonomous mode) is
+  unchanged — still decode-based, still capped.
+- The threshold is tunable post-hoc from logged `p_yes_norm` without
+  re-running inference.
+
+**Parity proof:** `tests/test_vlm_iter4_parity.py` runs the production
+`VLMManager.detect_ad` over the full 800-image holdout and compares to
+the calibration script's scores: **0/800 classification flips**, max
+|Δ p_yes_norm| = 0.00005, confusion matrix identical to `BENCHMARKS.md`
+(TP=377 TN=381 FP=19 FN=23). The in-app pipeline is byte-faithful, so
+the 0.76 threshold is valid — *provided the prompt stays byte-for-byte
+identical to `threshold_sweep.py`* (system = "You are a helpful
+assistant."). `VLMManager.AD_SYSTEM_PROMPT`/`AD_PROMPT` enforce this;
+do not edit them without recalibrating.
+
+**Path resolution:** iter4 ships a flat dir with no tokenizer/utils.
+`src/vlm.py` auto-detects flat-0.5B vs legacy-1.5B layout; tokenizer
+falls back to the canonical `FastVLM-0.5B/fastvlm_tokenizer` (dims MUST
+match the model: 896 hidden / 24 layers) and utils to the patched
+`FastVLM-1.5B/utils` (`infer_func` has the `max_new_tokens` cap that
+`query_image` needs; `llava_qwen` is byte-identical to the 0.5B copy).
+Overridable via `MINUS_VLM_TOKENIZER_DIR` / `MINUS_VLM_UTILS_DIR`.
+Vision encoder input is read from the session (`pixel_values` for
+iter4, `images` for the 1.5B) so both layouts work unchanged.
+
+**Worker-timeout retune (`src/vlm_worker.py`):** since `detect_ad` is
+now deterministic ~0.33s with no runaway-token failure mode,
+`HARD_TIMEOUT` 5.0→3.0→**2.0s** and `LATENCY_P95_TRIGGER` 3.0→2.0s — a
+real hang is the only thing that can exceed these now, so recovery is
+faster with zero false-restart risk. The timeouts are **shared** by
+`detect_ad` and `query_image`, and the floor is set by `query_image`,
+not `detect_ad`: measured `detect_ad` p95 0.33s / max 0.33s (0 events
+>1s over a full day) vs `query_image` (decode-based, autonomous mode)
+typical 1.3s / max 1.5s with `max_new_tokens=8`. So `HARD_TIMEOUT=2.0`
+keeps a 0.5s margin over `query_image`'s observed max; `SOFT_TIMEOUT`
+stays 1.5s — `query_image` legitimately reaches ~1.5s, so a lower soft
+timeout would spuriously time out screen queries and (3 consecutive)
+hard-kill the worker (~15s reload). Going below `HARD_TIMEOUT=2.0`
+would require per-request-type timeouts (not worth the complexity while
+`detect_ad` is this stable).
+
+**Sliding-window retune — the load-bearing fix.** The anti-waffle
+window was built for the 1.5B's ~36% home-screen FP rate. iter4 has
+near-perfect per-frame separation (clean video p_yes≈0.05, ad text
+p_yes≈0.85), so the window is now over-conservative. `tests/test_vlm_
+decision_sim.py` is a Monte-Carlo simulator that drives the faithful
+`DecisionEngine` mirror with a virtual clock and VLM verdicts
+**bootstrapped from the real 800-image holdout scores** (so per-frame
+error rate + calibrated confidence are statistically identical to
+production iter4) across 64 scenario shapes (pre/mid-roll, multi-ad
+breaks, back-to-back, pause-on-ad, content-only, rapid alternation,
+tiny/long ads × OCR strong/absent/delayed/flaky). Sweeping **1920
+param combos** found:
+- **`vlm_history_window` 45→8s is the decisive lever.** A 45s window
+  keeps stale *content* no-ad votes that mathematically prevent a
+  VLM-alone ad from reaching the start ratio until they age out:
+  VLM-only detect **~38s, 81% of VLM-only ads missed**. At 8s:
+  VLM-only detect **~7s, ~0% missed**, with OCR-path metrics unchanged
+  (OCR-triggered detect ~0.9s, 0 miss) and **0 phantom content-blocks**
+  preserved. Stop/recovery uses the consecutive counter, not the
+  window, so shrinking it has no recovery downside.
+- `vlm_start_agreement` 0.90→0.80→**0.70** (+0.10 hysteresis = 0.80
+  effective): with a short window you can't afford a high bar; the
+  sweep's feasible optimum is 0.65–0.70 and 0.70 stays phantom-free.
+- `vlm_min_decisions` 4→**3**, others unchanged.
+
+Validated on the real OCR+VLM rig (`block_latency_harness.py`,
+`tests/harness_iter4_retune_ab.py`): OCR detect/recover and
+false-positive/phantom behaviour unchanged; VLM-only transition sharply
+faster. The earlier-in-this-migration retune (4→3 decisions, 0.90→0.80)
+was validated only on the clean-injection rig which *resets state
+before each VLM-only test* — that masked the stale-vote dilution; the
+simulator (content precedes the ad, as in reality) exposed it.
+
+**New test scripts** (added to the suite):
+- `tests/test_vlm_iter4_parity.py` — 800-image holdout parity/accuracy.
+- `tests/test_vlm_decision_sim.py` — Monte-Carlo sliding-window sweep
+  (`--sweep`) and current-param eval; verdicts bootstrapped from real
+  holdout scores; class-aware feasibility (OCR-present must be perfect;
+  VLM-only is the optimised soft tail; multi-ad-gap flaps tracked
+  separately as a mirror artifact — production holds those via
+  `_is_transition_frame`).
+- `tests/harness_iter4_retune_ab.py` — A/B wrapper over the real rig.
+
+**Files modified:** `src/vlm.py` (logit path, dual-layout resolution,
+calibration-exact prompt, dynamic vision-input name, mmap embeds),
+`src/config.py` (`VLM_MODEL_DIR` → iter4, env-overridable),
+`src/vlm_worker.py` (timeouts), `minus.py` (sliding-window params),
+`tests/block_latency_harness.py` (PARAMS mirror — kept 1:1 with
+production), CLAUDE.md.
+
+### iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes (May 2026)
+
+Found by live monitoring on minus-2 (autonomous mode + Roku-driven ad
+tests) right after the iter4 migration deployed. Four coupled defects:
+
+**1. `query_image` crashed every call → autonomous mode fully blind.**
+Symptom: `[AutonomousMode] VLM screen query: list index out of range`
+every ~20s. Root cause: the iter4 LLM is **p128 — a single 128-token
+prefill chunk** (`qwen2_p128_l*` axmodels expose only shape-group 0
+=decode and 1=p128). `detect_ad`'s calibrated prompt is ~94 tokens
+(fits). `query_image` built a verbose system message *plus* the verbose
+`SCREEN_QUERY_PROMPT` (per-category descriptions) = **187 tokens** →
+`infer_func.prefill` needs `slice_idx=1` → asks axengine for
+`shape_group=2` → `self._outputs[2]` IndexError on every call.
+`detect_ad` is prefill-only-logit and short so it never hit this.
+Fixes: `src/autonomous_mode.py` `SCREEN_QUERY_PROMPT` reverted to the
+minimal form (≈119 tok with the short system prompt — **do not
+re-expand; the p128 budget is image-64 + ~64 text**); `src/vlm.py`
+`query_image` uses the short `AD_SYSTEM_PROMPT` and a hard guard that
+returns `PROMPT_TOO_LONG` (fail-soft, callers already treat non-category
+replies as "unknown screen") instead of crashing if any caller exceeds
+128 tokens again.
+
+**2. `query_image` decode shape mismatch (surfaced after fix 1).**
+`K_cache expect [1,1023,128], got [1,1024,128]`. iter4's decoder K/V
+cache is compiled for **seq-len 1023**, not the 1.5B's 1024 (the
+reference `test_ad_classifier.py` / `threshold_sweep.py` build
+`InferManager(max_seq_len=1023)`). `src/vlm.py` now sets a layout-aware
+`LLM_MAX_SEQ_LEN` (1023 for the flat 0.5B-iter* layout, 1024 for the
+legacy 1.5B subdir layout). `detect_ad` is prefill-only so it never hit
+this; only `query_image`'s decode path did.
+
+**3. Multi-minute false-positive blocks (observed: 591s).** A static
+"Sponsored · Peel to collect" promo held an OCR+VLM block for ~10 min.
+Three causes: (a) bare `'sponsored'` (a *weak* keyword) was triggering
+**and sustaining** OCR blocking whenever HDMI-IN audio was present — but
+home/promo screens carry audio (autoplay previews, music), so the
+`_hdmi_audio_present()` discriminator was wrong; (b) suppressed
+`'sponsored'` frames fell through *without* feeding the no-ad counters,
+so an active block's `ocr_no_ad_count` froze and it never decayed; (c)
+the only max-duration safeguard was on `source=="vlm"` (90s) — `ocr` and
+`both` had **no cap**. Fixes in `minus.py`: bare-`'sponsored'`-only is
+suppressed unless a `STRONG_AD_KEYWORD` was seen within
+`STRONG_AD_HOLD_SECONDS` (VLM still independently catches genuine
+sponsored-only video ads); suppressed frames now route into the same
+no-ad accounting so blocks **decay**; new universal
+`MAX_BLOCKING_DURATION` (150s, env `MINUS_MAX_BLOCKING_DURATION`) clears
+all detection state on cap.
+
+**4. Slow ad→content recovery (~3s, over the 1.5–2s target).** OCR
+snapshot capture runs ~2.5s/frame on a headless box (HDMI-OUT
+disconnected). A `both`-source block waited on OCR's 2 consecutive
+no-ad frames (~3s+) even though VLM had already cleared in ~0.3s. Fix:
+for `source=="both"` (both signals detected the ad) stop on whichever
+clears first — `ocr_says_stop OR vlm_says_stop`. Pure `source=="ocr"`
+still requires OCR (VLM dissent must not stop early); `source=="vlm"`
+unchanged. Measured live: recovery ~3s → **~1s** across Target / Ford /
+HBS / Acura / `skip in` / `ads` ad breaks, 0 multi-minute holds, 0
+`query_image` errors, 0 safeguard fires.
+
+**Monitoring:** `tools/ad_block_monitor.py` parses `journalctl -u minus`
+and reports per-block source / duration / recovery-latency / trigger
+keywords and flags `WEAK_FP` (sponsored-only/no-keyword block lingering
+>20s), `OVERLONG`, `SLOW_RECOVER(>3.5s)`, `query_errs`. Self-elevates
+via `sudo -n journalctl` when not root. Run periodically (a recurring
+agent re-runs it, root-causes any flag, tunes, restarts, commits) —
+target: zero false-positive blocks, zero multi-minute holds, recovery
+≤1.5–2s.
+
+**Files modified:** `src/autonomous_mode.py`, `src/vlm.py`, `minus.py`,
+`tools/ad_block_monitor.py` (new), CLAUDE.md.
+
+### FastVLM iter4 → LFM2.5-VL Migration (May 2026)
+
+**What changed:** the ad-detection VLM was swapped from FastVLM-0.5B
+iter4 (Qwen2-decoder, p128 prefill + KV-cache decode) to
+**LFM2.5-VL-450M-ft-v2-fused-v2** (16 fused-layer axmodels,
+prefill-only, no KV cache). Autonomous-mode `query_image` was also
+moved off FastVLM — there is now **no FastVLM dependency anywhere**.
+Per `/home/radxa/axera_models/LFM2/MINUS_INTEGRATION_GUIDE.md`.
+
+**Why:**
+- **Accuracy:** holdout 97.0% / 94.8% ad-rec / **99.2% non-ad-rec** vs
+  iter4's 94.75% / 94.25% / 95.25%. The remaining home-screen-FP class
+  is essentially eliminated at the model layer (-3.95% FP rate).
+- **Latency:** ~0.37s deterministic (vision 185ms + 16 fused layers
+  185ms) vs iter4's ~0.44s. Both prefill-only, both immune to the
+  descriptive-paragraph latency pathology that plagued the 1.5B.
+- **Code simplification:** no `LlavaConfig` / `InferManager` /
+  `expand2square` / `CLIPImageProcessor` / `ml_dtypes.bfloat16` /
+  `llava_qwen.py` / `infer_func.py`. No `_reset_kv_cache()` work
+  between inferences (conv state is per-call, freshly allocated). The
+  `sys.path.insert` to a `utils/` dir is gone. ~590 lines of
+  FastVLM-specific code in `src/vlm.py` collapsed to ~340 LOC for the
+  full LFM2 implementation.
+- **One model serves both paths.** FastVLM iter4 was p128 — a
+  single 128-token prefill chunk — which forced `query_image` to use
+  decode-based generation (~1.0s) with a 5-class chat prompt that
+  flirted with the 128-token ceiling. LFM2's 320-token prefill window
+  + first-token logit-lookup multi-class classification lets the same
+  prefill loop serve `detect_ad` and the autonomous-mode screen query.
+
+**Architecture:**
+- `detect_ad` returns `(is_ad, response, elapsed, p_yes_norm-derived
+  confidence)`. Decision is `argmax(max(YES_logits), max(NO_logits))`
+  over the 4 spelling variants each (Yes/yes/ Yes/ yes) — matches
+  `infer_vlm_fused.py:classify_image` exactly. `MINUS_VLM_AD_THRESHOLD`
+  (default 0.5 ≡ argmax) gates `p_yes_norm` instead if set != 0.5;
+  argmax already gives 97% holdout accuracy so the threshold knob is
+  rarely useful.
+- `query_image` does the same prefill, then looks up the first-token
+  logit for each of the 5 screen-state classes (max over the
+  no-leading-space and leading-space spellings of each) and returns
+  the argmax. `max_new_tokens` parameter retained for API compat but
+  IGNORED — there is no decode loop. Per-layer decode axmodels are not
+  shipped with v2-fused; only `post_d.axmodel` is.
+- Both paths use a single `VLMManager._lock` for serialisation. The
+  outer `VLMProcess._call_lock` is unchanged.
+
+**Hard 320-token prefill window:** the axmodels were compiled for a
+fixed `[1, 320, 1024]` input shape. The chat-template + 256-image-token
+overhead is ~37 text tokens (BOS, IM_START × 3, IM_END × 2, system =
+"You are a helpful multimodal assistant by Liquid AI.", `user\n`,
+`assistant\n`, etc.); the user question can be max ~30 tokens. The
+`ad-prompt` ("Is this an advertisement? Answer Yes or No.") tokenises
+to 293 total; `screen-prompt` ("Classify this TV screen: PLAYING,
+PAUSED, DIALOG, MENU, or SCREENSAVER?") tokenises to 312. **An earlier
+draft of the screen prompt tokenised to 326 — over by 6** — and
+silently truncated the `[IM_START] assistant\n` suffix → the
+last-position logits were garbage. `load_model()` now fails loud if
+either cached prompt overflows; `query_image` returns
+`"PROMPT_TOO_LONG"` for on-the-fly oversized prompts. The 326-token
+prompt was committed and quietly broken until the load-time check
+caught it during this migration.
+
+**Sliding-window / decision-engine retune (DONE, middle-ground):**
+`vlm_min_decisions: 5 → 3` and `vlm_start_agreement: 0.80 → 0.70`
+(+0.10 hysteresis → 0.80 effective). `vlm_history_window=8s` kept.
+The iter4-era hardening to 5 / 0.80 was sized against iter4's
+mid-show VLM-only FPs — a failure class LFM2 mostly does not produce
+(non-ad-recall 99.2% vs 95.25% → ~4× lower per-frame FP rate, with
+tighter logit margins on confident cases: clean p_yes ≈ 0.001–0.01,
+ad p_yes ≈ 0.97–0.99). At the iter4-hardened params, the LFM2
+holdout-bootstrapped simulator (`tests/test_vlm_decision_sim_lfm2.py`,
+2560-combo sweep × 64 scenarios × 30 seeds) measured the old params
+as **infeasible**: O_rec p95 = 18s, V_det mean 9.3s / p95 20s,
+V_miss 7.5%, Vs_miss 76% — the start gate could not accumulate
+enough votes fast enough on real ads. New params: **O_rec p95
+18s → 3.2s** (5.6× better), **V_det mean 9.3s → 7.4s, p95
+20s → 9s**, **V_miss 7.5% → 0.3%**, phantom blocks remain **0**.
+Middle-ground vs the sweep's most-aggressive winner (`min_dec=2,
+agree=0.60`): the winner halves V_det further (4.5s mean) and cuts
+Vs_miss to 29%, but pushes phantom-block math closer to the edge
+(~0.7/day estimated on holdout-bootstrapped content vs ~0.1/day at
+the middle ground). Chose the middle ground — it captures the
+biggest wins (recovery tail + VLM-only miss rate) without crowding
+the phantom margin. **Rollback path** if real-world VLM-only
+mid-show false triggers reappear: revert to `min_dec=5, agree=0.80`
+(see `minus.py` comment block around `self.vlm_min_decisions` — keep
+the iter4 hardening rationale documented for whoever does the
+rollback). Sweep raw log: `/tmp/lfm2_sweep.log` (until reboot);
+rerun via `python3 tests/test_vlm_decision_sim_lfm2.py --sweep`.
+
+**Gotchas (from the integration guide, kept here):**
+- Vision preprocessing is direct bilinear-resize + `(x/255 - 0.5)/0.5`
+  + patchify into `(1, 1024, 768)`. **Do not** reuse FastVLM's
+  `expand2square` + CLIPImageProcessor — the fine-tune is on the
+  patchify path, accuracy degrades otherwise.
+- `indices` input to the attention layers must be `int32` at runtime
+  (axengine asserts shape + dtype).
+- After running the vision encoder you get 256 feature vectors. The
+  prompt has 256 copies of `IMG_TOKEN_ID = 396` inserted at the
+  image slot; the `_prefill_last_logits` step then OVERWRITES those
+  256 prefill-data positions with the actual vision features. Forgetting
+  the splice leaves the model with the embedding for token 396 — garbage.
+- All axmodel I/O is FP32. The `ml_dtypes.bfloat16` casts from
+  FastVLM are gone.
+- NPU3 mode is baked into the axmodel files (Pulsar2 build flag) —
+  no runtime flag needed. If a rebuild loses NPU3, latency rises ~40%.
+
+**Files modified:**
+- `src/vlm.py` — full rewrite around `VLMManager` with LFM2 prefill,
+  fused-layer loop, multi-class logit lookup. `FASTVLM_MODEL_DIR`
+  kept as a backwards-compat alias pointing at the new model dir.
+- `src/config.py` — `VLM_MODEL_DIR` default → LFM2 dir, env var
+  `MINUS_VLM_MODEL_DIR` unchanged.
+- `src/autonomous_mode.py` — `SCREEN_QUERY_PROMPT` shortened from
+  the verbose 326-token form to 312-token "Classify this TV screen:
+  PLAYING, PAUSED, DIALOG, MENU, or SCREENSAVER?". Comment refreshed.
+- `minus.py` — VLM-loading log line "FastVLM-1.5B" → "LFM2.5-VL-450M".
+- CLAUDE.md — *Overview*, *Performance*, *VLM Model* sections and
+  this Known Issues entry.
+
+**Verification:** `sudo python3 minus.py` boot-to-ready in ~11s
+(model load 9.3s + 4 warmup inferences). Sustained inference at
+~360-400ms per frame. Live ad pods classified with `p_yes` 0.97-0.99
+(confident ad) and content `p_yes` 0.0009-0.01 (confident no-ad).
+Autonomous-mode `query_image` returns one of the 5 class names with
+clean logit margins (e.g. MENU=22.74 vs second-best 14.26).
+Zero `PROMPT_TOO_LONG`, zero IndexError, zero VLM-side hard-kills
+over the first ~70 inferences. Parity with the standalone
+`infer_vlm_fused.py` confirmed: on ad_0001 / nonad_0001 the
+in-process VLMManager produces logits identical to the standalone
+script (yes/no logits match to 3 decimals).
+
+### Autonomous Mode VLM-Misclassification Traps (May 2026)
+
+LFM2 classifies any screen showing the YouTube TV / Roku player overlay
+(Description / Subscribe / cc / Up next buttons + a `\d+:\d{2}` time
+marker) as **MENU**, regardless of whether the underlying video is
+playing, paused, or stuck. This drove three production bugs in a
+single 24-hour window. All three share a root cause — the
+**MENU-action branch was acting on VLM alone, ignoring authoritative
+playback signals (audio, screen activity, player-overlay markers)** —
+and the fixes are layered on top of each other. Documented together
+because the layering is non-obvious and easy to break.
+
+**Pitfall #1 — Sign-in trap via `down + select`.**
+Original code: `MENU → down + select`. On a video player with the
+overlay visible, `down` navigates from the play button to the "Sign
+in" CTA at the bottom of the overlay (always visible on Roku
+YouTube), and `select` confirms it. That opens the Google sign-in
+flow (keyboard / QR code / yt.be/activate code) — an unrecoverable
+trap that costs ~2 min per occurrence before the keyboard-stuck
+detector escapes. Observed loop: dozens of times per hour during
+ad-data collection runs.
+
+Fix: `_is_video_player_overlay()` veto BEFORE the down+select. Requires
+BOTH an overlay-only keyword (`description` / `up next` / `autoplay` /
+whole-token `cc`) AND a `\b\d{1,2}:\d{2}\b` time marker. All real menus
+(home page, account picker, settings, signed-out prompt) lack the time
+marker, so they pass through to the legitimate select action.
+
+**Pitfall #2 — `back` escalation exits paused videos.**
+First version of the overlay-veto used a 3-tier escalation:
+veto-wait → veto-wait → **`back`** → veto-wait × 3 → full reset. `back`
+on Roku/YouTube TV during a paused video EXITS to the recommendations
+page — the opposite of what the user wants when a video is paused.
+User reported live: "still fully paused. Autonomous mode was working
+before we made the last few commits ... audio not playing and being on
+Menu is a HUGE clue we are paused."
+
+Fix: replace `back` escalation with `play_pause`. play_pause is
+universally safe:
+- Paused video → resumes (the case the user reported).
+- Playing-but-silent video → pauses; next iteration's overlay-veto
+  re-toggles. Self-correcting flap rather than permanent EXIT.
+- Real menu → no-op (play_pause does nothing on a menu UI).
+- Crucially: play_pause does NOT navigate UI, so the Sign-in trap
+  from Pitfall #1 is structurally impossible from this action.
+
+The 3-tier wait/back/reset ladder collapsed to a single decision based
+on the audio + overlay signals.
+
+**Pitfall #3 — audio-blind interruption of playing videos.**
+With Pitfall #1 fixed but the audio guard absent, the MENU branch's
+down+select still interrupted videos that were genuinely playing —
+just because VLM misclassified the screen as MENU. Symptom: user
+selects a music video / talking-head / lo-fi stream, ~30s later
+autonomous mode selects a different video, repeat. The screen
+content was changing under the visible-but-not-overlay UI, so the
+overlay-veto didn't fire either. Same regression risk for the
+PAUSED → play_pause branch when VLM misclassifies a playing frame
+as PAUSED.
+
+Fix: `_is_audio_flowing()` guard at the top of BOTH the `select`
+and `play` branches. If HDMI-RX (`card4`) is receiving audio buffers
+within the last 3s, the video is genuinely playing — veto every
+interrupting action. Mirrors the precedent in `_is_screen_static()`
+("static frames + audio flowing = music stream = don't pause").
+
+**The full Action matrix that emerged from the three fixes:**
+
+| Signal | Action |
+|---|---|
+| audio flowing | none (always wins) |
+| no audio + overlay visible | `play_pause` (likely paused, resume) |
+| no audio + no overlay (VLM PAUSED) | `play_pause` (normal pause-recovery) |
+| no audio + no overlay (VLM MENU) | `down + select` (real menu) |
+
+**Architectural invariant to preserve:** any action that could
+interrupt or change playback (`down+select`, `back`, `play_pause`,
+`launch`) MUST consult an authoritative playback signal first. The
+hierarchy is:
+1. `_is_audio_flowing()` — HDMI-RX audio is ground truth when
+   HDMI-TX is connected.
+2. `_is_video_player_overlay()` — disambiguates overlay-on-video
+   vs real menu when audio is unavailable.
+3. `_is_screen_static()` — the slow (3s sleep) frame-change check,
+   used by the PLAYING-static branch but too expensive for the
+   select/play branches.
+
+VLM verdicts alone are not sufficient. The 99.2% non-ad-recall of
+LFM2 is for the ad/non-ad classifier; the screen-state classifier
+(`query_image`) is markedly noisier on overlay-heavy frames because
+its training signal was the visible UI, which on YouTube TV is
+indistinguishable from a menu by appearance alone.
+
+**Files:** `src/autonomous_mode.py` — `_is_video_player_overlay`,
+`_is_audio_flowing`, action dispatch in `_handle_screen_state`.
+
+**OCR-dynamics guard (`_ocr_text_active`) — tried and rejected.**
+An interim attempt to detect "screen is actively changing" via
+difflib similarity between consecutive OCR-text snapshots was added
+during Pitfall #3 debugging on the dev box (where audio guard can't
+fire because HDMI-TX is disconnected and the audio pipeline never
+opens). It worked on the music-video scenario but vetoed every
+legitimate MENU verdict on any slight OCR drift — including paused
+videos with timer ticks in the overlay — *exactly the regression
+Pitfall #2 documented*. Removed in the play_pause-escalation
+commit. If a future case demands a similar signal, the OCR
+similarity check is structurally OK but it MUST be combined with a
+positive-pause signal so it doesn't suppress recovery from real
+pauses.

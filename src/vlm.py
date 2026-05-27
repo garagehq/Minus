@@ -1,24 +1,51 @@
 """
 VLM (Vision Language Model) integration for Minus.
 
-Uses FastVLM-1.5B on Axera LLM 8850 NPU for ad detection.
-Model is loaded ONCE at startup and kept running for fast inference.
-1.5B model is smarter than 0.5B with fewer false positives.
+Uses LFM2.5-VL-450M-ft-v2-fused-v2 on the Axera LLM 8850 NPU for ad
+detection AND autonomous-mode screen-state classification.
+
+Both `detect_ad()` and `query_image()` are prefill-only on the 16
+fused decoder layers — no autoregressive decode, no KV cache state
+to manage between inferences. Total per-image latency ~370ms
+deterministic (vision ~185ms + prefill ~185ms).
+
+- `detect_ad`: argmax of max(YES_logits) vs max(NO_logits) from the
+  last-token vocab logits. Also exposes `p_yes_norm` for an optional
+  tunable threshold (env `MINUS_VLM_AD_THRESHOLD`); default 0.5 ≡
+  argmax. Holdout (800 images): 97.0% acc, 94.8% ad-recall, 99.2%
+  non-ad-recall.
+
+- `query_image`: prefill-only multi-class logit lookup over the first
+  token of each screen-state class (PLAYING / PAUSED / DIALOG / MENU /
+  SCREENSAVER). Returns the class name with the highest first-token
+  logit (max over no-leading-space and leading-space variants). No
+  autoregressive decode — the per-layer decode axmodels are not
+  shipped with this v2 build; only `post_d.axmodel` is. Single prefill
+  takes ~370ms, same as detect_ad.
+
+Migration notes vs FastVLM-0.5B iter4 (the previous model):
+  - Tokenizer is the LFM custom one (NOT Qwen2). All token IDs are
+    different.
+  - 256 image tokens (16×16 grid) instead of 64 (8×8).
+  - Vision preprocessing is direct bilinear resize → patchify into
+    (1, 1024, 768); not `expand2square` + CLIPImageProcessor.
+  - All axmodel I/O is FP32 (no bfloat16 ceremony).
+  - 16 fused-layer axmodels (10 conv + 6 attn) instead of 24 separate.
+  - Per-call conv state allocated fresh in `detect_ad`/`query_image`
+    — there is no persistent state to reset between calls. The
+    `_reset_kv_cache()` shim is kept as a no-op for backward compat.
+  - Prompt format is byte-exact per the fine-tune, including the BOS
+    + IM_START + system + IM_END skeleton — do NOT edit the prompt
+    strings in `_build_prompt_ids()` without recalibrating.
+
+Reference: /home/radxa/axera_models/LFM2/MINUS_INTEGRATION_GUIDE.md
+Working standalone: /home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/infer_vlm_fused.py
+
+Model is loaded ONCE at startup (~8s) and kept running.
 """
 
 import os
 import sys
-
-# CRITICAL: Import torch early before any logging configuration
-# This avoids "Unknown level: 'WARNING'" errors in torch.fx.passes
-os.environ['PYTORCH_MATCHER_LOGLEVEL'] = 'WARNING'
-os.environ['TORCH_LOGS'] = '-all'
-os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-try:
-    import torch  # Import torch first to avoid logging conflicts
-except ImportError:
-    pass  # torch might not be installed, will fail later with clear message
-
 import time
 import logging
 import threading
@@ -31,500 +58,558 @@ from config import VLM_MODEL_DIR
 
 logger = logging.getLogger('Minus.VLM')
 
-# Model paths - FastVLM-1.5B (smarter, fewer false positives than 0.5B)
-# Base directory can be overridden via MINUS_VLM_MODEL_DIR environment variable
-FASTVLM_MODEL_DIR = Path(VLM_MODEL_DIR)
-LLM_MODEL_PATH = FASTVLM_MODEL_DIR / "fastvlm_ax650_context_1k_prefill_640_int4"
-TOKENIZER_PATH = FASTVLM_MODEL_DIR / "fastvlm_tokenizer"
-VISION_MODEL_PATH = LLM_MODEL_PATH / "image_encoder_512x512.axmodel"
-EMBEDS_PATH = LLM_MODEL_PATH / "model.embed_tokens.weight.npy"
+# --- Model file layout ---
+# Default points at the LFM2.5-VL fused-v2 build; override the base
+# dir via MINUS_VLM_MODEL_DIR.
+LFM_MODEL_DIR = Path(VLM_MODEL_DIR)
+FUSED_DIR     = LFM_MODEL_DIR / "fused_models"
+VISION_PATH   = LFM_MODEL_DIR / "vision_encoder_512.axmodel"
+POST_PATH     = LFM_MODEL_DIR / "decode_models" / "post_d.axmodel"
+EMBEDS_PATH   = LFM_MODEL_DIR / "embed.npy"
+TOKENIZER_FILE = LFM_MODEL_DIR / "tokenizer.json"
 
-# Add utils path for LlavaConfig and InferManager
-UTILS_PATH = FASTVLM_MODEL_DIR / "utils"
+# Backwards-compat alias — older tests / external callers still import
+# `FASTVLM_MODEL_DIR`. Resolves to the current VLM model dir regardless
+# of which family is configured via MINUS_VLM_MODEL_DIR.
+FASTVLM_MODEL_DIR = LFM_MODEL_DIR
+
+# Decoder layer execution order. 10 conv + 6 full-attention = 16.
+# Matches the on-disk axmodel filenames (l{i}_{conv|attn}_fused.axmodel).
+# DO NOT REORDER — this is the model architecture itself.
+LAYER_TYPES = (
+    "conv", "conv", "attn",
+    "conv", "conv", "attn",
+    "conv", "conv", "attn",
+    "conv",         "attn",
+    "conv",         "attn",
+    "conv",         "attn",
+    "conv",
+)
+assert len(LAYER_TYPES) == 16
 
 
 class VLMManager:
     """
-    FastVLM-1.5B manager for ad detection on Axera LLM 8850.
+    LFM2.5-VL-450M ad-classifier on Axera LLM 8850 NPU.
 
-    The model is loaded once at initialization and kept running.
-    Uses Python axengine for inference.
-    1.5B model is smarter with fewer false positives than 0.5B.
+    Loaded once at init; both inference paths share the same prefill loop.
     """
 
-    # Simple prompt per original benchmark (94.7% accuracy)
-    # False positive reduction done via thresholds and OCR cross-validation
-    AD_PROMPT = "Is this an advertisement? Answer Yes or No."
-    INPUT_SIZE = 512  # Vision encoder input size
-    TOKEN_LENGTH = 64  # Number of image tokens for 512x512 input
+    # --- Image / prompt config (LFM-specific) ---
+    INPUT_SIZE     = 512
+    NUM_IMG_TOKENS = 256             # 16×16 grid
+    PREFILL_LEN    = 320             # padded buffer (37 text + 256 image = 293)
+    HIDDEN_SIZE    = 1024
+    PATCH_SIZE     = 16
+    GRID_SIZE      = 32              # 512 / PATCH_SIZE
+    VISION_HIDDEN  = 768
+    IMG_TOKEN_ID   = 396
+    CONV_L_CACHE   = 3               # per-layer conv state depth
 
-    # Timeout for response rejection (in seconds)
-    # Based on benchmark: responses > 1.0s correlate with model uncertainty
-    # When timeout occurs, return low confidence to avoid false positives
-    RESPONSE_TIMEOUT = 1.0
+    # LFM tokenizer special token IDs (probed from tokenizer.json)
+    BOS_TOKEN_ID  = 1
+    IM_START_ID   = 6
+    IM_END_ID     = 7
+    IMG_START_ID  = 498
+    IMG_END_ID    = 499
+
+    # Yes/No token IDs in the LFM tokenizer.
+    # ("Yes","yes"," Yes"," yes") / ("No","no"," No"," no")
+    YES_TOKEN_IDS = (12948, 12184, 18051, 18672)
+    NO_TOKEN_IDS  = (5048, 2744, 3253, 1295)
+
+    # First-token IDs for each autonomous-mode screen-state class.
+    # We use the leading-space-vs-no-space PAIR for each — max over both
+    # — so the lookup matches whether the model emits with or without a
+    # leading space after "assistant\n". Two-token classes ("M","PL"...)
+    # are sufficient for argmax-based class selection; we never need to
+    # decode past the first emitted token.
+    SCREEN_CLASS_TOKEN_IDS = (
+        ("PLAYING",     (9436,  60595)),   # "PL",   " PLA"
+        ("PAUSED",      (7055,  16137)),   # "PA",   " PA"
+        ("DIALOG",      (20546, 23238)),   # "DI",   " DI"
+        ("MENU",        (554,   857)),     # "M",    " M"
+        ("SCREENSAVER", (8421,  14151)),   # "SC",   " SC"
+    )
+
+    # Decision threshold on p_yes_norm. Default 0.5 == argmax (equivalent
+    # to max(YES_logits) > max(NO_logits)). LFM holdout-calibrated argmax
+    # gives 97.0% accuracy / 94.8% ad-recall / 99.2% non-ad-recall — the
+    # gain from threshold tuning is small. Override via env to bias
+    # ad-recall vs non-ad-recall without re-running inference.
+    AD_THRESHOLD = float(os.environ.get('MINUS_VLM_AD_THRESHOLD', '0.5'))
+
+    # Ad-detection prompt. MUST be byte-exact — the fine-tune was trained
+    # on this exact prompt string with the LFM chat template.
+    AD_PROMPT_TEXT = "Is this an advertisement? Answer Yes or No."
+
+    # Compatibility shims for old callers (FastVLM legacy):
+    AD_SYSTEM_PROMPT = "You are a helpful multimodal assistant by Liquid AI."
+    AD_PROMPT        = AD_PROMPT_TEXT
+    TOKEN_LENGTH     = NUM_IMG_TOKENS
 
     def __init__(self):
         """Initialize VLM manager."""
         self.is_ready = False
         self._lock = threading.Lock()
 
-        # Model components
-        self.config = None
+        # Model components (populated by load_model)
         self.tokenizer = None
-        self.imer = None
-        self.vision_session = None
+        self.vision = None
+        self.fused = None
+        self.post = None
         self.embeds = None
-        self.image_processor = None
+        self._ad_prompt_ids = None   # Cached: prompt for detect_ad
+        self._screen_prompt_ids = None  # Cached: prompt for query_image
 
-        # Validate paths
-        if not FASTVLM_MODEL_DIR.exists():
-            logger.error(f"FastVLM-1.5B not found at: {FASTVLM_MODEL_DIR}")
-            return
+        # Validate paths up front
+        for label, p in (("LFM model dir", LFM_MODEL_DIR),
+                          ("fused dir", FUSED_DIR),
+                          ("vision encoder", VISION_PATH),
+                          ("post", POST_PATH),
+                          ("embeds", EMBEDS_PATH),
+                          ("tokenizer", TOKENIZER_FILE)):
+            if not p.exists():
+                logger.error(f"{label} not found: {p}")
+                return
 
-        if not LLM_MODEL_PATH.exists():
-            logger.error(f"Model files not found: {LLM_MODEL_PATH}")
-            return
+        logger.info(f"VLM using LFM2.5-VL at: {LFM_MODEL_DIR}")
 
-        if not VISION_MODEL_PATH.exists():
-            logger.error(f"Vision encoder not found: {VISION_MODEL_PATH}")
-            return
-
-        if not EMBEDS_PATH.exists():
-            logger.error(f"Embeddings not found: {EMBEDS_PATH}")
-            return
-
-        logger.info(f"VLM using FastVLM-1.5B at: {FASTVLM_MODEL_DIR}")
+    # ------------------------------------------------------------------
+    # Loading
+    # ------------------------------------------------------------------
 
     def load_model(self):
-        """Load the model - initializes all components."""
+        """Load model — 17 axmodel sessions + embeds + tokenizer (~8s)."""
         if self.is_ready:
             logger.info("Model already loaded")
             return True
 
         try:
-            logger.info("Starting FastVLM-1.5B model...")
-            start_time = time.time()
+            logger.info("Starting LFM2.5-VL model...")
+            t0 = time.time()
 
-            # Add utils path to sys.path for imports
-            if str(UTILS_PATH) not in sys.path:
-                sys.path.insert(0, str(UTILS_PATH))
-
-            # Import dependencies
             try:
-                from ml_dtypes import bfloat16
                 import axengine as ax
-                # Suppress torch/transformers logging issues before import
-                os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
-                os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-                os.environ['TORCH_LOGS'] = '-all'
-                # Temporarily store and reset root logger to avoid conflicts
-                import logging as _logging
-                _root = _logging.getLogger()
-                _handlers = _root.handlers[:]
-                _level = _root.level
-                for h in _handlers:
-                    _root.removeHandler(h)
-                _root.setLevel(_logging.WARNING)
-                try:
-                    import transformers
-                    transformers.logging.set_verbosity_error()
-                    from transformers import AutoTokenizer, CLIPImageProcessor
-                finally:
-                    # Restore original logging configuration
-                    _root.setLevel(_level)
-                    for h in _handlers:
-                        _root.addHandler(h)
-                from llava_qwen import LlavaConfig, expand2square
-                from infer_func import InferManager
+                from transformers import PreTrainedTokenizerFast
             except ImportError as e:
                 logger.error(f"Missing dependency: {e}")
-                logger.error("Make sure axengine, transformers, ml_dtypes are installed")
+                logger.error("Install: pip3 install axengine transformers")
                 return False
 
-            # Load config and tokenizer
-            logger.info("  Loading config and tokenizer...")
-            self.config = LlavaConfig.from_pretrained(str(TOKENIZER_PATH))
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                str(TOKENIZER_PATH),
-                trust_remote_code=True
-            )
-
-            # Add special tokens if needed
-            mm_use_im_start_end = getattr(self.config, "mm_use_im_start_end", False)
-            mm_use_im_patch_token = getattr(self.config, "mm_use_im_patch_token", True)
-            if mm_use_im_patch_token:
-                self.tokenizer.add_tokens(["<im_patch>"], special_tokens=True)
-            if mm_use_im_start_end:
-                self.tokenizer.add_tokens(["<im_start>", "<im_end>"], special_tokens=True)
-
-            # Load LLM decoder layers
-            logger.info("  Loading LLM decoder layers...")
-            self.imer = InferManager(
-                self.config,
-                str(LLM_MODEL_PATH),
-                max_seq_len=1024
-            )
-
-            # Load vision encoder
+            # 1× vision encoder
             logger.info("  Loading vision encoder...")
-            self.vision_session = ax.InferenceSession(str(VISION_MODEL_PATH))
+            self.vision = ax.InferenceSession(str(VISION_PATH))
 
-            # Load embeddings - KEEP AS FLOAT32 per IMPLEMENTATION_GUIDE.md
-            logger.info("  Loading embeddings...")
-            self.embeds = np.load(str(EMBEDS_PATH))
-            logger.info(f"    Loaded embeddings: {self.embeds.shape}, dtype: {self.embeds.dtype}")
+            # 16× fused decoder layers, in execution order
+            logger.info("  Loading 16 fused decoder layers...")
+            self.fused = []
+            for i, lt in enumerate(LAYER_TYPES):
+                fname = f"l{i}_{lt}_fused.axmodel"
+                self.fused.append(ax.InferenceSession(str(FUSED_DIR / fname)))
 
-            # Initialize image processor
-            self.image_processor = CLIPImageProcessor(
-                size={"shortest_edge": self.INPUT_SIZE},
-                crop_size={"height": self.INPUT_SIZE, "width": self.INPUT_SIZE},
-                image_mean=[0, 0, 0],
-                image_std=[1/255, 1/255, 1/255]
+            # 1× post (LM head projection)
+            logger.info("  Loading post (LM head)...")
+            self.post = ax.InferenceSession(str(POST_PATH))
+
+            # Embedding table — mmap so we don't resident-load 256MB
+            logger.info("  Loading embedding table (mmap)...")
+            self.embeds = np.load(str(EMBEDS_PATH), mmap_mode='r')
+
+            # Tokenizer — pure-Python tokenizer.json, no chat template
+            logger.info("  Loading tokenizer...")
+            self.tokenizer = PreTrainedTokenizerFast(tokenizer_file=str(TOKENIZER_FILE))
+
+            # Pre-build the two prompts we use (ad-detection + screen
+            # classification). Their token IDs are identical across all
+            # calls — only the image features change. Caching saves a
+            # few ms per inference and avoids tokenizer thread issues.
+            self._ad_prompt_ids = self._build_prompt_ids(self.AD_PROMPT_TEXT)
+            # The screen prompt is identical to autonomous_mode's
+            # SCREEN_QUERY_PROMPT. We don't import that to avoid a
+            # circular dependency; this string MUST match it byte-exact.
+            # KEEP IT SHORT — the full prompt (text + 256 image + chat
+            # template) MUST fit in PREFILL_LEN=320 tokens or the
+            # [IM_START] assistant\n suffix gets truncated and the
+            # last-position logits become garbage. The previous, longer
+            # phrasing tokenised to 326 tokens — over by 6 — and silently
+            # truncated.
+            screen_prompt = (
+                "Classify this TV screen: PLAYING, PAUSED, DIALOG, MENU, or SCREENSAVER?"
             )
+            self._screen_prompt_ids = self._build_prompt_ids(screen_prompt)
 
-            load_time = time.time() - start_time
-            logger.info(f"FastVLM-1.5B loaded in {load_time:.1f}s")
+            # Fail loud if any cached prompt overflows the fixed prefill
+            # window. Future edits to the prompt strings will trip this
+            # before they silently degrade accuracy.
+            for label, ids in (("ad-prompt", self._ad_prompt_ids),
+                                ("screen-prompt", self._screen_prompt_ids)):
+                if len(ids) > self.PREFILL_LEN:
+                    logger.error(
+                        f"{label} is {len(ids)} tokens > PREFILL_LEN="
+                        f"{self.PREFILL_LEN}. The [IM_START] assistant suffix "
+                        f"will be truncated and inference will be garbage. "
+                        f"Shorten the prompt."
+                    )
+                    return False
+
+            load_time = time.time() - t0
+            logger.info(
+                f"LFM2.5-VL loaded in {load_time:.1f}s "
+                f"(ad-prompt={len(self._ad_prompt_ids)}t, "
+                f"screen-prompt={len(self._screen_prompt_ids)}t)"
+            )
             self.is_ready = True
             return True
 
         except Exception as e:
-            logger.error(f"Failed to load FastVLM-1.5B: {e}")
+            logger.error(f"Failed to load LFM2.5-VL: {e}")
             import traceback
-            tb_str = traceback.format_exc()
-            logger.error(f"Traceback:\n{tb_str}")
+            logger.error(f"Traceback:\n{traceback.format_exc()}")
             return False
 
+    # ------------------------------------------------------------------
+    # Compat shims (FastVLM legacy callers)
+    # ------------------------------------------------------------------
+
     def _reset_kv_cache(self):
-        """Reset KV cache between inferences - CRITICAL for accuracy."""
-        for i in range(self.config.num_hidden_layers):
-            self.imer.k_caches[i].fill(0)
-            self.imer.v_caches[i].fill(0)
+        """No-op for LFM (no persistent state between inferences)."""
+        pass
+
+    def start_tokenizer_service(self):
+        """Compatibility shim — alias for load_model()."""
+        return self.load_model()
+
+    # ------------------------------------------------------------------
+    # Preprocessing
+    # ------------------------------------------------------------------
 
     def _encode_image(self, image_path):
-        """Encode image using vision encoder."""
-        # Import here to avoid issues at module load time
-        if str(UTILS_PATH) not in sys.path:
-            sys.path.insert(0, str(UTILS_PATH))
-        from llava_qwen import expand2square
+        """Run vision encoder on `image_path` → (1, 256, 1024) FP32.
 
-        image = Image.open(image_path).convert('RGB')
-        # Expand to square with black background
-        image = expand2square(image, tuple(int(x*255) for x in self.image_processor.image_mean))
-
-        # Preprocess image
-        input_image = self.image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
-        input_image = input_image.unsqueeze(0)
-        input_image = input_image.numpy().astype(np.uint8).transpose((0, 2, 3, 1))
-
-        # Run vision encoder
-        vit_output = self.vision_session.run(None, {"images": input_image})[0]
-        return vit_output
-
-    def query_image(self, image_path, prompt, max_new_tokens=8):
+        LFM uses direct bilinear resize to 512×512 + (x/255 - 0.5)/0.5
+        normalization, then a patchify into (1, 1024, 768). DO NOT
+        substitute FastVLM-style expand2square/CLIPImageProcessor —
+        accuracy degrades.
         """
-        Run a custom prompt on an image.
+        img = Image.open(image_path).convert("RGB")
+        if img.size != (self.INPUT_SIZE, self.INPUT_SIZE):
+            img = img.resize((self.INPUT_SIZE, self.INPUT_SIZE), Image.BILINEAR)
+        arr = np.asarray(img, dtype=np.float32)
+        arr = (arr / 255.0 - 0.5) / 0.5    # → [-1, 1]
+        # (512, 512, 3) → (32, 16, 32, 16, 3) → (1024, 16, 16, 3) → (1024, 768)
+        x = arr.reshape(self.GRID_SIZE, self.PATCH_SIZE,
+                        self.GRID_SIZE, self.PATCH_SIZE, 3)
+        x = x.transpose(0, 2, 1, 3, 4).reshape(
+            self.GRID_SIZE * self.GRID_SIZE, -1)
+        patches = x.reshape(1, self.GRID_SIZE * self.GRID_SIZE,
+                            self.VISION_HIDDEN)
+        out = self.vision.run(None, {"pixel_values": patches})[0]
+        return out.astype(np.float32, copy=False)
+
+    def _build_prompt_ids(self, user_question_text):
+        """Build the full prompt token sequence for a given user question.
+
+        Format (must be byte-exact for the fine-tune to apply):
+
+          [BOS, IM_START] system "system\\n..." [IM_END] \\n
+          [IM_START] user "user\\n" [IMG_START] [IMG_TOKEN]×256 [IMG_END]
+          <user_question> [IM_END] \\n
+          [IM_START] assistant "assistant\\n"
+
+        ~37 text tokens + 256 image tokens = ~293 total (well under PREFILL_LEN=320).
+        """
+        BOS      = self.BOS_TOKEN_ID
+        IM_START = self.IM_START_ID
+        IM_END   = self.IM_END_ID
+        IMG_START = self.IMG_START_ID
+        IMG_END   = self.IMG_END_ID
+
+        def enc_strip_bos(s):
+            ids = self.tokenizer.encode(s)
+            return ids[1:] if ids and ids[0] == BOS else ids
+
+        system_text = "system\nYou are a helpful multimodal assistant by Liquid AI."
+        system_toks = enc_strip_bos(system_text)
+        user_toks   = enc_strip_bos("user\n")
+        prompt_toks = enc_strip_bos(user_question_text)
+        asst_toks   = enc_strip_bos("assistant\n")
+        nl_tok      = enc_strip_bos("\n")
+
+        return ([BOS, IM_START] + system_toks + [IM_END] + nl_tok +
+                [IM_START] + user_toks + [IMG_START] +
+                [self.IMG_TOKEN_ID] * self.NUM_IMG_TOKENS +
+                [IMG_END] + prompt_toks + [IM_END] + nl_tok +
+                [IM_START] + asst_toks)
+
+    # ------------------------------------------------------------------
+    # Prefill (shared by detect_ad + query_image)
+    # ------------------------------------------------------------------
+
+    def _prefill_last_logits(self, vision_out, prompt_ids):
+        """Run vision-feature-spliced prefill, return last-real-token logits.
 
         Args:
-            image_path: Path to image file (JPEG/PNG)
-            prompt: Custom question to ask about the image
-            max_new_tokens: Cap on generated tokens. Default 8 fits the
-                autonomous-mode multi-choice prompt (PLAYING / PAUSED /
-                DIALOG / MENU / SCREENSAVER, each ~1-3 tokens). Raise
-                explicitly for open-ended prompts; see
-                docs/VLM_NPU_DEGRADATION.md for why a cap matters.
+            vision_out: (1, 256, 1024) FP32 — from `_encode_image`.
+            prompt_ids: list[int] — from `_build_prompt_ids`.
 
         Returns:
-            tuple: (response_text, elapsed_time)
+            np.ndarray, (vocab_size,) FP32 — logits at the last real
+            (non-padding) prompt position.
         """
-        if not self.is_ready:
-            return "VLM not ready", 0
+        n_tokens = min(len(prompt_ids), self.PREFILL_LEN)
+        prompt_arr = np.array(prompt_ids[:n_tokens], dtype=np.int64)
 
-        if not os.path.exists(image_path):
-            return f"Image not found: {image_path}", 0
+        # Locate image-token slots
+        img_positions = np.where(prompt_arr == self.IMG_TOKEN_ID)[0]
+        img_start_pos = int(img_positions[0]) if len(img_positions) else -1
 
-        from ml_dtypes import bfloat16
+        # Build the (1, 320, 1024) prefill input: text embeddings + vision features
+        prefill_data = np.zeros(
+            (1, self.PREFILL_LEN, self.HIDDEN_SIZE), dtype=np.float32)
+        prefill_data[0, :n_tokens, :] = self.embeds[prompt_arr].astype(
+            np.float32, copy=False)
+        if img_start_pos >= 0:
+            n_v = min(len(img_positions), vision_out.shape[1])
+            prefill_data[0, img_start_pos:img_start_pos + n_v, :] = \
+                vision_out[0, :n_v, :]
 
-        with self._lock:
-            try:
-                start_time = time.time()
-                self._reset_kv_cache()
-                image_features = self._encode_image(image_path)
+        # Causal mask, vectorized. -65536 outside the live window, causal
+        # triangle inside the [0:n_tokens, 0:n_tokens] block.
+        mask = np.full((1, self.PREFILL_LEN, self.PREFILL_LEN),
+                       -65536.0, dtype=np.float32)
+        causal = np.triu(np.ones((n_tokens, n_tokens), dtype=np.float32), k=1)
+        mask[0, :n_tokens, :n_tokens] = causal * -65536.0
+        indices = np.arange(self.PREFILL_LEN, dtype=np.int32).reshape(
+            1, self.PREFILL_LEN)
 
-                full_prompt = "<|im_start|>system\nYou are a helpful assistant that answers questions accurately and concisely.<|im_end|>\n"
-                full_prompt += "<|im_start|>user\n" + "<image>" * self.TOKEN_LENGTH + "\n"
-                full_prompt += prompt + "<|im_end|>\n<|im_start|>assistant\n"
+        # Per-layer conv state, allocated fresh (no persistent state)
+        conv_states = {}
+        for i, lt in enumerate(LAYER_TYPES):
+            if lt == "conv":
+                conv_states[i] = np.zeros(
+                    (1, self.HIDDEN_SIZE, self.CONV_L_CACHE), dtype=np.float32)
 
-                token_ids = self.tokenizer.encode(full_prompt)
-                prefill_data = np.take(self.embeds, token_ids, axis=0)
-                prefill_data = prefill_data.astype(bfloat16)
+        # Run all 16 fused layers sequentially
+        data = prefill_data
+        for i, lt in enumerate(LAYER_TYPES):
+            if lt == "conv":
+                outs = self.fused[i].run(None, {
+                    "hidden": data,
+                    "conv_state_in": conv_states[i]})
+                data = outs[0]
+                conv_states[i] = outs[1]
+            else:  # attn
+                outs = self.fused[i].run(None, {
+                    "hidden": data,
+                    "mask": mask,
+                    "indices": indices})
+                data = outs[0]
 
-                image_token_indices = np.where(np.array(token_ids) == 151646)[0]
-                if len(image_token_indices) > 0:
-                    image_start_index = image_token_indices[0]
-                    image_insert_index = image_start_index + 1
-                    prefill_data[image_insert_index:image_insert_index + self.TOKEN_LENGTH] = \
-                        image_features[0, :, :].astype(bfloat16)
+        # Post: project last-real-token hidden state → vocab logits
+        last_hidden = data[:, n_tokens - 1:n_tokens, :]
+        logits = self.post.run(None, {"input": last_hidden})[0].flatten()
+        return logits, n_tokens
 
-                eos_token_id = None
-                if isinstance(self.config.eos_token_id, list) and len(self.config.eos_token_id) > 1:
-                    eos_token_id = self.config.eos_token_id
-
-                slice_len = 128
-                token_ids = self.imer.prefill(
-                    self.tokenizer, token_ids, prefill_data, slice_len=slice_len
-                )
-                response = self.imer.decode(
-                    self.tokenizer, token_ids, self.embeds,
-                    slice_len=slice_len, eos_token_id=eos_token_id, stream=False,
-                    max_new_tokens=max_new_tokens,
-                )
-
-                elapsed = time.time() - start_time
-                return response, elapsed
-
-            except Exception as e:
-                logger.error(f"VLM query error: {e}")
-                return str(e), time.time() - start_time
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def detect_ad(self, image_path):
-        """
-        Run ad detection on an image.
-
-        Args:
-            image_path: Path to image file (JPEG/PNG)
+        """Ad/not-ad classification.
 
         Returns:
-            tuple: (is_ad, response_text, elapsed_time, confidence)
-                - is_ad: bool, whether the VLM thinks this is an ad
-                - response_text: str, raw response from VLM
-                - elapsed_time: float, inference time in seconds
-                - confidence: float, 0.0-1.0 confidence score
+            (is_ad: bool, response_text: str, elapsed: float, confidence: float)
+
+        confidence ∈ [0,1] is `p_yes_norm` for ads, `1 - p_yes_norm` for
+        non-ads — feeds the existing sliding-window decision engine.
         """
         if not self.is_ready:
             return False, "VLM not ready", 0, 0.0
-
         if not os.path.exists(image_path):
             return False, f"Image not found: {image_path}", 0, 0.0
 
-        # Import bfloat16 here
-        from ml_dtypes import bfloat16
-
         with self._lock:
             try:
-                start_time = time.time()
+                t0 = time.time()
 
-                # Reset KV cache for fresh inference
-                self._reset_kv_cache()
+                vision_out = self._encode_image(image_path)
+                logits, _ = self._prefill_last_logits(
+                    vision_out, self._ad_prompt_ids)
 
-                # Encode image
-                image_features = self._encode_image(image_path)
+                # Argmax-of-spelling decision (matches reference script)
+                p_yes_logit = float(max(logits[t] for t in self.YES_TOKEN_IDS))
+                p_no_logit  = float(max(logits[t] for t in self.NO_TOKEN_IDS))
 
-                # Build prompt - IMAGE FIRST, then question (per IMPLEMENTATION_GUIDE.md)
-                full_prompt = "<|im_start|>system\nYou are a helpful assistant that answers questions accurately and concisely.<|im_end|>\n"
-                full_prompt += "<|im_start|>user\n" + "<image>" * self.TOKEN_LENGTH + "\n"
-                full_prompt += self.AD_PROMPT + "<|im_end|>\n<|im_start|>assistant\n"
+                # Also compute p_yes_norm in the {YES, NO} subspace for
+                # tunable thresholding. Softmax-normalize over only the
+                # 8 yes/no tokens for numerical stability with raw logits.
+                yn_logits = np.array(
+                    [logits[t] for t in self.YES_TOKEN_IDS] +
+                    [logits[t] for t in self.NO_TOKEN_IDS], dtype=np.float32)
+                yn_logits = yn_logits - yn_logits.max()
+                yn_probs = np.exp(yn_logits)
+                yn_probs /= yn_probs.sum()
+                p_yes_sub = float(yn_probs[:len(self.YES_TOKEN_IDS)].sum())
+                p_no_sub  = float(yn_probs[len(self.YES_TOKEN_IDS):].sum())
+                p_yes_norm = p_yes_sub / (p_yes_sub + p_no_sub + 1e-9)
 
-                token_ids = self.tokenizer.encode(full_prompt)
+                if abs(self.AD_THRESHOLD - 0.5) < 1e-6:
+                    # Pure argmax — matches eval_fused.py exactly
+                    is_ad = p_yes_logit > p_no_logit
+                else:
+                    is_ad = p_yes_norm > self.AD_THRESHOLD
 
-                # Prepare prefill data - use astype() NOT view() per IMPLEMENTATION_GUIDE.md
-                prefill_data = np.take(self.embeds, token_ids, axis=0)
-                prefill_data = prefill_data.astype(bfloat16)
+                confidence = p_yes_norm if is_ad else (1.0 - p_yes_norm)
+                response = f"{'Yes' if is_ad else 'No'} (p={p_yes_norm:.4f})"
 
-                # Insert image features (convert to bfloat16 to match prefill_data)
-                # Image token ID is 151646
-                image_token_indices = np.where(np.array(token_ids) == 151646)[0]
-                if len(image_token_indices) > 0:
-                    image_start_index = image_token_indices[0]
-                    image_insert_index = image_start_index + 1
-                    prefill_data[image_insert_index:image_insert_index + self.TOKEN_LENGTH] = \
-                        image_features[0, :, :].astype(bfloat16)
-
-                # Get EOS token(s)
-                eos_token_id = None
-                if isinstance(self.config.eos_token_id, list) and len(self.config.eos_token_id) > 1:
-                    eos_token_id = self.config.eos_token_id
-
-                # Run inference
-                slice_len = 128
-                token_ids = self.imer.prefill(
-                    self.tokenizer,
-                    token_ids,
-                    prefill_data,
-                    slice_len=slice_len
+                elapsed = time.time() - t0
+                logger.info(
+                    f"VLM(LFM2): {'AD' if is_ad else 'NO-AD'} "
+                    f"p_yes={p_yes_norm:.4f} "
+                    f"y_logit={p_yes_logit:.3f} n_logit={p_no_logit:.3f} "
+                    f"T={self.AD_THRESHOLD} lat={elapsed:.3f}s"
                 )
-                response = self.imer.decode(
-                    self.tokenizer,
-                    token_ids,
-                    self.embeds,
-                    slice_len=slice_len,
-                    eos_token_id=eos_token_id,
-                    stream=False,
-                    # Cap generation. detect_ad only needs the first word
-                    # ("Yes" / "No") plus a token of slack for parsing.
-                    # Without this, certain images make the model emit a
-                    # 30-60-token descriptive paragraph (~10s at ~0.23s/tok)
-                    # instead of the requested short answer. See
-                    # docs/VLM_NPU_DEGRADATION.md for the investigation.
-                    max_new_tokens=5,
-                )
-
-                elapsed = time.time() - start_time
-
-                # Always parse the response — even if it ran long. With
-                # max_new_tokens=5 the worst case is ~1.34s, so a slow
-                # answer still tells us what the model decided. We just
-                # halve the parsed confidence as a soft penalty for
-                # the model going descriptive instead of giving the
-                # one-word answer the prompt asked for.
-                is_ad, confidence = self._is_ad_response(response)
-                if elapsed > self.RESPONSE_TIMEOUT:
-                    logger.debug(
-                        f"VLM response slow ({elapsed:.2f}s > {self.RESPONSE_TIMEOUT}s), "
-                        f"keeping verdict but halving confidence"
-                    )
-                    confidence = confidence * 0.5
-
                 return is_ad, response, elapsed, confidence
 
             except Exception as e:
                 logger.error(f"VLM inference error: {e}")
                 import traceback
-                traceback.print_exc()
-                return False, str(e), time.time() - start_time, 0.0
+                logger.error(f"Traceback:\n{traceback.format_exc()}")
+                return False, str(e), time.time() - t0, 0.0
 
-    def _parse_confidence(self, response):
-        """
-        Parse confidence level from VLM response.
+    def query_image(self, image_path, prompt, max_new_tokens=8):
+        """Multi-class screen-state classification.
+
+        Specialized for autonomous_mode.SCREEN_QUERY_PROMPT. Returns the
+        class name (PLAYING/PAUSED/DIALOG/MENU/SCREENSAVER) whose
+        first-token logit is highest. `max_new_tokens` is ignored (no
+        decode loop) but kept for API compatibility.
 
         Returns:
-            float: Confidence score 0.0-1.0
-            - 0.9-1.0: High confidence (definitely, clearly, certainly)
-            - 0.6-0.8: Medium confidence (default, no qualifiers)
-            - 0.3-0.5: Low confidence (maybe, possibly, might)
-            - 0.1-0.2: Very low confidence (uncertain, not sure)
+            (response_text: str, elapsed: float)
         """
-        r = response.lower()
+        if not self.is_ready:
+            return "VLM not ready", 0.0
+        if not os.path.exists(image_path):
+            return f"Image not found: {image_path}", 0.0
 
-        # High confidence indicators
-        high_conf = ['definitely', 'clearly', 'certainly', 'absolutely',
-                     '100%', 'sure', 'obvious', 'without doubt', 'no doubt']
-        for word in high_conf:
+        with self._lock:
+            t0 = time.time()
+            try:
+                vision_out = self._encode_image(image_path)
+
+                # If the caller passed the canonical screen prompt, reuse
+                # the cached token IDs. Otherwise build on the fly (rare
+                # in production — only autonomous_mode uses query_image)
+                # and length-check against the fixed prefill window.
+                if (prompt and prompt.startswith("Classify this TV screen")):
+                    prompt_ids = self._screen_prompt_ids
+                else:
+                    prompt_ids = self._build_prompt_ids(prompt or self.AD_PROMPT_TEXT)
+                    if len(prompt_ids) > self.PREFILL_LEN:
+                        logger.warning(
+                            f"query_image prompt is {len(prompt_ids)} tokens > "
+                            f"PREFILL_LEN={self.PREFILL_LEN} — shorten the "
+                            f"prompt; returning PROMPT_TOO_LONG"
+                        )
+                        return "PROMPT_TOO_LONG", time.time() - t0
+
+                logits, _ = self._prefill_last_logits(vision_out, prompt_ids)
+
+                # Pick the class with the highest first-token logit (max
+                # over no-leading-space and leading-space spellings).
+                best_class = None
+                best_score = -float('inf')
+                scores = {}
+                for name, token_ids in self.SCREEN_CLASS_TOKEN_IDS:
+                    s = float(max(logits[t] for t in token_ids))
+                    scores[name] = s
+                    if s > best_score:
+                        best_score = s
+                        best_class = name
+
+                elapsed = time.time() - t0
+
+                # Format scores compactly for the log; autonomous_mode
+                # only consumes the leading class name via `startswith`.
+                score_str = " ".join(
+                    f"{n}={scores[n]:.2f}" for n, _ in self.SCREEN_CLASS_TOKEN_IDS)
+                logger.info(
+                    f"VLM(LFM2) query: {best_class} ({score_str}) "
+                    f"lat={elapsed:.3f}s"
+                )
+                return best_class, elapsed
+
+            except Exception as e:
+                import traceback
+                logger.error(f"VLM query error: {e}\n{traceback.format_exc()}")
+                return f"Error: {e}", time.time() - t0
+
+    # ------------------------------------------------------------------
+    # Confidence parsing (kept for backwards compat with callers that
+    # used the FastVLM response-text path; LFM responses are now
+    # structured ("Yes (p=…)" / class names) so these are mostly dead
+    # code now, but harmless to keep around).
+    # ------------------------------------------------------------------
+
+    def _parse_confidence(self, response):
+        r = (response or "").lower()
+        for word in ('definitely', 'clearly', 'certainly', 'absolutely',
+                     '100%', 'sure', 'obvious', 'without doubt', 'no doubt'):
             if word in r:
                 return 0.95
-
-        # Low confidence indicators
-        low_conf = ['maybe', 'possibly', 'might', 'could be', 'perhaps',
-                    'probably', 'likely', 'appears to', 'seems to', 'looks like']
-        for word in low_conf:
+        for word in ('maybe', 'possibly', 'might', 'could be', 'perhaps',
+                     'probably', 'likely', 'appears to', 'seems to', 'looks like'):
             if word in r:
                 return 0.5
-
-        # Very low confidence indicators
-        very_low = ['not sure', 'uncertain', 'unclear', 'hard to tell',
-                    'difficult to say', 'cannot determine', "can't tell"]
-        for word in very_low:
+        for word in ('not sure', 'uncertain', 'unclear', 'hard to tell',
+                     'difficult to say', 'cannot determine', "can't tell"):
             if word in r:
                 return 0.3
-
-        # Default medium confidence
         return 0.75
 
     def _is_ad_response(self, response):
-        """
-        Check if VLM response indicates an ad - STRICT parsing to reduce false positives.
-
-        Returns:
-            tuple: (is_ad: bool, confidence: float)
-        """
-        r = response.lower().strip()
+        r = (response or "").lower().strip()
         confidence = self._parse_confidence(response)
-
-        # Check for explicit No first (bias toward not blocking)
         if r.startswith('no') or r == 'n':
             return False, confidence
-
-        # Check for explicit Yes at start only
         if r.startswith('yes') or r == 'y':
             return True, confidence
-
-        # Check first word only (stricter than first 3 words)
-        first_word = r.split()[0] if r.split() else ''
-        if first_word == 'no' or first_word == 'no,' or first_word == 'no.':
-            return False, confidence
-        if first_word == 'yes' or first_word == 'yes,' or first_word == 'yes.':
-            return True, confidence
-
-        # Check for explicit negation phrases (these indicate NOT an ad)
-        non_ad_phrases = [
-            'not a commercial', 'not a tv commercial', 'not an ad',
-            'not an advertisement', 'not a video ad', 'no ad',
-            'this is not', 'this is a menu', 'this is a home screen',
-            'this appears to be a menu', 'this appears to be a home',
-            'interface', 'home screen', 'menu screen', 'app interface'
-        ]
-        for phrase in non_ad_phrases:
-            if phrase in r:
-                return False, confidence
-
-        # Only mark as ad if explicitly stated as commercial/tv ad
-        ad_phrases = ['tv commercial', 'commercial break', 'video advertisement', 'this is a commercial']
-        for phrase in ad_phrases:
-            if phrase in r:
-                return True, confidence
-
-        # Default to NOT an ad if uncertain (conservative - avoid false positives)
-        # Very low confidence for uncertain responses
         return False, 0.3
 
+    # ------------------------------------------------------------------
+    # Release
+    # ------------------------------------------------------------------
+
     def release(self):
-        """Release resources - clean up model components and free NPU memory."""
+        """Release NPU sessions and embeddings."""
         import gc
-
         with self._lock:
-            # Release InferManager first (holds NPU sessions)
-            if self.imer is not None:
-                try:
-                    # Clear KV caches
-                    if hasattr(self.imer, 'k_caches'):
-                        for cache in self.imer.k_caches:
-                            if cache is not None:
-                                cache.fill(0)
-                    if hasattr(self.imer, 'v_caches'):
-                        for cache in self.imer.v_caches:
-                            if cache is not None:
-                                cache.fill(0)
-                    # Release any axengine sessions
-                    if hasattr(self.imer, 'sessions'):
-                        for session in self.imer.sessions:
-                            if session is not None and hasattr(session, 'release'):
-                                try:
-                                    session.release()
-                                except Exception:
-                                    pass
-                except Exception as e:
-                    logger.debug(f"Error cleaning up InferManager: {e}")
-                self.imer = None
+            for attr in ('vision', 'post'):
+                sess = getattr(self, attr, None)
+                if sess is not None:
+                    try:
+                        if hasattr(sess, 'release'):
+                            sess.release()
+                    except Exception as e:
+                        logger.debug(f"Error releasing {attr}: {e}")
+                    setattr(self, attr, None)
 
-            # Release vision encoder session
-            if self.vision_session is not None:
-                try:
-                    if hasattr(self.vision_session, 'release'):
-                        self.vision_session.release()
-                except Exception as e:
-                    logger.debug(f"Error releasing vision session: {e}")
-                self.vision_session = None
+            if self.fused:
+                for sess in self.fused:
+                    try:
+                        if sess is not None and hasattr(sess, 'release'):
+                            sess.release()
+                    except Exception as e:
+                        logger.debug(f"Error releasing fused layer: {e}")
+                self.fused = None
 
-            # Clear other components
-            self.config = None
             self.tokenizer = None
             self.embeds = None
-            self.image_processor = None
+            self._ad_prompt_ids = None
+            self._screen_prompt_ids = None
             self.is_ready = False
 
-        # Force garbage collection to free memory
         gc.collect()
-        logger.info("[VLM] Model unloaded and resources released")
-
-    def start_tokenizer_service(self):
-        """Compatibility method - FastVLM uses transformers tokenizer."""
-        return self.load_model()
+        logger.info("[VLM] LFM2.5-VL model unloaded and resources released")
