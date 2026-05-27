@@ -1,0 +1,72 @@
+[
+  {
+    "file": "ad_pharma.wav",
+    "text_input": "Side effects may include nausea and dizziness. Consult your doctor before taking this medication. Available by prescription only at participating pharmacies.",
+    "expected_min_hits": 2,
+    "description": "Pharma ad \u2014 strong markers",
+    "size_bytes": 327618
+  },
+  {
+    "file": "ad_cta_strong.wav",
+    "text_input": "Call now! 1 800 555 1234! Save up to fifty percent. Available now at our website, brand dot com. Limited time only!",
+    "expected_min_hits": 3,
+    "description": "Strong CTA ad \u2014 multiple markers",
+    "size_bytes": 423468
+  },
+  {
+    "file": "ad_subtle.wav",
+    "text_input": "Introducing the all new pickup truck. Built tough. Voted number one in customer satisfaction.",
+    "expected_min_hits": 2,
+    "description": "Subtle car ad \u2014 introducing + voted #1",
+    "size_bytes": 211784
+  },
+  {
+    "file": "ad_price.wav",
+    "text_input": "Now only nine ninety nine. Free shipping on orders over twenty five dollars. Order yours today.",
+    "expected_min_hits": 1,
+    "description": "Price-focused ad",
+    "size_bytes": 215490
+  },
+  {
+    "file": "ad_streaming_promo.wav",
+    "text_input": "Coming soon to a theater near you. Available in stores December fifteenth. Rated PG-13.",
+    "expected_min_hits": 1,
+    "description": "Movie trailer end-tag",
+    "size_bytes": 205668
+  },
+  {
+    "file": "show_dialog.wav",
+    "text_input": "I just don't think it's a good idea, John. Sarah said she would be home by seven, but it's already nine. Should we be worried?",
+    "expected_min_hits": 0,
+    "description": "Show dialog \u2014 no markers",
+    "size_bytes": 272348
+  },
+  {
+    "file": "show_money_talk.wav",
+    "text_input": "She paid fifty dollars for that dress. Can you believe it? I would never spend that much.",
+    "expected_min_hits": 0,
+    "description": "Show dialog mentioning money \u2014 must not hit",
+    "size_bytes": 190342
+  },
+  {
+    "file": "show_netflix_promo.wav",
+    "text_input": "Available on Netflix this Friday. The new season of Stranger Things.",
+    "expected_min_hits": 0,
+    "description": "Service-promo exclusion \u2014 must not hit",
+    "size_bytes": 149408
+  },
+  {
+    "file": "show_youtube_creator.wav",
+    "text_input": "Subscribe to my channel and hit that bell icon for more content. Link in the description below.",
+    "expected_min_hits": 0,
+    "description": "YouTube creator exclusion \u2014 must not hit",
+    "size_bytes": 207662
+  },
+  {
+    "file": "silence.wav",
+    "text_input": "",
+    "expected_min_hits": 0,
+    "description": "Empty / silence",
+    "size_bytes": 32078
+  }
+]

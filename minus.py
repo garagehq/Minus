@@ -222,11 +222,23 @@ except ImportError as e:
 
 # Import Audio module
 try:
-    from audio import AudioPassthrough
+    from audio import AudioPassthrough, AudioASRTap
     HAS_AUDIO = True
 except ImportError as e:
     logger.warning(f"Audio module not available: {e}")
     HAS_AUDIO = False
+
+# Import ASR module (whisper.cpp-driven). Optional — installs without
+# whisper.cpp built will skip the audio-tap branch and the ASR thread,
+# leaving the audio pipeline byte-identical to the pre-ASR shape.
+try:
+    from asr import ASRManager, is_asr_available
+    HAS_ASR = True
+except ImportError as e:
+    logger.warning(f"ASR module not available: {e}")
+    HAS_ASR = False
+    def is_asr_available():
+        return False
 
 # Import Health Monitor
 try:
@@ -762,12 +774,33 @@ class Minus:
                 logger.warning(f"VLM init failed: {e}")
                 self.vlm = None
 
+        # Initialize ASR (whisper.cpp ad-content confirmation/veto) — must
+        # be created BEFORE the audio passthrough so the tap can be wired
+        # into the audio pipeline at construction time. The audio tap is
+        # only created if whisper.cpp is actually installed (otherwise we
+        # leave the audio pipeline shape unchanged, no tee branch).
+        self.asr_tap = None
+        self.asr = None
+        if HAS_ASR and is_asr_available():
+            try:
+                self.asr_tap = AudioASRTap()
+                self.asr = ASRManager(self.asr_tap)
+                logger.info("ASR initialized (whisper.cpp tiny.en + audio tap)")
+            except Exception as e:
+                logger.warning(f"ASR init failed: {e} — running without ASR")
+                self.asr_tap = None
+                self.asr = None
+        elif HAS_ASR:
+            logger.info("ASR module loaded but whisper.cpp not found at "
+                        "configured paths — running without ASR")
+
         # Initialize Audio passthrough
         if HAS_AUDIO:
             try:
                 self.audio = AudioPassthrough(
                     capture_device=config.audio_capture_device,  # HDMI-RX audio (hw:4,0)
-                    playback_device=config.audio_playback_device  # HDMI-TX audio (auto-detected)
+                    playback_device=config.audio_playback_device,  # HDMI-TX audio (auto-detected)
+                    asr_tap=self.asr_tap  # Optional; None disables the tap branch entirely
                 )
                 # Link audio to ad_blocker for mute control
                 if self.ad_blocker:
@@ -1707,6 +1740,25 @@ class Minus:
         remaining = self.vlm_paused_until - time.time()
         return max(0, int(remaining))
 
+    def _asr_verdict(self) -> str:
+        """Return ASR's current verdict on whether audio sounds like an ad.
+
+        Returns one of:
+          'confirm' — marketing language was heard in the rolling 8s window
+          'veto'    — clear show dialog with no markers; suppress VLM-alone
+          'unknown' — no ASR signal yet (cold start, music only, ASR disabled)
+
+        Always returns 'unknown' when ASR is unavailable so blocking
+        decisions degrade gracefully on installs without whisper.cpp.
+        """
+        if self.asr is None:
+            return 'unknown'
+        try:
+            return self.asr.verdict()
+        except Exception as e:
+            logger.debug(f"ASR verdict error: {e}")
+            return 'unknown'
+
     def resume_blocking(self):
         """Resume ad blocking immediately."""
         with self._state_lock:
@@ -1813,6 +1865,9 @@ class Minus:
             'pause_remaining': self.get_pause_remaining(),
             'vlm_user_paused': self.is_vlm_user_paused(),
             'vlm_user_pause_remaining': self.get_vlm_pause_remaining(),
+            'asr_verdict': self._asr_verdict(),
+            'asr': (self.asr.get_status() if self.asr is not None else
+                    {'available': False, 'enabled': False, 'running': False}),
             'hdmi_reconnect_grace': self.is_in_hdmi_reconnect_grace(),
             'hdmi_reconnect_grace_remaining': self.get_hdmi_reconnect_grace_remaining(),
             'static_suppressed': self.static_blocking_suppressed,
@@ -2634,6 +2689,14 @@ class Minus:
                     self.config.audio_playback_device = drm_info['audio_device']
                 if self.audio.start():
                     logger.info("Audio passthrough started")
+                    # Kick off ASR inference loop now that the audio
+                    # pipeline (and tap) is producing buffers. Safe to
+                    # call even if asr is None.
+                    if self.asr is not None:
+                        try:
+                            self.asr.start()
+                        except Exception as e:
+                            logger.warning(f"ASR start failed: {e}")
                 else:
                     logger.warning("Audio passthrough failed to start")
 
@@ -2702,10 +2765,36 @@ class Minus:
                         ad_ratio, _, total = self._get_vlm_agreement()
                         logger.info(f"VLM suppressed - static screen detected (prevents false positive on paused content). Agreement was {ad_ratio*100:.0f}% of {total}")
                     else:
-                        should_start = True
-                        source = "vlm"
-                        ad_ratio, _, total = self._get_vlm_agreement()
-                        logger.info(f"VLM triggered alone (agreement: {ad_ratio*100:.0f}% of {total} decisions)")
+                        # ASR confirmation/veto gate. ASR is a SECOND
+                        # opinion on the audio channel:
+                        #   'confirm' — marketing language heard recently;
+                        #               block as "vlm+asr" (highest conf)
+                        #   'veto'    — clear show dialog, no markers; do NOT
+                        #               start blocking (product-placement case)
+                        #   'unknown' — no useful signal yet (cold start, music
+                        #               only, ASR disabled); fall through to
+                        #               the existing VLM-alone behavior
+                        # OCR-driven paths above are untouched: OCR text on
+                        # screen is authoritative regardless of audio.
+                        asr_verdict = self._asr_verdict()
+                        if asr_verdict == 'veto':
+                            ad_ratio, _, total = self._get_vlm_agreement()
+                            transcript = (self.asr.last_transcript[:60]
+                                          if self.asr else '')
+                            logger.info(
+                                f"VLM-alone vetoed by ASR (no marketing "
+                                f"language heard). VLM agreement was "
+                                f"{ad_ratio*100:.0f}% of {total}. "
+                                f"ASR transcript: '{transcript}'")
+                        else:
+                            should_start = True
+                            source = "vlm+asr" if asr_verdict == 'confirm' else "vlm"
+                            ad_ratio, _, total = self._get_vlm_agreement()
+                            asr_note = (f" + ASR confirmed ({self.asr.last_marker_hits} markers)"
+                                        if asr_verdict == 'confirm' and self.asr else '')
+                            logger.info(f"VLM triggered alone (agreement: "
+                                        f"{ad_ratio*100:.0f}% of {total} "
+                                        f"decisions){asr_note}")
 
                 if should_start and self.is_in_hdmi_reconnect_grace():
                     remaining = self.get_hdmi_reconnect_grace_remaining()
@@ -2784,6 +2873,26 @@ class Minus:
                         # (OCR never detected the ad, so OCR's opinion is unreliable here)
                         # Use simple consecutive count, not sliding window (for responsiveness)
                         should_stop = vlm_says_stop
+
+                        # ASR force-stop: this is the "product placement
+                        # rescue" path. A block started on VLM alone
+                        # (source=="vlm", not "vlm+asr" — ASR didn't
+                        # confirm at start) but ASR has now been listening
+                        # for ≥4s and reports clear show dialog with zero
+                        # marketing markers. Almost certainly a brand on
+                        # screen during a show. Force the block to end.
+                        # OCR/both/vlm+asr blocks are NOT affected — their
+                        # other signal is still trusted.
+                        if (not should_stop and blocking_elapsed >= 4.0 and
+                                self.asr is not None and
+                                self.asr.verdict() == 'veto'):
+                            transcript = self.asr.last_transcript[:60]
+                            logger.warning(
+                                f"[VLM] Force-stopping VLM-only blocking "
+                                f"({blocking_elapsed:.1f}s): ASR confirms "
+                                f"show audio, no marketing markers heard. "
+                                f"Transcript: '{transcript}'")
+                            should_stop = True
 
                         # SAFEGUARD: Auto-stop VLM-only blocking after 90 seconds
                         # This prevents extended false positives on video interfaces
@@ -3950,6 +4059,15 @@ class Minus:
                 self.ustreamer_process.wait(timeout=5)
             except:
                 self.ustreamer_process.kill()
+
+        # Stop ASR BEFORE tearing down audio so any in-flight whisper-cli
+        # subprocess can finish/timeout cleanly while the audio pipeline
+        # is still alive.
+        if self.asr:
+            try:
+                self.asr.stop()
+            except Exception as e:
+                logger.debug(f"ASR stop error: {e}")
 
         if self.audio:
             self.audio.destroy()

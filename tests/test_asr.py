@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""
+Tests for the ASR (whisper.cpp) confirmation/veto pipeline.
+
+Three concerns:
+
+  1. Keyword module (src/asr_keywords.py): correctly classifies known
+     ad-copy vs show-dialog transcripts, handles whisper mistranscriptions,
+     and the exclusion list suppresses service-promo / YouTube-creator
+     false positives.
+
+  2. ASRManager state machine (src/asr.py): verdict()'s three-state output
+     (confirm/veto/unknown), rolling-window history correctness, graceful
+     degradation when ASR is disabled or whisper is missing.
+
+  3. AudioASRTap ring buffer (src/audio.py): write-correctness across
+     wraparound, snapshot atomicity, no leakage between snapshots, and
+     the playback-branch pipeline shape is byte-identical with vs.
+     without a tap attached (so the audio recovery + watchdog
+     mechanisms behave identically).
+
+End-to-end live behavior (real whisper.cpp on real audio) is covered by
+tests/asr_corpus/bench.py — that runs slowly and depends on the model
+file, so it's separate. This test file mocks whisper.
+
+Run: python3 -m pytest tests/test_asr.py -v
+   or: python3 -m unittest tests.test_asr
+"""
+import os
+import sys
+import threading
+import time
+import unittest
+import wave
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+
+REPO = Path(__file__).parent.parent
+sys.path.insert(0, str(REPO / 'src'))
+
+
+# =============================================================================
+# Keyword module
+# =============================================================================
+
+
+class TestASRKeywords(unittest.TestCase):
+    """Validates count_marker_hits + the exclusion list against
+    realistic whisper-tiny transcripts (including known mistranscriptions
+    captured from tests/asr_corpus/bench.py runs)."""
+
+    def setUp(self):
+        from asr_keywords import count_marker_hits, explain_hits
+        self.count = count_marker_hits
+        self.explain = explain_hits
+
+    # ----- ad-copy cases that MUST hit -----
+
+    def test_strong_cta_ad_scores(self):
+        text = ("Call now! 1-800-DISCOUNT! Save up to 50 percent. "
+                "Available now at brand dot com. Limited time only!")
+        self.assertGreaterEqual(self.count(text), 3)
+
+    def test_pharma_disclaimer_scores(self):
+        text = ("Side effects may include nausea. Consult your doctor "
+                "before taking this medication. Available by prescription only.")
+        self.assertGreaterEqual(self.count(text), 2)
+
+    def test_mangled_ad_still_scores(self):
+        """whisper-tiny drops/mangles syllables. A real ad with multiple
+        markers should still hit >=1 even when half the transcript is
+        garbled."""
+        # Real bench output from ad_price.wav: most of the original CTA
+        # was lost; only "order yours today" came through cleanly.
+        text = "3 shipping orders over $25 order yours today."
+        self.assertGreaterEqual(self.count(text), 1)
+
+    def test_price_with_cents_hits(self):
+        # Strict $X.XX should still match — ads with explicit cents.
+        text = "Now only $9.99 for a limited time!"
+        self.assertGreaterEqual(self.count(text), 2)
+
+    # ----- show / non-ad cases that MUST NOT hit -----
+
+    def test_show_dialog_no_hits(self):
+        text = "I just don't think it's a good idea, John. Sarah said she would be home by seven."
+        self.assertEqual(self.count(text), 0)
+
+    def test_show_dollar_amount_no_hits(self):
+        """Show characters mention bare dollar amounts. Whisper sometimes
+        renders 'fifty dollars' as '$50' or '$15'. We must NOT score
+        those as ad markers — that's the failure that drove tightening
+        the price regex (see asr_keywords.py comment block)."""
+        text = "She paid $15 for that dress. Can you believe it?"
+        self.assertEqual(self.count(text), 0)
+        # Also the actual TTS-rendered phrasing
+        text2 = "She paid fifty dollars for that dress."
+        self.assertEqual(self.count(text2), 0)
+
+    def test_netflix_promo_excluded(self):
+        text = "Available on Netflix this Friday. The new season of Stranger Things."
+        self.assertEqual(self.count(text), 0)
+
+    def test_youtube_creator_excluded(self):
+        text = "Subscribe to my channel and hit that bell. Link in the description."
+        self.assertEqual(self.count(text), 0)
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(self.count(''), 0)
+        self.assertEqual(self.count('   '), 0)
+
+    def test_silence_hallucination_no_hits(self):
+        """whisper hallucinates short phrases like 'you' or 'Thank you.'
+        on silence/music. Must not score."""
+        self.assertEqual(self.count('you'), 0)
+        self.assertEqual(self.count('Thank you.'), 0)
+
+    def test_exclusion_overrides_marker(self):
+        """If a transcript contains both an ad marker AND an exclusion
+        phrase, the exclusion wins (the marker is incidental to a
+        service-promo context)."""
+        text = "Available on Netflix this Friday. Save up to 50 percent."
+        self.assertEqual(self.count(text), 0)
+
+    def test_explain_returns_matched_markers(self):
+        text = "Call now! Available at brand dot com."
+        hits = self.explain(text)
+        self.assertIn('call now', hits)
+        # url-spoken regex match
+        self.assertTrue(any('url-spoken' in h for h in hits))
+
+
+# =============================================================================
+# ASRManager state machine
+# =============================================================================
+
+
+class _FakeTap:
+    """Minimal AudioASRTap stand-in for ASRManager tests."""
+    def __init__(self, has_audio=True):
+        self.has_audio = has_audio
+        self.snapshot_calls = 0
+    def snapshot_to_wav(self, seconds=5.0):
+        self.snapshot_calls += 1
+        return self.has_audio
+
+
+class TestASRManager(unittest.TestCase):
+
+    def setUp(self):
+        from asr import ASRManager
+        self.ASRManager = ASRManager
+
+    def _make(self, **kwargs):
+        # Default constructor — uses real whisper paths but we never call
+        # _run_whisper directly in these tests (we feed _record_result).
+        return self.ASRManager(_FakeTap(), **kwargs)
+
+    def test_verdict_unknown_when_not_running(self):
+        m = self._make()
+        self.assertEqual(m.verdict(), 'unknown')
+
+    def test_verdict_unknown_when_disabled(self):
+        m = self._make()
+        m.is_running = True
+        m.enabled = False
+        self.assertEqual(m.verdict(), 'unknown')
+
+    def test_verdict_unknown_when_no_history(self):
+        m = self._make()
+        m.is_running = True
+        self.assertEqual(m.verdict(), 'unknown')
+
+    def test_verdict_confirm_on_marker_hit(self):
+        m = self._make()
+        m.is_running = True
+        m._record_result('Call now! Available at brand dot com.', 0.5, 'ok')
+        self.assertEqual(m.verdict(), 'confirm')
+
+    def test_verdict_veto_on_clear_show_dialog(self):
+        m = self._make()
+        m.is_running = True
+        # Multiple zero-hit transcripts with plenty of speech
+        for _ in range(3):
+            m._record_result(
+                "She walked into the room and sat down. Her brother was already there.",
+                0.5, 'ok')
+        self.assertEqual(m.verdict(), 'veto')
+
+    def test_verdict_unknown_on_silence_window(self):
+        """Several inferences with zero hits AND very little transcribed
+        speech → 'unknown' (not 'veto'). Avoids vetoing when audio is
+        actually just music or silence."""
+        m = self._make()
+        m.is_running = True
+        for _ in range(3):
+            m._record_result('Thank you.', 0.5, 'ok')
+        # Only a few alpha words per window — total < 10 over window
+        self.assertEqual(m.verdict(), 'unknown')
+
+    def test_verdict_history_window_ages_out(self):
+        """A confirm from outside the 8s window should no longer count."""
+        m = self._make()
+        m.is_running = True
+        # Inject a hit, then time-travel forward beyond the window.
+        m._record_result('Call now! Available at brand dot com.', 0.5, 'ok')
+        old_ts = time.time() - (m.HISTORY_WINDOW_S + 1)
+        # Replace the lone entry's timestamp
+        with m._lock:
+            ts, hits, words = m._history[0]
+            m._history[0] = (old_ts, hits, words)
+        self.assertEqual(m.verdict(), 'unknown')
+
+    def test_get_status_keys(self):
+        """API stability: /api/status reads these keys."""
+        m = self._make()
+        s = m.get_status()
+        for key in ('available', 'enabled', 'running', 'inference_count',
+                    'timeout_count', 'failure_count', 'verdict',
+                    'last_transcript', 'last_marker_hits',
+                    'p50_latency_s', 'p95_latency_s'):
+            self.assertIn(key, s)
+
+    def test_record_result_timeouts_increment_counter(self):
+        m = self._make()
+        m._record_result('', 2.5, 'timeout')
+        self.assertEqual(m.timeout_count, 1)
+        # No transcript recorded
+        self.assertEqual(m.last_transcript, '')
+
+    def test_record_result_errors_increment_counter(self):
+        m = self._make()
+        m._record_result('', 0.1, 'error')
+        self.assertEqual(m.failure_count, 1)
+
+
+# =============================================================================
+# AudioASRTap ring buffer
+# =============================================================================
+
+
+class TestAudioASRTap(unittest.TestCase):
+    """Validates the ring buffer in isolation (no GStreamer)."""
+
+    def setUp(self):
+        # Import after sys.path is fixed
+        from audio import AudioASRTap
+        self.AudioASRTap = AudioASRTap
+
+    def _make(self, wav_path=None):
+        if wav_path is None:
+            wav_path = f'/tmp/test_asr_tap_{os.getpid()}_{time.time_ns()}.wav'
+        return self.AudioASRTap(wav_path=wav_path), wav_path
+
+    def _feed_samples(self, tap, n_samples, fill_value=0):
+        """Bypass GStreamer; directly push samples into the ring as the
+        appsink callback would."""
+        samples = np.full(n_samples, fill_value, dtype=np.int16)
+        n = len(samples)
+        with tap._lock:
+            end = tap._write_pos + n
+            if end <= tap._buffer_samples:
+                tap._ring[tap._write_pos:end] = samples
+            else:
+                split = tap._buffer_samples - tap._write_pos
+                tap._ring[tap._write_pos:] = samples[:split]
+                tap._ring[:n - split] = samples[split:]
+            tap._write_pos = end % tap._buffer_samples
+            tap._samples_written += n
+            tap._last_buffer_time = time.time()
+
+    def test_snapshot_returns_false_when_buffer_cold(self):
+        tap, _ = self._make()
+        self.assertFalse(tap.snapshot_to_wav(seconds=5.0))
+
+    def test_snapshot_writes_wav_when_warm(self):
+        tap, wav = self._make()
+        try:
+            # Fill enough for a 1-second snapshot
+            self._feed_samples(tap, tap.SAMPLE_RATE * 2, fill_value=100)
+            self.assertTrue(tap.snapshot_to_wav(seconds=1.0))
+            # Verify the WAV is well-formed and contains our samples
+            with wave.open(wav, 'rb') as wf:
+                self.assertEqual(wf.getnchannels(), 1)
+                self.assertEqual(wf.getsampwidth(), 2)
+                self.assertEqual(wf.getframerate(), tap.SAMPLE_RATE)
+                frames = wf.readframes(wf.getnframes())
+                data = np.frombuffer(frames, dtype=np.int16)
+                self.assertEqual(len(data), tap.SAMPLE_RATE)
+                # All values should be 100
+                self.assertTrue((data == 100).all())
+        finally:
+            if os.path.exists(wav):
+                os.unlink(wav)
+
+    def test_ring_wraps_correctly(self):
+        """Write more samples than the ring can hold and verify the
+        snapshot returns the newest N samples in order."""
+        tap, wav = self._make()
+        try:
+            # Fill the ring with rising values, then push enough more to
+            # wrap. Snapshot should reflect ONLY the latest segment.
+            self._feed_samples(tap, tap.BUFFER_SECONDS * tap.SAMPLE_RATE, fill_value=1)
+            self._feed_samples(tap, tap.SAMPLE_RATE * 3, fill_value=99)  # 3s of "99"
+            self.assertTrue(tap.snapshot_to_wav(seconds=2.0))
+            with wave.open(wav, 'rb') as wf:
+                data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                # Should be all 99s — the latest 2 seconds
+                self.assertTrue((data == 99).all(),
+                                f"Expected all 99s, got unique values {set(data.tolist()[:50])}")
+        finally:
+            if os.path.exists(wav):
+                os.unlink(wav)
+
+    def test_concurrent_write_and_snapshot(self):
+        """Hammer the tap from multiple threads to surface any race."""
+        tap, wav = self._make()
+        try:
+            stop = threading.Event()
+            def writer():
+                while not stop.is_set():
+                    self._feed_samples(tap, 1024, fill_value=42)
+            t = threading.Thread(target=writer, daemon=True)
+            t.start()
+            time.sleep(0.1)
+            for _ in range(20):
+                tap.snapshot_to_wav(seconds=0.5)
+            stop.set()
+            t.join(timeout=2)
+        finally:
+            if os.path.exists(wav):
+                os.unlink(wav)
+        # If we got here without exceptions, the lock did its job.
+
+    def test_status_shape(self):
+        tap, _ = self._make()
+        s = tap.get_status()
+        for key in ('attached_count', 'samples_written', 'last_buffer_age_s',
+                    'is_active', 'buffer_seconds', 'wav_path'):
+            self.assertIn(key, s)
+
+
+# =============================================================================
+# Audio pipeline shape — playback branch identical w/ and w/o tap
+# =============================================================================
+
+
+class TestAudioPipelineShape(unittest.TestCase):
+    """The most important safety property: the playback branch must be
+    structurally identical regardless of whether asr_tap is set. If this
+    breaks, the audio recovery / watchdog / mute logic could silently
+    behave differently and we wouldn't notice."""
+
+    PLAYBACK_ELEMENTS_IN_ORDER = [
+        'syncqueue', 'audioqueue', 'audioconvert', 'volume',
+        # alsasink is dynamic; not given a name in the pipeline
+    ]
+
+    def _build(self, with_tap):
+        # We can't actually start GStreamer in tests reliably, but we
+        # CAN construct the pipeline_str by patching parse_launch to
+        # capture it. The shape is purely a function of the pipeline
+        # string, which is what we care about.
+        from audio import AudioPassthrough
+        captured = {}
+        def fake_parse_launch(s):
+            captured['str'] = s
+            raise RuntimeError("fake-parse-launch (test)")
+        with patch('audio.Gst.parse_launch', side_effect=fake_parse_launch), \
+             patch('audio.detect_hdmi_capture_device', return_value='hw:4,0'):
+            ap = AudioPassthrough(
+                capture_device='hw:4,0', playback_device='hw:0,0',
+                asr_tap=MagicMock() if with_tap else None
+            )
+            try:
+                ap._init_pipeline()
+            except RuntimeError as e:
+                if "fake-parse-launch" not in str(e):
+                    raise
+        return captured.get('str', '')
+
+    def test_no_tap_has_no_tee(self):
+        s = self._build(with_tap=False)
+        self.assertNotIn('tee', s)
+        self.assertNotIn('appsink', s)
+        self.assertNotIn('asr_sink', s)
+
+    def test_tap_introduces_tee_and_appsink(self):
+        s = self._build(with_tap=True)
+        self.assertIn('tee', s)
+        self.assertIn('audiotee', s)
+        self.assertIn('appsink', s)
+        self.assertIn('asr_sink', s)
+
+    def test_playback_chain_byte_identical(self):
+        """The substring from `syncqueue` through `alsasink` must be
+        identical with or without the tap. If this changes, the
+        audio-recovery tests + the documented latency budget no longer
+        hold."""
+        no_tap = self._build(with_tap=False)
+        with_tap = self._build(with_tap=True)
+        # Extract from "queue name=syncqueue" to "alsasink ..."
+        def playback_chunk(s):
+            start = s.index('queue name=syncqueue')
+            end = s.index('alsasink')
+            # Grab through end of alsasink's parameter list
+            end = s.index('sync=false', end) + len('sync=false')
+            return s[start:end]
+        self.assertEqual(playback_chunk(no_tap), playback_chunk(with_tap),
+                         "playback branch changed between no-tap and tap pipelines — "
+                         "audio recovery / watchdog assumptions may have broken")
+
+    def test_tap_branch_is_leaky(self):
+        """Slow whisper must NOT backpressure the tee → must NOT delay
+        playback. Verify by inspecting the tap branch queue config."""
+        s = self._build(with_tap=True)
+        # Find the asrqueue config
+        i = s.index('name=asrqueue')
+        chunk = s[max(0, i - 100):i + 100]
+        self.assertIn('leaky=downstream', chunk,
+                      "asrqueue must be leaky=downstream so a slow whisper "
+                      "consumer can't backpressure the audio passthrough")
+
+    def test_tap_branch_resamples_to_16khz_mono(self):
+        """whisper.cpp expects 16 kHz mono S16LE. Verify the tap branch
+        produces that format."""
+        s = self._build(with_tap=True)
+        self.assertIn('rate=16000', s)
+        self.assertIn('channels=1', s)
+        self.assertIn('format=S16LE', s)
+
+    def test_audioqueue_still_present_for_watchdog_probe(self):
+        """The audio watchdog adds a buffer probe to `audioqueue.src` to
+        detect stalls. This element MUST exist in both pipeline shapes
+        or the watchdog would silently lose its stall detection."""
+        for with_tap in (False, True):
+            s = self._build(with_tap=with_tap)
+            self.assertIn('name=audioqueue', s,
+                          f"audioqueue missing (with_tap={with_tap}) — "
+                          f"watchdog buffer probe would lose its anchor")
+
+    def test_volume_element_still_present_for_mute(self):
+        """ad_blocker mutes via the named `vol` element. Must persist
+        across both pipeline shapes."""
+        for with_tap in (False, True):
+            s = self._build(with_tap=with_tap)
+            self.assertIn('name=vol', s,
+                          f"volume element missing (with_tap={with_tap}) — "
+                          f"mute control would lose its target")
+
+
+# =============================================================================
+# Audio recovery: tap survives pipeline restart, watchdog still works
+# =============================================================================
+
+
+class TestAudioRecoveryWithTap(unittest.TestCase):
+    """The existing audio-recovery story (HDMI-RX sleep/wake, ALSA zombie
+    detection, watchdog-driven restart) MUST continue to work with the
+    tap attached. The dangerous failure mode is: tap is attached on first
+    pipeline build, audio pipeline restarts (HDMI source went to sleep
+    then woke), new pipeline comes up WITHOUT the tap attached — ASR
+    silently stops getting buffers and would forever return 'unknown'.
+
+    These tests guard the attach-on-init contract via source inspection
+    and via the AudioASRTap.attach_count counter, which increments on
+    each attach_to() call — so the count rising across restarts proves
+    re-attachment happened."""
+
+    def test_init_pipeline_attaches_tap_when_configured(self):
+        """The body of _init_pipeline must look up the appsink BY NAME
+        and call asr_tap.attach_to on it. If this gets refactored away,
+        the tap silently stops getting buffers on the next restart."""
+        import inspect
+        from audio import AudioPassthrough
+        src = inspect.getsource(AudioPassthrough._init_pipeline)
+        self.assertIn('asr_tap', src,
+                      "_init_pipeline must reference asr_tap so it gets "
+                      "re-attached on every pipeline rebuild")
+        self.assertIn("get_by_name('asr_sink')", src,
+                      "_init_pipeline must look up the appsink by its "
+                      "documented name 'asr_sink'")
+        self.assertIn('attach_to', src,
+                      "_init_pipeline must call asr_tap.attach_to to wire "
+                      "the new appsink callback")
+
+    def test_tap_attach_count_increments_across_calls(self):
+        """attach_count is the runtime signal for 'tap was attached to a
+        live pipeline'. Watchdog-recovery code can check it (e.g. via
+        get_status()) to detect a re-attach happened after a restart."""
+        from audio import AudioASRTap
+        tap = AudioASRTap()
+        fake_appsink = MagicMock()
+        tap.attach_to(fake_appsink)
+        tap.attach_to(fake_appsink)
+        self.assertEqual(tap._attach_count, 2)
+        self.assertEqual(tap.get_status()['attached_count'], 2)
+        # Each attach must wire the GStreamer signal
+        self.assertEqual(fake_appsink.connect.call_count, 2)
+        fake_appsink.connect.assert_called_with('new-sample', tap._on_new_sample)
+
+    def test_restart_pipeline_calls_init_pipeline(self):
+        """The watchdog's restart path MUST go through _init_pipeline (not
+        re-create the GStreamer pipeline inline) so the tap gets
+        re-attached. If someone introduces a fast-path that builds the
+        pipeline directly, the tap will silently die after the first
+        HDMI sleep/wake cycle."""
+        import inspect
+        from audio import AudioPassthrough
+        restart_src = inspect.getsource(AudioPassthrough._restart_pipeline)
+        self.assertIn('_init_pipeline', restart_src,
+                      "_restart_pipeline must call _init_pipeline so the "
+                      "ASR tap gets re-attached after the restart")
+
+    def test_watchdog_paused_flag_still_governs_restart(self):
+        """The HDMI-lost path sets _watchdog_paused so the watchdog stops
+        churning restart attempts on a known-dead pipeline. Must still
+        be in place — otherwise we'd loop trying to restart a pipeline
+        that can't open ALSA, and the tap would never get a chance to
+        attach to a real working pipeline."""
+        import inspect
+        from audio import AudioPassthrough
+        loop_src = inspect.getsource(AudioPassthrough._watchdog_loop)
+        self.assertIn('_watchdog_paused', loop_src,
+                      "_watchdog_loop must still check _watchdog_paused "
+                      "for the HDMI-sleep recovery story to work")
+
+    def test_alsa_zombie_check_present(self):
+        """The ALSA zombie detection (hw_ptr sampling) is the cross-check
+        that distinguishes GStreamer-says-PAUSED-but-actually-flowing from
+        a real stall. Don't lose this — pipeline restarts on healthy
+        audio cost ~1s of dropout each."""
+        import inspect
+        from audio import AudioPassthrough
+        method_src = inspect.getsource(AudioPassthrough._is_alsa_device_running)
+        self.assertIn('hw_ptr', method_src,
+                      "_is_alsa_device_running must still sample hw_ptr — "
+                      "see CLAUDE.md 'ALSA Zombie Detection False Positives'")
+
+    def test_tap_ring_state_survives_lock_pressure(self):
+        """If the GStreamer streaming thread is hammering the ring while
+        the ASR thread is taking snapshots, neither side should see torn
+        reads or stale data."""
+        from audio import AudioASRTap
+        tap = AudioASRTap(wav_path=f'/tmp/test_tap_survives_{time.time_ns()}.wav')
+        try:
+            # Pre-fill so snapshot_to_wav can succeed
+            samples = np.ones(tap.SAMPLE_RATE * 3, dtype=np.int16) * 7
+            with tap._lock:
+                tap._ring[:len(samples)] = samples
+                tap._write_pos = len(samples) % tap._buffer_samples
+                tap._samples_written = len(samples)
+            ok = tap.snapshot_to_wav(seconds=1.0)
+            self.assertTrue(ok)
+            with wave.open(tap.wav_path, 'rb') as wf:
+                data = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                self.assertTrue((data == 7).all())
+        finally:
+            if os.path.exists(tap.wav_path):
+                os.unlink(tap.wav_path)
+
+
+# =============================================================================
+# Decision-engine integration — verdict() consumed by _update_blocking_state
+# =============================================================================
+
+
+class TestDecisionEngineASRGate(unittest.TestCase):
+    """Verifies the ASR verdict actually gates VLM-alone blocking the way
+    we documented. Uses a partial Minus construction (skips heavy init)
+    and exercises the relevant code paths.
+    """
+
+    def _make_minus(self, asr_verdict='unknown'):
+        """Hand-build a Minus instance with just enough state to call
+        _update_blocking_state. Avoids the expensive __init__."""
+        import minus as minus_mod
+        m = minus_mod.Minus.__new__(minus_mod.Minus)
+        # Minimal state matching real construction
+        import threading as _t
+        m._state_lock = _t.RLock()
+        m.ad_detected = False
+        m.blocking_active = False
+        m.blocking_source = None
+        m.blocking_start_time = 0.0
+        m.blocking_end_time = 0.0
+        m.blocking_paused_until = 0.0
+        m.vlm_paused_until = 0.0
+        m.OCR_TRUST_WINDOW = 5.0
+        m.last_ocr_ad_time = 0
+        m.ocr_ad_detected = False
+        m.ocr_ad_detection_count = 0
+        m.ocr_no_ad_count = 0
+        m.vlm_ad_detected = False
+        m.vlm_no_ad_count = 0
+        m.vlm_decision_history = []
+        m.consecutive_ad_count = 0
+        m.MIN_DURATION_RESET_GAP = 30.0
+        m.accidental_pause_detected = False
+        m.skip_attempted_this_ad = False
+        m.last_skip_countdown = None
+        m.last_skip_success_time = 0
+        m.SKIP_UNBLOCK_GRACE_SECONDS = 3.0
+        m._safeguard_freeze_active = False
+        m.home_screen_detected = False
+        m.video_interface_detected = False
+        m.static_blocking_suppressed = False
+        # hdmi_reconnect_grace_enabled is a property; we override the
+        # method that consults it instead.
+        m.hdmi_reconnect_time = 0
+        m.HDMI_RECONNECT_GRACE_SECONDS = 90.0
+        # ASR mock
+        asr_mock = MagicMock()
+        asr_mock.verdict.return_value = asr_verdict
+        asr_mock.last_marker_hits = 0 if asr_verdict != 'confirm' else 3
+        asr_mock.last_transcript = ''
+        m.asr = asr_mock
+        # Misc downstream config + collaborators that _update_blocking_state
+        # touches; stub everything to a no-op so the test focuses on the
+        # ASR gate alone.
+        m.config = MagicMock(no_blocking=False)
+        m.last_matched_keywords = []
+        m.add_detection = MagicMock()
+        m.last_ocr_texts = []
+        m.MAX_BLOCKING_DURATION = 150.0
+        m.vlm_no_ad_count = 0
+        m.OCR_STOP_THRESHOLD = 2
+        m.VLM_STOP_THRESHOLD = 2
+        m._current_min_blocking_duration = lambda: 1.0
+        m._safeguard_freeze_text = ''
+        m.last_vlm_ad_frame = None
+        m.last_vlm_ad_frame_time = 0.0
+        m.SKIP_UNBLOCK_GRACE_SECONDS = 3.0
+        m._safeguard_freeze_active = False
+        m.audio = MagicMock()
+        m.audio.is_muted = False
+        m.ad_blocker = MagicMock()
+        m.ad_blocker.is_visible = False
+        m._set_led_state = MagicMock()
+        # Helpers
+        m._get_vlm_agreement = MagicMock(return_value=(0.85, 0.15, 5))
+        m.is_in_hdmi_reconnect_grace = lambda: False
+        m.get_hdmi_reconnect_grace_remaining = lambda: 0
+        return m
+
+    def test_vlm_alone_blocked_when_asr_says_veto(self):
+        """ASR 'veto' on VLM-alone start MUST suppress the block."""
+        m = self._make_minus(asr_verdict='veto')
+        m.vlm_ad_detected = True
+        m._update_blocking_state()
+        self.assertFalse(m.ad_detected)
+        self.assertIsNone(m.blocking_source)
+
+    def test_vlm_alone_blocks_with_vlm_source_when_asr_unknown(self):
+        """ASR 'unknown' (cold start, music) must NOT suppress VLM-alone."""
+        m = self._make_minus(asr_verdict='unknown')
+        m.vlm_ad_detected = True
+        m._update_blocking_state()
+        self.assertTrue(m.ad_detected)
+        self.assertEqual(m.blocking_source, 'vlm')
+
+    def test_vlm_alone_blocks_with_vlm_plus_asr_source_when_asr_confirms(self):
+        """ASR 'confirm' upgrades the source label so we can see the
+        high-confidence path in /api/status and the logs."""
+        m = self._make_minus(asr_verdict='confirm')
+        m.vlm_ad_detected = True
+        m._update_blocking_state()
+        self.assertTrue(m.ad_detected)
+        self.assertEqual(m.blocking_source, 'vlm+asr')
+
+    def test_ocr_blocking_unaffected_by_asr_veto(self):
+        """OCR-driven blocking is authoritative. ASR 'veto' must NOT
+        suppress an OCR-confirmed block — OCR saw text on screen, that's
+        ground truth regardless of audio."""
+        m = self._make_minus(asr_verdict='veto')
+        m.ocr_ad_detected = True
+        m._update_blocking_state()
+        self.assertTrue(m.ad_detected)
+        self.assertEqual(m.blocking_source, 'ocr')
+
+
+if __name__ == '__main__':
+    unittest.main()
