@@ -1,0 +1,437 @@
+{
+  "whisper.cpp tiny.en": {
+    "pass": 10,
+    "fail": 0,
+    "total_time": 15.154552936553955,
+    "rows": [
+      {
+        "file": "ad_pharma.wav",
+        "expected_min": 2,
+        "transcript": "Side effect may include nausea and dizziness. Consult your doctor before taking ",
+        "hits": 2,
+        "time_s": 1.675,
+        "ok": true
+      },
+      {
+        "file": "ad_cta_strong.wav",
+        "expected_min": 3,
+        "transcript": "Call now 85551234. Same up to 50%. Available now on our website, brand.com. Limi",
+        "hits": 5,
+        "time_s": 1.617,
+        "ok": true
+      },
+      {
+        "file": "ad_subtle.wav",
+        "expected_min": 2,
+        "transcript": "Introducing the all-new big up truck, built tough, voted number well in customer",
+        "hits": 2,
+        "time_s": 1.514,
+        "ok": true
+      },
+      {
+        "file": "ad_price.wav",
+        "expected_min": 1,
+        "transcript": "3 shipping orders over $25 order yours today.",
+        "hits": 1,
+        "time_s": 1.393,
+        "ok": true
+      },
+      {
+        "file": "ad_streaming_promo.wav",
+        "expected_min": 1,
+        "transcript": "Coming soon to at the other near you, available in stores December 15th, rated P",
+        "hits": 1,
+        "time_s": 1.541,
+        "ok": true
+      },
+      {
+        "file": "show_dialog.wav",
+        "expected_min": 0,
+        "transcript": "I just don't think it's a good idea, John. Sarah said she would become my servan",
+        "hits": 0,
+        "time_s": 1.779,
+        "ok": true
+      },
+      {
+        "file": "show_money_talk.wav",
+        "expected_min": 0,
+        "transcript": "She paid $15 for net rest. Can you believe it? I would never spend that much.",
+        "hits": 0,
+        "time_s": 1.513,
+        "ok": true
+      },
+      {
+        "file": "show_netflix_promo.wav",
+        "expected_min": 0,
+        "transcript": "available on Netflix this Friday. The new season of Stranger Things.",
+        "hits": 0,
+        "time_s": 1.434,
+        "ok": true
+      },
+      {
+        "file": "show_youtube_creator.wav",
+        "expected_min": 0,
+        "transcript": "Subscribe to my channel and hit that bell icon for more content. Link in the des",
+        "hits": 0,
+        "time_s": 1.502,
+        "ok": true
+      },
+      {
+        "file": "silence.wav",
+        "expected_min": 0,
+        "transcript": "you",
+        "hits": 0,
+        "time_s": 1.187,
+        "ok": true
+      }
+    ]
+  },
+  "faster-whisper tiny.en": {
+    "pass": 10,
+    "fail": 0,
+    "total_time": 11.449211597442627,
+    "rows": [
+      {
+        "file": "ad_pharma.wav",
+        "expected_min": 2,
+        "transcript": "Side effect may include nausea and dizziness.  Consult your doctor before taking",
+        "hits": 2,
+        "time_s": 1.358,
+        "ok": true
+      },
+      {
+        "file": "ad_cta_strong.wav",
+        "expected_min": 3,
+        "transcript": "Call now, 1-800-555-1234  Same up to 50%  Available now at our website, brand.co",
+        "hits": 6,
+        "time_s": 1.27,
+        "ok": true
+      },
+      {
+        "file": "ad_subtle.wav",
+        "expected_min": 2,
+        "transcript": "Introducing the all-new big up truck.  Build tough.  Voted number one in custome",
+        "hits": 3,
+        "time_s": 1.171,
+        "ok": true
+      },
+      {
+        "file": "ad_price.wav",
+        "expected_min": 1,
+        "transcript": "The only high 90-line free shipping orders over $25 order yours today",
+        "hits": 2,
+        "time_s": 1.083,
+        "ok": true
+      },
+      {
+        "file": "ad_streaming_promo.wav",
+        "expected_min": 1,
+        "transcript": "Coming soon to our theater near you, available in stores December 15th, rated PG",
+        "hits": 1,
+        "time_s": 1.097,
+        "ok": true
+      },
+      {
+        "file": "show_dialog.wav",
+        "expected_min": 0,
+        "transcript": "I just don't think it's a good idea, John.  Sarah said she would be home by 7, b",
+        "hits": 0,
+        "time_s": 1.301,
+        "ok": true
+      },
+      {
+        "file": "show_money_talk.wav",
+        "expected_min": 0,
+        "transcript": "She paid $15 for net rest. Can you believe it? I would never spend that much.",
+        "hits": 0,
+        "time_s": 1.08,
+        "ok": true
+      },
+      {
+        "file": "show_netflix_promo.wav",
+        "expected_min": 0,
+        "transcript": "available on Netflix this Friday.  The new season of Stranger Things.",
+        "hits": 0,
+        "time_s": 1.059,
+        "ok": true
+      },
+      {
+        "file": "show_youtube_creator.wav",
+        "expected_min": 0,
+        "transcript": "Subscribe to my channel and hit that bell icon for more content.  Link in the de",
+        "hits": 0,
+        "time_s": 1.082,
+        "ok": true
+      },
+      {
+        "file": "silence.wav",
+        "expected_min": 0,
+        "transcript": "",
+        "hits": 0,
+        "time_s": 0.948,
+        "ok": true
+      }
+    ]
+  },
+  "moonshine tiny": {
+    "pass": 8,
+    "fail": 2,
+    "total_time": 11.252616882324219,
+    "rows": [
+      {
+        "file": "ad_pharma.wav",
+        "expected_min": 2,
+        "transcript": "Side effect may include narcissism and dizziness. Consult your doctor before tak",
+        "hits": 1,
+        "time_s": 1.723,
+        "ok": false
+      },
+      {
+        "file": "ad_cta_strong.wav",
+        "expected_min": 3,
+        "transcript": "Cold power. 1800 555 1234 Same up to 50%. A available powered web site brand.com",
+        "hits": 3,
+        "time_s": 1.899,
+        "ok": true
+      },
+      {
+        "file": "ad_subtle.wav",
+        "expected_min": 2,
+        "transcript": "Introducing the all-new pickup truck. Build tough. Welded, humbled, well-in-cust",
+        "hits": 2,
+        "time_s": 1.301,
+        "ok": true
+      },
+      {
+        "file": "ad_price.wav",
+        "expected_min": 1,
+        "transcript": "I only have 19.99. Free shipping on order over twenty five dollars. Order yours ",
+        "hits": 2,
+        "time_s": 1.094,
+        "ok": true
+      },
+      {
+        "file": "ad_streaming_promo.wav",
+        "expected_min": 1,
+        "transcript": "Come in soon to the other near you. A male little in stores December fifteenth. ",
+        "hits": 0,
+        "time_s": 1.13,
+        "ok": false
+      },
+      {
+        "file": "show_dialog.wav",
+        "expected_min": 0,
+        "transcript": "I just don't think it's a good idea. John. Sarah said she would be home by seven",
+        "hits": 0,
+        "time_s": 1.419,
+        "ok": true
+      },
+      {
+        "file": "show_money_talk.wav",
+        "expected_min": 0,
+        "transcript": "She paid $50 for net risk. Can you believe it? I will never spend that much.",
+        "hits": 0,
+        "time_s": 0.968,
+        "ok": true
+      },
+      {
+        "file": "show_netflix_promo.wav",
+        "expected_min": 0,
+        "transcript": "A male of a long netflix list Friday. And who sees enough to change your things?",
+        "hits": 0,
+        "time_s": 0.8,
+        "ok": true
+      },
+      {
+        "file": "show_youtube_creator.wav",
+        "expected_min": 0,
+        "transcript": "Subscribe to my channel and hit that bell icon for more content. Link in the des",
+        "hits": 0,
+        "time_s": 0.907,
+        "ok": true
+      },
+      {
+        "file": "silence.wav",
+        "expected_min": 0,
+        "transcript": "",
+        "hits": 0,
+        "time_s": 0.012,
+        "ok": true
+      }
+    ]
+  },
+  "moonshine small-streaming": {
+    "pass": 9,
+    "fail": 1,
+    "total_time": 19.546827793121338,
+    "rows": [
+      {
+        "file": "ad_pharma.wav",
+        "expected_min": 2,
+        "transcript": "I detect may include dossier and dizziness. Consult your doctor before taking th",
+        "hits": 1,
+        "time_s": 2.871,
+        "ok": false
+      },
+      {
+        "file": "ad_cta_strong.wav",
+        "expected_min": 3,
+        "transcript": "Call now. 1800-555-1234. Save up to 50%  Limited time only.",
+        "hits": 5,
+        "time_s": 3.284,
+        "ok": true
+      },
+      {
+        "file": "ad_subtle.wav",
+        "expected_min": 2,
+        "transcript": "Introducing the all-new Pickup Track. Built tough Voted number one in customer s",
+        "hits": 3,
+        "time_s": 1.939,
+        "ok": true
+      },
+      {
+        "file": "ad_price.wav",
+        "expected_min": 1,
+        "transcript": "Not only 999, I'm not sure. Free shipping on orders over $25. Order yours today",
+        "hits": 3,
+        "time_s": 2.024,
+        "ok": true
+      },
+      {
+        "file": "ad_streaming_promo.wav",
+        "expected_min": 1,
+        "transcript": "Coming soon to see a turn here you Available in stores December 15th Rated pg-13",
+        "hits": 1,
+        "time_s": 1.943,
+        "ok": true
+      },
+      {
+        "file": "show_dialog.wav",
+        "expected_min": 0,
+        "transcript": "I just don't think it's a good idea, John. Sammy and she would be home by seven,",
+        "hits": 0,
+        "time_s": 2.567,
+        "ok": true
+      },
+      {
+        "file": "show_money_talk.wav",
+        "expected_min": 0,
+        "transcript": "She paid $50 for that dress. Can you believe it? I won't ever spend that much.",
+        "hits": 0,
+        "time_s": 1.839,
+        "ok": true
+      },
+      {
+        "file": "show_netflix_promo.wav",
+        "expected_min": 0,
+        "transcript": "I'm a level on Netflix this Friday. The who sees a host range or sings",
+        "hits": 0,
+        "time_s": 1.442,
+        "ok": true
+      },
+      {
+        "file": "show_youtube_creator.wav",
+        "expected_min": 0,
+        "transcript": "Subscribe to my channel and hit that bell icon for more content. Link in the des",
+        "hits": 0,
+        "time_s": 1.626,
+        "ok": true
+      },
+      {
+        "file": "silence.wav",
+        "expected_min": 0,
+        "transcript": "",
+        "hits": 0,
+        "time_s": 0.011,
+        "ok": true
+      }
+    ]
+  },
+  "moonshine medium-streaming": {
+    "pass": 10,
+    "fail": 0,
+    "total_time": 26.31316089630127,
+    "rows": [
+      {
+        "file": "ad_pharma.wav",
+        "expected_min": 2,
+        "transcript": "I defect may include nausea and dizziness. Consult your doctor before taking thi",
+        "hits": 2,
+        "time_s": 3.798,
+        "ok": true
+      },
+      {
+        "file": "ad_cta_strong.wav",
+        "expected_min": 3,
+        "transcript": "Call now. 18551234 Save up to 50 percent Available now at our website, brand.com",
+        "hits": 8,
+        "time_s": 4.758,
+        "ok": true
+      },
+      {
+        "file": "ad_subtle.wav",
+        "expected_min": 2,
+        "transcript": "Introducing the all-new Pickup Track. Bill tough Voted number one in customer sa",
+        "hits": 3,
+        "time_s": 2.515,
+        "ok": true
+      },
+      {
+        "file": "ad_price.wav",
+        "expected_min": 1,
+        "transcript": "Now only 999. Free shipping on orders over $25. Order yours today",
+        "hits": 3,
+        "time_s": 2.517,
+        "ok": true
+      },
+      {
+        "file": "ad_streaming_promo.wav",
+        "expected_min": 1,
+        "transcript": "Coming soon to see a near you Available in stores December 15th Raiden pg-13",
+        "hits": 1,
+        "time_s": 2.606,
+        "ok": true
+      },
+      {
+        "file": "show_dialog.wav",
+        "expected_min": 0,
+        "transcript": "I just don't think it's a good idea, John. Sarah said she would be home by seven",
+        "hits": 0,
+        "time_s": 3.598,
+        "ok": true
+      },
+      {
+        "file": "show_money_talk.wav",
+        "expected_min": 0,
+        "transcript": "She paid $50 for that dress. Can you believe it? I would never spend that much.",
+        "hits": 0,
+        "time_s": 2.444,
+        "ok": true
+      },
+      {
+        "file": "show_netflix_promo.wav",
+        "expected_min": 0,
+        "transcript": "I may level on Netflix this Friday. The new season of stranger things",
+        "hits": 0,
+        "time_s": 1.805,
+        "ok": true
+      },
+      {
+        "file": "show_youtube_creator.wav",
+        "expected_min": 0,
+        "transcript": "Subscribe to my channel and hit that bell icon for more content. Link in the des",
+        "hits": 0,
+        "time_s": 2.262,
+        "ok": true
+      },
+      {
+        "file": "silence.wav",
+        "expected_min": 0,
+        "transcript": "",
+        "hits": 0,
+        "time_s": 0.011,
+        "ok": true
+      }
+    ]
+  }
+}

@@ -18,8 +18,10 @@ Environment=OPENCV_LOG_LEVEL=ERROR
 Environment=PYTORCH_MATCHER_LOGLEVEL=WARNING
 Environment=TORCH_LOGS=-all
 Environment=TRANSFORMERS_VERBOSITY=error
-# Use FastVLM venv site-packages for VLM dependencies (ml_dtypes, transformers, axengine)
-Environment=PYTHONPATH=/home/radxa/axera_models/FastVLM-0.5B/fastvlm05_venv/lib/python3.11/site-packages:/home/radxa/.local/lib/python3.11/site-packages
+# User-local site-packages on PYTHONPATH so the root-owned service can import
+# pip3 --user installs (axengine, opencv, etc.). LFM2.5-VL needs only axengine
+# + numpy + PreTrainedTokenizerFast — no ml_dtypes/transformers AutoTokenizer.
+Environment=PYTHONPATH=/home/radxa/.local/lib/python3.11/site-packages
 
 # Pre-start: ensure clean state
 # Stop display managers (gdm3, etc.) to release DRM/KMS resources

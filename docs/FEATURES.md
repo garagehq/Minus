@@ -171,9 +171,12 @@ The overlay also gets:
 
 **Training Data:**
 - `screenshots/ads/` - OCR-detected ads
-- `screenshots/non_ads/` - User paused (false positives)
+- `screenshots/non_ads/` - User paused (false positives). For **VLM-only blocks**, saves the VLM-triggering frame (cached on each `is_ad=True` verdict) rather than the current frame — see *User-Feedback Cooldown* below.
 - `screenshots/vlm_spastic/` - VLM uncertainty cases
 - `screenshots/static/` - Static screen suppression
+
+**User-Feedback Cooldown (VLM-only blocks):**
+Pausing ad-blocking during a VLM-only block tells Minus the VLM misclassified the frame. Response: save the VLM-triggering frame to `non_ads/` and put VLM inference on a **5-min cooldown** so the same content can't immediately re-trigger if the user resumes early. OCR keeps running. Only fires when `blocking_source == "vlm"` strictly — `"ocr"` and `"both"` blocks use the existing save-current-frame behaviour. Status exposed at `/api/status` as `vlm_user_paused` + `vlm_user_pause_remaining`.
 
 **Quality Filtering (all categories):**
 - dHash perceptual deduplication (hamming distance < 10 bits = ~85% similar)

@@ -222,11 +222,24 @@ except ImportError as e:
 
 # Import Audio module
 try:
-    from audio import AudioPassthrough
+    from audio import AudioPassthrough, AudioASRTap
     HAS_AUDIO = True
 except ImportError as e:
     logger.warning(f"Audio module not available: {e}")
     HAS_AUDIO = False
+
+# Import ASR module (faster-whisper-driven, runs in a subprocess worker
+# for hard-timeout safety — see src/asr_worker.py). Optional — installs
+# without faster-whisper will skip the audio-tap branch and the ASR
+# thread, leaving the audio pipeline byte-identical to the pre-ASR shape.
+try:
+    from asr import ASRManager, is_asr_available
+    HAS_ASR = True
+except ImportError as e:
+    logger.warning(f"ASR module not available: {e}")
+    HAS_ASR = False
+    def is_asr_available():
+        return False
 
 # Import Health Monitor
 try:
@@ -337,6 +350,28 @@ class Minus:
         self.vlm_frame_count = 0
         self.vlm_consecutive_ad_count = 0
         self.vlm_no_ad_count = 0
+
+        # VLM false-positive feedback loop.
+        # When the user pauses during a VLM-only block (blocking_source ==
+        # "vlm"), that's an explicit signal that VLM misclassified the
+        # frame — they're saying "this is not actually an ad". Two
+        # responses: (1) save the VLM-triggering frame to screenshots/
+        # non_ads/ as training data so a future retrain has the example;
+        # (2) put VLM contribution to blocking on a 5-min cooldown so the
+        # same misclassified content doesn't immediately re-trigger if
+        # the user resumes early. Only applies when blocking_source is
+        # exactly "vlm" — if OCR also confirmed (source "both"), the
+        # block wasn't a VLM-alone misclassification and we use the
+        # existing pause behaviour. OCR-only blocks (source "ocr") are
+        # also unaffected.
+        self.vlm_paused_until = 0.0
+        self.VLM_FALSE_POSITIVE_COOLDOWN = 300.0  # 5 minutes
+        # The frame that most-recently caused a VLM AD verdict. Updated
+        # in the VLM dispatch loop every time `detect_ad` returns True,
+        # cleared when a block ends. This is the frame we save as non_ad
+        # when the user signals misclassification.
+        self.last_vlm_ad_frame = None
+        self.last_vlm_ad_frame_time = 0.0
 
         # VLM stability system - sliding window approach to prevent waffling
         # Re-retuned for LFM2.5-VL-450M-ft-v2-fused-v2 (May 2026). LFM2 has
@@ -462,6 +497,46 @@ class Minus:
         # overlays makes consecutive misses extremely rare.
         self.OCR_STOP_THRESHOLD = 2
         self.VLM_STOP_THRESHOLD = 2
+
+        # OCR transience guard. OCR is normally fast-fire (1 frame → block
+        # starts). But a single-frame OCR misread — a movie billboard with
+        # "SKIP" visible briefly, a sign held by an actor reading
+        # "Sponsored", a caption containing an ad-keyword word — should
+        # NOT trigger blocking. Real ad UIs keep the keyword visible
+        # continuously, so requiring 2 consecutive OCR-matched frames
+        # before firing the first block rejects single-frame artifacts
+        # at a ~500-1000ms latency cost on legitimate ads (OCR cadence
+        # ~500ms/frame). Triangulation override: if VLM-ad-detected OR
+        # ASR-confirms in the same window, fast-fire on 1 frame —
+        # all three signals agreeing makes the artifact case
+        # vanishingly rare. env-overridable.
+        self.OCR_TRANSIENCE_MIN_FRAMES = int(
+            os.environ.get('MINUS_OCR_TRANSIENCE_MIN_FRAMES', '2'))
+
+        # OCR triangulation veto. OCR is normally authoritative for
+        # stopping its own block, but when both VLM and ASR have firmly
+        # disagreed for several seconds, OCR is probably misreading a
+        # TV-show artifact (sign in a scene, news-ticker text, captions
+        # mentioning brands). Force-stop the block in that case. Gated
+        # on minimum block duration so the system has time to gather
+        # VLM+ASR evidence before vetoing.
+        self.OCR_TRIANGULATION_MIN_BLOCK_S = float(
+            os.environ.get('MINUS_OCR_TRIANGULATION_MIN_BLOCK_S', '4.0'))
+        # VLM "clearly says no-ad" threshold (sliding-window no_ad_ratio).
+        # Higher than the start threshold (0.70) — we want HIGH confidence
+        # before overriding OCR.
+        self.OCR_TRIANGULATION_VLM_NOAD_RATIO = float(
+            os.environ.get('MINUS_OCR_TRIANGULATION_VLM_NOAD_RATIO', '0.80'))
+        # Sustained OCR overpowers the triangulation veto. If OCR has been
+        # matching an ad keyword for ≥OCR_TRUSTED_DWELL_FRAMES consecutive
+        # cycles, that's a STRONG indicator it really IS an ad — the ad UI
+        # has been visible continuously for ~1.5s+ at OCR's ~500ms cadence.
+        # In that case VLM saying no-ad (transient frame-classification
+        # noise) and ASR saying veto (a quiet moment in the ad copy) are
+        # NOT enough to override OCR. Prevents the veto from killing a
+        # legitimate "Skip in 15" ad block when VLM/ASR briefly disagree.
+        self.OCR_TRUSTED_DWELL_FRAMES = int(
+            os.environ.get('MINUS_OCR_TRUSTED_DWELL_FRAMES', '3'))
         # Transition-frame hold bridges a BRIEF black/solid screen between
         # two ads in a real break so the overlay doesn't flicker. But a
         # dark/low-detail lofi music video reads as "uniform" forever, so
@@ -740,12 +815,37 @@ class Minus:
                 logger.warning(f"VLM init failed: {e}")
                 self.vlm = None
 
+        # Initialize ASR (faster-whisper ad-content confirmation/veto) —
+        # must be created BEFORE the audio passthrough so the tap can be
+        # wired into the audio pipeline at construction time. The audio
+        # tap is only created if faster-whisper is installed (otherwise
+        # we leave the audio pipeline shape unchanged, no tee branch).
+        self.asr_tap = None
+        self.asr = None
+        if HAS_ASR and is_asr_available():
+            try:
+                self.asr_tap = AudioASRTap()
+                self.asr = ASRManager(self.asr_tap)
+                # ASRManager.get_status() exposes the engine + model name,
+                # but it isn't ready yet at construction; read from the
+                # manager attrs for the boot log line instead.
+                logger.info(f"ASR initialized (faster-whisper "
+                            f"{self.asr._model_name} + audio tap)")
+            except Exception as e:
+                logger.warning(f"ASR init failed: {e} — running without ASR")
+                self.asr_tap = None
+                self.asr = None
+        elif HAS_ASR:
+            logger.info("ASR module loaded but faster-whisper not "
+                        "available — running without ASR")
+
         # Initialize Audio passthrough
         if HAS_AUDIO:
             try:
                 self.audio = AudioPassthrough(
                     capture_device=config.audio_capture_device,  # HDMI-RX audio (hw:4,0)
-                    playback_device=config.audio_playback_device  # HDMI-TX audio (auto-detected)
+                    playback_device=config.audio_playback_device,  # HDMI-TX audio (auto-detected)
+                    asr_tap=self.asr_tap  # Optional; None disables the tap branch entirely
                 )
                 # Link audio to ad_blocker for mute control
                 if self.ad_blocker:
@@ -1572,14 +1672,33 @@ class Minus:
     # ===== Web UI Methods =====
 
     def pause_blocking(self, duration_seconds: int = 120):
-        """Pause ad blocking for specified duration."""
+        """Pause ad blocking for specified duration.
+
+        Special case — user paused during a VLM-only block: routes to
+        `_handle_vlm_false_positive_feedback` which (a) saves the
+        VLM-triggering frame (not the current frame) as non_ad training
+        data and (b) sets a 5-min VLM-specific cooldown. See the
+        VLM_FALSE_POSITIVE_COOLDOWN block in __init__.
+        """
+        # Snapshot whether this is a VLM-only block BEFORE clearing state.
+        # Use the active blocking_source — if OCR is also confirming
+        # ("both"), the block isn't a VLM-alone misclassification, so the
+        # standard pause-and-save-current-frame behaviour applies.
+        was_vlm_only_block = (
+            self.ad_detected and self.blocking_source == "vlm"
+        )
+
         with self._state_lock:
             self.blocking_paused_until = time.time() + duration_seconds
             logger.info(f"[WebUI] Blocking paused for {duration_seconds}s")
 
-        # Capture non-ad screenshot for future VLM training
-        # This helps collect examples of content that should NOT be classified as ads
-        if self.frame_capture:
+        if was_vlm_only_block:
+            # VLM-misclassification path: save the trigger frame + start
+            # 5-min VLM cooldown.
+            self._handle_vlm_false_positive_feedback()
+        elif self.frame_capture:
+            # Default path: save the current frame as non_ad training data
+            # (this is what the user is looking at and signalling "not an ad").
             frame = self.frame_capture.capture()
             self.screenshot_manager.save_non_ad_screenshot(frame)
 
@@ -1592,6 +1711,98 @@ class Minus:
         # ad_blocker.hide() will have set state=idle; override with paused
         # so the LED visually distinguishes "user-paused" from "running clean".
         self._set_led_state('paused')
+
+    def _handle_vlm_false_positive_feedback(self):
+        """User paused during a VLM-only block — treat as explicit
+        misclassification feedback.
+
+        Two actions:
+          1. Save the frame that most-recently caused VLM to verdict AD
+             (cached in `last_vlm_ad_frame` by the VLM dispatch loop) to
+             screenshots/non_ads/. This becomes training data showing
+             content that should NOT be classified as an ad.
+          2. Set `vlm_paused_until = now + VLM_FALSE_POSITIVE_COOLDOWN`
+             (5 min). The VLM dispatch loop skips inference entirely while
+             paused, so the same misclassified content can't immediately
+             re-trigger if the user resumes blocking before the cooldown
+             expires. OCR keeps running normally.
+
+        Falls back to the current frame if no VLM-AD frame was cached
+        (vanishingly rare — would mean the block fired without any
+        is_ad=True VLM verdict, which shouldn't happen).
+        """
+        now = time.time()
+        cooldown_seconds = self.VLM_FALSE_POSITIVE_COOLDOWN
+
+        with self._state_lock:
+            self.vlm_paused_until = now + cooldown_seconds
+            # Clear VLM state so a fresh evaluation happens after cooldown
+            self.vlm_ad_detected = False
+            self.vlm_decision_history.clear()
+            self.vlm_no_ad_count = 0
+            # Snapshot the frame we'll save (under the lock so the
+            # dispatch loop can't overwrite it mid-read).
+            frame_to_save = self.last_vlm_ad_frame
+            # frame_age is only meaningful if we actually have a timestamp.
+            # Tests can seed `last_vlm_ad_frame` without setting the time,
+            # which would produce a bogus 56-year "age" in the log line.
+            frame_age = (
+                now - self.last_vlm_ad_frame_time
+                if frame_to_save is not None and self.last_vlm_ad_frame_time > 0
+                else None
+            )
+
+        logger.warning(
+            f"[Feedback] User paused during VLM-only block — treating "
+            f"as misclassification. VLM blocking paused for "
+            f"{cooldown_seconds:.0f}s ({cooldown_seconds/60:.0f} min)."
+        )
+
+        if frame_to_save is not None:
+            self.screenshot_manager.save_non_ad_screenshot(frame_to_save)
+            age_str = f"{frame_age:.1f}s" if frame_age is not None else "unknown age"
+            logger.info(
+                f"[Feedback] Saved VLM-triggering frame as non_ad "
+                f"(frame was {age_str} at pause time)"
+            )
+        elif self.frame_capture:
+            # Fallback: no cached frame, use current. Shouldn't normally
+            # happen — log it so we notice if it does.
+            logger.warning(
+                "[Feedback] No cached VLM-trigger frame — falling back "
+                "to current frame for non_ad training capture"
+            )
+            frame = self.frame_capture.capture()
+            if frame is not None:
+                self.screenshot_manager.save_non_ad_screenshot(frame)
+
+    def is_vlm_user_paused(self) -> bool:
+        """True if VLM inference is on a user-feedback cooldown."""
+        return time.time() < self.vlm_paused_until
+
+    def get_vlm_pause_remaining(self) -> int:
+        """Seconds remaining in the VLM user-feedback cooldown."""
+        remaining = self.vlm_paused_until - time.time()
+        return max(0, int(remaining))
+
+    def _asr_verdict(self) -> str:
+        """Return ASR's current verdict on whether audio sounds like an ad.
+
+        Returns one of:
+          'confirm' — marketing language was heard in the rolling 8s window
+          'veto'    — clear show dialog with no markers; suppress VLM-alone
+          'unknown' — no ASR signal yet (cold start, music only, ASR disabled)
+
+        Always returns 'unknown' when ASR is unavailable so blocking
+        decisions degrade gracefully on installs without faster-whisper.
+        """
+        if self.asr is None:
+            return 'unknown'
+        try:
+            return self.asr.verdict()
+        except Exception as e:
+            logger.debug(f"ASR verdict error: {e}")
+            return 'unknown'
 
     def resume_blocking(self):
         """Resume ad blocking immediately."""
@@ -1697,6 +1908,11 @@ class Minus:
             'blocking_source': self.blocking_source,
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
+            'vlm_user_paused': self.is_vlm_user_paused(),
+            'vlm_user_pause_remaining': self.get_vlm_pause_remaining(),
+            'asr_verdict': self._asr_verdict(),
+            'asr': (self.asr.get_status() if self.asr is not None else
+                    {'available': False, 'enabled': False, 'running': False}),
             'hdmi_reconnect_grace': self.is_in_hdmi_reconnect_grace(),
             'hdmi_reconnect_grace_remaining': self.get_hdmi_reconnect_grace_remaining(),
             'static_suppressed': self.static_blocking_suppressed,
@@ -2518,6 +2734,14 @@ class Minus:
                     self.config.audio_playback_device = drm_info['audio_device']
                 if self.audio.start():
                     logger.info("Audio passthrough started")
+                    # Kick off ASR inference loop now that the audio
+                    # pipeline (and tap) is producing buffers. Safe to
+                    # call even if asr is None.
+                    if self.asr is not None:
+                        try:
+                            self.asr.start()
+                        except Exception as e:
+                            logger.warning(f"ASR start failed: {e}")
                 else:
                     logger.warning("Audio passthrough failed to start")
 
@@ -2586,10 +2810,36 @@ class Minus:
                         ad_ratio, _, total = self._get_vlm_agreement()
                         logger.info(f"VLM suppressed - static screen detected (prevents false positive on paused content). Agreement was {ad_ratio*100:.0f}% of {total}")
                     else:
-                        should_start = True
-                        source = "vlm"
-                        ad_ratio, _, total = self._get_vlm_agreement()
-                        logger.info(f"VLM triggered alone (agreement: {ad_ratio*100:.0f}% of {total} decisions)")
+                        # ASR confirmation/veto gate. ASR is a SECOND
+                        # opinion on the audio channel:
+                        #   'confirm' — marketing language heard recently;
+                        #               block as "vlm+asr" (highest conf)
+                        #   'veto'    — clear show dialog, no markers; do NOT
+                        #               start blocking (product-placement case)
+                        #   'unknown' — no useful signal yet (cold start, music
+                        #               only, ASR disabled); fall through to
+                        #               the existing VLM-alone behavior
+                        # OCR-driven paths above are untouched: OCR text on
+                        # screen is authoritative regardless of audio.
+                        asr_verdict = self._asr_verdict()
+                        if asr_verdict == 'veto':
+                            ad_ratio, _, total = self._get_vlm_agreement()
+                            transcript = (self.asr.last_transcript[:60]
+                                          if self.asr else '')
+                            logger.info(
+                                f"VLM-alone vetoed by ASR (no marketing "
+                                f"language heard). VLM agreement was "
+                                f"{ad_ratio*100:.0f}% of {total}. "
+                                f"ASR transcript: '{transcript}'")
+                        else:
+                            should_start = True
+                            source = "vlm+asr" if asr_verdict == 'confirm' else "vlm"
+                            ad_ratio, _, total = self._get_vlm_agreement()
+                            asr_note = (f" + ASR confirmed ({self.asr.last_marker_hits} markers)"
+                                        if asr_verdict == 'confirm' and self.asr else '')
+                            logger.info(f"VLM triggered alone (agreement: "
+                                        f"{ad_ratio*100:.0f}% of {total} "
+                                        f"decisions){asr_note}")
 
                 if should_start and self.is_in_hdmi_reconnect_grace():
                     remaining = self.get_hdmi_reconnect_grace_remaining()
@@ -2669,6 +2919,26 @@ class Minus:
                         # Use simple consecutive count, not sliding window (for responsiveness)
                         should_stop = vlm_says_stop
 
+                        # ASR force-stop: this is the "product placement
+                        # rescue" path. A block started on VLM alone
+                        # (source=="vlm", not "vlm+asr" — ASR didn't
+                        # confirm at start) but ASR has now been listening
+                        # for ≥4s and reports clear show dialog with zero
+                        # marketing markers. Almost certainly a brand on
+                        # screen during a show. Force the block to end.
+                        # OCR/both/vlm+asr blocks are NOT affected — their
+                        # other signal is still trusted.
+                        if (not should_stop and blocking_elapsed >= 4.0 and
+                                self.asr is not None and
+                                self.asr.verdict() == 'veto'):
+                            transcript = self.asr.last_transcript[:60]
+                            logger.warning(
+                                f"[VLM] Force-stopping VLM-only blocking "
+                                f"({blocking_elapsed:.1f}s): ASR confirms "
+                                f"show audio, no marketing markers heard. "
+                                f"Transcript: '{transcript}'")
+                            should_stop = True
+
                         # SAFEGUARD: Auto-stop VLM-only blocking after 90 seconds
                         # This prevents extended false positives on video interfaces
                         # Real ads rarely last more than 60-90 seconds
@@ -2694,6 +2964,74 @@ class Minus:
                         # OCR is authoritative; VLM's opinion is unreliable
                         # here so it must NOT be allowed to stop early.
                         should_stop = ocr_says_stop
+
+                # TRIANGULATION VETO: OCR-source block can be force-stopped
+                # when BOTH VLM and ASR firmly disagree. The motivating
+                # failure case: OCR picks up an ad-keyword word from a
+                # TV-show artifact — a billboard with "SKIP" in a movie
+                # scene, a news ticker passing through "BUY", a movie
+                # title containing "Sponsored". OCR's start-side
+                # transience guard catches the 1-frame version of this,
+                # but a multi-frame artifact (e.g. a sign held by an
+                # actor for 2-3 seconds) can survive. If during the
+                # resulting block VLM clearly sees show content AND ASR
+                # clearly hears show dialog, the block is almost
+                # certainly an OCR FP and should release.
+                #
+                # Gated on:
+                #   - source in {ocr, both}: VLM agreeing at start
+                #     ("both") doesn't preclude later disagreement —
+                #     a transient ad-text overlay can match BOTH OCR
+                #     and VLM briefly. Keeping both eligible.
+                #   - blocking_elapsed >= MIN_BLOCK_S: give VLM/ASR
+                #     time to gather sliding-window evidence after the
+                #     block starts. Without this, we'd veto a real ad
+                #     within the first OCR/VLM cycle before signals settle.
+                #   - VLM agreement >= 80% no-ad over ≥ vlm_min_decisions:
+                #     a strong, sustained "I don't see an ad" signal.
+                #   - ASR verdict == 'veto': clear show dialog, no
+                #     marketing markers in the 8s rolling window.
+                #   - OCR has NOT been sustained: if OCR has been
+                #     matching consecutively for ≥OCR_TRUSTED_DWELL_FRAMES
+                #     cycles, OCR has "earned" its authority and the
+                #     veto is DISABLED. A persistent on-screen ad UI
+                #     (Skip in 15, Ad 2 of 3) cannot be overridden by
+                #     transient VLM/ASR noise. The artifact case the
+                #     veto targets is by definition NOT sustained —
+                #     a sign passes through the scene then leaves.
+                #
+                # OCR-only "skip in" countdown tail-end: as the ad ends
+                # the player hides the countdown but the still-visible
+                # "Sponsored" text can keep OCR firing for a few cycles
+                # while VLM has already flipped. The existing "both"
+                # branch handles that (vlm_says_stop OR ocr_says_stop).
+                # This veto adds the "OCR-only but in a TV show"
+                # recovery path that the standard logic never reached.
+                _ocr_strongly_trusted = (
+                    self.ocr_ad_detection_count >= self.OCR_TRUSTED_DWELL_FRAMES
+                )
+                if (not should_stop
+                        and not _ocr_strongly_trusted
+                        and self.blocking_source in ('ocr', 'both')
+                        and blocking_elapsed >= self.OCR_TRIANGULATION_MIN_BLOCK_S):
+                    _ad_ratio, _no_ad_ratio, _total = self._get_vlm_agreement()
+                    _vlm_says_clean = (_total >= self.vlm_min_decisions
+                                       and _no_ad_ratio
+                                       >= self.OCR_TRIANGULATION_VLM_NOAD_RATIO)
+                    _asr_says_clean = (self._asr_verdict() == 'veto')
+                    if _vlm_says_clean and _asr_says_clean:
+                        _transcript = (self.asr.last_transcript[:60]
+                                       if self.asr is not None else '')
+                        logger.warning(
+                            f"[Triangulation] Force-stopping "
+                            f"{self.blocking_source} block "
+                            f"({blocking_elapsed:.1f}s): VLM "
+                            f"no_ad={_no_ad_ratio*100:.0f}% of {_total}, "
+                            f"ASR=veto, OCR dwell="
+                            f"{self.ocr_ad_detection_count}. Suspect OCR "
+                            f"FP on TV-show artifact. "
+                            f"Transcript: '{_transcript}'")
+                        should_stop = True
 
                 # UNIVERSAL SAFEGUARD: no single continuous block should ever
                 # exceed MAX_BLOCKING_DURATION regardless of source. Observed
@@ -2761,6 +3099,11 @@ class Minus:
                     # Also clear VLM state so it doesn't immediately re-trigger
                     self.vlm_ad_detected = False
                     self.vlm_decision_history.clear()
+                    # Clear cached VLM-trigger frame: a pause AFTER the block
+                    # ends is not "during a VLM ad block" — don't act on a
+                    # stale frame from a block that already cleared cleanly.
+                    self.last_vlm_ad_frame = None
+                    self.last_vlm_ad_frame_time = 0.0
                     # Track when blocking ended (for accidental pause detection)
                     self.blocking_end_time = time.time()
                     # Reset skip state for next ad
@@ -3222,8 +3565,44 @@ class Minus:
                     self.ocr_no_ad_count = 0
                     self.last_ocr_ad_time = time.time()
 
-                    if self.ocr_ad_detection_count >= 1 and not self.ocr_ad_detected:
+                    # Transience guard: require ≥OCR_TRANSIENCE_MIN_FRAMES
+                    # consecutive OCR-matched frames before firing the
+                    # FIRST block. Rejects single-frame OCR misreads
+                    # (movie billboard with "SKIP", a sign in a scene
+                    # reading "Sponsored", caption text that contains an
+                    # ad-keyword word). Real ad UIs keep the keyword
+                    # visible continuously so they clear the threshold
+                    # within 1-2 OCR cycles (~500-1000ms penalty).
+                    #
+                    # Triangulation override — fast-fire on 1 frame when
+                    # VLM is also asserting ad OR ASR confirms marketing
+                    # language in audio. All three signals agreeing
+                    # makes the single-frame-artifact case vanishingly
+                    # rare; the latency penalty isn't worth paying when
+                    # we have corroboration.
+                    fast_fire = (self.vlm_ad_detected
+                                 or self._asr_verdict() == 'confirm')
+                    required_frames = (1 if fast_fire
+                                       else self.OCR_TRANSIENCE_MIN_FRAMES)
+
+                    if (self.ocr_ad_detection_count >= required_frames
+                            and not self.ocr_ad_detected):
                         self.ocr_ad_detected = True
+                        if required_frames > 1:
+                            logger.info(
+                                f"OCR ad-detection confirmed after "
+                                f"{self.ocr_ad_detection_count}-frame "
+                                f"dwell (transience guard)")
+                    elif (self.ocr_ad_detection_count < required_frames
+                            and not self.ocr_ad_detected):
+                        # Logged at INFO so the user can see why blocking
+                        # didn't fire — a single-frame OCR hit awaiting
+                        # confirmation from the next cycle.
+                        logger.info(
+                            f"OCR ad-detection pending dwell "
+                            f"({self.ocr_ad_detection_count}/"
+                            f"{required_frames} frames, keywords="
+                            f"{keywords_found})")
                     logger.info(f"OCR detected ad keywords: {keywords_found}")
                     self.screenshot_manager.save_ad_screenshot(frame, matched_keywords, all_texts)
                     self.add_detection('OCR', all_texts, matched_keywords)
@@ -3314,6 +3693,23 @@ class Minus:
                     time.sleep(1.0)
                     continue
 
+                # VLM false-positive cooldown: user paused during a
+                # VLM-only block recently → don't run VLM inference at
+                # all for 5 min. Stops repeat-trigger on the same misclassified
+                # content even if it stays on screen. OCR keeps running.
+                if self.is_vlm_user_paused():
+                    # vlm_frame_count doesn't increment in this branch, so
+                    # gate the log on wall-clock time instead.
+                    now = time.time()
+                    if (now - getattr(self, '_vlm_pause_last_log', 0)) >= 30:
+                        self._vlm_pause_last_log = now
+                        logger.info(
+                            f"VLM: skipping inference — user-feedback "
+                            f"cooldown ({self.vlm_paused_until - now:.0f}s "
+                            f"remaining)")
+                    time.sleep(1.0)
+                    continue
+
                 start_time = time.time()
                 frame = self.frame_capture.capture()
 
@@ -3361,6 +3757,16 @@ class Minus:
                 # Add decision to sliding window history with confidence
                 now = time.time()
                 self._add_vlm_decision(is_ad, confidence)
+
+                # Cache the most-recent VLM-AD-verdict frame for user
+                # feedback (see VLM_FALSE_POSITIVE_COOLDOWN block in
+                # __init__). If the user later pauses during a VLM-only
+                # block, this is the frame we save to non_ads/ as the
+                # misclassification example.
+                if is_ad:
+                    with self._state_lock:
+                        self.last_vlm_ad_frame = frame.copy()
+                        self.last_vlm_ad_frame_time = now
 
                 # Track state changes for waffle detection and logging
                 current_state = 'ad' if is_ad else 'no-ad'
@@ -3802,6 +4208,15 @@ class Minus:
                 self.ustreamer_process.wait(timeout=5)
             except:
                 self.ustreamer_process.kill()
+
+        # Stop ASR BEFORE tearing down audio so any in-flight whisper-cli
+        # subprocess can finish/timeout cleanly while the audio pipeline
+        # is still alive.
+        if self.asr:
+            try:
+                self.asr.stop()
+            except Exception as e:
+                logger.debug(f"ASR stop error: {e}")
 
         if self.audio:
             self.audio.destroy()

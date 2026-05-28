@@ -10,7 +10,43 @@ import time
 import numpy as np
 import cv2
 from pathlib import Path
-from rknnlite.api import RKNNLite
+
+# RKNNLite (Rockchip NPU SDK) has a side effect at import: it globally
+# overwrites `logging._nameToLevel` from the standard
+# {'CRITICAL': 50, 'DEBUG': 10, 'ERROR': 40, 'FATAL': 50, 'INFO': 20,
+#  'NOTSET': 0, 'WARN': 30, 'WARNING': 30}
+# to single-letter shorthands
+# {'C': 50, 'D': 10, 'E': 40, 'I': 20, 'W': 30}.
+# This breaks any code that later calls `logger.setLevel('WARNING')`
+# with a full name string — stdlib logging then rejects it as
+# "Unknown level: 'WARNING'".
+#
+# Observed crash (2026-05-27): the faster-whisper ASR engine swap added
+# torch to the indirect dep chain. torch.fx.passes.utils.matcher_utils
+# ._init_logger reads PYTORCH_MATCHER_LOGLEVEL=WARNING (set by
+# minus.service) and calls setLevel('WARNING') during torch import.
+# Before faster-whisper landed, nothing in the import path triggered
+# that call, so RKNNLite's mutation was harmless. After: minus crashed
+# at every startup with "ValueError: Unknown level: 'WARNING'".
+#
+# Snapshot the standard table before importing rknnlite and restore it
+# afterward. The restoration is idempotent — if a future rknnlite
+# release stops mutating, this is a no-op.
+import logging as _logging
+_logging_levels_before = dict(_logging._nameToLevel)
+from rknnlite.api import RKNNLite  # noqa: E402
+if 'WARNING' not in _logging._nameToLevel:
+    _logging._nameToLevel.clear()
+    _logging._nameToLevel.update(_logging_levels_before)
+    # Rebuild the reverse mapping (CRITICAL/FATAL and WARN/WARNING
+    # alias to the same numeric levels — keep the canonical primary
+    # name for each).
+    _logging._levelToName.clear()
+    for _name, _lvl in _logging_levels_before.items():
+        if _name in ('FATAL', 'WARN'):
+            continue
+        _logging._levelToName[_lvl] = _name
+del _logging_levels_before
 
 try:
     import pyclipper

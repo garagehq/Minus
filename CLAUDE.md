@@ -2,9 +2,10 @@
 
 ## Overview
 
-HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs:
+HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs + CPU ASR:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
 - **LFM2.5-VL-450M (ft-v2-fused-v2)** on Axera LLM 8850 NPU — **prefill-only on 16 fused decoder layers, ~0.37s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-0.5B iter4 (May 2026): 97.0% holdout accuracy / 99.2% non-ad-recall vs iter4's 94.75% / 95.25%, structurally simpler (no KV cache, no autoregressive decode for `detect_ad` OR autonomous-mode `query_image`, no ml_dtypes bfloat16 ceremony). Both inference paths share one model — no FastVLM dependency anymore. See *FastVLM iter4 → LFM2.5-VL Migration* under Known Issues.
+- **faster-whisper tiny.en (CTranslate2 int8)** on 3 CPU threads (~1.1s per 5s audio window, ~4× real-time on RK3588's A76/A55 mix). Runs in a multiprocessing worker subprocess (mirrors OCR/VLM worker pattern) for hard-timeout safety. Audio-channel confirmation/veto on top of OCR+VLM — gates VLM-alone blocking against product placements in TV shows (brand on screen but no marketing language in audio). Never fires blocking alone; never affects OCR-driven blocking. Audio pipeline playback latency unchanged. Was whisper.cpp tiny.en initially (1.52s/window); migrated to faster-whisper after corpus benchmark (`tests/asr_corpus/bench.py`) showed 25% speedup at identical accuracy. See [docs/ASR.md](docs/ASR.md).
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -18,6 +19,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/DEBUG_GLITCHES.md](docs/DEBUG_GLITCHES.md) | Video glitch debugging notes |
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
+| [docs/ASR.md](docs/ASR.md) | faster-whisper ASR — audio-based ad confirmation/veto on top of OCR+VLM (worker process, hard timeout) |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
 | [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
 | [docs/IR_RECEIVER.md](docs/IR_RECEIVER.md) | IR receiver eval on pin 3 (`gpiochip4 11`) — bench-tested decode of NEC remotes, gotchas, sketch for a future `IRReceiver` module |
@@ -48,9 +50,9 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
      ┌────────┴────────┐           ┌──────────┴──────────┐
      │   OCR Worker    │           │    VLM Worker       │
      │  ┌───────────┐  │           │  ┌───────────────┐  │
-     │  │ PaddleOCR │  │           │  │ FastVLM-0.5B  │  │
+     │  │ PaddleOCR │  │           │  │  LFM2.5-VL    │  │
      │  │ RK3588 NPU│  │           │  │ Axera LLM 8850│  │
-     │  │ ~400ms    │  │           │  │ ~0.9s         │  │
+     │  │ ~400ms    │  │           │  │ ~0.37s        │  │
      │  └───────────┘  │           │  └───────────────┘  │
      └────────┬────────┘           └──────────┬──────────┘
               │                               │
@@ -81,7 +83,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `src/audio.py` | GStreamer audio passthrough with mute control |
 | `src/ocr.py` | PaddleOCR on RKNN NPU, keyword detection |
 | `src/ocr_worker.py` | Process-based OCR with hard timeout, warmup, and keepalive |
-| `src/vlm.py` | FastVLM-0.5B iter4 on Axera NPU — logit-thresholded `detect_ad` + decode-based `query_image` |
+| `src/vlm.py` | LFM2.5-VL-450M on Axera NPU — prefill-only `detect_ad` (argmax YES/NO logits) + prefill-only `query_image` (first-token class logit) |
 | `src/vlm_worker.py` | Process-based VLM with hard timeout, warmup, and keepalive |
 | `src/autonomous_mode.py` | Autonomous mode - VLM-guided YouTube playback |
 | `src/health.py` | Unified health monitor for all subsystems |
@@ -123,7 +125,7 @@ See **[docs/AESTHETICS.md](docs/AESTHETICS.md)** for the complete visual design 
 | `stop.sh` | Graceful shutdown script |
 | `minus.service` | systemd service file |
 | `screenshots/ads/` | OCR-detected ads (for training) |
-| `screenshots/non_ads/` | User paused = false positives (for training) |
+| `screenshots/non_ads/` | User paused = false positives (for training). For VLM-only blocks, the saved frame is the *VLM-triggering frame* (cached on each `is_ad=True` verdict) rather than the current frame at pause time. |
 | `screenshots/vlm_spastic/` | VLM uncertainty cases (for analysis) |
 | `screenshots/static/` | Static screen suppression (still frames) |
 
@@ -188,7 +190,7 @@ sudo systemctl start minus
 ```bash
 # Paths (override defaults for different installations)
 MINUS_USTREAMER_PATH=/path/to/ustreamer     # Default: /home/radxa/ustreamer-patched
-MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4
+MINUS_VLM_MODEL_DIR=/path/to/vlm/models     # Default: /home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2
 MINUS_OCR_MODEL_DIR=/path/to/ocr/models     # Default: /home/radxa/rknn-llm/.../paddleocr
 
 # Timing thresholds
@@ -342,12 +344,19 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 
 ## Ad Detection Logic (Weighted Model)
 
-**OCR (Primary - Authoritative):**
-- Triggers blocking immediately on 1 detection
+**OCR (Primary - Authoritative, with triangulation safety net):**
+- Triggers blocking after a brief dwell — `OCR_TRANSIENCE_MIN_FRAMES=2` consecutive OCR-matched frames (~500-1000ms penalty at OCR's ~500ms cadence). Fast-fires on 1 frame when VLM is asserting ad OR ASR confirms (all three signals agreeing → no dwell needed). Rationale: a single-frame OCR misread (movie billboard with "SKIP", actor holding a sign reading "Sponsored", caption containing 'BUY') shouldn't trigger blocking. Real ad UIs keep the keyword visible continuously, so 2 consecutive frames is trivially cleared. env-overridable: `MINUS_OCR_TRANSIENCE_MIN_FRAMES`.
 - Stops blocking after **2 consecutive no-ads** (`OCR_STOP_THRESHOLD=2`, was 4 — tuned via `tests/block_latency_harness.py`)
-- **Authoritative for stopping** when OCR triggered the block
+- **Authoritative for stopping** when OCR triggered the block — UNLESS the triangulation veto fires (see below).
 - Tracks `last_ocr_ad_time` for VLM context
 - Handles common OCR misreads in ad timestamps (see below)
+
+**Triangulation veto (OCR ↔ VLM ↔ ASR cross-check):** an OCR-source (or "both"-source) block is force-stopped when ALL of these hold for ≥`OCR_TRIANGULATION_MIN_BLOCK_S` (4s) into the block:
+- VLM sliding-window agreement says **≥80% no-ad** over ≥`vlm_min_decisions` decisions (`OCR_TRIANGULATION_VLM_NOAD_RATIO`)
+- ASR `verdict() == 'veto'` — clear show dialog with no marketing markers in the rolling window
+- OCR is **NOT** sustained — `ocr_ad_detection_count < OCR_TRUSTED_DWELL_FRAMES` (3). Sustained OCR overpowers the veto: a continuously-visible "Skip in 15" or "Ad 2 of 3" UI is ground truth, transient VLM/ASR noise cannot override it.
+
+Motivating case: OCR matches an ad keyword that's actually a TV-show artifact — a billboard with "SKIP" in a movie, a news ticker passing through "BUY", a movie title containing the word "Sponsored", a paused-on-pause-screen tile. The transience guard catches the 1-frame version; this veto catches the 2-4-frame version when VLM (seeing a regular show frame) and ASR (hearing actor dialogue) both clearly disagree. env-overridable: `MINUS_OCR_TRIANGULATION_MIN_BLOCK_S`, `MINUS_OCR_TRIANGULATION_VLM_NOAD_RATIO`, `MINUS_OCR_TRUSTED_DWELL_FRAMES`.
 
 **VLM (Secondary - Anti-Waffle Protected):**
 - Uses sliding window of last **8 seconds** of VLM decisions (`vlm_history_window`). **Why 8s, not 45s:** a long window keeps stale *content* (no-ad) votes that mathematically prevent a VLM-alone ad from ever reaching the start-agreement ratio until they age out — measured VLM-only detect was ~38s with 81% of VLM-only ads missed. 8s collapses that to ~6-7s with ~0 misses and 0 phantom blocks (swept over 1920 param combos × thousands of holdout-bootstrapped scenarios; see *FastVLM-1.5B → 0.5B iter4 Logit-Threshold Migration* and `tests/test_vlm_decision_sim.py`). Stop responsiveness is governed by the consecutive counter, not the window, so shrinking it has no recovery downside.
@@ -383,8 +392,8 @@ When blocking is active, black/solid-color frames are detected as transitions be
 4. Home screen detection suppresses both OCR and VLM blocking on streaming interfaces
 
 **Stopping Blocking:**
-1. **If OCR triggered alone** (source=ocr): OCR says stop (`OCR_STOP_THRESHOLD=2` no-ads) → ends (~1s). VLM dissent must NOT stop early here (OCR is authoritative).
-2. **If BOTH triggered** (source=both): stop on whichever clears first — `ocr_says_stop OR vlm_says_stop` (2 consecutive no-ad). Both detected the ad, so either clearing is a correct "ad ended" signal; this decouples recovery from slow OCR snapshot capture (~2.5s/frame headless) so recovery is ~1s instead of ~3s. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
+1. **If OCR triggered alone** (source=ocr): OCR says stop (`OCR_STOP_THRESHOLD=2` no-ads) → ends (~1s). VLM dissent must NOT stop early here (OCR is authoritative). **Triangulation veto override:** if VLM agrees no-ad (≥80%) AND ASR=veto AND OCR dwell < `OCR_TRUSTED_DWELL_FRAMES` AND block ≥4s old, force-stop early — catches OCR FPs on TV-show artifacts.
+2. **If BOTH triggered** (source=both): stop on whichever clears first — `ocr_says_stop OR vlm_says_stop` (2 consecutive no-ad). Both detected the ad, so either clearing is a correct "ad ended" signal; this decouples recovery from slow OCR snapshot capture (~2.5s/frame headless) so recovery is ~1s instead of ~3s. The triangulation veto also applies here for the rare case where OCR+VLM briefly agreed on an artifact then both flipped. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
 3. **If VLM triggered alone** (source=vlm): VLM says stop (`VLM_STOP_THRESHOLD=2` no-ads) → ends (~1-2s); 90s VLM-only safeguard.
 4. **Universal cap:** any source, `MAX_BLOCKING_DURATION` (150s, env `MINUS_MAX_BLOCKING_DURATION`) force-stops and clears all detection state — bounds the worst-case static-weak-keyword false positive. **Frozen-stream guard:** when the cap fires it sets `_safeguard_freeze_active` + snapshots the frozen OCR text (`_safeguard_freeze_text`), which suppresses *re-blocking* until the OCR text **meaningfully changes** (difflib ratio <0.7 vs the snapshot). This handles the upstream stream freezing on an ad frame (observed: stuck on "Sponsored…31 Skip in", countdown frozen, OCR byte-identical for 150s → it's a genuine ad frame so OCR+VLM correctly keep flagging it and `skip in` correctly disables static-suppression, but capping then immediately re-blocking the *same frozen frame* produced a 150s→150s churn). **Note:** the first implementation cleared on pixel `is_scene_changed()` and failed — a frozen stream still pixel-jitters (buffering spinner / compression noise) so scene-change tripped ~1s after the cap and the churn continued; the reliable "stream resumed" signal is the OCR *text* changing. A real long ad pod is unaffected (its text changes, clearing within a cycle); a stuck source keeps ~identical text → stays suppressed so autonomous mode can recover it. **Early frozen-stream detection (`FROZEN_EARLY_SECONDS`=30s, env `MINUS_FROZEN_EARLY_SECONDS`):** the 150s cap bounds a freeze but a single ~150s hold still violates the zero-multi-minute-holds goal and recurred ~daily. The OCR loop tracks text stability (`_ocr_text_frozen_for`: seconds the normalised OCR text has been unchanged, difflib >0.93, non-empty only); when a block has been active with frozen OCR text for ≥30s, the SAME proven force-stop+freeze path fires early (only the trigger time is new — reuses `_norm_alnum`/difflib/`_safeguard_freeze_*`). A real skippable ad's "Skip in N" countdown decrements every ≤3s so its text never stays identical 30s; bumpers end well before 30s — so real ads don't trip it. Worst-case rare ≥30s fully-static-text no-countdown ad unblocks at 30s (vs 150s), an acceptable trade for eliminating the multi-minute hold.
 5. VLM history cleared on stop → prevents immediate re-trigger
@@ -657,11 +666,11 @@ pip3 install --break-system-packages \
 **Note:** The `rknnlite` package is provided by Rockchip and may need to be installed from their SDK or a custom repository. On the Radxa board with NPU support, it may already be pre-installed.
 
 **Axera NPU (for VLM):**
-The FastVLM-0.5B iter4 model runs on the Axera LLM 8850 NPU. Required Python packages:
+The LFM2.5-VL-450M model runs on the Axera LLM 8850 NPU. Required Python packages:
 ```bash
-pip3 install --break-system-packages axengine transformers ml_dtypes
+pip3 install --break-system-packages axengine
 ```
-The `axengine` package requires the Axera AXCL runtime to be installed - see the Axera documentation.
+The `axengine` package requires the Axera AXCL runtime to be installed - see the Axera documentation. LFM2.5-VL does **not** need `transformers` or `ml_dtypes` (it uses `PreTrainedTokenizerFast` direct from `tokenizer.json` and FP32 throughout) — those were FastVLM-era dependencies.
 
 ## Troubleshooting
 
@@ -673,8 +682,8 @@ pkill -9 ustreamer    # Kill orphaned ustreamer
 
 **VLM not loading:**
 - Check Axera card: `axcl_smi`
-- Verify model files exist in `/home/radxa/axera_models/FastVLM-0.5B-ad-classifier-iter4/`
-- Ensure Python dependencies: `pip3 show axengine transformers ml_dtypes`
+- Verify model files exist in `/home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/`
+- Ensure Python dependencies: `pip3 show axengine`
 
 **OCR not detecting:**
 - Test snapshot: `curl http://localhost:9090/snapshot -o test.jpg`
@@ -857,7 +866,7 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 
 **Key API Routes:**
 - `GET /`, `/api/status`, `/api/detections`, `/api/logs`
-- `POST /api/pause/N`, `/api/resume`
+- `POST /api/pause/N`, `/api/resume` — pause/resume all blocking. **Special case for VLM-only blocks**: a pause issued while `blocking_source == "vlm"` is treated as a VLM-misclassification signal (the user is saying "this isn't an ad") and triggers two additional actions: (a) the VLM-triggering frame (the last `is_ad=True` frame cached by the dispatch loop) is saved to `screenshots/non_ads/` as training data, (b) VLM inference is paused for **5 min** (`VLM_FALSE_POSITIVE_COOLDOWN`) independently of the general pause timer — so even if the user clicks Resume early, VLM stays cold until the cooldown expires. OCR keeps running. `/api/status` exposes `vlm_user_paused` + `vlm_user_pause_remaining`. Scope is strict: `"ocr"` and `"both"` blocks fall through to the standard "save current frame, no VLM cooldown" path.
 - `GET/POST /api/preview/*`, `/api/debug-overlay/*` (the debug-overlay route is the unified *Debug* toggle: header + bottom-left stats + top-right OCR snippet, persisted to `~/.minus_system_settings.json` as `debug_overlay`)
 - `POST /api/test/trigger-block`, `/api/test/stop-block`
 - `GET /stream`, `/snapshot` - Proxy to ustreamer
@@ -923,9 +932,22 @@ Minus automatically collects training data for future VLM improvements, organize
 
 **Screenshot directories:**
 - `screenshots/ads/` - OCR-detected ads
-- `screenshots/non_ads/` - User paused = false positives
+- `screenshots/non_ads/` - User paused = false positives. **VLM-only blocks** save the *VLM-triggering frame* (the last `is_ad=True` frame cached by the dispatch loop), not the current frame at pause time — see *User-Pause Feedback Loop for VLM Misclassifications* below. OCR-only and OCR+VLM-both blocks save the current frame (unchanged behaviour).
 - `screenshots/vlm_spastic/` - VLM uncertainty cases (detected 2-5x then changed)
 - `screenshots/static/` - Static screen suppression
+
+**User-Pause Feedback Loop for VLM Misclassifications:**
+
+When the user pauses ad blocking *during a VLM-only block* (`blocking_source == "vlm"`), Minus reads that as an explicit "this isn't actually an ad" signal and reacts with two coordinated actions:
+
+1. **Save the trigger frame as training data.** The VLM dispatch loop caches the most recent frame that produced an `is_ad=True` verdict (`last_vlm_ad_frame`, cleared when a block ends). On pause-during-VLM-block, that cached frame goes to `screenshots/non_ads/`. The current frame is *not* used because by the time the user clicks pause the underlying video may have advanced past the misclassified moment — the trigger frame is what VLM actually got wrong.
+2. **5-min VLM cooldown** (`VLM_FALSE_POSITIVE_COOLDOWN = 300s`). The VLM dispatch loop skips inference entirely while paused, so the same misclassified content can't immediately re-trigger if the user clicks Resume before the cooldown expires. OCR keeps running normally — the cooldown is VLM-only. The general blocking-paused timer is independent of this and uses the duration the user picked (1/2/5/10 min).
+
+Scope is strict: only `blocking_source == "vlm"` triggers the feedback path. `"ocr"` (OCR detected alone) and `"both"` (OCR + VLM agreed) fall through to the existing "save current frame, no VLM cooldown" behaviour — those aren't VLM-alone misclassifications. Window is the entire block: works at any point from start to end of a VLM-only block.
+
+Falls back to the current frame if no VLM-AD frame was cached (defensive — would require a block to fire without any `is_ad=True` verdict in the dispatch loop, which shouldn't happen in practice but is logged at WARN if it does).
+
+`/api/status` exposes `vlm_user_paused` and `vlm_user_pause_remaining` so the UI can surface the cooldown state. See `tests/test_recent_features.py::TestVLMFalsePositiveFeedback` for the 9 unit tests covering trigger-frame save, cooldown duration, VLM state clearing, source-scope guards, accessor edge cases, and the missing-frame fallback.
 
 **Screenshot Quality Filtering (all categories):**
 
@@ -1121,7 +1143,7 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 
 **API:** `/api/ir/status | enable | disable | command`. See the Web UI *Key API Routes* section above. Server enforces a **1.5 s cooldown** between successful sends (`IRCooldownError` → HTTP `429` with `retry_after`).
 
-**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`.
+**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`. When IR is enabled, the **same 6-button remote also appears on the Home tab** next to the live feed (gated on a `body.ir-home-enabled` class JS sets only when IR is available+enabled): on **desktop (≥768px)** it sits beside the main streaming remote inside the "Remote" dropdown and rides its open state (no separate toggle); on **mobile (<768px)** it's its **own separate dropdown** with a dedicated *HDMI Switch* toggle (opening the main remote does not reveal it). Both placements share `sendIRCommand()`, the cooldown, and the status line. The desktop/mobile split is pure CSS (`.main-open` honored ≥768px, `.ir-open` honored <768px).
 
 **Standalone CLI:** `sudo python3 ir_transmit.py <button>` sends one button; `--list` prints all valid names. Uses the same `IRTransmitter` class as the webui so there is one source of truth.
 
@@ -1135,9 +1157,10 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 - `ir_transmit.py` — standalone CLI shim
 - `minus.py` — instantiates `self.ir_transmitter`, persists `ir_enabled` in `~/.minus_system_settings.json`
 - `src/webui.py` — `/api/ir/*` endpoints, cooldown → 429
-- `src/templates/index.html` — toggle + remote panel in Autonomous Mode section
+- `src/templates/index.html` — Settings toggle + remote panel, plus the Home-tab IR remote (desktop side-by-side / mobile dropdown)
+- `src/static/style.css` — responsive Home-tab IR remote rules (`.inline-remote-wrap`, `.inline-ir-caption`, `body.ir-home-enabled` gating, `.main-open`/`.ir-open` breakpoint behavior)
 - `tests/test_ir_transmitter.py` — 20 unit tests (mocked sysfs)
-- `tests/test_ir_ui.py` — Playwright UI tests (live service)
+- `tests/test_ir_ui.py` — Playwright UI tests (live service); `TestIRHomeRemoteUI` covers the Home-tab remote
 - `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
 
 **Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.
@@ -1466,8 +1489,9 @@ python3 tests/test_modules.py                  # 300+ unit tests
 python3 tests/test_autonomous_mode.py          # Autonomous mode tests
 python3 tests/test_recent_features.py          # Recent feature tests
 python3 tests/test_block_decision_engine.py    # Blocking state-machine regressions
-python3 tests/test_vlm_iter4_parity.py         # iter4 logit parity vs 800-img holdout (needs NPU; --full)
-python3 tests/test_vlm_decision_sim.py         # Monte-Carlo sliding-window eval (--sweep to retune; no NPU)
+python3 tests/test_vlm_decision_sim_lfm2.py    # Monte-Carlo sliding-window eval (LFM2.5-VL; --sweep to retune; no NPU)
+python3 tests/test_vlm_iter4_parity.py         # HISTORICAL: iter4 logit parity vs 800-img holdout — kept for reference, iter4 model no longer shipped
+python3 tests/test_vlm_decision_sim.py         # HISTORICAL: iter4-bootstrapped sim, superseded by test_vlm_decision_sim_lfm2.py
 python3 tests/test_review_ui.py                # Playwright UI tests (requires chromium)
 python3 tests/test_ir_transmitter.py           # IR transmitter unit tests (mocked sysfs)
 python3 tests/test_ir_ui.py                    # Playwright UI tests for IR remote panel

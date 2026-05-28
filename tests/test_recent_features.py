@@ -1404,5 +1404,178 @@ class TestOfflineImportHygiene(unittest.TestCase):
                                  f"{name} references {forbidden!r} — breaks offline mode")
 
 
+# =============================================================================
+# VLM false-positive feedback loop (user pauses during VLM-only block)
+# =============================================================================
+
+
+class TestVLMFalsePositiveFeedback(unittest.TestCase):
+    """When the user pauses during a VLM-only block, treat it as
+    explicit misclassification feedback. See VLM_FALSE_POSITIVE_COOLDOWN
+    in minus.py and the "Autonomous Mode VLM-Misclassification Traps"
+    entry in CLAUDE.md for the motivation."""
+
+    def _make_minus(self):
+        """Build a Minus instance with mocked external deps. The state we
+        care about (ad_detected, blocking_source, last_vlm_ad_frame,
+        vlm_paused_until, etc.) is plain attribute assignment, so we can
+        skip the heavy I/O parts of __init__."""
+        from unittest.mock import MagicMock
+        import minus as minus_mod
+        m = minus_mod.Minus.__new__(minus_mod.Minus)
+        # Minimum state __init__ would have set
+        import threading
+        m._state_lock = threading.RLock()
+        m.ad_detected = False
+        m.blocking_source = None
+        m.blocking_paused_until = 0.0
+        m.vlm_paused_until = 0.0
+        m.VLM_FALSE_POSITIVE_COOLDOWN = 300.0
+        m.vlm_ad_detected = False
+        m.vlm_decision_history = []
+        m.vlm_no_ad_count = 0
+        m.last_vlm_ad_frame = None
+        m.last_vlm_ad_frame_time = 0.0
+        m.ad_blocker = MagicMock()
+        m.audio = MagicMock()
+        m.screenshot_manager = MagicMock()
+        m.frame_capture = MagicMock()
+        m.frame_capture.capture.return_value = b'\x00' * 16
+        # _set_led_state pokes a controller we don't have — stub it.
+        m._set_led_state = MagicMock()
+        return m
+
+    def test_vlm_only_block_pause_saves_trigger_frame(self):
+        """blocking_source='vlm' → save last_vlm_ad_frame (not current)."""
+        m = self._make_minus()
+        m.ad_detected = True
+        m.blocking_source = "vlm"
+        trigger = b'TRIGGER-FRAME'
+        m.last_vlm_ad_frame = trigger
+        m.last_vlm_ad_frame_time = time.time() - 1.2
+
+        m.pause_blocking(120)
+
+        m.screenshot_manager.save_non_ad_screenshot.assert_called_once_with(trigger)
+        # The current frame_capture path must NOT also fire — that would
+        # save the user's current view (a paused-overlay frame) as
+        # non_ad which is not the misclassification we want to learn from.
+        m.frame_capture.capture.assert_not_called()
+
+    def test_vlm_only_block_pause_starts_5min_cooldown(self):
+        m = self._make_minus()
+        m.ad_detected = True
+        m.blocking_source = "vlm"
+        m.last_vlm_ad_frame = b'FRAME'
+        before = time.time()
+        m.pause_blocking(60)
+        after = time.time()
+
+        # vlm_paused_until is ~now + 300 (5 min)
+        self.assertGreaterEqual(m.vlm_paused_until - before, 300.0 - 0.5)
+        self.assertLessEqual(m.vlm_paused_until - after, 300.0 + 0.5)
+        # Note: blocking_paused_until uses the caller-provided 60s — they're
+        # independent. The 5-min cooldown is a VLM-only signal that
+        # outlives the general pause if the user resumes early.
+        self.assertGreater(m.vlm_paused_until, m.blocking_paused_until)
+
+    def test_vlm_only_block_pause_clears_vlm_state(self):
+        """Cooldown must reset VLM bookkeeping so post-cooldown evaluation
+        starts fresh — otherwise a stale sliding window could re-trigger
+        immediately at cooldown end."""
+        m = self._make_minus()
+        m.ad_detected = True
+        m.blocking_source = "vlm"
+        m.vlm_ad_detected = True
+        m.vlm_decision_history = [(time.time(), True, 0.95)] * 5
+        m.vlm_no_ad_count = 2
+        m.last_vlm_ad_frame = b'FRAME'
+
+        m.pause_blocking(60)
+
+        self.assertFalse(m.vlm_ad_detected)
+        self.assertEqual(m.vlm_decision_history, [])
+        self.assertEqual(m.vlm_no_ad_count, 0)
+
+    def test_ocr_only_block_pause_uses_current_frame(self):
+        """blocking_source='ocr' → existing behaviour: save the current
+        frame and do NOT start a VLM cooldown."""
+        m = self._make_minus()
+        m.ad_detected = True
+        m.blocking_source = "ocr"
+        m.last_vlm_ad_frame = b'STALE-VLM-FRAME'
+
+        m.pause_blocking(60)
+
+        # Saved the current frame from frame_capture, not last_vlm_ad_frame
+        m.frame_capture.capture.assert_called_once()
+        saved_frame = m.screenshot_manager.save_non_ad_screenshot.call_args[0][0]
+        self.assertNotEqual(saved_frame, b'STALE-VLM-FRAME')
+        # No VLM cooldown started
+        self.assertEqual(m.vlm_paused_until, 0.0)
+
+    def test_both_source_block_pause_uses_current_frame(self):
+        """blocking_source='both' (OCR + VLM agreed) → not a VLM-alone
+        misclassification. Use the existing current-frame path."""
+        m = self._make_minus()
+        m.ad_detected = True
+        m.blocking_source = "both"
+        m.last_vlm_ad_frame = b'STALE-VLM-FRAME'
+
+        m.pause_blocking(60)
+
+        m.frame_capture.capture.assert_called_once()
+        self.assertEqual(m.vlm_paused_until, 0.0)
+
+    def test_no_active_block_pause_uses_current_frame(self):
+        """Pause with no active block → still saves current frame (the
+        existing behaviour, kept intact)."""
+        m = self._make_minus()
+        m.ad_detected = False
+        m.blocking_source = None
+
+        m.pause_blocking(60)
+
+        m.frame_capture.capture.assert_called_once()
+        self.assertEqual(m.vlm_paused_until, 0.0)
+
+    def test_is_vlm_user_paused_reflects_cooldown(self):
+        m = self._make_minus()
+        self.assertFalse(m.is_vlm_user_paused())
+        m.vlm_paused_until = time.time() + 100
+        self.assertTrue(m.is_vlm_user_paused())
+        m.vlm_paused_until = time.time() - 1
+        self.assertFalse(m.is_vlm_user_paused())
+
+    def test_get_vlm_pause_remaining_clamps_to_zero(self):
+        m = self._make_minus()
+        m.vlm_paused_until = time.time() - 5
+        self.assertEqual(m.get_vlm_pause_remaining(), 0)
+        m.vlm_paused_until = time.time() + 120
+        # ~120, allow a second of slop for clock jitter
+        self.assertGreaterEqual(m.get_vlm_pause_remaining(), 119)
+        self.assertLessEqual(m.get_vlm_pause_remaining(), 120)
+
+    def test_fallback_to_current_frame_when_trigger_missing(self):
+        """If a VLM-only block somehow fires without ever caching a
+        trigger frame (shouldn't happen in practice — defensive), fall
+        back to the current frame so we still get *some* training
+        sample."""
+        m = self._make_minus()
+        m.ad_detected = True
+        m.blocking_source = "vlm"
+        m.last_vlm_ad_frame = None  # No cached trigger
+
+        m.pause_blocking(60)
+
+        # Fallback path: frame_capture.capture() WAS called, and the
+        # captured frame was passed to save_non_ad_screenshot.
+        m.frame_capture.capture.assert_called_once()
+        m.screenshot_manager.save_non_ad_screenshot.assert_called_once()
+        # Cooldown still set — the user feedback signal stands even
+        # without the trigger frame.
+        self.assertGreater(m.vlm_paused_until, time.time())
+
+
 if __name__ == '__main__':
     unittest.main()

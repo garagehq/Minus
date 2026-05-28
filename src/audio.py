@@ -10,9 +10,25 @@ Features:
 - Auto-detection of HDMI capture device
 
 Architecture:
-    alsasrc (hw:X,0) -> audioconvert -> volume -> alsasink (hw:Y,0)
-                                          ^
-                                          | mute=true during ads
+
+    PLAYBACK BRANCH (always present, latency-critical):
+        alsasrc (hw:X,0) -> audioconvert -> volume -> alsasink (hw:Y,0)
+                                              ^
+                                              | mute=true during ads
+
+    ASR TAP BRANCH (optional, attached when AudioASRTap is passed in):
+        alsasrc -> tee ─┬─► playback branch (above)
+                        │
+                        └─► leaky queue -> audioresample 48kHz/2ch -> 16kHz/1ch
+                                          -> appsink -> AudioASRTap ring buffer
+                                          -> snapshot_to_wav() for the ASR worker
+
+    Tap branch is non-blocking: its queue is `leaky=downstream` so a slow
+    consumer (the ASR worker falling behind) drops the oldest buffers rather
+    than backpressuring the tee. Playback latency is identical with or
+    without the tap branch present. See `_init_pipeline` for the exact
+    pipeline string + the safety properties asserted by
+    tests/test_audio_tap.py.
 """
 
 import gc
@@ -21,6 +37,7 @@ import os
 import subprocess
 import threading
 import time
+import wave
 
 import gi
 gi.require_version('Gst', '1.0')
@@ -78,13 +95,21 @@ class AudioPassthrough:
     # The card number can change depending on boot order
     HDMI_CAPTURE_DEVICES = ["hw:4,0", "hw:2,0", "hw:3,0", "hw:5,0"]
 
-    def __init__(self, capture_device=None, playback_device="hw:0,0"):
+    def __init__(self, capture_device=None, playback_device="hw:0,0",
+                 asr_tap=None):
         """
         Initialize audio passthrough.
 
         Args:
             capture_device: ALSA capture device (HDMI-RX) - auto-detected if None or "auto"
             playback_device: ALSA playback device (HDMI-TX)
+            asr_tap: optional AudioASRTap instance. If passed, the pipeline
+                will include a parallel `tee` branch that feeds 16kHz mono
+                S16LE audio into the tap's ring buffer for ASR.
+                The playback branch is unchanged whether asr_tap is set or
+                not — same elements, same parameters, same latency budget.
+                Passing None keeps the pre-ASR pipeline shape byte-identical
+                (used by installs without faster-whisper present).
         """
         # Auto-detect capture device if not specified or set to "auto"
         if capture_device is None or capture_device == "auto":
@@ -92,6 +117,7 @@ class AudioPassthrough:
 
         self.capture_device = capture_device
         self.playback_device = playback_device
+        self.asr_tap = asr_tap
         self._capture_device_candidates = self.HDMI_CAPTURE_DEVICES.copy()
         # Move the auto-detected/specified device to front of candidates list
         if capture_device in self._capture_device_candidates:
@@ -221,28 +247,75 @@ class AudioPassthrough:
             return False
 
     def _init_pipeline(self):
-        """Initialize GStreamer audio pipeline."""
+        """Initialize GStreamer audio pipeline.
+
+        SAFETY INVARIANT: the playback branch (alsasrc → syncqueue →
+        audioqueue → audioconvert → volume → alsasink) MUST be
+        byte-identical regardless of whether the ASR tap is attached.
+        Same elements, same names, same parameters. Latency budget
+        (~500ms to match video) is unchanged. The tap is added as a
+        parallel `tee` branch with its own leaky queue so a slow
+        ASR consumer cannot backpressure the playback side.
+        """
         try:
             # Audio passthrough pipeline with A/V sync delay
             # Video pipeline has ~350-500ms latency (HTTP streaming + decode + queue)
             # Audio needs matching delay to stay in sync
             # Using provide-clock=false to prevent alsasrc from being clock master
             #
-            # Latency breakdown:
+            # Latency breakdown (PLAYBACK branch — applies whether or not the
+            # ASR tap branch is attached):
             #   - alsasrc: 50ms buffer
             #   - syncqueue: 300ms delay (min-threshold-time forces buffering before output)
             #   - audioqueue: up to 100ms for jitter absorption
             #   - alsasink: 50ms buffer
             #   Total: ~500ms to match video latency
-            pipeline_str = (
-                f"alsasrc device={self.capture_device} buffer-time=50000 latency-time=10000 provide-clock=false ! "
-                f"audio/x-raw,rate=48000,channels=2,format=S16LE ! "
+            #
+            # When asr_tap is not None, we additionally insert a `tee` right
+            # after the source caps, with the playback chain on one branch
+            # and the 16kHz mono downsampling + appsink on the other. tee
+            # buffer fanout is zero-copy reference-counting, so it adds no
+            # measurable latency to the playback branch.
+            playback_chain = (
                 f"queue name=syncqueue min-threshold-time=300000000 max-size-time=500000000 max-size-buffers=0 max-size-bytes=0 ! "
                 f"queue max-size-buffers=10 max-size-time=100000000 leaky=downstream name=audioqueue ! "
                 f"audioconvert ! "
                 f"volume name=vol volume=1.0 mute=false ! "
                 f"alsasink device={self.playback_device} buffer-time=50000 latency-time=10000 sync=false"
             )
+            if self.asr_tap is not None:
+                # ASR tap branch is leaky: if the ASR worker falls behind, the
+                # tap queue drops the oldest buffers rather than blocking
+                # the tee. max-size-buffers=40 at 48kHz with ~1024-sample
+                # buffers ≈ 850ms of headroom; more than enough for the
+                # 2s ASR cadence even under transient CPU pressure.
+                asr_chain = (
+                    f"audiotee. ! "
+                    f"queue name=asrqueue max-size-buffers=40 max-size-time=2000000000 leaky=downstream ! "
+                    f"audioconvert ! audioresample quality=4 ! "
+                    f"audio/x-raw,rate=16000,channels=1,format=S16LE ! "
+                    f"appsink name=asr_sink emit-signals=true drop=true sync=false max-buffers=20"
+                )
+                pipeline_str = (
+                    f"alsasrc device={self.capture_device} buffer-time=50000 latency-time=10000 provide-clock=false ! "
+                    f"audio/x-raw,rate=48000,channels=2,format=S16LE ! "
+                    f"tee name=audiotee allow-not-linked=true "
+                    # Playback branch (this comes off the tee and runs the
+                    # same elements as the no-tap pipeline)
+                    f"audiotee. ! {playback_chain} "
+                    # ASR tap branch
+                    f"{asr_chain}"
+                )
+            else:
+                # No tap configured — keep the original linear pipeline so
+                # behaviour on installs without faster-whisper is identical
+                # to pre-ASR Minus. No tee, no risk of pipeline-shape
+                # regressions on those installs.
+                pipeline_str = (
+                    f"alsasrc device={self.capture_device} buffer-time=50000 latency-time=10000 provide-clock=false ! "
+                    f"audio/x-raw,rate=48000,channels=2,format=S16LE ! "
+                    f"{playback_chain}"
+                )
 
             logger.debug(f"[AudioPassthrough] Creating pipeline: {pipeline_str}")
             self.pipeline = Gst.parse_launch(pipeline_str)
@@ -264,8 +337,23 @@ class AudioPassthrough:
                 if pad:
                     pad.add_probe(Gst.PadProbeType.BUFFER, self._buffer_probe, None)
 
+            # Attach the ASR tap to the appsink (if a tap is configured).
+            # Done here, after parse_launch, so the tap gets re-attached
+            # automatically across pipeline restarts (the appsink element
+            # is recreated each time the pipeline is rebuilt).
+            if self.asr_tap is not None:
+                appsink = self.pipeline.get_by_name('asr_sink')
+                if appsink is not None:
+                    self.asr_tap.attach_to(appsink)
+                    logger.info("[AudioPassthrough] ASR tap attached to pipeline")
+                else:
+                    logger.error("[AudioPassthrough] asr_tap configured but appsink "
+                                 "'asr_sink' not found in pipeline — tap inactive")
+
             if self.volume:
-                logger.info(f"[AudioPassthrough] Pipeline created: {self.capture_device} -> {self.playback_device}")
+                tap_status = " + ASR tap" if self.asr_tap is not None else ""
+                logger.info(f"[AudioPassthrough] Pipeline created: "
+                            f"{self.capture_device} -> {self.playback_device}{tap_status}")
             else:
                 logger.error("[AudioPassthrough] Failed to get volume element")
 
@@ -1037,3 +1125,148 @@ class AudioPassthrough:
     def destroy(self):
         """Clean up resources."""
         self.stop()
+
+
+# ===========================================================================
+# Audio ASR Tap — ring buffer for ASR worker consumption
+# ===========================================================================
+
+
+class AudioASRTap:
+    """Ring-buffer audio tap fed by the GStreamer appsink on the ASR
+    pipeline branch.
+
+    Receives 16kHz mono S16LE buffers from the GStreamer appsink
+    callback (called from a GStreamer streaming thread, NOT the main
+    Python thread). Writes them into a fixed-size numpy ring buffer.
+    Exposes `snapshot_to_wav(seconds)` for the ASR worker to atomically
+    grab the most recent N seconds as a WAV file on disk for
+    the ASR worker (faster-whisper).
+
+    Threading model:
+      - GStreamer streaming thread: holds _lock briefly to append samples
+      - ASR thread:                 holds _lock briefly to copy the
+                                    snapshot region out of the ring
+      - Both lock holds are O(samples) without I/O; the lock is fine to
+        be a regular Lock, no contention concern.
+
+    Survives pipeline restarts because `attach_to` is called fresh in
+    `_init_pipeline` each time the GStreamer pipeline is rebuilt. The
+    ring buffer state persists across restarts (older audio stays until
+    overwritten) — desired behaviour, since whisper inference doesn't
+    care about discontinuities and a brief audio gap mid-buffer just
+    looks like silence in the transcript.
+    """
+
+    SAMPLE_RATE = 16000
+    CHANNELS = 1
+    SAMPLE_WIDTH_BYTES = 2  # S16LE
+    BUFFER_SECONDS = 8  # Hold a bit more than the 5s window so we never run short
+
+    def __init__(self, wav_path: str = '/dev/shm/minus_asr_window.wav'):
+        # numpy import is local so AudioPassthrough's import chain stays
+        # numpy-free for installs that never enable the tap.
+        import numpy as np
+        self._np = np
+        self.wav_path = wav_path
+        self._buffer_samples = self.SAMPLE_RATE * self.BUFFER_SECONDS
+        self._ring = np.zeros(self._buffer_samples, dtype=np.int16)
+        self._write_pos = 0      # Next index to write (0..buffer_samples-1)
+        self._samples_written = 0  # Total samples ever received
+        self._lock = threading.Lock()
+        self._last_buffer_time = 0.0
+        self._attach_count = 0   # Bumped on each attach_to (track restarts)
+
+    def attach_to(self, appsink):
+        """Connect this tap to a GStreamer appsink. Idempotent; called
+        once per `_init_pipeline` invocation (including across pipeline
+        restarts)."""
+        appsink.connect('new-sample', self._on_new_sample)
+        self._attach_count += 1
+
+    def _on_new_sample(self, appsink):
+        """GStreamer appsink callback. Pull the sample and append to the
+        ring buffer. Runs on a GStreamer streaming thread."""
+        sample = appsink.emit('pull-sample')
+        if sample is None:
+            return Gst.FlowReturn.OK
+        buf = sample.get_buffer()
+        if buf is None:
+            return Gst.FlowReturn.OK
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.FlowReturn.OK
+        try:
+            samples = self._np.frombuffer(mapinfo.data, dtype=self._np.int16)
+            n = len(samples)
+            if n == 0:
+                return Gst.FlowReturn.OK
+            with self._lock:
+                end = self._write_pos + n
+                if end <= self._buffer_samples:
+                    self._ring[self._write_pos:end] = samples
+                else:
+                    split = self._buffer_samples - self._write_pos
+                    self._ring[self._write_pos:] = samples[:split]
+                    self._ring[:n - split] = samples[split:]
+                self._write_pos = end % self._buffer_samples
+                self._samples_written += n
+                self._last_buffer_time = time.time()
+        finally:
+            buf.unmap(mapinfo)
+        return Gst.FlowReturn.OK
+
+    def snapshot_to_wav(self, seconds: float = 5.0) -> bool:
+        """Write the most recent `seconds` of audio to self.wav_path as
+        a 16kHz mono 16-bit WAV file. Atomic via tmp + rename.
+
+        Returns False if the ring buffer doesn't yet have `seconds` of
+        audio (cold start) — the ASR worker waits and retries.
+        """
+        n_samples = min(int(seconds * self.SAMPLE_RATE), self._buffer_samples)
+        with self._lock:
+            if self._samples_written < n_samples:
+                return False
+            start = (self._write_pos - n_samples) % self._buffer_samples
+            if start + n_samples <= self._buffer_samples:
+                data = self._ring[start:start + n_samples].copy()
+            else:
+                first_part = self._buffer_samples - start
+                data = self._np.concatenate([
+                    self._ring[start:],
+                    self._ring[:n_samples - first_part],
+                ])
+
+        # Atomic write — whisper-cli may open the file while we're
+        # writing if we don't go through tmp+rename.
+        tmp = self.wav_path + '.tmp'
+        with wave.open(tmp, 'wb') as wf:
+            wf.setnchannels(self.CHANNELS)
+            wf.setsampwidth(self.SAMPLE_WIDTH_BYTES)
+            wf.setframerate(self.SAMPLE_RATE)
+            wf.writeframes(data.tobytes())
+        os.replace(tmp, self.wav_path)
+        return True
+
+    @property
+    def last_buffer_age(self) -> float:
+        """Seconds since the last appsink callback. -1 if no buffer ever
+        received (no audio source connected, or pipeline not running)."""
+        if self._last_buffer_time == 0.0:
+            return -1.0
+        return time.time() - self._last_buffer_time
+
+    @property
+    def is_active(self) -> bool:
+        age = self.last_buffer_age
+        return 0.0 <= age < 5.0
+
+    def get_status(self) -> dict:
+        return {
+            'attached_count': self._attach_count,
+            'samples_written': self._samples_written,
+            'last_buffer_age_s': round(self.last_buffer_age, 2),
+            'is_active': self.is_active,
+            'buffer_seconds': self.BUFFER_SECONDS,
+            'wav_path': self.wav_path,
+        }

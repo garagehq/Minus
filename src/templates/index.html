@@ -52,7 +52,11 @@
                         <span id="inline-remote-icon">&#9654;</span> Remote
                         <span id="firetv-inline-status" class="connection-badge-sm disconnected">--</span>
                     </button>
+                    <button class="inline-remote-btn" id="inline-ir-toggle-btn" onclick="toggleInlineIRRemote()">
+                        <span id="inline-ir-icon">&#9654;</span> HDMI Switch
+                    </button>
                 </div>
+                <div class="inline-remote-wrap">
                 <div id="inline-remote" class="inline-remote hidden">
                     <div class="remote-grid compact">
                         <div class="remote-row">
@@ -86,6 +90,26 @@
                         <button class="app-btn-sm" onclick="launchApp('prime')">Prime</button>
                         <button class="app-btn-sm" onclick="launchApp('disney')">Disney+</button>
                     </div>
+                </div>
+                <!-- IR HDMI-switch remote (shown only when IR enabled in Settings).
+                     Desktop: appears beside the main remote when it's open.
+                     Mobile: its own separate dropdown via the HDMI Switch toggle. -->
+                <div id="inline-ir-remote" class="inline-remote inline-ir-remote">
+                    <div class="inline-ir-caption">HDMI Switch</div>
+                    <div class="remote-grid compact">
+                        <div class="remote-row">
+                            <button class="remote-btn select" onclick="sendIRCommand('input_1')">Input 1</button>
+                            <button class="remote-btn select" onclick="sendIRCommand('input_2')">Input 2</button>
+                            <button class="remote-btn select" onclick="sendIRCommand('input_3')">Input 3</button>
+                        </div>
+                        <div class="remote-row">
+                            <button class="remote-btn" onclick="sendIRCommand('power')">&#9211; Power</button>
+                            <button class="remote-btn nav" onclick="sendIRCommand('next')">Next &#8594;</button>
+                            <button class="remote-btn" onclick="sendIRCommand('auto')">Auto</button>
+                        </div>
+                    </div>
+                    <div class="ir-status-line" id="inline-ir-status-line"></div>
+                </div>
                 </div>
             </section>
 
@@ -566,7 +590,7 @@
             <section class="settings-section">
                 <h2>Detection Settings</h2>
                 <div class="setting-item">
-                    <span class="setting-label">VLM (FastVLM-1.5B)</span>
+                    <span class="setting-label">VLM (LFM2.5-VL)</span>
                     <label class="toggle-switch">
                         <input type="checkbox" id="vlm-toggle" onchange="toggleVLM(this.checked)">
                         <span class="toggle-slider"></span>
@@ -973,10 +997,25 @@
             const remote = document.getElementById('inline-remote');
             const icon = document.getElementById('inline-remote-icon');
             remote.classList.toggle('hidden');
-            icon.textContent = remote.classList.contains('hidden') ? '\u25B6' : '\u25BC';
-            if (!remote.classList.contains('hidden')) {
+            const open = !remote.classList.contains('hidden');
+            icon.textContent = open ? '\u25BC' : '\u25B6';
+            // On desktop the IR remote rides the main remote's open state so it
+            // shows beside it. (CSS only honors .main-open at >=768px.)
+            const ir = document.getElementById('inline-ir-remote');
+            if (ir) ir.classList.toggle('main-open', open);
+            if (open) {
                 updateFireTVStatus();
             }
+        }
+
+        // Mobile-only: the IR remote is its own separate dropdown.
+        function toggleInlineIRRemote() {
+            const ir = document.getElementById('inline-ir-remote');
+            const icon = document.getElementById('inline-ir-icon');
+            if (!ir) return;
+            ir.classList.toggle('ir-open');
+            const open = ir.classList.contains('ir-open');
+            if (icon) icon.textContent = open ? '\u25BC' : '\u25B6';
         }
 
         // =========================================================================
@@ -1763,11 +1802,13 @@
                     toggle.disabled = true;
                     panel.classList.add('hidden');
                     help.textContent = 'IR hardware not detected. Enable the rk3588-pwm3-m1 device-tree overlay and reboot.';
+                    document.body.classList.remove('ir-home-enabled');
                     return;
                 }
                 toggle.disabled = false;
                 toggle.checked = !!data.enabled;
                 panel.classList.toggle('hidden', !data.enabled);
+                document.body.classList.toggle('ir-home-enabled', !!data.enabled);
             } catch (e) {
                 console.error('Failed to load IR status:', e);
             }
@@ -1786,6 +1827,7 @@
                     return;
                 }
                 panel.classList.toggle('hidden', !enabled);
+                document.body.classList.toggle('ir-home-enabled', enabled);
                 setIRStatus(enabled ? 'enabled' : 'disabled', false);
             } catch (e) {
                 toggle.checked = !enabled;
@@ -1829,16 +1871,17 @@
         }
 
         function setIRButtonsEnabled(enabled) {
-            const panel = document.getElementById('ir-remote-panel');
-            if (!panel) return;
-            panel.querySelectorAll('button').forEach(b => { b.disabled = !enabled; });
+            document.querySelectorAll('#ir-remote-panel button, #inline-ir-remote button')
+                .forEach(b => { b.disabled = !enabled; });
         }
 
         function setIRStatus(text, isError) {
-            const el = document.getElementById('ir-status-line');
-            if (!el) return;
-            el.textContent = text;
-            el.style.color = isError ? 'var(--danger)' : 'var(--text-secondary)';
+            ['ir-status-line', 'inline-ir-status-line'].forEach(id => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.textContent = text;
+                el.style.color = isError ? 'var(--danger)' : 'var(--text-secondary)';
+            });
         }
 
         // =========================================================================

@@ -7,7 +7,7 @@ Build with:
 
 Note: Models are external and must be present at runtime:
     - PaddleOCR models: /home/radxa/rknn-llm/.../paddleocr/
-    - VLM models: /home/radxa/axera_models/FastVLM-1.5B/
+    - VLM models: /home/radxa/axera_models/LFM2/LFM2-450M-ft-v2-fused-v2/
 
 The executable expects these to be in their standard locations.
 """
