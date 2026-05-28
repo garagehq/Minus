@@ -12,7 +12,7 @@ The integration is split so the IR code is reusable from multiple callers:
 | Core class | `src/ir_transmitter.py` | NEC encoder + PWM driver + 1.5 s cooldown |
 | Standalone CLI | `ir_transmit.py` | `sudo python3 ir_transmit.py <button>` for testing |
 | Web API | `src/webui.py` (`/api/ir/*`) | HTTP endpoints used by the web UI |
-| Web UI | `src/templates/index.html` | Toggle + remote panel in the Autonomous Mode section |
+| Web UI | `src/templates/index.html` | Settings toggle + remote panel; plus a Home-tab remote (desktop side-by-side / mobile dropdown) gated on `body.ir-home-enabled` |
 | Wiring | `minus.py` | Instantiates `IRTransmitter`, exposes `ir_enabled` setting |
 
 ---
@@ -161,6 +161,30 @@ Settings tab → **Autonomous Mode** section:
 The state survives page reloads — `loadIRStatus()` runs on every page load
 and hydrates both the toggle and the panel visibility.
 
+### Home-tab remote
+
+When IR is enabled in Settings, the same 6-button IR remote is also exposed
+on the **Home** tab next to the live feed, so you can switch HDMI inputs
+without leaving the home view. It's gated entirely behind a
+`body.ir-home-enabled` class that JS adds only when IR is *available and
+enabled* (set by `loadIRStatus()` on load and by the Settings toggle live),
+and it's responsive:
+
+- **Desktop (≥768px):** the IR remote sits **beside** the main streaming
+  remote inside the "Remote" dropdown and follows its open state (the
+  `.inline-remote-wrap` becomes a flex row). There is no separate IR toggle
+  button at this width.
+- **Mobile (<768px):** the IR remote is its **own separate dropdown** driven
+  by a dedicated *HDMI Switch* toggle button. Opening the main "Remote"
+  dropdown does **not** reveal it; it only opens via its own toggle.
+
+Both placements reuse `sendIRCommand()`, share the 1.5 s cooldown, and the
+home status line (`#inline-ir-status-line`) mirrors the Settings one. The
+desktop/mobile split is pure CSS — the IR remote's visibility keys off a
+`.main-open` class on desktop (mirrored from the main remote) and a
+`.ir-open` class on mobile (its own toggle), with `@media` queries deciding
+which one is honored.
+
 ---
 
 ## Standalone CLI
@@ -234,6 +258,14 @@ panel hidden-by-default, toggle-on reveals panel, toggle-off hides panel,
 persistence across page reload, `/api/ir/command` actually fires from a
 click, cooldown disables all six buttons during the window and re-enables
 them after, `403` when calling the endpoint while disabled.
+
+`TestIRHomeRemoteUI` additionally covers the Home-tab remote: desktop
+side-by-side (no separate toggle, IR remote rides the main remote's open
+state, six buttons present), desktop-absent-when-disabled, mobile separate
+dropdown (own toggle, hidden when the main remote opens, revealed by its own
+toggle), mobile-toggle-absent-when-disabled, and a home IR button firing
+`/api/ir/command`. The send test is the only one that emits a real NEC code
+(`power`) — skip it if the live switch state must not be disturbed.
 
 The Playwright suite seeds the service to `ir_enabled=false` in
 `setUpClass` and resets it again in `tearDownClass`, so running the tests

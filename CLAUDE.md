@@ -1143,7 +1143,7 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 
 **API:** `/api/ir/status | enable | disable | command`. See the Web UI *Key API Routes* section above. Server enforces a **1.5 s cooldown** between successful sends (`IRCooldownError` → HTTP `429` with `retry_after`).
 
-**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`.
+**UI:** toggle + 6-button remote (Input 1/2/3, Power, Next, Auto) inside the *Autonomous Mode* section of the Settings tab. Panel hidden until toggled on. Buttons auto-disable during cooldown and a status line shows `sent power` or `cooldown — wait 0.74s`. When IR is enabled, the **same 6-button remote also appears on the Home tab** next to the live feed (gated on a `body.ir-home-enabled` class JS sets only when IR is available+enabled): on **desktop (≥768px)** it sits beside the main streaming remote inside the "Remote" dropdown and rides its open state (no separate toggle); on **mobile (<768px)** it's its **own separate dropdown** with a dedicated *HDMI Switch* toggle (opening the main remote does not reveal it). Both placements share `sendIRCommand()`, the cooldown, and the status line. The desktop/mobile split is pure CSS (`.main-open` honored ≥768px, `.ir-open` honored <768px).
 
 **Standalone CLI:** `sudo python3 ir_transmit.py <button>` sends one button; `--list` prints all valid names. Uses the same `IRTransmitter` class as the webui so there is one source of truth.
 
@@ -1157,9 +1157,10 @@ An IR LED wired to Rock Pi 5B header pin **38** (`GPIO3_B2` / Linux GPIO **106**
 - `ir_transmit.py` — standalone CLI shim
 - `minus.py` — instantiates `self.ir_transmitter`, persists `ir_enabled` in `~/.minus_system_settings.json`
 - `src/webui.py` — `/api/ir/*` endpoints, cooldown → 429
-- `src/templates/index.html` — toggle + remote panel in Autonomous Mode section
+- `src/templates/index.html` — Settings toggle + remote panel, plus the Home-tab IR remote (desktop side-by-side / mobile dropdown)
+- `src/static/style.css` — responsive Home-tab IR remote rules (`.inline-remote-wrap`, `.inline-ir-caption`, `body.ir-home-enabled` gating, `.main-open`/`.ir-open` breakpoint behavior)
 - `tests/test_ir_transmitter.py` — 20 unit tests (mocked sysfs)
-- `tests/test_ir_ui.py` — Playwright UI tests (live service)
+- `tests/test_ir_ui.py` — Playwright UI tests (live service); `TestIRHomeRemoteUI` covers the Home-tab remote
 - `docs/IR_TRANSMITTER.md` — full hardware, protocol, API, and troubleshooting docs
 
 **Future work:** hook `minus.ir_transmitter.send("next")` into autonomous mode's scheduler on a 12 h or 24 h cadence. The boilerplate (flag, endpoints, UI, cooldown) is in place so the autonomous-mode change is a single call site.

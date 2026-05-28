@@ -230,5 +230,139 @@ class TestIRRemoteUI(unittest.TestCase):
         self.assertEqual(resp.status, 403)
 
 
+@unittest.skipUnless(HAS_PLAYWRIGHT, "playwright not installed")
+class TestIRHomeRemoteUI(unittest.TestCase):
+    """Home-tab IR remote.
+
+    When IR is enabled in Settings, an IR (HDMI-switch) remote is exposed on
+    the Home tab:
+      - Desktop (>=768px): sits beside the main remote and follows its open
+        state; there is NO separate IR toggle button.
+      - Mobile (<768px): its own separate dropdown driven by a dedicated
+        "HDMI Switch" toggle; opening the main remote does not reveal it.
+    All of it is gated behind body.ir-home-enabled (set only when IR is
+    available AND enabled).
+    """
+
+    DESKTOP = {"width": 1280, "height": 900}
+    MOBILE = {"width": 390, "height": 844}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pw = sync_playwright().start()
+        cls.browser = cls.pw.chromium.launch()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._set_ir(cls.browser, enable=False)
+        cls.browser.close()
+        cls.pw.stop()
+
+    @staticmethod
+    def _set_ir(browser, enable):
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        try:
+            ep = "/api/ir/enable" if enable else "/api/ir/disable"
+            page.request.post(f"{BASE_URL}{ep}")
+        finally:
+            page.close()
+            ctx.close()
+
+    def _load(self, viewport, ir_enabled):
+        # Server-side state must be set BEFORE load so loadIRStatus() hydrates
+        # body.ir-home-enabled correctly.
+        self._set_ir(self.browser, enable=ir_enabled)
+        page = self.browser.new_page(viewport=viewport)
+        page.goto(BASE_URL)
+        page.wait_for_timeout(1500)
+        return page
+
+    def tearDown(self):
+        self._set_ir(self.browser, enable=False)
+
+    def test_desktop_beside_main_when_enabled(self):
+        page = self._load(self.DESKTOP, ir_enabled=True)
+        try:
+            self.assertTrue(page.evaluate(
+                "document.body.classList.contains('ir-home-enabled')"))
+            # No separate IR toggle button on desktop.
+            self.assertFalse(page.is_visible("#inline-ir-toggle-btn"))
+            # IR remote stays hidden until the main remote is opened.
+            self.assertFalse(page.is_visible("#inline-ir-remote"))
+            page.evaluate("toggleInlineRemote()")
+            page.wait_for_timeout(250)
+            self.assertTrue(page.is_visible("#inline-remote"))
+            self.assertTrue(page.is_visible("#inline-ir-remote"))
+            btns = page.query_selector_all("#inline-ir-remote button")
+            self.assertEqual(len(btns), 6)
+            _shot(page, "home_desktop_sidebyside")
+        finally:
+            page.close()
+
+    def test_desktop_absent_when_disabled(self):
+        page = self._load(self.DESKTOP, ir_enabled=False)
+        try:
+            self.assertFalse(page.evaluate(
+                "document.body.classList.contains('ir-home-enabled')"))
+            page.evaluate("toggleInlineRemote()")
+            page.wait_for_timeout(250)
+            self.assertTrue(page.is_visible("#inline-remote"))
+            self.assertFalse(page.is_visible("#inline-ir-remote"))
+            self.assertFalse(page.is_visible("#inline-ir-toggle-btn"))
+        finally:
+            page.close()
+
+    def test_mobile_separate_dropdown(self):
+        page = self._load(self.MOBILE, ir_enabled=True)
+        try:
+            # Separate toggle button is shown on mobile when enabled.
+            self.assertTrue(page.is_visible("#inline-ir-toggle-btn"))
+            # Opening the main remote must NOT reveal the IR remote on mobile.
+            page.evaluate("toggleInlineRemote()")
+            page.wait_for_timeout(250)
+            self.assertTrue(page.is_visible("#inline-remote"))
+            self.assertFalse(page.is_visible("#inline-ir-remote"))
+            # The IR toggle reveals it independently.
+            page.evaluate("toggleInlineIRRemote()")
+            page.wait_for_timeout(250)
+            self.assertTrue(page.is_visible("#inline-ir-remote"))
+            btns = page.query_selector_all("#inline-ir-remote button")
+            self.assertEqual(len(btns), 6)
+            _shot(page, "home_mobile_dropdown")
+        finally:
+            page.close()
+
+    def test_mobile_toggle_absent_when_disabled(self):
+        page = self._load(self.MOBILE, ir_enabled=False)
+        try:
+            self.assertFalse(page.is_visible("#inline-ir-toggle-btn"))
+            page.evaluate("toggleInlineIRRemote()")
+            page.wait_for_timeout(250)
+            self.assertFalse(page.is_visible("#inline-ir-remote"))
+        finally:
+            page.close()
+
+    def test_home_ir_button_sends_command(self):
+        page = self._load(self.DESKTOP, ir_enabled=True)
+        try:
+            page.evaluate("toggleInlineRemote()")
+            page.wait_for_timeout(250)
+            seen = []
+            page.on("request", lambda r: (
+                seen.append(r.url) if "/api/ir/command" in r.url else None))
+            page.click("#inline-ir-remote button:has-text('Power')")
+            page.wait_for_timeout(600)
+            self.assertEqual(
+                len([u for u in seen if "/api/ir/command" in u]), 1,
+                "exactly one IR command request expected")
+            # Status line under the home IR remote should reflect the send.
+            status = page.text_content("#inline-ir-status-line")
+            self.assertTrue(status and "power" in status.lower(),
+                            f"unexpected status: {status!r}")
+        finally:
+            page.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -973,6 +973,41 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     color: var(--text-primary);
 }
 
+/* ---- Home IR (HDMI-switch) remote ----
+   Gated entirely behind body.ir-home-enabled, which JS adds only when IR is
+   available AND enabled in Settings. The IR toggle button + remote are also
+   breakpoint-dependent:
+     - Mobile (<768px): a separate dropdown driven by its own toggle (.ir-open).
+     - Desktop (>=768px): no separate toggle; it sits beside the main remote and
+       follows the main remote's open state (.main-open). */
+#inline-ir-toggle-btn { display: none; }
+#inline-ir-remote { display: none; }
+
+.inline-ir-caption {
+    font-family: var(--font-body);
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    text-align: center;
+    margin-bottom: 0.25rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+@media (max-width: 767px) {
+    body.ir-home-enabled #inline-ir-toggle-btn { display: flex; }
+    body.ir-home-enabled #inline-ir-remote.ir-open { display: block; }
+}
+
+@media (min-width: 768px) {
+    .inline-remote-wrap {
+        display: flex;
+        justify-content: center;
+        align-items: flex-start;
+        gap: 1.5rem;
+    }
+    body.ir-home-enabled #inline-ir-remote.main-open { display: block; }
+}
+
 /* ==================== DETECTIONS SECTION ==================== */
 .detections-section {
     background: var(--bg-card);
