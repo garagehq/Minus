@@ -656,6 +656,19 @@ class Minus:
             'learn more', 'shop now', 'buy now',
             'shop now (fuzzy)', 'shop now (fuzzy-shan)',
         })
+        # DEFINITIVE ad-UI keywords: the subset of STRONG that ONLY ever
+        # appears inside an active video-ad overlay and is therefore
+        # implausible as a single-frame OCR misread of show content. These
+        # BYPASS the 2-frame transience guard and fire blocking on the FIRST
+        # matched frame (saves ~one OCR cycle, ~0.8-1.5s, off detect latency —
+        # the dominant ad-break activation tax). 'sponsored' is deliberately
+        # EXCLUDED: it legitimately appears on home/promo tiles and as
+        # show-content text, so it keeps the dwell. The transience guard's
+        # cited artifact cases ("SKIP" on a billboard, "Sponsored" on a tile,
+        # "BUY" in a caption) do NOT match any name below, so single-frame
+        # fast-fire here reintroduces none of the FP risk the guard prevents.
+        self.DEFINITIVE_AD_KEYWORD_NAMES = (
+            self.STRONG_AD_KEYWORD_NAMES - frozenset({'sponsored'}))
 
         self.vlm_prev_frame = None
         self.vlm_prev_frame_had_ad = False
@@ -3700,13 +3713,22 @@ class Minus:
                     # visible continuously so they clear the threshold
                     # within 1-2 OCR cycles (~500-1000ms penalty).
                     #
-                    # Triangulation override — fast-fire on 1 frame when
-                    # VLM is also asserting ad OR ASR confirms marketing
-                    # language in audio. All three signals agreeing
-                    # makes the single-frame-artifact case vanishingly
-                    # rare; the latency penalty isn't worth paying when
-                    # we have corroboration.
-                    fast_fire = (self.vlm_ad_detected
+                    # Fast-fire on 1 frame (skip the dwell) when ANY of:
+                    #   - a DEFINITIVE ad-UI keyword matched (skip in / skip
+                    #     ad / ad countdown / ad N of M / ad with timestamp /
+                    #     visit advertiser / video will play after ad) — these
+                    #     never occur as a 1-frame show-content artifact, so
+                    #     the transience guard buys nothing but latency here.
+                    #   - VLM is also asserting ad, OR ASR confirms marketing
+                    #     language — corroboration makes the artifact case
+                    #     vanishingly rare.
+                    # The 2-frame dwell still protects ambiguous matches
+                    # (bare 'sponsored', weak keywords) that CAN be artifacts.
+                    definitive_ocr = any(
+                        kw in self.DEFINITIVE_AD_KEYWORD_NAMES
+                        for kw in keywords_found)
+                    fast_fire = (definitive_ocr
+                                 or self.vlm_ad_detected
                                  or self._asr_verdict() == 'confirm')
                     required_frames = (1 if fast_fire
                                        else self.OCR_TRANSIENCE_MIN_FRAMES)

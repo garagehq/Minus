@@ -345,7 +345,7 @@ v4l2-ctl -d /dev/video0 --get-ctrl audio_present
 ## Ad Detection Logic (Weighted Model)
 
 **OCR (Primary - Authoritative, with triangulation safety net):**
-- Triggers blocking after a brief dwell — `OCR_TRANSIENCE_MIN_FRAMES=2` consecutive OCR-matched frames (~500-1000ms penalty at OCR's ~500ms cadence). Fast-fires on 1 frame when VLM is asserting ad OR ASR confirms (all three signals agreeing → no dwell needed). Rationale: a single-frame OCR misread (movie billboard with "SKIP", actor holding a sign reading "Sponsored", caption containing 'BUY') shouldn't trigger blocking. Real ad UIs keep the keyword visible continuously, so 2 consecutive frames is trivially cleared. env-overridable: `MINUS_OCR_TRANSIENCE_MIN_FRAMES`.
+- Triggers blocking after a brief dwell — `OCR_TRANSIENCE_MIN_FRAMES=2` consecutive OCR-matched frames (~500-1000ms penalty at OCR's ~500ms cadence). **Fast-fires on 1 frame (no dwell)** when ANY of: (a) the matched keyword is a *definitive ad-UI keyword* (`DEFINITIVE_AD_KEYWORD_NAMES` = `STRONG_AD_KEYWORD_NAMES` minus `sponsored`: `skip ad`/`skip ads`/`skip in`/`skip ad (fuzzy*)`/`video will play after ad`/`visit advertiser`/`ad X of Y`/`ad countdown`/`ad with timestamp(+cross-element)`); (b) VLM is asserting ad; (c) ASR confirms. Rationale: a single-frame OCR misread (movie billboard with "SKIP", actor holding a sign reading "Sponsored", caption containing 'BUY') shouldn't trigger blocking — but those artifact strings match **none** of the definitive keywords (which only ever appear inside an active ad overlay), so fast-firing them reintroduces no FP risk while cutting ~one OCR cycle (~0.8-1.5s) off the most common ad-break activation. `sponsored` is excluded from the definitive set (it legitimately appears on home/promo tiles and as show-content text) and keeps the 2-frame dwell, as do weak keywords. Real ad UIs keep the keyword visible continuously, so 2 consecutive frames is trivially cleared. env-overridable: `MINUS_OCR_TRANSIENCE_MIN_FRAMES`. See *Definitive-keyword single-frame fast-fire* under Known Issues.
 - Stops blocking after **2 consecutive no-ads** (`OCR_STOP_THRESHOLD=2`, was 4 — tuned via `tests/block_latency_harness.py`)
 - **Authoritative for stopping** when OCR triggered the block — UNLESS the triangulation veto fires (see below).
 - Tracks `last_ocr_ad_time` for VLM context
@@ -2597,8 +2597,12 @@ only upgrades the label). The mid-block product-placement rescue
 (`source==vlm` + ASR veto ≥4s → force-stop) is now GATED on `ad_ratio <
 0.5` so it can only end a block once **VLM itself has weakened** — a
 confident visual detection is always trusted. The `tests/test_asr.py`
-decision-engine cases that asserted the old veto behaviour are now stale
-and need updating.
+decision-engine cases were updated to assert the new behaviour
+(`TestDecisionEngineASRGate`: VLM-alone blocks despite ASR veto with
+base source `vlm`; `confirm` only flips `blocking_asr_confirmed` so the
+DISPLAY label becomes `vlm+asr`); `test_get_status_keys` now matches the
+default engine (`MINUS_ASR_ENGINE`, default `moonshine`) instead of
+hard-coding `faster-whisper`.
 
 **4. ASR markers expanded (~45 phrases + written-URL regex).**
 `src/asr_keywords.py` gained urgency/CTA/guarantee/sale/code/pharma/
@@ -2654,3 +2658,42 @@ audio/ASR startup decoupling), `src/audio.py` (fakesink fallback),
 - **Vocabulary unpack fix.** `get_current_vocabulary()` unpacked a 4-tuple
   but `VOCABULARY_COMBINED` also has 5-tuple extended entries → "too many
   values to unpack (expected 4)" spamming during blocks. Now `[:4]`.
+
+### Definitive-keyword single-frame fast-fire (May 2026)
+
+**Symptom:** ad-break activation felt like ~3s. Measured from live logs
+(e.g. a `skip in`/`sponsored` break): OCR first matched the keyword at
+T, logged `OCR ad-detection pending dwell (1/2 frames)`, and the block
+did not fire until T+~1s after the *second* OCR-matched frame. The
+2-frame transience guard (`OCR_TRANSIENCE_MIN_FRAMES=2`) was costing a
+full extra OCR cycle (~0.8-1.5s, capture cadence is noisy 120-2160ms)
+on the most common ad-break case.
+
+**Root cause:** the transience guard was added to reject *single-frame
+OCR misreads* of an ad-keyword *word* appearing in show content — a
+billboard reading "SKIP", a caption with "BUY", a movie title with
+"Sponsored". But it applied uniformly to ALL keywords, including
+*definitive ad-UI strings* (`skip in`, `skip ad`, `ad countdown`, `ad N
+of M`, `ad with timestamp`, `visit advertiser`, `video will play after
+ad`) that only ever render inside an active ad overlay and are
+implausible as a 1-frame artifact. So the guard bought nothing but
+latency for exactly the keywords that fire most often.
+
+**Fix:** `DEFINITIVE_AD_KEYWORD_NAMES = STRONG_AD_KEYWORD_NAMES -
+{'sponsored'}` (`minus.py.__init__`). In the OCR-loop transience guard,
+`fast_fire` is now true when ANY matched keyword is in that set (in
+addition to the pre-existing VLM-asserting / ASR-confirm corroboration
+paths) → blocks on the FIRST matched frame, no dwell. The guard's cited
+artifact strings ("SKIP"/"Sponsored"/"BUY") match **none** of the
+definitive names, so no FP risk is reintroduced. `sponsored` is
+deliberately EXCLUDED (it legitimately appears on home/promo tiles and
+as show-content text — kept at the 2-frame dwell), as are all weak
+keywords. Cuts the typical OCR ad-break activation under 2s.
+
+**Verification:** `tests/test_asr.py::TestOCRTransienceGuard` updated to
+mirror the new logic + 2 new cases (`test_fast_fire_on_definitive_ocr_keyword`,
+`test_sponsored_alone_still_requires_dwell`); 68 tests pass. Deployed
+and confirmed clean boot (OCR/ASR/VLM up, no errors).
+
+**Files modified:** `minus.py` (`DEFINITIVE_AD_KEYWORD_NAMES` +
+transience-guard `fast_fire`), `tests/test_asr.py`, CLAUDE.md.

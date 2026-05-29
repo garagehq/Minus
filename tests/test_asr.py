@@ -232,8 +232,11 @@ class TestASRManager(unittest.TestCase):
                     'last_transcript', 'last_marker_hits',
                     'p50_latency_s', 'p95_latency_s'):
             self.assertIn(key, s)
-        # engine label tells the UI which backend is in use
-        self.assertEqual(s['engine'], 'faster-whisper')
+        # engine label tells the UI which backend is in use. Moonshine is
+        # the default now; faster-whisper is selectable via MINUS_ASR_ENGINE.
+        expected_engine = os.environ.get('MINUS_ASR_ENGINE', 'moonshine').lower()
+        self.assertEqual(s['engine'], expected_engine)
+        self.assertIn(s['engine'], ('moonshine', 'faster-whisper'))
 
     def test_record_result_timeouts_increment_counter(self):
         m = self._make()
@@ -704,9 +707,15 @@ class TestAudioRecoveryWithTap(unittest.TestCase):
 
 
 class TestDecisionEngineASRGate(unittest.TestCase):
-    """Verifies the ASR verdict actually gates VLM-alone blocking the way
-    we documented. Uses a partial Minus construction (skips heavy init)
-    and exercises the relevant code paths.
+    """Verifies how the ASR verdict decorates VLM-alone blocking at START.
+
+    ASR is CONFIRM-ONLY at the start gate now: a 'confirm' upgrades the
+    display label to 'vlm+asr' via the blocking_asr_confirmed flag, but
+    'veto' is IGNORED — the visual detector is trusted, so a VLM-alone
+    block always fires regardless of ASR. (A genuine product-placement
+    false positive is caught later by the gated mid-block ASR rescue,
+    which only force-stops once VLM ITSELF has weakened.) Uses a partial
+    Minus construction (skips heavy init) and exercises the start gate.
     """
 
     def _make_minus(self, asr_verdict='unknown'):
@@ -775,36 +784,52 @@ class TestDecisionEngineASRGate(unittest.TestCase):
         m.ad_blocker = MagicMock()
         m.ad_blocker.is_visible = False
         m._set_led_state = MagicMock()
+        m.blocking_asr_confirmed = False
         # Helpers
         m._get_vlm_agreement = MagicMock(return_value=(0.85, 0.15, 5))
         m.is_in_hdmi_reconnect_grace = lambda: False
         m.get_hdmi_reconnect_grace_remaining = lambda: 0
         return m
 
-    def test_vlm_alone_blocked_when_asr_says_veto(self):
-        """ASR 'veto' on VLM-alone start MUST suppress the block."""
+    def test_vlm_alone_blocks_despite_asr_veto(self):
+        """ASR 'veto' is IGNORED at the start gate now — the visual
+        detector is trusted, so a VLM-alone block fires anyway with base
+        source 'vlm' and the +asr label OFF. (The old start-veto wrongly
+        killed real ads VLM was sure about; product-placement FPs are
+        caught by the gated mid-block rescue instead.)"""
         m = self._make_minus(asr_verdict='veto')
         m.vlm_ad_detected = True
         m._update_blocking_state()
-        self.assertFalse(m.ad_detected)
-        self.assertIsNone(m.blocking_source)
+        self.assertTrue(m.ad_detected,
+                        "ASR veto must NOT suppress a VLM-alone block at start")
+        self.assertEqual(m.blocking_source, 'vlm')
+        self.assertFalse(m.blocking_asr_confirmed)
+        self.assertEqual(m._display_source(), 'vlm')
 
     def test_vlm_alone_blocks_with_vlm_source_when_asr_unknown(self):
-        """ASR 'unknown' (cold start, music) must NOT suppress VLM-alone."""
+        """ASR 'unknown' (cold start, music) must NOT suppress VLM-alone
+        and must NOT set the +asr label."""
         m = self._make_minus(asr_verdict='unknown')
         m.vlm_ad_detected = True
         m._update_blocking_state()
         self.assertTrue(m.ad_detected)
         self.assertEqual(m.blocking_source, 'vlm')
+        self.assertFalse(m.blocking_asr_confirmed)
+        self.assertEqual(m._display_source(), 'vlm')
 
-    def test_vlm_alone_blocks_with_vlm_plus_asr_source_when_asr_confirms(self):
-        """ASR 'confirm' upgrades the source label so we can see the
-        high-confidence path in /api/status and the logs."""
+    def test_vlm_alone_confirm_upgrades_display_label(self):
+        """ASR 'confirm' keeps the base source 'vlm' (stop-logic depends
+        on it) but flips blocking_asr_confirmed so the DISPLAY label
+        becomes 'vlm+asr' in /api/status and the logs — the high-confidence
+        path. The base source must stay 'vlm', not 'vlm+asr'."""
         m = self._make_minus(asr_verdict='confirm')
         m.vlm_ad_detected = True
         m._update_blocking_state()
         self.assertTrue(m.ad_detected)
-        self.assertEqual(m.blocking_source, 'vlm+asr')
+        self.assertEqual(m.blocking_source, 'vlm',
+                         "base source must stay 'vlm' for stop-logic")
+        self.assertTrue(m.blocking_asr_confirmed)
+        self.assertEqual(m._display_source(), 'vlm+asr')
 
     def test_ocr_blocking_unaffected_by_asr_veto(self):
         """OCR-driven blocking is authoritative. ASR 'veto' must NOT
@@ -850,6 +875,7 @@ class TestOCRTriangulationVeto(unittest.TestCase):
         m.ad_detected = True
         m.blocking_active = True
         m.blocking_source = source
+        m.blocking_asr_confirmed = False
         m.blocking_start_time = time.time() - blocking_elapsed
         m.blocking_end_time = 0.0
         m.blocking_paused_until = 0.0
@@ -1031,18 +1057,29 @@ class TestOCRTransienceGuard(unittest.TestCase):
         m.ocr_ad_detection_count = 0
         m.vlm_ad_detected = vlm_ad
         m.OCR_TRANSIENCE_MIN_FRAMES = 2
+        # Mirror the production definitive-keyword set (STRONG minus
+        # 'sponsored'); only the names exercised here are needed.
+        m.DEFINITIVE_AD_KEYWORD_NAMES = frozenset({
+            'skip ad', 'skip ads', 'skip in', 'ad countdown',
+            'ad X of Y', 'ad with timestamp', 'visit advertiser',
+            'video will play after ad'})
 
         asr_mock = MagicMock()
         asr_mock.verdict.return_value = asr_verdict
         m.asr = asr_mock
         return m
 
-    def _simulate_ocr_match(self, m):
+    def _simulate_ocr_match(self, m, keywords_found=('sponsored',)):
         """Run the transience-guard branch from the OCR loop once. This
         copies the production logic literally so a refactor that
-        diverges shows up as a test failure."""
+        diverges shows up as a test failure. keywords_found defaults to a
+        non-definitive keyword ('sponsored') so the dwell applies unless a
+        test passes a definitive ad-UI keyword."""
         m.ocr_ad_detection_count += 1
-        fast_fire = (m.vlm_ad_detected
+        definitive_ocr = any(kw in m.DEFINITIVE_AD_KEYWORD_NAMES
+                             for kw in keywords_found)
+        fast_fire = (definitive_ocr
+                     or m.vlm_ad_detected
                      or (m.asr is not None
                          and m.asr.verdict() == 'confirm'))
         required_frames = (1 if fast_fire else m.OCR_TRANSIENCE_MIN_FRAMES)
@@ -1075,9 +1112,35 @@ class TestOCRTransienceGuard(unittest.TestCase):
     def test_fast_fire_when_asr_confirms(self):
         """Triangulation override: ASR has marker hits → fast-fire."""
         m = self._make_minus(asr_verdict='confirm')
-        self._simulate_ocr_match(m)
+        self._simulate_ocr_match(m, keywords_found=['sponsored'])
         self.assertTrue(m.ocr_ad_detected,
                         "ASR 'confirm' must fast-fire on 1 frame")
+
+    def test_fast_fire_on_definitive_ocr_keyword(self):
+        """Latency fix: a DEFINITIVE ad-UI keyword (skip in / skip ad / ad
+        countdown / visit advertiser / ...) fires on the FIRST frame with
+        no VLM/ASR corroboration — these strings never occur as a
+        single-frame show-content artifact, so the dwell only added
+        latency (~1 OCR cycle) to the most common ad-break case."""
+        for kw in ('skip in', 'skip ad', 'ad countdown', 'ad X of Y',
+                   'ad with timestamp', 'visit advertiser',
+                   'video will play after ad'):
+            m = self._make_minus()  # no VLM, ASR unknown
+            self._simulate_ocr_match(m, keywords_found=[kw])
+            self.assertTrue(m.ocr_ad_detected,
+                            f"definitive keyword {kw!r} must fast-fire on 1 frame")
+
+    def test_sponsored_alone_still_requires_dwell(self):
+        """'sponsored' is STRONG but NOT definitive — it appears on home /
+        promo tiles and as show-content text, so a single 'sponsored'
+        frame must still wait for the 2-frame dwell (artifact protection)."""
+        m = self._make_minus()
+        self._simulate_ocr_match(m, keywords_found=['sponsored'])
+        self.assertFalse(m.ocr_ad_detected,
+                         "single 'sponsored' frame must not fast-fire")
+        self._simulate_ocr_match(m, keywords_found=['sponsored'])
+        self.assertTrue(m.ocr_ad_detected,
+                        "second 'sponsored' frame clears the dwell")
 
     def test_dwell_resets_after_gap(self):
         """The artifact pattern the user described — keyword appears
