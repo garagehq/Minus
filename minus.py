@@ -467,6 +467,13 @@ class Minus:
         self.frame_count = 0
         self.blocking_start_time = 0
         self.blocking_source = None
+        # Whether ASR has confirmed (marketing language heard) for the active
+        # block. Kept SEPARATE from blocking_source (which stays the base
+        # ocr/vlm/both for all stop-logic checks) and only decorates the
+        # DISPLAY label → ocr+asr / both+asr / vlm+asr. Set at start from the
+        # ASR verdict and upgraded mid-block when ASR later confirms (ASR
+        # usually confirms a few seconds after an instant OCR block fires).
+        self.blocking_asr_confirmed = False
 
         # Weighted detection parameters
         self.OCR_TRUST_WINDOW = 5.0
@@ -618,6 +625,16 @@ class Minus:
             'visit advertiser', 'visitadvertiser',
             'ad X of Y', 'ad countdown',
             'ad with timestamp', 'ad with timestamp (cross-element)',
+            # 'sponsored' promoted to STRONG per product decision (2026-05):
+            # it should decisively trigger ad blocking. NOTE: this overrides
+            # static-screen suppression, so a STATIC "Sponsored" promo/tile
+            # (not on a detected home screen) can now block and hold until a
+            # cap fires — bounded by FROZEN_EARLY_SECONDS (30s, frozen text)
+            # and MAX_BLOCKING_DURATION (150s). This re-opens (in a bounded
+            # form) the static-promo false-hold class that the weak-keyword
+            # layer originally guarded; home-screen detection still suppresses
+            # home/browse tiles. Revert by moving 'sponsored' back to WEAK.
+            'sponsored',
         })
         self.STRONG_AD_HOLD_SECONDS = 5.0
         self.last_strong_ad_time = 0.0
@@ -635,7 +652,8 @@ class Minus:
         # (the pair evaded the sponsored-only test). Names must match what
         # OCRProcess.check_ad_keywords emits.
         self.WEAK_AD_KEYWORD_NAMES = frozenset({
-            'sponsored', 'learn more', 'shop now', 'buy now',
+            # 'sponsored' moved to STRONG_AD_KEYWORD_NAMES (see above).
+            'learn more', 'shop now', 'buy now',
             'shop now (fuzzy)', 'shop now (fuzzy-shan)',
         })
 
@@ -826,11 +844,16 @@ class Minus:
             try:
                 self.asr_tap = AudioASRTap()
                 self.asr = ASRManager(self.asr_tap)
+                # Honour the persisted on/off toggle. When off we still
+                # construct the manager (so it can be re-enabled at
+                # runtime via the web UI) but skip starting the worker.
+                self.asr.enabled = bool(self._system_settings.get('asr_enabled', True))
                 # ASRManager.get_status() exposes the engine + model name,
                 # but it isn't ready yet at construction; read from the
                 # manager attrs for the boot log line instead.
                 logger.info(f"ASR initialized (faster-whisper "
-                            f"{self.asr._model_name} + audio tap)")
+                            f"{self.asr._model_name} + audio tap, "
+                            f"enabled={self.asr.enabled})")
             except Exception as e:
                 logger.warning(f"ASR init failed: {e} — running without ASR")
                 self.asr_tap = None
@@ -1785,6 +1808,27 @@ class Minus:
         remaining = self.vlm_paused_until - time.time()
         return max(0, int(remaining))
 
+    def _display_source(self):
+        """Source string for the overlay header: the base blocking_source
+        plus an '+asr' suffix when ASR confirmed the active block →
+        ocr / ocr+asr / vlm / vlm+asr / both / both+asr. blocking_source
+        itself stays the base (ocr/vlm/both) so all stop-logic equality
+        checks are unaffected."""
+        src = self.blocking_source
+        if src and self.blocking_asr_confirmed and src in ('ocr', 'vlm', 'both'):
+            return src + '+asr'
+        return src
+
+    _SOURCE_LABELS = {
+        'ocr': 'OCR', 'vlm': 'VLM', 'both': 'OCR+VLM',
+        'ocr+asr': 'OCR+ASR', 'vlm+asr': 'VLM+ASR', 'both+asr': 'OCR+VLM+ASR',
+    }
+
+    def _display_source_label(self) -> str:
+        """Human-readable label for logs / UI, e.g. 'OCR+VLM+ASR'."""
+        src = self._display_source() or ''
+        return self._SOURCE_LABELS.get(src, src.upper())
+
     def _asr_verdict(self) -> str:
         """Return ASR's current verdict on whether audio sounds like an ad.
 
@@ -1906,6 +1950,7 @@ class Minus:
             # Blocking state
             'blocking': is_blocking,
             'blocking_source': self.blocking_source,
+            'blocking_source_display': self._display_source(),
             'paused': self.is_blocking_paused(),
             'pause_remaining': self.get_pause_remaining(),
             'vlm_user_paused': self.is_vlm_user_paused(),
@@ -1936,6 +1981,18 @@ class Minus:
             'vlm_disabled': self.vlm_disabled,
             'ocr_ready': self.ocr is not None and self.ocr.is_ready,
             'ocr_disabled': getattr(self, 'ocr_disabled', False),
+            # Live OCR block for the webui OCR-Live panel (mirrors 'asr').
+            # last_ocr_texts is refreshed every OCR frame, so this is the
+            # live on-screen text; matched_keywords lists any ad-keyword
+            # hits on the current frame (empty on non-ad content).
+            'ocr': {
+                'ready': self.ocr is not None and self.ocr.is_ready,
+                'disabled': getattr(self, 'ocr_disabled', False),
+                'detected': self.ocr_ad_detected,
+                'frame_count': self.frame_count,
+                'last_text': ' | '.join(self.last_ocr_texts or [])[:300],
+                'matched_keywords': [kw for kw, _ in (self.last_matched_keywords or [])],
+            },
             'display_connected': self.display_connected,
             'display_error': self.display_error,
 
@@ -2241,6 +2298,7 @@ class Minus:
         """Load system settings from disk."""
         defaults = {
             'vlm_preload': True,          # Load VLM at startup (vs wait for HDMI)
+            'asr_enabled': True,          # Run faster-whisper ASR confirm/veto for VLM-alone blocks
             'block_falloff': True,        # Shorten min-block duration on consecutive ads
             'hdmi_reconnect_grace': True, # Disable ad blocking for 90s after HDMI reconnect
             'greyscale_preview': True,    # Desaturate the ad preview window in blocking mode
@@ -2301,6 +2359,37 @@ class Minus:
     def vlm_preload(self) -> bool:
         """Whether to preload VLM at startup."""
         return self._system_settings.get('vlm_preload', True)
+
+    @property
+    def asr_enabled(self) -> bool:
+        """Whether ASR (faster-whisper confirm/veto) is enabled."""
+        return self._system_settings.get('asr_enabled', True)
+
+    def set_asr_enabled(self, enabled: bool) -> dict:
+        """Enable or disable ASR at runtime and persist the choice.
+
+        ASR is a confirm/veto signal for VLM-alone blocks (never blocks
+        on its own), so toggling it off only relaxes VLM-alone handling
+        back to pre-ASR behaviour — OCR/VLM blocking is unaffected.
+
+        Disabling stops the worker (frees the ~250MB model + the
+        inference thread); enabling (re)starts it. Takes effect
+        immediately and survives restarts.
+        """
+        enabled = bool(enabled)
+        self._system_settings['asr_enabled'] = enabled
+        self._save_system_settings()
+        if self.asr is not None:
+            self.asr.enabled = enabled
+            try:
+                if enabled and not self.asr.is_running:
+                    self.asr.start()
+                elif not enabled and self.asr.is_running:
+                    self.asr.stop()
+            except Exception as e:
+                logger.warning(f"ASR {'start' if enabled else 'stop'} failed: {e}")
+                return {'success': False, 'error': str(e), 'asr_enabled': enabled}
+        return {'success': True, 'asr_enabled': enabled}
 
     @property
     def block_falloff_enabled(self) -> bool:
@@ -2714,30 +2803,45 @@ class Minus:
                 return False
 
         logger.info("Starting display pipeline...")
-        if self.ad_blocker.start():
+        display_ok = self.ad_blocker.start()
+        if display_ok:
             logger.info("Display pipeline started - 30 FPS with instant ad blocking")
+        else:
+            logger.error("Display pipeline failed to start")
 
-            # Start audio passthrough. If the TV was off at boot,
-            # __init__ fell back to hw:0,0 — re-probe now and re-point
-            # the audio sink at the live HDMI output before starting,
-            # otherwise audio plays out the wrong port.
-            if self.audio:
-                drm_info = probe_drm_output()
-                if (drm_info['audio_device'] and
-                        drm_info['audio_device'] != self.audio.playback_device):
-                    logger.info(
-                        f"Audio device changed: {self.audio.playback_device} "
-                        f"-> {drm_info['audio_device']}"
-                    )
-                    self.audio.stop()
-                    self.audio.playback_device = drm_info['audio_device']
-                    self.config.audio_playback_device = drm_info['audio_device']
+        # Start audio passthrough + ASR REGARDLESS of display state. The audio
+        # path is HDMI-RX(capture) -> HDMI-TX(playback); decoupling it from the
+        # display (video) pipeline means ASR runs off HDMI-RX even when the TV
+        # is off — the audio pipeline falls back to fakesink for playback
+        # (see AudioPassthrough._init_pipeline) so capture + the ASR tap stay
+        # live. When the TV is present we re-point the sink at the live HDMI
+        # output first; if the TV just returned while audio was on fakesink,
+        # rebuild with the real alsasink so TV audio resumes.
+        if self.audio:
+            need_start = not self.audio.is_running
+            if display_ok and self.audio.is_running and getattr(self.audio, '_playback_fakesink', False):
+                logger.info("HDMI-TX now present — rebuilding audio with alsasink (was fakesink)")
+                self.audio.stop()
+                need_start = True
+            if need_start:
+                if display_ok:
+                    drm_info = probe_drm_output()
+                    if (drm_info['audio_device'] and
+                            drm_info['audio_device'] != self.audio.playback_device):
+                        logger.info(
+                            f"Audio device changed: {self.audio.playback_device} "
+                            f"-> {drm_info['audio_device']}"
+                        )
+                        self.audio.playback_device = drm_info['audio_device']
+                        self.config.audio_playback_device = drm_info['audio_device']
                 if self.audio.start():
-                    logger.info("Audio passthrough started")
+                    logger.info("Audio passthrough started"
+                                + (" (fakesink — TV off)" if getattr(self.audio, '_playback_fakesink', False) else ""))
                     # Kick off ASR inference loop now that the audio
                     # pipeline (and tap) is producing buffers. Safe to
-                    # call even if asr is None.
-                    if self.asr is not None:
+                    # call even if asr is None. Skip when disabled via the
+                    # persisted toggle (worker not spawned, no model load).
+                    if self.asr is not None and self.asr.enabled:
                         try:
                             self.asr.start()
                         except Exception as e:
@@ -2745,10 +2849,7 @@ class Minus:
                 else:
                     logger.warning("Audio passthrough failed to start")
 
-            return True
-        else:
-            logger.error("Display pipeline failed to start")
-            return False
+        return display_ok
 
     def start_display(self):
         """Start ustreamer and display pipeline."""
@@ -2790,11 +2891,16 @@ class Minus:
             if not self.ad_detected:
                 should_start = False
                 source = None
+                asr_confirmed = False  # decorates the display label only
 
                 if self.ocr_ad_detected:
                     # OCR is primary - always trust it immediately
                     should_start = True
                     source = "both" if self.vlm_ad_detected else "ocr"
+                    # Label decoration: if ASR is also hearing marketing copy,
+                    # show it (ocr+asr / both+asr). ASR has no say in WHETHER
+                    # the OCR block fires — only in the label.
+                    asr_confirmed = (self._asr_verdict() == 'confirm')
                 elif self.vlm_ad_detected:
                     # VLM alone - vlm_ad_detected is now managed by sliding window
                     # which already requires sustained agreement before setting True
@@ -2821,25 +2927,31 @@ class Minus:
                         #               the existing VLM-alone behavior
                         # OCR-driven paths above are untouched: OCR text on
                         # screen is authoritative regardless of audio.
+                        # ASR is a CONFIRM-ONLY signal at start now: it can
+                        # upgrade a VLM-alone block to "vlm+asr" (higher
+                        # confidence label) but NEVER suppresses it. The old
+                        # start-veto wrongly killed real ads VLM was sure
+                        # about (observed: a Hotels.com ad at 80%, an
+                        # insurance ad "What's important to you?" at 100% — ASR
+                        # vetoed only because the spoken copy lacked explicit
+                        # marketing markers). The visual detector is trusted
+                        # at start; a genuine product-placement false positive
+                        # is caught by the GATED mid-block ASR rescue below,
+                        # which only force-stops once VLM ITSELF has weakened.
                         asr_verdict = self._asr_verdict()
-                        if asr_verdict == 'veto':
-                            ad_ratio, _, total = self._get_vlm_agreement()
-                            transcript = (self.asr.last_transcript[:60]
-                                          if self.asr else '')
-                            logger.info(
-                                f"VLM-alone vetoed by ASR (no marketing "
-                                f"language heard). VLM agreement was "
-                                f"{ad_ratio*100:.0f}% of {total}. "
-                                f"ASR transcript: '{transcript}'")
+                        should_start = True
+                        source = "vlm"  # base stays "vlm" for stop-logic;
+                        asr_confirmed = (asr_verdict == 'confirm')  # label only
+                        ad_ratio, _, total = self._get_vlm_agreement()
+                        if asr_verdict == 'confirm' and self.asr:
+                            asr_note = f" + ASR confirmed ({self.asr.last_marker_hits} markers)"
+                        elif asr_verdict == 'veto':
+                            asr_note = " (ASR veto ignored at start — trusting VLM)"
                         else:
-                            should_start = True
-                            source = "vlm+asr" if asr_verdict == 'confirm' else "vlm"
-                            ad_ratio, _, total = self._get_vlm_agreement()
-                            asr_note = (f" + ASR confirmed ({self.asr.last_marker_hits} markers)"
-                                        if asr_verdict == 'confirm' and self.asr else '')
-                            logger.info(f"VLM triggered alone (agreement: "
-                                        f"{ad_ratio*100:.0f}% of {total} "
-                                        f"decisions){asr_note}")
+                            asr_note = ''
+                        logger.info(f"VLM triggered alone (agreement: "
+                                    f"{ad_ratio*100:.0f}% of {total} "
+                                    f"decisions){asr_note}")
 
                 if should_start and self.is_in_hdmi_reconnect_grace():
                     remaining = self.get_hdmi_reconnect_grace_remaining()
@@ -2881,6 +2993,7 @@ class Minus:
                     self.ad_detected = True
                     self.blocking_start_time = now
                     self.blocking_source = source
+                    self.blocking_asr_confirmed = asr_confirmed
                     # Falloff counter: if the last block ended recently (within the
                     # reset gap), this is a consecutive ad — bump the counter. If
                     # it's been a while, this is a fresh ad sequence — reset.
@@ -2892,8 +3005,7 @@ class Minus:
                     self.accidental_pause_detected = False
                     self.skip_attempted_this_ad = False
                     self.last_skip_countdown = None
-                    source_display = source.upper() if source != "both" else "OCR+VLM"
-                    logger.warning(f"AD BLOCKING STARTED ({source_display})")
+                    logger.warning(f"AD BLOCKING STARTED ({self._display_source_label()})")
 
                     # NOTE: Ad skipping is handled separately based on skip button detection
                     # We only skip when "Skip" appears without countdown (handled in OCR worker)
@@ -2902,6 +3014,13 @@ class Minus:
             elif self.ad_detected:
                 if self.ocr_ad_detected and self.vlm_ad_detected and self.blocking_source != "both":
                     self.blocking_source = "both"
+                # ASR confirms mid-block → upgrade the display label (ocr→ocr+asr,
+                # both→both+asr, vlm→vlm+asr). ASR usually confirms a few seconds
+                # after an instant OCR block, so this is the common path for the
+                # "+ASR" label to actually appear. Logic/stop behaviour unchanged.
+                if not self.blocking_asr_confirmed and self._asr_verdict() == 'confirm':
+                    self.blocking_asr_confirmed = True
+                    logger.info(f"ASR confirmed active block → {self._display_source_label()}")
 
                 blocking_elapsed = now - self.blocking_start_time
                 should_stop = False
@@ -2919,25 +3038,30 @@ class Minus:
                         # Use simple consecutive count, not sliding window (for responsiveness)
                         should_stop = vlm_says_stop
 
-                        # ASR force-stop: this is the "product placement
-                        # rescue" path. A block started on VLM alone
-                        # (source=="vlm", not "vlm+asr" — ASR didn't
-                        # confirm at start) but ASR has now been listening
-                        # for ≥4s and reports clear show dialog with zero
-                        # marketing markers. Almost certainly a brand on
-                        # screen during a show. Force the block to end.
-                        # OCR/both/vlm+asr blocks are NOT affected — their
-                        # other signal is still trusted.
+                        # ASR force-stop: the "product placement rescue".
+                        # A VLM-alone block (source=="vlm") where ASR reports
+                        # clear show dialog with zero marketing markers for
+                        # ≥4s. GATED on VLM HAVING WEAKENED (ad_ratio < 0.5):
+                        # we trust the visual detector, so ASR may only end a
+                        # block once VLM itself is no longer confidently
+                        # calling it an ad. This keeps real ads — where VLM
+                        # stays firmly "ad" — blocked even when their spoken
+                        # copy has no markers (the Hotels.com / insurance-ad
+                        # case). A genuine brand-in-a-show FP shows VLM voting
+                        # no-ad as the scene continues, so its ad_ratio drops
+                        # and the rescue fires. OCR/both/vlm+asr unaffected.
                         if (not should_stop and blocking_elapsed >= 4.0 and
                                 self.asr is not None and
                                 self.asr.verdict() == 'veto'):
-                            transcript = self.asr.last_transcript[:60]
-                            logger.warning(
-                                f"[VLM] Force-stopping VLM-only blocking "
-                                f"({blocking_elapsed:.1f}s): ASR confirms "
-                                f"show audio, no marketing markers heard. "
-                                f"Transcript: '{transcript}'")
-                            should_stop = True
+                            _vlm_ad_ratio, _, _vlm_total = self._get_vlm_agreement()
+                            if _vlm_total >= 3 and _vlm_ad_ratio < 0.5:
+                                transcript = self.asr.last_transcript[:60]
+                                logger.warning(
+                                    f"[VLM] Force-stopping VLM-only blocking "
+                                    f"({blocking_elapsed:.1f}s): VLM weakened "
+                                    f"(ad {_vlm_ad_ratio*100:.0f}% of {_vlm_total}) "
+                                    f"+ ASR show-audio veto. Transcript: '{transcript}'")
+                                should_stop = True
 
                         # SAFEGUARD: Auto-stop VLM-only blocking after 90 seconds
                         # This prevents extended false positives on video interfaces
@@ -3092,6 +3216,7 @@ class Minus:
                     self.ad_detected = False
                     source_was = self.blocking_source
                     self.blocking_source = None
+                    self.blocking_asr_confirmed = False
                     # Clear the OCR snippet so the next block starts fresh
                     # (otherwise the prior ad's "(Ad) 0:30" would render briefly
                     # on the next OCR trigger before fresh OCR data arrives).
@@ -3127,7 +3252,7 @@ class Minus:
             if self.ad_blocker:
                 if should_show_blocking:
                     self.ad_blocker.show(
-                        self.blocking_source,
+                        self._display_source(),
                         ocr_trigger_text=self._first_match_for_overlay(),
                     )
                 else:
@@ -3485,6 +3610,7 @@ class Minus:
                                 self.vlm_ad_detected = False
                                 self.ocr_no_ad_count = self.OCR_STOP_THRESHOLD
                                 self.blocking_source = None
+                                self.blocking_asr_confirmed = False
                                 if self.ad_blocker:
                                     self.ad_blocker.hide()
                                 if self.audio:

@@ -1273,7 +1273,7 @@ class DRMAdBlocker:
         within the snippet, e.g. ``(Ad) 0:30 left``. For VLM-only blocks or
         if no trigger is provided, returns ''.
         """
-        if not raw or source == 'vlm':
+        if not raw or source in ('vlm', 'vlm+asr'):
             return ""
         try:
             if isinstance(raw, tuple) and len(raw) == 2:
@@ -1319,10 +1319,16 @@ class DRMAdBlocker:
             header = ""
         elif source == 'ocr':
             header = "[ BLOCKING // OCR ]"
+        elif source == 'ocr+asr':
+            header = "[ BLOCKING // OCR+ASR ]"
         elif source == 'vlm':
             header = "[ BLOCKING // VLM ]"
+        elif source == 'vlm+asr':
+            header = "[ BLOCKING // VLM+ASR ]"
         elif source == 'both':
             header = "[ BLOCKING // OCR+VLM ]"
+        elif source == 'both+asr':
+            header = "[ BLOCKING // OCR+VLM+ASR ]"
         else:
             header = "[ BLOCKING ]"
 
@@ -1441,8 +1447,11 @@ class DRMAdBlocker:
     def _push_photo_background(self):
         """Send a random library photo to ustreamer as the blocking bg.
 
-        The photo is already a re-encoded JPEG on disk so we just read and
-        forward its bytes. No re-encoding here — hot path.
+        ustreamer scales whatever we POST to fill the composite frame, so a
+        raw photo of arbitrary aspect gets STRETCHED/distorted. We letterbox
+        it to the display aspect first (fit-within + black bars), so the
+        encoder's full-frame scale is aspect-preserving. Runs on the ~5s
+        photo-swap cadence (not a hot path), so the decode+pad+encode is fine.
         """
         try:
             from photo_library import get_photo_library
@@ -1453,6 +1462,24 @@ class DRMAdBlocker:
             data = lib.get_photo_bytes(photo_id)
             if not data:
                 return False
+            # Letterbox to display aspect to avoid stretching.
+            try:
+                import numpy as np
+                W, H = int(self.output_width), int(self.output_height)
+                img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+                if img is not None and W > 0 and H > 0:
+                    ih, iw = img.shape[:2]
+                    scale = min(W / iw, H / ih)
+                    nw, nh = max(1, int(round(iw * scale))), max(1, int(round(ih * scale)))
+                    resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_AREA)
+                    canvas = np.zeros((H, W, 3), dtype=np.uint8)  # black bars
+                    x, y = (W - nw) // 2, (H - nh) // 2
+                    canvas[y:y + nh, x:x + nw] = resized
+                    ok, enc = cv2.imencode('.jpg', canvas, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    if ok:
+                        data = enc.tobytes()
+            except Exception as e:
+                logger.debug(f"[DRMAdBlocker] photo letterbox skipped (sending raw): {e}")
             result = self._blocking_api_call(
                 '/blocking/background', data=data, method='POST', timeout=0.8)
             return bool(result and result.get('ok', False))
@@ -1819,7 +1846,11 @@ class DRMAdBlocker:
     def get_current_vocabulary(self) -> dict:
         """Get the current vocabulary word being displayed."""
         if self._current_vocab and self.is_visible:
-            spanish, pronunciation, english, example = self._current_vocab
+            # VOCABULARY_COMBINED mixes 4-tuples (SPANISH_VOCABULARY) and
+            # 5-tuples (SPANISH_VOCABULARY_EXTENDED, which carries a 2nd
+            # example). Take the first 4 fields so a 5-tuple doesn't raise
+            # "too many values to unpack".
+            spanish, pronunciation, english, example = self._current_vocab[:4]
             return {
                 'word': spanish,
                 'pronunciation': pronunciation,
@@ -1851,7 +1882,7 @@ class DRMAdBlocker:
             # the timer ticks past the model's confidence cutoff and we don't want
             # the top-right slot to flicker on/off.
             new_snippet = self._format_ocr_trigger(ocr_trigger_text, source)
-            if new_snippet or source == 'vlm':
+            if new_snippet or source in ('vlm', 'vlm+asr'):
                 self._ocr_trigger_text = new_snippet
 
             if self.is_visible and self._animation_direction != 'end':

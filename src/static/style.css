@@ -919,6 +919,72 @@ section h2, .firetv-header h2, .apps-section h2, .network-section h2,
     color: var(--danger);
 }
 
+/* ASR live transcript debug panel (Home > Debug) */
+.asr-live-panel {
+    margin-top: 0.5rem;
+    padding: 0.6rem 0.8rem;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-size: 0.85rem;
+}
+.asr-live-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
+}
+.asr-live-label {
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    font-size: 0.7rem;
+    letter-spacing: 0.05em;
+}
+.asr-live-verdict { font-family: var(--font-body); font-weight: bold; }
+.asr-live-verdict.v-confirm { color: var(--danger); }
+.asr-live-verdict.v-veto { color: var(--accent); }
+.asr-live-verdict.v-unknown { color: var(--text-secondary); }
+.asr-live-btn {
+    background: transparent;
+    border: 1px solid var(--border-highlight);
+    color: var(--text-primary);
+    border-radius: 4px;
+    padding: 0.2rem 0.6rem;
+    cursor: pointer;
+    font-size: 0.75rem;
+    font-family: var(--font-body);
+}
+/* Push the button group to the right of the verdict label. */
+.asr-live-row > .asr-live-btn:first-of-type { margin-left: auto; }
+.asr-live-btn:hover { background: var(--bg-card-hover); }
+.asr-live-btn:disabled { opacity: 0.5; cursor: default; }
+.asr-live-meta {
+    color: var(--text-secondary);
+    font-family: var(--font-body);
+    font-size: 0.72rem;
+    margin-bottom: 0.4rem;
+    word-break: break-word;
+}
+.asr-live-transcript-label {
+    color: var(--text-secondary);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.2rem;
+}
+.asr-live-transcript {
+    font-family: var(--font-body);
+    color: var(--text-primary);
+    background: var(--bg-primary);
+    border-radius: 4px;
+    padding: 0.5rem;
+    min-height: 2.5rem;
+    max-height: 8rem;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
 .inline-remote {
     margin-top: 0.5rem;
     transition: all 0.2s;

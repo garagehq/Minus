@@ -170,7 +170,7 @@
                         <button onclick="pauseBlocking(2)" class="pause-btn">2m</button>
                         <button onclick="pauseBlocking(5)" class="pause-btn">5m</button>
                         <button onclick="pauseBlocking(10)" class="pause-btn">10m</button>
-                        <input type="number" id="custom-pause" class="custom-pause-input" min="1" max="60" placeholder="min">
+                        <input type="number" id="custom-pause" class="custom-pause-input" min="1" max="600" placeholder="min">
                         <button onclick="pauseCustom()" class="pause-btn custom">Go</button>
                     </div>
                 </div>
@@ -205,6 +205,41 @@
                     </div>
                     <span id="snapshot-status" class="snapshot-status"></span>
                 </div>
+                <!-- ASR live transcript (collapsible, like the Remote panel) -->
+                <div class="inline-remote-toggle">
+                    <button class="inline-remote-btn" onclick="toggleASRLive()">
+                        <span id="asr-live-icon">&#9654;</span> ASR Live
+                        <span id="asr-live-badge" class="connection-badge-sm disconnected">--</span>
+                    </button>
+                </div>
+                <div id="asr-live-panel" class="asr-live-panel hidden">
+                    <div class="asr-live-row">
+                        <span class="asr-live-label">Verdict</span>
+                        <span id="asr-live-verdict" class="asr-live-verdict v-unknown">--</span>
+                        <button id="asr-test-btn" class="asr-live-btn" onclick="testASR('ad')">Test (ad)</button>
+                        <button id="asr-test-show-btn" class="asr-live-btn" onclick="testASR('show')">Test (show)</button>
+                        <button id="asr-live-toggle-btn" class="asr-live-btn" onclick="toggleASRFromPanel()">Disable</button>
+                    </div>
+                    <div id="asr-live-meta" class="asr-live-meta">&mdash;</div>
+                    <div class="asr-live-transcript-label">Last transcript</div>
+                    <div id="asr-live-transcript" class="asr-live-transcript">(waiting for audio&hellip;)</div>
+                </div>
+                <!-- OCR live text (collapsible, same interface as ASR Live) -->
+                <div class="inline-remote-toggle">
+                    <button class="inline-remote-btn" onclick="toggleOCRLive()">
+                        <span id="ocr-live-icon">&#9654;</span> OCR Live
+                        <span id="ocr-live-badge" class="connection-badge-sm disconnected">--</span>
+                    </button>
+                </div>
+                <div id="ocr-live-panel" class="asr-live-panel hidden">
+                    <div class="asr-live-row">
+                        <span class="asr-live-label">Ad match</span>
+                        <span id="ocr-live-match" class="asr-live-verdict v-unknown">--</span>
+                    </div>
+                    <div id="ocr-live-meta" class="asr-live-meta">&mdash;</div>
+                    <div class="asr-live-transcript-label">Live OCR text</div>
+                    <div id="ocr-live-text" class="asr-live-transcript">(waiting for text&hellip;)</div>
+                </div>
             </section>
 
             <!-- Recent Detections -->
@@ -220,6 +255,7 @@
                 <div class="system-info">
                     <span id="ocr-status" class="system-badge">OCR: --</span>
                     <span id="vlm-status" class="system-badge">VLM: --</span>
+                    <span id="asr-status" class="system-badge">ASR: --</span>
                     <span id="memory-status" class="system-badge">Mem: --</span>
                     <span id="hdmi-status" class="system-badge">HDMI: --</span>
                 </div>
@@ -608,6 +644,17 @@
                     </label>
                 </div>
                 <p class="help-text">When enabled, VLM loads immediately at startup (even without HDMI signal). When disabled, VLM waits for HDMI signal before loading. Takes effect on next restart.</p>
+                <div class="setting-item" style="margin-top: 1rem;">
+                    <span class="setting-label">ASR (faster-whisper audio)</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="asr-toggle" checked onchange="toggleASR(this.checked)">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+                <div class="vlm-status" id="asr-status-info">
+                    <span class="status-text">Status: <span id="asr-status-text">Loading...</span></span>
+                </div>
+                <p class="help-text">Listens to the audio for marketing language to confirm or veto VLM-only ad blocks (e.g. a product placement in a show). Never blocks on its own and never affects OCR detection. Disabling stops the whisper worker and frees its memory.</p>
             </section>
 
             <!-- Blocking Optimizations -->
@@ -1008,6 +1055,64 @@
             }
         }
 
+        function toggleASRLive() {
+            const panel = document.getElementById('asr-live-panel');
+            const icon = document.getElementById('asr-live-icon');
+            panel.classList.toggle('hidden');
+            icon.textContent = panel.classList.contains('hidden') ? '▶' : '▼';
+        }
+
+        function toggleOCRLive() {
+            const panel = document.getElementById('ocr-live-panel');
+            const icon = document.getElementById('ocr-live-icon');
+            panel.classList.toggle('hidden');
+            icon.textContent = panel.classList.contains('hidden') ? '▶' : '▼';
+        }
+
+        // Enable/disable ASR from the live debug panel (mirrors the Settings
+        // toggle + the VLM enable/disable controls). Flips based on the
+        // last-known enabled state and lets updateStatus() refresh the UI.
+        async function toggleASRFromPanel() {
+            const cur = !!(lastStatus && lastStatus.asr && lastStatus.asr.enabled);
+            const enable = !cur;
+            const btn = document.getElementById('asr-live-toggle-btn');
+            btn.disabled = true;
+            btn.textContent = enable ? 'Enabling…' : 'Disabling…';
+            try {
+                await fetch(enable ? '/api/asr/enable' : '/api/asr/disable', { method: 'POST' });
+                const settingsToggle = document.getElementById('asr-toggle');
+                if (settingsToggle && !settingsToggle.disabled) settingsToggle.checked = enable;
+            } catch (e) {
+                console.error('ASR panel toggle error:', e);
+            }
+            btn.disabled = false;
+            updateStatus();
+        }
+
+        // Pipe a bundled test clip through the live ASR worker (transcribe →
+        // markers → verdict) and refresh the panel. Lets you exercise ASR
+        // end-to-end without live HDMI-RX audio (e.g. TV off → silent source).
+        async function testASR(sample) {
+            const tx = document.getElementById('asr-live-transcript');
+            const ids = ['asr-test-btn', 'asr-test-show-btn'];
+            ids.forEach(i => { const b = document.getElementById(i); if (b) b.disabled = true; });
+            tx.textContent = `Running ${sample} test…`;
+            try {
+                const r = await fetch('/api/asr/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sample: sample })
+                });
+                const d = await r.json();
+                if (!d.success && d.error) tx.textContent = 'Test error: ' + d.error;
+            } catch (e) {
+                console.error('ASR test error:', e);
+                tx.textContent = 'Test error';
+            }
+            ids.forEach(i => { const b = document.getElementById(i); if (b) b.disabled = false; });
+            updateStatus();
+        }
+
         // Mobile-only: the IR remote is its own separate dropdown.
         function toggleInlineIRRemote() {
             const ir = document.getElementById('inline-ir-remote');
@@ -1148,6 +1253,83 @@
                     vlmStatus.className = 'system-badge loading';
                 }
 
+                const asrStatus = document.getElementById('asr-status');
+                const asr = status.asr || {};
+                if (!asr.available) {
+                    asrStatus.textContent = 'ASR: N/A';
+                    asrStatus.className = 'system-badge warning';
+                } else if (!asr.enabled) {
+                    asrStatus.textContent = 'ASR: Off';
+                    asrStatus.className = 'system-badge warning';
+                } else if (asr.running) {
+                    // Surface the live verdict so the badge is informative
+                    // when audio is flowing (confirm/veto), plain Ready otherwise.
+                    const v = status.asr_verdict;
+                    if (v === 'confirm') {
+                        asrStatus.textContent = 'ASR: Ad audio';
+                        asrStatus.className = 'system-badge error';
+                    } else if (v === 'veto') {
+                        asrStatus.textContent = 'ASR: Show audio';
+                        asrStatus.className = 'system-badge ok';
+                    } else {
+                        asrStatus.textContent = 'ASR: Ready';
+                        asrStatus.className = 'system-badge ok';
+                    }
+                } else {
+                    asrStatus.textContent = 'ASR: Loading';
+                    asrStatus.className = 'system-badge loading';
+                }
+
+                // ASR live debug panel (collapsible, under Debug on Home)
+                const asrLiveVerdict = document.getElementById('asr-live-verdict');
+                if (asrLiveVerdict) {
+                    const v = status.asr_verdict || 'unknown';
+                    asrLiveVerdict.textContent = v;
+                    asrLiveVerdict.className = 'asr-live-verdict ' +
+                        (v === 'confirm' ? 'v-confirm' : v === 'veto' ? 'v-veto' : 'v-unknown');
+                    const tx = (asr.last_transcript || '').trim();
+                    document.getElementById('asr-live-transcript').textContent =
+                        tx || (asr.running ? '(no speech transcribed yet)' : '(ASR not running)');
+                    const lat = (typeof asr.last_latency_s === 'number') ? asr.last_latency_s.toFixed(2) : '—';
+                    const p95 = (typeof asr.p95_latency_s === 'number') ? asr.p95_latency_s.toFixed(2) : '—';
+                    document.getElementById('asr-live-meta').textContent =
+                        `${asr.engine || '—'} ${asr.model || ''} · hits ${asr.last_marker_hits || 0} · ` +
+                        `last ${lat}s · p95 ${p95}s · inf ${asr.inference_count || 0} / timeout ${asr.timeout_count || 0} / killed ${asr.killed_count || 0}`;
+                    const liveBadge = document.getElementById('asr-live-badge');
+                    if (!asr.available) { liveBadge.textContent = 'N/A'; liveBadge.className = 'connection-badge-sm disconnected'; }
+                    else if (!asr.enabled) { liveBadge.textContent = 'off'; liveBadge.className = 'connection-badge-sm disconnected'; }
+                    else if (asr.running) { liveBadge.textContent = 'live'; liveBadge.className = 'connection-badge-sm connected'; }
+                    else { liveBadge.textContent = 'loading'; liveBadge.className = 'connection-badge-sm disconnected'; }
+                    const liveBtn = document.getElementById('asr-live-toggle-btn');
+                    if (liveBtn && !liveBtn.disabled) {
+                        liveBtn.textContent = asr.enabled ? 'Disable' : 'Enable';
+                        liveBtn.disabled = !asr.available;
+                    }
+                }
+
+                // OCR live debug panel (collapsible, same interface as ASR Live)
+                const ocrLiveMatch = document.getElementById('ocr-live-match');
+                if (ocrLiveMatch) {
+                    const o = status.ocr || {};
+                    const kws = o.matched_keywords || [];
+                    if (kws.length) {
+                        ocrLiveMatch.textContent = kws.join(', ');
+                        ocrLiveMatch.className = 'asr-live-verdict v-confirm';
+                    } else {
+                        ocrLiveMatch.textContent = 'none';
+                        ocrLiveMatch.className = 'asr-live-verdict v-unknown';
+                    }
+                    const txt = (o.last_text || '').trim();
+                    document.getElementById('ocr-live-text').textContent =
+                        txt || (o.ready ? '(no text on screen)' : '(OCR not ready)');
+                    document.getElementById('ocr-live-meta').textContent =
+                        `frames ${o.frame_count || 0} · ad_detected ${o.detected ? 'yes' : 'no'}`;
+                    const ocrBadge = document.getElementById('ocr-live-badge');
+                    if (o.disabled) { ocrBadge.textContent = 'off'; ocrBadge.className = 'connection-badge-sm disconnected'; }
+                    else if (o.ready) { ocrBadge.textContent = 'live'; ocrBadge.className = 'connection-badge-sm connected'; }
+                    else { ocrBadge.textContent = 'loading'; ocrBadge.className = 'connection-badge-sm disconnected'; }
+                }
+
                 const memStatus = document.getElementById('memory-status');
                 const memPercent = Math.round(status.memory_percent || 0);
                 memStatus.textContent = `Mem: ${memPercent}%`;
@@ -1169,7 +1351,18 @@
                 // Footer status
                 const footerStatus = document.getElementById('footer-status');
                 if (status.blocking) {
-                    footerStatus.textContent = 'BLOCKING';
+                    // Show what triggered the block, including ASR confirmation
+                    // (e.g. 'ocr+asr' = OCR block ASR also confirmed).
+                    const srcLabels = {
+                        'ocr': 'OCR',
+                        'vlm': 'VLM',
+                        'both': 'OCR+VLM',
+                        'ocr+asr': 'OCR+ASR',
+                        'vlm+asr': 'VLM+ASR',
+                        'both+asr': 'OCR+VLM+ASR',
+                    };
+                    const src = srcLabels[status.blocking_source_display || status.blocking_source] || '';
+                    footerStatus.textContent = src ? `BLOCKING · ${src}` : 'BLOCKING';
                     footerStatus.className = 'status-blocking';
                 } else if (status.paused) {
                     footerStatus.textContent = 'PAUSED';
@@ -1334,11 +1527,11 @@
         function pauseCustom() {
             const input = document.getElementById('custom-pause');
             const minutes = parseInt(input.value);
-            if (minutes >= 1 && minutes <= 60) {
+            if (minutes >= 1 && minutes <= 600) {
                 pauseBlocking(minutes);
                 input.value = '';
             } else {
-                alert('Enter 1-60 minutes');
+                alert('Enter 1-600 minutes');
             }
         }
 
@@ -1584,6 +1777,58 @@
                 document.getElementById('vlm-preload-toggle').checked = data.vlm_preload;
             } catch (error) {
                 console.error('Failed to load VLM preload setting:', error);
+            }
+        }
+
+        let asrOperationInProgress = false;
+        async function toggleASR(enabled) {
+            if (asrOperationInProgress) {
+                document.getElementById('asr-toggle').checked = !enabled;
+                return;
+            }
+            const statusText = document.getElementById('asr-status-text');
+            asrOperationInProgress = true;
+            try {
+                const endpoint = enabled ? '/api/asr/enable' : '/api/asr/disable';
+                statusText.textContent = enabled ? 'Starting worker...' : 'Stopping worker...';
+                const response = await fetch(endpoint, { method: 'POST' });
+                const data = await response.json();
+                if (data.success) {
+                    statusText.textContent = enabled ? 'Enabled' : 'Disabled';
+                } else {
+                    statusText.textContent = 'Error: ' + (data.error || 'Unknown');
+                    document.getElementById('asr-toggle').checked = !enabled;
+                }
+            } catch (error) {
+                statusText.textContent = 'Error';
+                document.getElementById('asr-toggle').checked = !enabled;
+                console.error('ASR toggle error:', error);
+            }
+            asrOperationInProgress = false;
+        }
+
+        async function loadASRSetting() {
+            try {
+                const response = await fetch('/api/asr/status');
+                const data = await response.json();
+                const toggle = document.getElementById('asr-toggle');
+                const statusText = document.getElementById('asr-status-text');
+                if (!data.available) {
+                    toggle.checked = false;
+                    toggle.disabled = true;
+                    statusText.textContent = 'Not installed';
+                    return;
+                }
+                toggle.checked = !!data.enabled;
+                if (!data.enabled) {
+                    statusText.textContent = 'Disabled';
+                } else if (data.running) {
+                    statusText.textContent = 'Enabled';
+                } else {
+                    statusText.textContent = 'Loading...';
+                }
+            } catch (error) {
+                console.error('Failed to load ASR setting:', error);
             }
         }
 
@@ -3183,6 +3428,7 @@
         updateFireTVStatus();
         updateVLMStatus();
         loadVLMPreloadSetting();
+        loadASRSetting();
         loadOptimizationSettings();
         loadIRStatus();
         loadStatusLEDs();

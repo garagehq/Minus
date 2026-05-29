@@ -89,6 +89,62 @@ ASR_CTA_MARKERS = [
     # rating / recommendation
     "doctor recommended", 'dentists recommend',
     'clinically proven',
+    # --- expanded marker set (2026-05) — broaden ASR ad-copy coverage ---
+    # urgency / CTA
+    'act now', 'act fast', 'hurry', 'hurry in', "don't wait", 'dont wait',
+    'get started today', 'find out more', 'find out how', 'learn more at',
+    'for more information', 'for more info', 'more info', 'click the link',
+    'tap the link', 'swipe up', 'link below', 'check out',
+    # try / guarantee
+    'try it free', 'try it today', 'try risk free', 'risk free', 'risk-free',
+    'money back', 'money-back guarantee', 'satisfaction guaranteed',
+    'guaranteed', '100% guaranteed', 'no risk',
+    # sale / deal / urgency-time
+    'on sale now', 'on sale', 'sale ends', 'ends soon', 'ends tonight',
+    'this week only', 'this weekend', 'today and tomorrow', 'while it lasts',
+    'last chance', 'final days', "deal of the day", 'door buster',
+    # availability / location
+    'in stores now', 'in stores', 'a store near you', 'near you',
+    'a dealer near you', 'see your local', 'visit your local',
+    'at your local', 'find a store', 'find a location', 'nationwide',
+    # pre-order / reserve / claim
+    'pre order', 'pre-order', 'preorder', 'reserve yours', 'reserve now',
+    'claim your', 'claim yours', 'get yours today',
+    # codes / coupons
+    'use promo code', 'promo code', 'use code', 'enter code', 'with code',
+    'coupon code', 'discount code', 'use the code',
+    # bundle / quantity
+    'buy one get one', 'bogo', 'two for one', 'half price', 'half off',
+    'free gift', 'free sample', 'free quote', 'free consultation',
+    'free estimate', 'free shipping and returns',
+    # subscription / commitment
+    'cancel anytime', 'no contract', 'no commitment', 'no obligation',
+    'first month free', 'months free', 'no hidden fees', 'no fees',
+    # price superlatives
+    'lowest price', 'lowest prices', 'best price', 'best deal',
+    'great deal', 'unbeatable', 'lowest rate', 'low monthly',
+    # switch / save (insurance / telco ad staples)
+    'switch to', 'switch and save', 'switch today', 'bundle and save',
+    'save on your', 'lower your', 'cut your bill', 'get a quote',
+    'get a free quote', 'free quote today',
+    # pharma / health disclaimers
+    'ask your pharmacist', 'talk to your doctor', 'ask your doctor',
+    'do not take if', 'individual results may vary', 'results may vary',
+    'results not typical', 'consult a physician', 'use as directed',
+    # sponsor self-reference
+    'official sponsor', 'proud sponsor', 'proud partner',
+    'in partnership with', 'presented by',
+    # phone / screen CTAs
+    'call us', 'call the number', 'number on your screen',
+    'call the number on your screen', 'text us', 'visit the website',
+    # shop online
+    'shop online', 'order online', 'online or in stores', 'shop now at',
+    # entertainment promos
+    'in theaters', 'in theaters now', 'now streaming', 'coming soon',
+    'this fall', 'this summer', 'this holiday season', 'rated pg',
+    # product hype
+    'limited edition', 'brand new', 'all-new', 'now available',
+    'introducing', 'proven to', 'designed to', 'engineered to',
 ]
 
 # Shape-based regex markers. Compiled lazily once.
@@ -126,6 +182,9 @@ _REGEX_MARKERS_SOURCE = [
     (r'\bsave\s+\d{1,3}\s*percent\b', 'pct-off-spoken'),
     # URLs spoken out — "visit example dot com", "go to brand dot net"
     (r'\b\w{2,}\s+dot\s+(?:com|org|net|co|io|us)\b', 'url-spoken'),
+    # URLs in WRITTEN form — whisper transcribes "Hotels.com" / "brand.net"
+    # literally with the dot (this is exactly the Hotels.com ad we missed).
+    (r'\b[a-z][\w-]{1,}\.(?:com|net|org|io|co|tv|app|shop|store|gov)\b', 'url-written'),
     # 1-800 / 1-888 numbers — usual ad phone-number shapes
     (r'\b1[\s-]?(?:800|888|877|866|855|844)[\s-]?[\d-]{3,}\b', 'phone-tollfree'),
     # Spoken toll-free — "one eight hundred", "one eight oh oh"

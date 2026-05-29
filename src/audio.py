@@ -152,6 +152,9 @@ class AudioPassthrough:
         # Restart coordination - prevent multiple concurrent restarts
         self._restart_in_progress = False
         self._restart_lock = threading.Lock()  # Separate lock for restart coordination
+        # True when the playback branch fell back to fakesink because HDMI-TX
+        # is disconnected (capture + ASR tap still run; no TV audio out).
+        self._playback_fakesink = False
 
         # A/V sync watchdog - periodic queue flush to prevent drift
         # The sync queue adds fixed delay but clock drift over time could cause issues
@@ -246,6 +249,27 @@ class AudioPassthrough:
             logger.debug(f"[AudioPassthrough] Error checking ALSA status: {e}")
             return False
 
+    def _hdmi_tx_connected(self) -> bool:
+        """Whether an HDMI-TX output (the TV) is connected, via sysfs.
+
+        Fast, no-subprocess read of /sys/class/drm/card0-HDMI-A-*/status —
+        mirrors HealthMonitor._check_hdmi_output_connected(). Used to decide
+        whether the playback branch can use alsasink (TV present) or must fall
+        back to fakesink (TV off) so HDMI-RX capture + the ASR tap stay alive.
+        Fails OPEN (returns True) on any error so a probe glitch never
+        needlessly downgrades a working playback path to fakesink.
+        """
+        try:
+            from pathlib import Path
+            for connector in Path('/sys/class/drm').glob('card0-HDMI-A-*'):
+                status_file = connector / 'status'
+                if status_file.exists() and status_file.read_text().strip() == 'connected':
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"[AudioPassthrough] HDMI-TX check error: {e}")
+            return True
+
     def _init_pipeline(self):
         """Initialize GStreamer audio pipeline.
 
@@ -276,12 +300,27 @@ class AudioPassthrough:
             # and the 16kHz mono downsampling + appsink on the other. tee
             # buffer fanout is zero-copy reference-counting, so it adds no
             # measurable latency to the playback branch.
+            # Pick the playback sink based on HDMI-TX availability. When the
+            # TV (HDMI-TX) is off/disconnected, alsasink can't open its device
+            # and would error the WHOLE pipeline — which also kills the HDMI-RX
+            # capture feeding the ASR tap. Fall back to fakesink so capture +
+            # the ASR tap keep running (ASR works off HDMI-RX even with the TV
+            # off — useful for autonomous-mode data collection). The display
+            # recovery loop rebuilds with alsasink when HDMI-TX returns.
+            self._playback_fakesink = not self._hdmi_tx_connected()
+            if self._playback_fakesink:
+                sink = "fakesink sync=false"
+                logger.warning("[AudioPassthrough] HDMI-TX not connected — "
+                               "playback via fakesink; HDMI-RX capture + ASR tap stay live")
+            else:
+                sink = (f"alsasink device={self.playback_device} "
+                        f"buffer-time=50000 latency-time=10000 sync=false")
             playback_chain = (
                 f"queue name=syncqueue min-threshold-time=300000000 max-size-time=500000000 max-size-buffers=0 max-size-bytes=0 ! "
                 f"queue max-size-buffers=10 max-size-time=100000000 leaky=downstream name=audioqueue ! "
                 f"audioconvert ! "
                 f"volume name=vol volume=1.0 mute=false ! "
-                f"alsasink device={self.playback_device} buffer-time=50000 latency-time=10000 sync=false"
+                f"{sink}"
             )
             if self.asr_tap is not None:
                 # ASR tap branch is leaky: if the ASR worker falls behind, the

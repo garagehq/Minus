@@ -1,19 +1,51 @@
 # ASR (audio-based ad confirmation)
 
-**faster-whisper tiny.en** (CTranslate2 int8) running on 3 CPU threads
-in a dedicated multiprocessing worker subprocess (`src/asr_worker.py`).
-Fed from a parallel `tee` branch of the existing GStreamer audio
-pipeline, used as a **confirmation + veto signal** for VLM-alone ad
-blocking. Does not trigger blocking alone; does not affect OCR-driven
-blocking.
+**Moonshine tiny-en** (`moonshine-voice`, ONNX) running on 3 pinned CPU
+cores in a dedicated multiprocessing worker subprocess
+(`src/asr_worker.py`). Fed from a parallel `tee` branch of the existing
+GStreamer audio pipeline, used as a **CONFIRM-ONLY** signal that
+decorates the block label and gates nothing at start. Does not trigger
+blocking alone; does not suppress OCR/VLM blocking.
 
-**Engine history:** initial implementation used whisper.cpp (binary
-subprocess invocation), swapped to faster-whisper after the corpus
-benchmark in `tests/asr_corpus/bench.py` showed 25% speedup (1.14s vs
-1.52s per 5s window) at identical 10/10 corpus accuracy with cleaner
-transcripts. The multiprocessing worker pattern restores the
-hard-timeout safety we previously got "for free" from whisper.cpp's
-binary subprocess invocation.
+**Engine: Moonshine (default), faster-whisper (fallback).** Selectable via
+`MINUS_ASR_ENGINE=moonshine|faster-whisper`. On the target hardware
+(RK3588 doing 4K passthrough) the SoC thermally throttles cores to
+408MHz–1.6GHz, where faster-whisper's **fixed 30s-padded encoder** costs
+~3.3–5s per window regardless of audio length — a floor that streaming /
+smaller chunks does NOT reduce (benchmarked). Moonshine processes audio
+**proportionally** (no 30s pad), so a 2s window is ~1.6s (p50, max <2s)
+even on wall-to-wall continuous speech. It trades a little accuracy
+(~8/10 vs faster-whisper's 10/10 on the clean corpus, and it misses some
+quiet/sung speech) but never false-positives on show audio, which is what
+matters for the confirm role. Set `MINUS_ASR_ENGINE=faster-whisper` on a
+cool/idle host to trade latency for the extra accuracy.
+
+**Window = 2s, env `MINUS_ASR_WINDOW`.** Sized so Moonshine stays under 2s
+even on dense speech (5s window was ~3.3s — too slow). Interval 1.5s
+(`MINUS_ASR_INTERVAL`), overlapping windows. Since ASR is confirm-only,
+a CTA split across two short windows still lands in the 8s rolling
+history and a missed confirm only changes the LABEL, never whether a
+block fires.
+
+**3-core affinity** (`MINUS_ASR_CPU_AFFINITY`, default `{3,4,5}` on the
+8-core RK3588 — the least thermally-throttled cores). Honours the "≤3
+CPUs" budget; onnxruntime/CTranslate2 would otherwise grab every core.
+
+**Engine history:** whisper.cpp tiny.en (binary subprocess) →
+faster-whisper (corpus benchmark: 25% faster at 10/10) → Moonshine
+(2026-05, for sub-2s latency on the thermally-throttled production box;
+see *Moonshine migration + decision-engine retune* below). The keyword
+module (`src/asr_keywords.py`) is engine-agnostic.
+
+> **2026-05 decision-engine change — the ASR VETO was REMOVED.** ASR used
+> to *suppress* a VLM-alone block when it heard speech with no marketing
+> markers ("product placement" veto). In practice it suppressed REAL ads
+> VLM was 100% sure about (a Hotels.com ad at 80%, an insurance ad at
+> 100% — the spoken copy just lacked explicit markers). ASR now NEVER
+> suppresses at start; it only (a) decorates the label (`+asr`) when it
+> confirms, and (b) does a GATED mid-block rescue that force-stops a
+> VLM-only block only once **VLM itself has weakened** (`ad_ratio < 0.5`),
+> so a confident visual detection is always trusted. See the table below.
 
 ## Why it exists
 
@@ -89,43 +121,65 @@ counting; latency added to playback = 0. The tap branch is leaky
 rather than backpressuring the playback side. Asserted by
 `tests/test_asr.py::TestAudioPipelineShape`.
 
-## Decision-engine integration
+## Decision-engine integration (2026-05 — veto removed)
 
-| OCR | VLM | ASR verdict | Action |
+ASR never suppresses a block at start. It decorates the label when it
+confirms, and rescues mid-block ONLY when VLM itself weakens.
+
+| OCR | VLM | ASR verdict | Action / `blocking_source` |
 |---|---|---|---|
-| ad | * | * | **block** (`source=ocr` or `both`) — OCR is authoritative, ASR has no role |
-| no | ad (3+ decisions, 80%+) | confirm | **block** (`source=vlm+asr`) — high confidence |
-| no | ad (3+ decisions, 80%+) | unknown | **block** (`source=vlm`) — VLM alone, no ASR signal yet |
-| **no** | **ad (3+, 80%+)** | **veto** | **SUPPRESS** — this is the product-placement case |
-| (mid-block) | source=`vlm` | veto for ≥4s | **force-stop** — VLM-only block, ASR confirmed show audio |
+| ad | * | confirm | **block** `ocr+asr` (or `ocr+vlm+asr` if VLM too) — OCR authoritative; ASR decorates label |
+| ad | * | veto/unknown | **block** `ocr` (or `both`) — OCR authoritative; ASR ignored |
+| no | ad (3+, 80%+) | confirm | **block** `vlm+asr` |
+| no | ad (3+, 80%+) | veto/unknown | **block** `vlm` — VLM trusted; **veto IGNORED at start** |
+| (mid-block) | source=`vlm`, **ad_ratio <0.5** | veto ≥4s | **force-stop** — VLM has weakened AND ASR hears show audio |
+| (mid-block) | source=`vlm`, ad_ratio ≥0.5 | veto | **keep blocking** — VLM still confident, ASR cannot override |
 
 Notes:
 
-- `verdict='confirm'`: ≥1 marker hit in the rolling 8-second window of
-  ASR transcripts.
-- `verdict='veto'`: 0 marker hits AND ≥10 alpha-words transcribed across
-  the window (i.e. real speech we processed, not silence/music). This
-  is the "there was speech, it didn't sound like marketing" signal.
-- `verdict='unknown'`: cold start, music-only audio, silence, ASR
-  disabled, or whisper hung. Falls through to existing VLM behaviour —
-  we NEVER let an ASR outage prevent legitimate VLM blocking.
-- The 4-second mid-block force-stop floor exists so the rolling window
-  has time to fill with show audio after the block starts. VLM-only
-  blocks that ASR has been listening to for ≥4s with zero markers are
-  almost certainly false positives on visual brand content.
+- `+asr` is a label only (`blocking_asr_confirmed` flag); `blocking_source`
+  stays the base `ocr`/`vlm`/`both` for all stop-logic. Set at start from
+  the ASR verdict and **upgraded mid-block** when ASR later confirms
+  (the common path — OCR blocks instantly, ASR confirms a few seconds in).
+  Overlay headers: `OCR+ASR`, `VLM+ASR`, `OCR+VLM+ASR`.
+- `verdict='confirm'`: ≥1 marker hit in the rolling 8-second window.
+- `verdict='veto'`: 0 marker hits AND ≥10 alpha-words. NO LONGER suppresses
+  at start; only feeds the gated mid-block rescue.
+- `verdict='unknown'`: cold start, music/silence, ASR disabled, or worker
+  hung. Always degrades to plain VLM/OCR behaviour.
+- The mid-block rescue is gated on `ad_ratio < 0.5` precisely so it can't
+  kill a real ad whose spoken copy lacks markers (a Hotels.com / insurance
+  ad VLM is sure about). A genuine brand-in-a-show FP shows VLM drifting to
+  no-ad as the scene continues, so its ad_ratio drops and the rescue fires.
 
 ## Install
 
 ```bash
-pip3 install --break-system-packages --user faster-whisper
+pip3 install --break-system-packages --user moonshine-voice   # default engine
+pip3 install --break-system-packages --user faster-whisper     # fallback engine
 ```
 
-Model files auto-download from HuggingFace to `~/.cache/huggingface/`
-on first use (~75 MB for tiny.en). Subsequent loads are local.
+Moonshine ONNX model files auto-download on first use (tiny-en, ~40 MB);
+faster-whisper's tiny.en (~75 MB) downloads to `~/.cache/huggingface/`.
+Subsequent loads are local.
 
-Override the model via `MINUS_ASR_MODEL` env var. Built-in sizes:
-`tiny.en` (default), `base.en`, `small.en`, `medium.en`, `large`.
-Can also be a path to a local model directory.
+Env knobs: `MINUS_ASR_ENGINE` (`moonshine`/`faster-whisper`),
+`MINUS_ASR_WINDOW` (2.0s), `MINUS_ASR_INTERVAL` (1.5s),
+`MINUS_ASR_CPU_AFFINITY` (`3,4,5`), `MINUS_ASR_SOFT_TIMEOUT` (4.0s),
+`MINUS_ASR_HARD_TIMEOUT` (6.0s), `MINUS_ASR_MODEL` (faster-whisper size).
+
+**Self-deadlock fix (2026-05):** `ASRProcess._call_lock` is a
+`threading.RLock` (was a plain `Lock`). `transcribe()` holds the lock and,
+on the hard-timeout escalation, calls `restart()` → `stop()`/`start()`,
+which re-acquire it — a plain Lock self-deadlocked there and froze the
+worker mid-restart under sustained load (observed as `inference_count`
+stuck with no `killed` count).
+
+**Manual test path:** `POST /api/asr/test` (and the Home → ASR-Live
+"Test (ad)" / "Test (show)" buttons) pipe a bundled corpus clip through the
+live worker and update the panel — lets you exercise ASR end-to-end with
+no live audio (e.g. TV off → source sends digital silence). The endpoint
+trims the clip to ~4s so it fits the 2s-window-tuned worker timeout.
 
 CTranslate2 (the inference engine under faster-whisper) auto-detects
 ARM NEON kernels on RK3588 — no manual flags needed.

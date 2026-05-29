@@ -107,15 +107,20 @@ class ASRManager:
     # provides enough evidence to veto.
     HISTORY_WINDOW_S = 8.0
 
-    # How often to invoke whisper. 2s = overlapping windows (each 5s
-    # snapshot overlaps the previous by 3s), which catches short bursts
-    # of marketing copy that a non-overlapping 5s grid might split.
-    INFERENCE_INTERVAL_S = 2.0
+    # How often to invoke whisper. Overlapping windows catch short bursts
+    # of marketing copy that a non-overlapping grid might split. Env-
+    # overridable (MINUS_ASR_INTERVAL).
+    INFERENCE_INTERVAL_S = float(os.environ.get('MINUS_ASR_INTERVAL', '1.5'))
 
-    # Audio window length per inference. 5s is a good marketing-copy
-    # capture: most ad CTAs ("call 1-800, available now at X dot com")
-    # fit in 4-5s of speech.
-    WINDOW_SECONDS = 5.0
+    # Audio window length per inference. Moonshine latency scales with how
+    # much SPEECH is in the window — on dense continuous speech a 5s window
+    # takes ~3.3s on the throttled RK3588 (too slow). A 2s window is ~1.6s
+    # (p50), comfortably under 2s even on wall-to-wall casual speech.
+    # Since ASR is now a CONFIRM-ONLY signal (the veto was removed), shorter
+    # transcripts are low-cost: a CTA split across two windows still lands in
+    # the 8s rolling history, and a missed confirm only changes the source
+    # LABEL, never whether a block fires. Env-overridable (MINUS_ASR_WINDOW).
+    WINDOW_SECONDS = float(os.environ.get('MINUS_ASR_WINDOW', '2.0'))
 
     def __init__(self, audio_tap, *, model_name: str = None, cpu_threads: int = 3):
         """audio_tap must be an AudioASRTap (see src/audio.py).
@@ -278,6 +283,36 @@ class ASRManager:
             return 'veto'
         return 'unknown'
 
+    # ----- test / diagnostics -----
+
+    def test_transcribe(self, wav_path: str) -> dict:
+        """Run a WAV through the live ASR worker and fold the result into the
+        rolling state (so /api/status + the webui ASR-Live panel reflect it).
+
+        Lets ASR be exercised end-to-end without live HDMI-RX audio (e.g. when
+        the TV/HDMI-TX is off and the source sends digital silence). Starts the
+        worker on demand if it isn't running yet.
+        """
+        if not is_asr_available():
+            return {'success': False, 'error': 'faster-whisper/moonshine not installed'}
+        # The worker is independent of the audio tap — it just transcribes a
+        # file — so we can start it even if the audio pipeline never came up.
+        if not self._process.is_ready:
+            if not self._process.start():
+                return {'success': False, 'error': 'ASR worker failed to start'}
+            self.is_running = True
+        status, text, latency = self._process.transcribe(wav_path)
+        self._record_result(status, text, latency)
+        hits = count_marker_hits(text) if status == 'ok' else 0
+        return {
+            'success': status == 'ok',
+            'status': status,
+            'transcript': text,
+            'latency_s': round(latency, 3),
+            'marker_hits': hits,
+            'verdict': self.verdict(),
+        }
+
     # ----- status surface -----
 
     def get_status(self) -> dict:
@@ -289,7 +324,7 @@ class ASRManager:
             'available': is_asr_available(),
             'enabled': self.enabled,
             'running': self.is_running,
-            'engine': 'faster-whisper',
+            'engine': os.environ.get('MINUS_ASR_ENGINE', 'moonshine'),
             'model': self._model_name,
             'inference_count': self.inference_count,
             'timeout_count': self.timeout_count,

@@ -149,9 +149,9 @@ class WebUI:
 
         @self.app.route('/api/pause/<int:minutes>', methods=['POST'])
         def api_pause(minutes):
-            """Pause blocking for specified minutes (1-60)."""
-            if minutes < 1 or minutes > 60:
-                return jsonify({'error': 'Invalid duration. Use 1-60 minutes.'}), 400
+            """Pause blocking for specified minutes (1-600)."""
+            if minutes < 1 or minutes > 600:
+                return jsonify({'error': 'Invalid duration. Use 1-600 minutes.'}), 400
 
             try:
                 self.minus.pause_blocking(minutes * 60)
@@ -2467,6 +2467,102 @@ class WebUI:
                 return jsonify({'success': False, 'error': 'VLM control not available'}), 500
             except Exception as e:
                 logger.error(f"Error enabling VLM: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/asr/status', methods=['GET'])
+        def api_asr_status():
+            """Get ASR (faster-whisper) status block.
+
+            Mirrors the `asr` sub-object in /api/status; provided as a
+            dedicated route so the Settings toggle can load its state.
+            """
+            try:
+                if getattr(self.minus, 'asr', None) is not None:
+                    return jsonify(self.minus.asr.get_status())
+                return jsonify({'available': False, 'enabled': False,
+                                'running': False})
+            except Exception as e:
+                logger.error(f"Error getting ASR status: {e}")
+                return jsonify({'available': False, 'enabled': False,
+                                'running': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/asr/enable', methods=['POST'])
+        def api_asr_enable():
+            """Enable ASR (faster-whisper confirm/veto) and start the worker."""
+            try:
+                result = self.minus.set_asr_enabled(True)
+                return jsonify(result), (200 if result.get('success') else 500)
+            except Exception as e:
+                logger.error(f"Error enabling ASR: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/asr/disable', methods=['POST'])
+        def api_asr_disable():
+            """Disable ASR and stop the worker (frees the whisper model)."""
+            try:
+                result = self.minus.set_asr_enabled(False)
+                return jsonify(result), (200 if result.get('success') else 500)
+            except Exception as e:
+                logger.error(f"Error disabling ASR: {e}")
+                return jsonify({'success': False, 'error': str(e)}), 500
+
+        @self.app.route('/api/asr/test', methods=['POST'])
+        def api_asr_test():
+            """Run a WAV through the live ASR worker end-to-end (transcribe →
+            keyword markers → verdict) and fold it into the rolling state so
+            the ASR-Live panel reflects it. Exercises ASR without live HDMI-RX
+            audio (e.g. TV off → source sends digital silence).
+
+            Body (all optional): {"wav": "<path>"} to transcribe a specific
+            file, or {"sample": "ad"|"show"} to use a bundled corpus clip.
+            Defaults to a bundled ad clip so the panel shows a real
+            transcript + 'confirm' verdict.
+            """
+            try:
+                if getattr(self.minus, 'asr', None) is None:
+                    return jsonify({'success': False, 'error': 'ASR not available'}), 500
+                data = request.get_json(silent=True) or {}
+                wav = data.get('wav')
+                if not wav:
+                    sample = data.get('sample', 'ad')
+                    base = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                        'tests', 'asr_corpus')
+                    wav = os.path.join(base, 'ad_cta_strong.wav' if sample == 'ad'
+                                       else 'show_dialog.wav')
+                if not os.path.exists(wav):
+                    return jsonify({'success': False, 'error': f'wav not found: {wav}'}), 400
+                # The bundled corpus clips are ~13s; Moonshine's per-call time
+                # scales with audio length, so a full clip exceeds the ASR
+                # worker's soft timeout (tuned for the ~2s production window)
+                # and returns 'timeout'. Trim to the first ~4s (where ad CTAs
+                # sit) so the test reflects production latency and still hits
+                # markers. Uploaded wavs are used as-is unless oversized.
+                try:
+                    import wave as _wave
+                    max_s = float(data.get('max_seconds', 4.0))
+                    w = _wave.open(wav, 'rb')
+                    nframes = w.getnframes()
+                    keep = min(nframes, int(max_s * w.getframerate()))
+                    if keep < nframes:
+                        frames = w.readframes(keep)
+                        params = w.getparams()
+                        w.close()
+                        trimmed = '/tmp/minus_asr_test_clip.wav'
+                        ow = _wave.open(trimmed, 'wb')
+                        ow.setnchannels(params.nchannels)
+                        ow.setsampwidth(params.sampwidth)
+                        ow.setframerate(params.framerate)
+                        ow.writeframes(frames)
+                        ow.close()
+                        wav = trimmed
+                    else:
+                        w.close()
+                except Exception as e:
+                    logger.debug(f"ASR test trim skipped: {e}")
+                result = self.minus.asr.test_transcribe(wav)
+                return jsonify(result), (200 if result.get('success') else 500)
+            except Exception as e:
+                logger.error(f"Error in ASR test: {e}")
                 return jsonify({'success': False, 'error': str(e)}), 500
 
         # =========================================================================

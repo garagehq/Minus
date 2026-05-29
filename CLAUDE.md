@@ -5,7 +5,7 @@
 HDMI passthrough with real-time ML-based ad detection and blocking using dual NPUs + CPU ASR:
 - **PaddleOCR** on RK3588 NPU (~400ms per frame, 1.0s timeout)
 - **LFM2.5-VL-450M (ft-v2-fused-v2)** on Axera LLM 8850 NPU — **prefill-only on 16 fused decoder layers, ~0.37s per frame deterministic** (1.5s soft / 2s hard timeout). Replaced FastVLM-0.5B iter4 (May 2026): 97.0% holdout accuracy / 99.2% non-ad-recall vs iter4's 94.75% / 95.25%, structurally simpler (no KV cache, no autoregressive decode for `detect_ad` OR autonomous-mode `query_image`, no ml_dtypes bfloat16 ceremony). Both inference paths share one model — no FastVLM dependency anymore. See *FastVLM iter4 → LFM2.5-VL Migration* under Known Issues.
-- **faster-whisper tiny.en (CTranslate2 int8)** on 3 CPU threads (~1.1s per 5s audio window, ~4× real-time on RK3588's A76/A55 mix). Runs in a multiprocessing worker subprocess (mirrors OCR/VLM worker pattern) for hard-timeout safety. Audio-channel confirmation/veto on top of OCR+VLM — gates VLM-alone blocking against product placements in TV shows (brand on screen but no marketing language in audio). Never fires blocking alone; never affects OCR-driven blocking. Audio pipeline playback latency unchanged. Was whisper.cpp tiny.en initially (1.52s/window); migrated to faster-whisper after corpus benchmark (`tests/asr_corpus/bench.py`) showed 25% speedup at identical accuracy. See [docs/ASR.md](docs/ASR.md).
+- **Moonshine tiny-en (ONNX) ASR** on 3 pinned CPU cores (~1.6s per **2s** audio window, max <2s even on dense continuous speech). Runs in a multiprocessing worker subprocess (mirrors OCR/VLM worker pattern) for hard-timeout safety. **CONFIRM-ONLY** audio signal on top of OCR+VLM: decorates the block label (`+asr`) and does a gated mid-block rescue, but **never suppresses a block at start** (the old VETO was removed in 2026-05 — it was killing real ads VLM was sure about). Never fires blocking alone. Engine-selectable via `MINUS_ASR_ENGINE` (faster-whisper fallback for cool/idle hosts; on the thermally-throttled production box faster-whisper's fixed 30s encoder is ~3.3-5s/window — too slow, hence Moonshine which processes audio proportionally). Was whisper.cpp → faster-whisper → Moonshine. See [docs/ASR.md](docs/ASR.md) and *Moonshine ASR migration + decision-engine retune* under Known Issues.
 - **Spanish vocabulary practice** during ad blocks!
 
 ## Documentation
@@ -19,7 +19,7 @@ HDMI passthrough with real-time ML-based ad detection and blocking using dual NP
 | [docs/DEBUG_GLITCHES.md](docs/DEBUG_GLITCHES.md) | Video glitch debugging notes |
 | [docs/FPS_DEBUGGING.md](docs/FPS_DEBUGGING.md) | FPS tracking and optimization |
 | [docs/AUDIO.md](docs/AUDIO.md) | Audio passthrough documentation |
-| [docs/ASR.md](docs/ASR.md) | faster-whisper ASR — audio-based ad confirmation/veto on top of OCR+VLM (worker process, hard timeout) |
+| [docs/ASR.md](docs/ASR.md) | Moonshine (ONNX) ASR — audio-based ad CONFIRM signal on top of OCR+VLM (worker process, 2s window, veto removed 2026-05) |
 | [docs/VLM_NPU_DEGRADATION.md](docs/VLM_NPU_DEGRADATION.md) | Investigation of "NPU degradation" — root cause is per-image output-length variance; fix is `max_new_tokens` cap |
 | [docs/IR_TRANSMITTER.md](docs/IR_TRANSMITTER.md) | IR transmitter for the REI 8K HDMI switch (PWM3 on pin 38) — wiring, NEC codes, API, troubleshooting |
 | [docs/IR_RECEIVER.md](docs/IR_RECEIVER.md) | IR receiver eval on pin 3 (`gpiochip4 11`) — bench-tested decode of NEC remotes, gotchas, sketch for a future `IRReceiver` module |
@@ -418,8 +418,8 @@ When blocking is active, black/solid-color frames are detected as transitions be
 - When video resumes, 0.5s cooldown (`DYNAMIC_COOLDOWN`) before re-enabling blocking
 - Detection state (OCR/VLM) cleared on cooldown complete to prevent false positives
 - Static ad screenshots saved to `screenshots/static/` for analysis
-- **Strong-ad-signal override (`STRONG_AD_KEYWORD_NAMES`):** suppression refuses to activate, and force-clears mid-suppression, when OCR has matched a keyword that ONLY appears in active video-ad UIs within the last `STRONG_AD_HOLD_SECONDS` (5s). Strong keywords: `skip ad` / `skip ads` / `skip in` / `skip ad (fuzzy*)` / `video will play after ad` / `visit advertiser` / `visitadvertiser` / `ad X of Y` / `ad countdown` / `ad with timestamp` / `ad with timestamp (cross-element)`. Bare `Sponsored` / `Learn more` / `Shop now` stay weak — those can legitimately appear on home screens or paused-on-ad tiles. See *Static Suppression Catches Real Video Ads* under Known Issues for the root-cause investigation.
-- **Weak-keyword-only OCR suppression (detection layer, not just static):** if *every* matched keyword is in `WEAK_AD_KEYWORD_NAMES` (`sponsored`, `learn more`, `shop now` (+fuzzy), `buy now`) and no `STRONG_AD_KEYWORD` was seen within `STRONG_AD_HOLD_SECONDS`, the frame is suppressed AND routed into no-ad accounting so it neither starts nor sustains a block, and an active block decays. Replaced the old `_hdmi_audio_present()` discriminator (home/promo screens carry audio → it failed, holding a 591s block on a static "Sponsored · Peel to collect" promo). Originally a bare-`'sponsored'`-only check; **generalised to the full weak set** after a 150s VLM+OCR hold on a static "Learn more · Sponsored" promo — the keyword *pair* evaded the sponsored-only test (each weak keyword alone is suppressed but two together wasn't). Real video ads always also surface a strong keyword within the hold window, and VLM independently catches genuine ad video, so OCR can stay strict. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
+- **Strong-ad-signal override (`STRONG_AD_KEYWORD_NAMES`):** suppression refuses to activate, and force-clears mid-suppression, when OCR has matched a strong keyword within the last `STRONG_AD_HOLD_SECONDS` (5s). Strong keywords: `skip ad` / `skip ads` / `skip in` / `skip ad (fuzzy*)` / `video will play after ad` / `visit advertiser` / `visitadvertiser` / `ad X of Y` / `ad countdown` / `ad with timestamp` / `ad with timestamp (cross-element)` / **`sponsored`** (promoted to STRONG 2026-05 per product decision — see *Sponsored promoted to strong* under Known Issues; bounded against static-promo holds by FROZEN_EARLY/MAX caps + home-screen detection). `Learn more` / `Shop now` / `Buy now` stay weak — those legitimately appear on home screens / paused-on-ad tiles.
+- **Weak-keyword-only OCR suppression (detection layer, not just static):** if *every* matched keyword is in `WEAK_AD_KEYWORD_NAMES` (`learn more`, `shop now` (+fuzzy), `buy now` — `sponsored` was removed when promoted to STRONG) and no `STRONG_AD_KEYWORD` was seen within `STRONG_AD_HOLD_SECONDS`, the frame is suppressed AND routed into no-ad accounting so it neither starts nor sustains a block, and an active block decays. Replaced the old `_hdmi_audio_present()` discriminator (home/promo screens carry audio → it failed, holding a 591s block on a static "Sponsored · Peel to collect" promo). Originally a bare-`'sponsored'`-only check; **generalised to the full weak set** after a 150s VLM+OCR hold on a static "Learn more · Sponsored" promo — the keyword *pair* evaded the sponsored-only test (each weak keyword alone is suppressed but two together wasn't). Real video ads always also surface a strong keyword within the hold window, and VLM independently catches genuine ad video, so OCR can stay strict. See *iter4 query_image p128 Overflow + Production FP / Slow-Recovery Fixes* under Known Issues.
 
 **OCR Timestamp Pattern Handling:**
 OCR frequently misreads characters in ad timestamps. The detection handles these common confusions:
@@ -858,10 +858,12 @@ Minus includes a lightweight Flask-based web UI for remote monitoring and contro
 
 **Features:**
 - **Live video feed** - MJPEG stream proxied from ustreamer (CORS bypass)
-- **Status display** - Blocking state, FPS, HDMI info, uptime
-- **Pause controls** - 1/2/5/10 minute presets to pause ad blocking
+- **Status display** - Blocking state, FPS, HDMI info, uptime. Footer shows the block source incl. ASR (`OCR`/`VLM`/`OCR+VLM`/`OCR+ASR`/`VLM+ASR`/`OCR+VLM+ASR`).
+- **Pause controls** - 1/2/5/10 minute presets + custom input, **up to 600 minutes** (`/api/pause/<minutes>` validates 1-600; was 60).
 - **Detection history** - Recent OCR/VLM detections with timestamps
-- **Settings** - Toggle preview window and debug dashboard
+- **ASR Live panel** (Home) - collapsible dropdown: live transcript, verdict (confirm/veto/unknown), marker hits, latency, engine; on/off toggle + Test (ad)/Test (show) buttons (`/api/asr/test`).
+- **OCR Live panel** (Home) - collapsible dropdown mirroring ASR Live: live OCR text flowing, matched ad keywords, frame count.
+- **Settings** - Toggle preview window, debug dashboard, **ASR enable/disable** (Detection Settings, persisted `asr_enabled`)
 - **Log viewer** - Collapsible log output for debugging
 
 **Key API Routes:**
@@ -2551,3 +2553,104 @@ commit. If a future case demands a similar signal, the OCR
 similarity check is structurally OK but it MUST be combined with a
 positive-pause signal so it doesn't suppress recovery from real
 pauses.
+
+### Moonshine ASR migration + decision-engine retune (May 2026)
+
+A cluster of coupled changes after live testing showed ASR was both too
+slow and actively suppressing real ads.
+
+**1. Self-deadlock froze ASR under load (root cause of "ASR does nothing").**
+`ASRProcess._call_lock` was a non-reentrant `threading.Lock`. `transcribe()`
+holds it and, on the hard-timeout escalation, calls `restart()` →
+`stop()`/`start()`, which re-acquire it → deadlock. Under sustained load
+every inference hit the timeout → restart → permanent wedge (symptom:
+`inference_count` stuck, `killed_count=0`, empty transcript). Fix: RLock.
+(VLM's `restart`/`kill`/`start` are lock-free, so VLMProcess never had this.)
+
+**2. Engine swapped faster-whisper → Moonshine for sub-2s latency.** On the
+thermally-throttled production box (4K passthrough pins the SoC at the
+~85°C trip, cores throttled to 408MHz-1.6GHz — fan maxed, GPU also
+throttled and exposes no usable compute provider so GPU offload is out)
+faster-whisper's **fixed 30s-padded encoder** costs ~3.3-5s/window
+*regardless of audio length* — a floor that streaming / smaller chunks
+does NOT reduce (benchmarked: 5s=5.3s … 1s=4.0s). Moonshine
+(`moonshine-voice`, ONNX, tiny-en) processes audio **proportionally**, so
+a **2s window** is ~1.6s (p50, max <2s) even on wall-to-wall continuous
+speech. Engine is env-selectable (`MINUS_ASR_ENGINE`); faster-whisper
+stays the fallback for cool/idle hosts (more accurate: ~10/10 corpus vs
+Moonshine ~8/10, and Moonshine misses some quiet/sung speech). Pinned to 3
+cores (`MINUS_ASR_CPU_AFFINITY={3,4,5}`) to honour the "≤3 CPUs" budget.
+Earlier "faster-whisper is 4-5s" benchmarks were CONTAMINATED by running
+two whisper engines at once; single-engine faster-whisper is ~2s but
+**starves OCR** (OCR's snapshot capture exceeds its 1s hard timeout → OCR
+flap) and its p95 under full load is ~3.7s — so Moonshine wins on both
+counts. Moonshine returns a result OBJECT, not a str — extract with
+`str(raw)` (a `' '.join(raw)` assumption errored 100% of inferences once).
+
+**3. ASR start-VETO removed; mid-block rescue gated on VLM weakening.** The
+veto used to SUPPRESS a VLM-alone block when ASR heard speech with no
+marketing markers. Live, it suppressed REAL ads VLM was sure about
+(a Hotels.com ad at 80%, an insurance ad "What's important to you?" at
+100% — the spoken copy just lacked explicit markers). ASR now NEVER
+suppresses at start (a VLM-alone detection always blocks; ASR `confirm`
+only upgrades the label). The mid-block product-placement rescue
+(`source==vlm` + ASR veto ≥4s → force-stop) is now GATED on `ad_ratio <
+0.5` so it can only end a block once **VLM itself has weakened** — a
+confident visual detection is always trusted. The `tests/test_asr.py`
+decision-engine cases that asserted the old veto behaviour are now stale
+and need updating.
+
+**4. ASR markers expanded (~45 phrases + written-URL regex).**
+`src/asr_keywords.py` gained urgency/CTA/guarantee/sale/code/pharma/
+sponsor phrases plus a written-URL regex (`brand.com`) — the spoken
+"dot com" regex missed the transcribed "Hotels.com". Markers now only
+feed CONFIRM (veto is gone), so additions are low-risk.
+
+**5. ASR block labels.** New `blocking_asr_confirmed` flag (kept SEPARATE
+from `blocking_source`, which stays the base `ocr`/`vlm`/`both` for all
+stop-logic). Display source → `ocr+asr` / `vlm+asr` / `both+asr`; overlay
+headers `[ BLOCKING // OCR+ASR ]` etc.; set at start from the verdict and
+**upgraded mid-block** when ASR later confirms (the common path). Also
+fixed the prior `vlm+asr` source value that fell through to a blank
+`[ BLOCKING ]` and didn't match the `== "vlm"` stop checks. Exposed as
+`blocking_source_display` in `/api/status`.
+
+**6. ASR audio without HDMI-TX (partial).** Audio pipeline falls back to
+`fakesink` when HDMI-TX is disconnected (`AudioPassthrough._init_pipeline`)
+and `start_display_pipeline` was decoupled to start audio+ASR even when
+the display fails — so ASR runs off HDMI-RX with the TV off. BUT the
+RK3588 HDMI-RX delivers **digital silence** when HDMI-TX is off (the
+source mutes when its downstream sink/EDID drops: measured 0 non-zero
+samples over 12s while `audio_present=1`), so live ASR has no real audio
+without the TV. The `/api/asr/test` endpoint sidesteps this for testing.
+
+**Files:** `src/asr_worker.py` (RLock, engine select, affinity, env
+timeouts, Moonshine path), `src/asr.py` (2s window, env interval/window,
+engine label, `test_transcribe`), `src/asr_keywords.py` (markers),
+`minus.py` (veto removed, gated rescue, `blocking_asr_confirmed` +
+`_display_source`, `sponsored`→STRONG, ASR enable/disable persistence,
+audio/ASR startup decoupling), `src/audio.py` (fakesink fallback),
+`src/webui.py` (`/api/asr/test`, pause cap 60→600), `src/templates/index.html`
++ `src/static/style.css` (ASR/OCR Live panels, ASR settings toggle).
+
+### Sponsored promoted to strong; pause cap 60→600; misc UI (May 2026)
+
+- **`sponsored` moved WEAK→STRONG** (`STRONG_AD_KEYWORD_NAMES`) per product
+  decision so it decisively triggers ad blocking. Trade-off: STRONG
+  overrides static-screen suppression, so a STATIC "Sponsored" promo/tile
+  off a detected home screen can now block and hold — but bounded by
+  `FROZEN_EARLY_SECONDS` (30s) and `MAX_BLOCKING_DURATION` (150s), and
+  home-screen detection still guards home/browse tiles. Real *video* ads
+  almost always also show a Skip/Visit-advertiser strong keyword, so the
+  main *new* effect is catching static sponsored promos. Revert by moving
+  `sponsored` back to WEAK.
+- **Pause cap 60→600 min** in `/api/pause/<minutes>` validation, the
+  Home custom-pause `max`, and the `pauseCustom()` JS clamp.
+- **Replace-mode photos no longer stretched.** `_push_photo_background`
+  decodes the photo, letterboxes it (fit-within + black bars) to the
+  display dimensions, and re-encodes before POST — ustreamer's
+  scale-to-composite is then aspect-preserving. Was sending the raw photo,
+  which ustreamer stretched to full screen (distorting non-16:9 photos).
+- **Vocabulary unpack fix.** `get_current_vocabulary()` unpacked a 4-tuple
+  but `VOCABULARY_COMBINED` also has 5-tuple extended entries → "too many
+  values to unpack (expected 4)" spamming during blocks. Now `[:4]`.

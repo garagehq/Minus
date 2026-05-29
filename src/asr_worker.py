@@ -69,36 +69,99 @@ def _asr_worker_main(request_queue, response_queue, ready_event, shutdown_event,
                          format='%(asctime)s [%(levelname)s] %(message)s')
     log = _logging.getLogger('ASRWorker')
 
+    # Engine selection. Default 'faster-whisper' (10/10 corpus, ~1.1s on a
+    # cool box). On a thermally-throttled box (4K passthrough pins the SoC
+    # at the throttle trip → cores at 408MHz-1.6GHz) faster-whisper's fixed
+    # 30s-padded encoder costs ~3.3s regardless of window. 'moonshine'
+    # (moonshine-voice tiny-en, ONNX) processes audio PROPORTIONALLY (no 30s
+    # pad), so a 5s window is ~1.1s even throttled — comfortably <2.5s. It
+    # trades a little accuracy (~8/10 vs 10/10) but never false-positives on
+    # show audio, which is what matters for the confirm/veto role.
+    # DEFAULT IS 'moonshine': on the target hardware (RK3588 doing 4K
+    # passthrough) the SoC thermally throttles cores to 408MHz-1.6GHz, where
+    # faster-whisper's fixed 30s encoder costs ~4-5s (a hard floor that
+    # streaming/smaller-chunks does NOT reduce — benchmarked). Moonshine is
+    # the only engine that meets <2.5s here. Set MINUS_ASR_ENGINE=faster-whisper
+    # on a cool/idle host to trade latency for the extra 2/10 corpus accuracy.
+    engine = os.environ.get('MINUS_ASR_ENGINE', 'moonshine').lower()
+
+    # Honour "N CPUs max" by pinning the whole worker (and thus the engine's
+    # threads) to a fixed core set. onnxruntime/CTranslate2 otherwise grab
+    # every core. Overridable with MINUS_ASR_CPU_AFFINITY="3,4,5".
+    # Default for the 8-core RK3588 (4×A55 little 0-3, 4×A76 big 4-7): pin to
+    # {3,4,5}. Cores 4,5 (cpufreq policy4) stay the least thermally-throttled
+    # big cores under load; core 6,7 (policy6) get parked at ~408MHz, so we
+    # avoid them. Measured ~1.1s/window there vs slower on {5,6,7}.
+    try:
+        aff_env = os.environ.get('MINUS_ASR_CPU_AFFINITY', '')
+        ncpu = os.cpu_count() or cpu_threads
+        if aff_env.strip():
+            cores = {int(c) for c in aff_env.split(',') if c.strip() != ''}
+        elif ncpu >= 8:
+            cores = set(range(3, 3 + cpu_threads))  # {3,4,5} on RK3588
+        else:
+            cores = set(range(max(0, ncpu - cpu_threads), ncpu))
+        os.environ.setdefault('OMP_NUM_THREADS', str(cpu_threads))
+        os.sched_setaffinity(0, cores)
+        log.info(f"[ASRWorker] CPU affinity pinned to {sorted(cores)} (cpu_threads={cpu_threads})")
+    except Exception as e:
+        log.warning(f"[ASRWorker] could not set CPU affinity: {e}")
+
     try:
         load_start = time.time()
-        log.info(f"[ASRWorker] Loading faster-whisper {model_name!r} "
-                 f"(cpu_threads={cpu_threads}, compute_type=int8)...")
+        import numpy as np
 
-        # Import inside the worker so the parent doesn't carry the
-        # faster-whisper / CTranslate2 dependency footprint.
-        from faster_whisper import WhisperModel
+        if engine == 'moonshine':
+            log.info(f"[ASRWorker] Loading moonshine (tiny-en, ONNX)...")
+            import re as _re
+            import wave as _wave
+            import moonshine_voice as _mv
+            from moonshine_voice import download as _mv_dl
+            _arch = _mv.ModelArch.TINY
+            _mpath, _ = _mv_dl.download_model_from_info(
+                _mv_dl.find_model_info(language='en', model_arch=_arch))
+            _ms = _mv.Transcriber(model_path=_mpath, model_arch=_arch)
+            _ts_re = _re.compile(r'\[[\d.]+s\]')  # moonshine inserts [1.23s] segment marks
 
-        model = WhisperModel(
-            model_name,
-            device='cpu',
-            compute_type='int8',
-            cpu_threads=cpu_threads,
-            # The model auto-downloads to ~/.cache/huggingface on first
-            # use. Subsequent loads are local and fast (~1s for tiny.en).
-        )
+            def _infer(wav_path):
+                w = _wave.open(wav_path, 'rb')
+                sr = w.getframerate()
+                d = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+                w.close()
+                audio = d.astype(np.float32) / 32768.0
+                raw = _ms.transcribe_without_streaming(audio, sample_rate=sr)
+                # moonshine returns a result object whose str() is the
+                # transcript (with inline [1.23s] segment marks); str() works
+                # whether raw is already a plain string or the result object.
+                txt = _ts_re.sub(' ', str(raw)).replace('\n', ' ').strip()
+                return txt
 
-        # Tiny warmup: a single empty/silence inference primes the
-        # CTranslate2 kernels so the first real call doesn't pay
-        # one-time overhead.
+            warmup = lambda: _ms.transcribe_without_streaming(
+                np.zeros(16000, dtype=np.float32), sample_rate=16000)
+        else:
+            log.info(f"[ASRWorker] Loading faster-whisper {model_name!r} "
+                     f"(cpu_threads={cpu_threads}, compute_type=int8)...")
+            from faster_whisper import WhisperModel
+            _fw = WhisperModel(model_name, device='cpu', compute_type='int8',
+                               cpu_threads=cpu_threads)
+
+            def _infer(wav_path):
+                segments, _info = _fw.transcribe(
+                    wav_path, beam_size=1, language='en',
+                    condition_on_previous_text=False, vad_filter=False)
+                return ' '.join(s.text for s in segments).strip()
+
+            warmup = lambda: list(_fw.transcribe(
+                np.zeros(16000, dtype=np.float32), beam_size=1, language='en')[0])
+
+        # Warmup primes the kernels so the first real call isn't slow.
         try:
-            import numpy as np
-            warmup_audio = np.zeros(16000, dtype=np.float32)  # 1s of silence
-            list(model.transcribe(warmup_audio, beam_size=1, language='en')[0])
+            warmup()
         except Exception as e:
             log.warning(f"[ASRWorker] Warmup skipped: {e}")
 
         log.info(f"[ASRWorker] Model loaded in {time.time() - load_start:.1f}s "
-                 f"(ready)")
+                 f"(engine={engine}, ready)")
         ready_event.set()
 
         # Main request loop. `get(timeout=1.0)` returns control to check
@@ -117,14 +180,7 @@ def _asr_worker_main(request_queue, response_queue, ready_event, shutdown_event,
             wav_path = request
             start = time.time()
             try:
-                segments, _info = model.transcribe(
-                    wav_path,
-                    beam_size=1,        # greedy decoding — fastest
-                    language='en',
-                    condition_on_previous_text=False,
-                    vad_filter=False,
-                )
-                text = ' '.join(s.text for s in segments).strip()
+                text = _infer(wav_path)
                 response_queue.put(('ok', text, time.time() - start))
             except FileNotFoundError as e:
                 response_queue.put(('error', f'wav not found: {e}', time.time() - start))
@@ -160,12 +216,20 @@ class ASRProcess:
 
     # Healthy faster-whisper tiny.en (CT2 int8) on 3 threads, measured
     # from tests/asr_corpus/bench.py against the 10-sample corpus:
-    #   p50 ~1.10 s, max ~1.40 s per 5-second window.
-    # Soft timeout 2.5s gives ~2.2× headroom over observed max; hard
-    # timeout 3.0s reaps a genuinely hung worker before the next 2-second
-    # snapshot cycle can pile up a second request.
-    SOFT_TIMEOUT = 2.5
-    HARD_TIMEOUT = 3.0
+    #   p50 ~1.10 s, max ~1.40 s per 5-second window — BUT that bench was
+    #   run with the minus service STOPPED (cool SoC, cores at full 2.3GHz).
+    # On a thermally-saturated box (e.g. 4K passthrough keeping the SoC at
+    # ~84°C with the fan maxed → cores throttled to 408MHz-1.6GHz) the SAME
+    # inference takes ~5-6s. Defaults are sized for the DEFAULT moonshine
+    # engine, whose per-window latency on the throttled box is p50 ~1.1s /
+    # p95 ~1.8s with occasional ~3.4s spikes during dense continuous speech.
+    # SOFT 4.0 / HARD 6.0 give margin so real inferences COMPLETE (and
+    # produce verdicts) rather than timing out, while still reaping a truly
+    # hung worker. Env-overridable (e.g. tighten on a cool host running
+    # faster-whisper, or widen further if you see timeout churn).
+    #   MINUS_ASR_SOFT_TIMEOUT / MINUS_ASR_HARD_TIMEOUT (seconds)
+    SOFT_TIMEOUT = float(os.environ.get('MINUS_ASR_SOFT_TIMEOUT', '4.0'))
+    HARD_TIMEOUT = float(os.environ.get('MINUS_ASR_HARD_TIMEOUT', '6.0'))
     RESTART_THRESHOLD = 3  # Hard kill after this many consecutive soft timeouts
     WORKER_LOAD_TIMEOUT = 30.0  # tiny.en loads ~1s; allow plenty for first-time HF download
 
@@ -185,7 +249,11 @@ class ASRProcess:
         self._restart_count = 0
         self._consecutive_timeouts = 0
         self._pending_response = False  # True if previous call timed out and worker may still answer
-        self._call_lock = threading.Lock()
+        # RLock (not Lock): transcribe() holds this lock and, on the hard-timeout
+        # escalation path, calls restart() -> stop()/start(), which re-acquire it.
+        # A plain Lock self-deadlocks there (the worker freezes mid-restart under
+        # sustained load — observed as inference_count stuck + no 'killed' count).
+        self._call_lock = threading.RLock()
         self._recent_latencies = deque(maxlen=20)
 
     # ----- lifecycle -----
