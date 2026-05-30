@@ -232,6 +232,28 @@ class ASRProcess:
     HARD_TIMEOUT = float(os.environ.get('MINUS_ASR_HARD_TIMEOUT', '6.0'))
     RESTART_THRESHOLD = 3  # Hard kill after this many consecutive soft timeouts
     WORKER_LOAD_TIMEOUT = 30.0  # tiny.en loads ~1s; allow plenty for first-time HF download
+    # Periodic worker restart to bound the upstream moonshine_voice 0.0.59
+    # transcript leak. Measured: ~3 MB of anonymous heap per
+    # transcribe_without_streaming() call on real speech, because the C
+    # library mallocs (well, `new`-allocates — confirmed: libc free crashes
+    # with "invalid pointer", and Transcriber del+gc doesn't free either —
+    # the leak lives in globally-cached ONNX runtime / libmoonshine.so
+    # state, NOT in the Transcriber instance) a TranscriptC struct + line
+    # text + audio_data float buffers + word structs on every call and
+    # never exposes a `moonshine_free_transcript` symbol to free them.
+    # Production observed: 11 GB anonymous heap after ~44k inferences
+    # (~20 h continuous) which pushed the box to 88% memory and starved
+    # other subsystems. The only way to release the memory is to exit the
+    # process. We restart the worker every RESTART_AFTER_INFERENCES
+    # successful calls: at 500 the worker peaks ~1.5 GB above baseline
+    # before recycling (~28 min wall-clock at the production cadence),
+    # well under any pressure threshold. Restart costs ~0.8 s of ASR
+    # downtime (tiny.en reload from disk cache); ASR is a confirm-only
+    # signal so OCR+VLM keep blocking ads through the gap. Override via
+    # MINUS_ASR_RESTART_AFTER_INFERENCES (set to 0 to disable, e.g. for
+    # tests or after the upstream bug is fixed).
+    RESTART_AFTER_INFERENCES = int(
+        os.environ.get('MINUS_ASR_RESTART_AFTER_INFERENCES', '500'))
 
     def __init__(self, model_name='tiny.en', cpu_threads=3):
         self.model_name = model_name
@@ -249,6 +271,9 @@ class ASRProcess:
         self._restart_count = 0
         self._consecutive_timeouts = 0
         self._pending_response = False  # True if previous call timed out and worker may still answer
+        # Counter for the periodic-restart leak workaround — see
+        # RESTART_AFTER_INFERENCES.
+        self._inferences_since_restart = 0
         # RLock (not Lock): transcribe() holds this lock and, on the hard-timeout
         # escalation path, calls restart() -> stop()/start(), which re-acquire it.
         # A plain Lock self-deadlocks there (the worker freezes mid-restart under
@@ -423,6 +448,21 @@ class ASRProcess:
             status, payload, latency = result
             if status == 'ok':
                 self._recent_latencies.append(latency)
+                self._inferences_since_restart += 1
+                if (self.RESTART_AFTER_INFERENCES > 0 and
+                        self._inferences_since_restart
+                        >= self.RESTART_AFTER_INFERENCES):
+                    # Periodic restart to bound the upstream moonshine_voice
+                    # 0.0.59 transcript leak (~3 MB/call, no exposed free).
+                    # restart() is RLock-safe (the lock was upgraded to RLock
+                    # specifically so stop()/start() can re-acquire it).
+                    logger.info(
+                        f"[ASRProcess] Periodic restart "
+                        f"({self._inferences_since_restart} inferences) — "
+                        f"bounds the upstream moonshine_voice transcript "
+                        f"leak (~3 MB/call). ASR unavailable for ~0.8s.")
+                    self._inferences_since_restart = 0
+                    self.restart()
             return status, payload, latency
 
     # Hard cap on drain iterations. The drain loop SHOULD exit naturally

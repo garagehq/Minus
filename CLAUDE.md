@@ -2697,3 +2697,130 @@ and confirmed clean boot (OCR/ASR/VLM up, no errors).
 
 **Files modified:** `minus.py` (`DEFINITIVE_AD_KEYWORD_NAMES` +
 transience-guard `fast_fire`), `tests/test_asr.py`, CLAUDE.md.
+
+### Moonshine 0.0.59 transcript leak — periodic worker restart (May 2026)
+
+**Symptom:** after ~20 hours of continuous runtime, memory hit 88% and
+the box was at risk of OOM. The leaker was PID 1643 — the ASR worker
+subprocess — at **11.3 GB anonymous heap** (`smaps_rollup` PSS_Anon
+11.19 GB) after 44,494 inferences. No timeouts, no kills, no
+restart_count growth — just steady inference with monotonically growing
+RSS.
+
+**Root cause:** `moonshine_voice 0.0.59`'s
+`Transcriber.transcribe_without_streaming` allocates a `TranscriptC`
+struct (lines + per-line text/audio_data/words + per-word text) via the
+C library on every call and **never exposes a `moonshine_free_transcript`
+symbol** to release it. Measured leak rate: **~3.08 MB per inference** on
+real speech (44k iters × 3MB ≈ 132 GB; the process was capped at 11 GB
+by physical RAM pressure). The Python `_parse_transcript` does deep-copy
+the fields into Python objects (`ctypes.string_at` for text,
+`list(audio_array)` for audio) so the source data isn't aliased — the
+sub-structures are pure leak.
+
+Three mitigations were probed empirically before settling on the right
+one (`tests/asr_corpus/` scripts in /tmp during diagnosis):
+
+1. **Manual deep free** via `moonshine_free(addr)` (= `libc.free`) on
+   each sub-pointer → `free(): invalid pointer` crash on the first
+   `audio_data` free. The library uses C++ `new` for these
+   allocations, not libc `malloc`, so libc `free` is undefined
+   behaviour. The exported symbol list confirms this: there are
+   per-type free helpers for `intent_matches`, `tts_synthesizer`,
+   `grapheme_to_phonemizer`, `stream`, `tensor`, etc. — but
+   conspicuously no `moonshine_free_transcript`. Upstream forgot to
+   expose it.
+2. **Top-level pointer free** only (`libc.free(out_transcript)`,
+   leaking the sub-structures but recovering the outer struct) → same
+   `free(): invalid pointer` crash. Even the TOP struct isn't a libc
+   malloc.
+3. **Periodic `del Transcriber + gc.collect()`** (recreate the
+   Transcriber object every N calls, hoping its destructor releases
+   accumulated state) → measured `RSS=320.7 MB` *after* 25 leaky iters
+   then `RSS=320.7 MB` after `del+gc` and `RSS=335.1 MB` after
+   recreate. The destructor does NOT release the leaked memory — the
+   leak lives in **globally-cached ONNX runtime / libmoonshine.so
+   state**, not in the Transcriber instance. So Transcriber recreation
+   is useless.
+
+**Fix (the only viable one without forking upstream):**
+parent-side **periodic subprocess restart** in `ASRProcess`. Added
+`RESTART_AFTER_INFERENCES = int(os.environ.get(
+'MINUS_ASR_RESTART_AFTER_INFERENCES', '500'))` and a counter in
+`__init__`. In the `'ok'` branch of `transcribe()` the counter
+increments; when it reaches the threshold, we log + call
+`self.restart()` (which already exists for hard-timeout escalation,
+`RLock`-safe). The OS frees ALL process memory on exit — the only
+mechanism that reliably reclaims the leak.
+
+At the default 500 inferences: with the production cadence of ~1.7s/
+inference + ~1.5s gap = ~3.2s per cycle, restarts every ~27 min.
+~1.5 GB of leaked memory recovered per cycle. Restart costs ~1.4 s of
+ASR downtime (Moonshine tiny.en reload from disk cache); ASR is a
+confirm-only signal on top of OCR+VLM so the gap doesn't drop any
+ad blocks. Override via `MINUS_ASR_RESTART_AFTER_INFERENCES` (set 0 to
+disable when upstream is fixed).
+
+**Verification** (`/tmp/test_fix_integration.py`, threshold=5):
+- 18 inferences → 3 restarts (at 5, 10, 15) as expected.
+- RSS sawtooth: 228 → 236 (4 iters, leaked +8 MB) → **RESTART** → 226
+  → 238 (5 iters, +12 MB) → **RESTART** → 225 → 236 (+11 MB) →
+  **RESTART** → 227 → 244 (+17 MB).
+- All 18 transcribes returned `ok`; ASR keeps working through every
+  restart (~1.2-1.5 s reload, well under SOFT_TIMEOUT=4 s).
+- Memory is bounded (sawtooth, no monotonic growth) — the actual user
+  requirement.
+
+**Files modified:** `src/asr_worker.py` (`RESTART_AFTER_INFERENCES`
+constant + `_inferences_since_restart` counter + restart trigger in
+`transcribe()`), CLAUDE.md.
+
+### Axera libaxcl_*.so broken symlinks — VLM dead at boot (May 2026)
+
+**Symptom:** VLM marked `disabled` in `/api/health.subsystems.vlm`
+while `vlm_disabled: false` in `/api/status` (i.e., VLM was supposed
+to be ENABLED but never loaded). Every VLM load attempt in the
+journal showed:
+
+```
+[E] Failed to load LFM2.5-VL: cannot load library 'libaxcl_rt.so.1':
+libaxcl_pkg.so: cannot open shared object file: No such file or directory.
+```
+
+Three load attempts on three different worker PIDs over ~3 minutes
+(graceful-degradation retry path), then VLM gave up and the service
+ran OCR-only for 20+ hours.
+
+**Root cause:** `/usr/lib/axcl/` has the pattern `libaxcl_NAME.so` →
+`libaxcl_NAME.so.1` → `libaxcl_NAME.so.1.0.0` (three dots). The
+`.so.1` symlinks (radxa-owned, Mar 26) point correctly at the
+`.so.1.0.0` file. But the top-level `.so` symlinks (root-owned, May
+29 17:34 — created in some prior provisioning step) all point at
+non-existent `libaxcl_NAME.so.1.0` (TWO dots, missing). All 17
+top-level symlinks were broken (`libaxcl_comm.so`, `libaxcl_pkg.so`,
+`libaxcl_rt.so`, etc.).
+
+`ldconfig` couldn't stat them → the linker cache had no `libaxcl_*.so`
+entries → `dlopen("libaxcl_rt.so.1")` couldn't resolve its
+`DT_NEEDED libaxcl_pkg.so` → VLM load fails. The `.so.1` file IS
+present and resolvable directly, but dlopen still has to resolve the
+DT_NEEDED chain, and the cache miss on `libaxcl_pkg.so` (because of
+the broken `libaxcl_pkg.so` symlink) breaks the load.
+
+**Fix:** re-point each of the 17 broken `libaxcl_*.so` symlinks to
+the working `libaxcl_*.so.1`, then `ldconfig` to rebuild the cache.
+After: `ldd /usr/lib/axcl/libaxcl_rt.so.1` resolves every dependency,
+and VLM loads cleanly on restart (10.1 s model load + 1.6 s warmup).
+
+```bash
+sudo bash -c '
+for f in /usr/lib/axcl/libaxcl_*.so; do
+  if [ -L "$f" ] && [ ! -e "$f" ]; then
+    ln -sfn "$(basename "$f").1" "$f"
+  fi
+done
+ldconfig'
+```
+
+If the box ever gets re-imaged from the same source the symlinks may
+break again; the snippet above is idempotent.
