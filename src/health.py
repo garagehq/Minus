@@ -242,6 +242,14 @@ class HealthMonitor:
                 if time_since_last_trigger >= self._no_signal_retry_interval:
                     logger.warning(f"[HealthMonitor] Signal lost but NO SIGNAL mode not active - re-triggering")
                     self._last_no_signal_trigger = now
+                    # Also stamp lost-time so a subsequent restoration fires
+                    # _on_hdmi_restored. Without this, when the signal was
+                    # already absent at startup (no lost→present transition
+                    # ever recorded), `_hdmi_lost_time` stays 0 and the
+                    # restored callback is gated out — leaving the lost flag
+                    # set on consumers (e.g. detect loops) forever.
+                    if self._hdmi_lost_time == 0:
+                        self._hdmi_lost_time = now
                     if self._on_hdmi_lost:
                         self._on_hdmi_lost()
 
