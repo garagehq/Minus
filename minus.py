@@ -449,6 +449,14 @@ class Minus:
         }
 
         self.last_ocr_texts = []            # Last OCR detected texts
+        # Periodic non-ad screenshot sampler: capture the current frame as
+        # training data every NONAD_SAMPLE_INTERVAL seconds while content
+        # is playing normally (no block active, no static-screen freeze, no
+        # ad keywords matched). Builds a steady stream of non-ad examples
+        # for future VLM retraining beyond the user-pause feedback path.
+        self._last_nonad_sample_time = 0.0
+        self.NONAD_SAMPLE_INTERVAL = float(
+            os.environ.get('MINUS_NONAD_SAMPLE_INTERVAL', '90'))
         # Most recent OCR matched keywords (list of (keyword, snippet) tuples).
         # Picked up by ad_blocker.show() to render a "(Ad) 0:30 left" hint in
         # the top-right of the blocking overlay when debug mode is on.
@@ -3479,6 +3487,32 @@ class Minus:
 
                 # Store OCR texts and check for home screen / video interface keywords
                 self.last_ocr_texts = all_texts
+
+                # Periodic non-ad screenshot sampler. Captures the current
+                # frame as training data when content is unambiguously not
+                # an ad: no ad keywords matched this frame, ad blocker not
+                # currently showing, no static-screen suppression active,
+                # and the per-sample cooldown has elapsed. Dedup +
+                # blank-rejection in ScreenshotManager prevents flooding.
+                # Tuned conservatively (90s default) to avoid pressuring
+                # the OCR loop / disk IO.
+                try:
+                    _nonad_now = time.time()
+                    if (_nonad_now - self._last_nonad_sample_time
+                            >= self.NONAD_SAMPLE_INTERVAL
+                            and not matched_keywords
+                            and frame is not None
+                            and self.ad_blocker is not None
+                            and not getattr(self.ad_blocker, 'is_visible',
+                                            False)
+                            and not getattr(self, 'static_blocking_suppressed',
+                                            False)
+                            and self.screenshot_manager is not None):
+                        self.screenshot_manager.save_non_ad_screenshot(frame)
+                        self._last_nonad_sample_time = _nonad_now
+                except Exception as _e:
+                    logger.debug(
+                        f"[NonAdSampler] skipped: {_e}")
 
                 # Track OCR-text stability for EARLY frozen-stream
                 # detection. Non-empty text only (empty OCR = content /

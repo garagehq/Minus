@@ -826,22 +826,43 @@ class AutonomousMode:
         except Exception:
             return False
 
+    # Minimum recent RMS level to count as "real audio content" rather than
+    # silent HDMI carrier. HDMI sources keep emitting silence buffers when
+    # the connected device is paused (Roku/Fire TV/Google TV all do this) —
+    # buffer-age alone returns True for silence and would make every paused
+    # MENU verdict get vetoed by `audio flowing`. The visual-curved RMS in
+    # audio.py rests near 0.0 in true silence and rises into the 0.02-0.30+
+    # range with speech/music. 0.01 is comfortably below speech but above
+    # the noise floor measured on the HDMI-RX device.
+    AUDIO_SILENCE_THRESHOLD = 0.01
+
     def _is_audio_flowing(self) -> bool:
-        """Check if audio is currently flowing (music/sound playing).
+        """Check if audio is currently flowing with REAL content (not just
+        the HDMI carrier emitting silence on a paused source).
 
-        Uses the ad_blocker's audio module if available, otherwise checks
-        ALSA capture device status directly via /proc/asound.
-
-        Returns True if audio buffers are actively flowing.
+        Uses the ad_blocker's audio module if available, otherwise falls
+        back to ALSA capture device status (less reliable — RUNNING is
+        true even during silence). When the audio module is available we
+        require BOTH: a fresh buffer (<3s old) AND a recent RMS level
+        above the silence threshold. This was added 2026-06-06 after
+        the conservative MENU guard was vetoing every action because
+        Roku's HDMI output emits a silent 48kHz stream while paused.
         """
         # Method 1: Check via ad_blocker's audio module
         if self._ad_blocker and hasattr(self._ad_blocker, 'audio') and self._ad_blocker.audio:
             try:
                 status = self._ad_blocker.audio.get_status()
                 buffer_age = status.get('last_buffer_age', 999)
-                # -1 means no buffer ever received, so NOT flowing
-                is_flowing = 0 <= buffer_age < 3.0  # Buffer received within last 3 seconds
-                logger.debug(f"[AutonomousMode] Audio buffer age: {buffer_age:.1f}s, flowing={is_flowing}")
+                recent_level = status.get('recent_level', 0.0)
+                buffer_fresh = 0 <= buffer_age < 3.0
+                has_content = recent_level >= self.AUDIO_SILENCE_THRESHOLD
+                is_flowing = buffer_fresh and has_content
+                logger.debug(
+                    f"[AutonomousMode] Audio buffer age={buffer_age:.1f}s "
+                    f"recent_level={recent_level:.3f} "
+                    f"(threshold={self.AUDIO_SILENCE_THRESHOLD}) "
+                    f"flowing={is_flowing}"
+                )
                 return is_flowing
             except Exception:
                 pass
@@ -975,6 +996,28 @@ class AutonomousMode:
         'skip ad',
     ]
 
+    # Indicators that the currently-highlighted tile (or its row) is a LIVE
+    # YouTube stream. Live streams are bad picks for ad-training autonomous
+    # mode because: (a) they often have long unskippable mid-roll pods,
+    # (b) audio/video are stream-paced (drift causes pause-detection FPs),
+    # (c) "live chat" overlays confuse VLM screen classification.
+    # Phrases here are specific enough to avoid common false matches
+    # ("olive", "delivery", "alive", etc. don't contain these tokens).
+    LIVE_CONTENT_KEYWORDS = [
+        'live now',
+        'livenow',           # OCR merges spaces
+        'streaming now',
+        'streamingnow',
+        'started streaming',
+        'watching now',
+        'watchingnow',
+        'is live',
+        'islive',
+        ' live ·',           # YouTube "· LIVE ·" badge separator pattern
+        '· live',
+        'live ·',
+    ]
+
     def _is_youtube_login_screen(self) -> bool:
         """Check if we're on the YouTube login/account selection screen using OCR keywords.
 
@@ -1008,6 +1051,29 @@ class AutonomousMode:
 
         except Exception as e:
             logger.debug(f"[AutonomousMode] Login screen check failed: {e}")
+            return False
+
+    def _has_live_content_indicator(self) -> bool:
+        """Detect that the currently-visible YouTube screen contains a LIVE
+        stream indicator (a "LIVE" badge or "Watching now" count). When this
+        is true on a home screen, the highlighted tile is most likely the
+        first live row — autonomous mode should push selection further down
+        to skip past it and pick recorded content instead.
+        """
+        try:
+            if not self._ad_blocker or not hasattr(self._ad_blocker, 'last_ocr_texts'):
+                return False
+            texts = self._ad_blocker.last_ocr_texts
+            if not texts:
+                return False
+            combined = ' '.join(str(t) for t in texts).lower()
+            for kw in self.LIVE_CONTENT_KEYWORDS:
+                if kw in combined:
+                    logger.info(f"[AutonomousMode] Live-content indicator detected ('{kw}') — will skip past live tile")
+                    return True
+            return False
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Live-indicator check failed: {e}")
             return False
 
     def _is_youtube_home_screen(self) -> bool:
@@ -1582,9 +1648,44 @@ class AutonomousMode:
                 logger.info("[AutonomousMode] YouTube home screen detected via OCR - selecting a video")
                 self._log_event("YouTube home screen detected - selecting a video")
 
-                # Vary navigation to find different videos (some require sign-in)
+                # Vary navigation to find different videos (some require sign-in).
+                # If the page shows a live-stream indicator, push the selection
+                # further down to skip past the live row entirely (live streams
+                # are unsuitable for autonomous ad-training, see LIVE_CONTENT_KEYWORDS).
+                # Same treatment when 'shorts' OCR keyword is present — YouTube
+                # TV's Shorts row sits near the top of home, so the default
+                # 3-6 downs lands on it ~half the time; the Shorts-exit
+                # recovery succeeds but wastes a screensaver/relaunch cycle.
+                # Pattern observed 2026-06-06: 5/7/6 Shorts exits in 3
+                # consecutive 15-min windows. Push past Shorts row when its
+                # keyword is visible.
                 import random
-                down_count = random.randint(3, 6)  # Randomize how far down we go
+                ocr_combined = ''
+                try:
+                    if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
+                        ocr_combined = ' '.join(
+                            str(t) for t in (self._ad_blocker.last_ocr_texts or [])
+                        ).lower()
+                except Exception:
+                    pass
+                if self._has_live_content_indicator():
+                    down_count = random.randint(6, 9)  # Push past live row
+                    self._log_event("Live content detected — skipping past live row")
+                elif 'shorts' in ocr_combined:
+                    down_count = random.randint(7, 10)  # Push past Shorts row
+                    self._log_event("Shorts row detected — skipping past it")
+                else:
+                    # Default bumped from (3,6) to (5,8) on 2026-06-06: the
+                    # narrow `'shorts' in ocr_combined` check above only
+                    # caught a fraction of Shorts hits because the home-
+                    # screen-detection frame typically OCRs `'recommended'`
+                    # or `'search'` without `'shorts'` even when the Shorts
+                    # row IS on the page (below the focused tile). YouTube
+                    # TV layout puts Shorts in row 1-2 consistently, so a
+                    # higher floor avoids landing on it. 5-8 stays below
+                    # the (6,9) live-row push and well below (7,10) Shorts-
+                    # explicit push, so behavioral overlap is intentional.
+                    down_count = random.randint(5, 8)
                 right_first = random.choice([True, False])  # Sometimes skip the right press
 
                 if right_first:
@@ -1791,12 +1892,37 @@ class AutonomousMode:
                     self._device_controller.send_command("play_pause")
                     return True
 
-                # No overlay, no audio: most likely a real menu screen
-                # (home page, settings, etc.). Original down+select path.
-                # No Sign-in trap risk because Sign-in only appears in
-                # the player overlay UI, which we just ruled out.
-                self._device_controller.send_command("down")
-                time.sleep(0.5)
+                # No overlay, no audio: VLM says MENU. Before pressing
+                # down+select, require OCR-confirmation that we're actually
+                # on a home/browse screen (HOME_SCREEN_KEYWORDS). LFM2's
+                # screen classifier is markedly noisy on overlay-heavy
+                # frames — a single MENU verdict without OCR home keywords
+                # is most often the briefly-overlay-less middle of a
+                # playing video, and down+select there navigates the
+                # player UI to Sign-in or exits to home. Skipping the
+                # action when home isn't OCR-confirmed lets the next
+                # iteration's audio/overlay signals catch up, eliminating
+                # the home-flap loop observed 2026-06-06.
+                if not self._is_youtube_home_screen():
+                    logger.info("[AutonomousMode] MENU select dispatch "
+                                "skipped — OCR shows no home-screen "
+                                "keywords (likely overlay-less playing "
+                                "frame, not a real menu)")
+                    self._log_event(
+                        "MENU select skipped — home OCR not confirmed")
+                    self._overlay_veto_count = 0
+                    return False
+
+                # OCR confirms home screen. Apply live-skip logic if
+                # the visible row is a live-stream tile.
+                if self._has_live_content_indicator():
+                    for _ in range(5):  # Push past live row
+                        self._device_controller.send_command("down")
+                        time.sleep(0.3)
+                    self._log_event("MENU + home + live → skipped past live row")
+                else:
+                    self._device_controller.send_command("down")
+                    time.sleep(0.5)
                 self._device_controller.send_command("select")
                 self.stats.videos_played += 1
                 logger.info("[AutonomousMode] Selected video from menu")

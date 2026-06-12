@@ -958,12 +958,21 @@ class AudioPassthrough:
             except Exception:
                 state_name = "error"
 
+            # Peak RMS over recent buffer history. Used by autonomous mode
+            # to distinguish "audio buffer flowing with silence" (HDMI source
+            # paused → still emits silent buffers) from "audio has real
+            # content". Empty history → 0.0 (no buffers seen yet).
+            try:
+                recent_level = max(self._level_history) if self._level_history else 0.0
+            except Exception:
+                recent_level = 0.0
             return {
                 "state": state_name,
                 "muted": self.is_muted,
                 "restart_count": self._restart_count,
                 "restart_in_progress": self._restart_in_progress,
-                "last_buffer_age": time.time() - self._last_buffer_time if self._last_buffer_time > 0 else -1
+                "last_buffer_age": time.time() - self._last_buffer_time if self._last_buffer_time > 0 else -1,
+                "recent_level": recent_level
             }
         finally:
             self._lock.release()
