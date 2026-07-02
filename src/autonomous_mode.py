@@ -195,6 +195,17 @@ class AutonomousMode:
         self._OVERLAY_VETO_BACK_AT = 3
         self._OVERLAY_VETO_RESET_AT = 6
 
+        # Consecutive MENU verdicts whose select-dispatch was skipped
+        # because OCR showed no home-screen keywords. That guard prevents
+        # sign-in traps, but with no escalation it can no-op FOREVER on an
+        # unrecognized dead-end screen (observed live 2026-07-02: the
+        # "Sign in to YouTube TV" activation screen stalled the session
+        # 40 min with a MENU-skip every ~33s). After N consecutive skips
+        # (~3 min) with no audio, no overlay, and no recognizable screen,
+        # escape with Back presses + content selection.
+        self._menu_skip_count: int = 0
+        self._MENU_SKIP_ESCAPE_AT = 5
+
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
 
@@ -934,6 +945,13 @@ class AutonomousMode:
         'tryyoutube tv',     # OCR sometimes merges spaces
         'youtube tv free trial',
         'new users only. terms apply',
+        # The signup flow itself ("Sign in to YouTube TV" + activation
+        # code + tv.youtube.com/start). Observed live 2026-07-02: this
+        # screen stalled autonomous mode for 40 min because no detector
+        # knew it. The keyboard-stuck check also catches it (activation
+        # code markers) and runs first; this entry is belt-and-braces.
+        'sign in to youtube tv',
+        'signin to youtube tv',
     ]
 
     # Generic promo markers: any of these *together with* "youtube tv" in
@@ -963,7 +981,11 @@ class AutonomousMode:
         'verification code',
         'yt.be/activate',    # YouTube sign-in with code screen
         'enter the code',    # Sign-in code entry
+        'enter this code',   # YouTube TV activation screen wording
+        'enterthis code',    # OCR-merged variant (observed live 2026-07-02)
         'scan qr code',      # QR code sign-in
+        'scan with your phone',  # "Or scan with your phone" (YouTube TV activation)
+        'youtube.com/start', # tv.youtube.com/start activation URL
         'sign in with your phone',  # Mobile sign-in prompt
         'add your google',   # Google account addition
     ]
@@ -1518,6 +1540,7 @@ class AutonomousMode:
         self._recovery_attempt_count = 0
         self._consecutive_static = 0
         self._persistent_static_count = 0
+        self._menu_skip_count = 0
 
         return True
 
@@ -1960,6 +1983,7 @@ class AutonomousMode:
                     # Screen is changing - truly playing! Reset all stuck counters.
                     self._consecutive_static = 0
                     self._stuck_count = 0
+                    self._menu_skip_count = 0
                     self._last_screen_state = 'playing'
                     logger.debug("[AutonomousMode] Screen looks good, video is playing")
                     return False
@@ -1973,6 +1997,11 @@ class AutonomousMode:
             # escalate as intended.
             _prev_overlay_veto = self._overlay_veto_count
             self._overlay_veto_count = 0
+
+            # Same snapshot pattern for the MENU-skip watchdog: any real
+            # action below resets it; the skip path re-installs prev+1.
+            _prev_menu_skip = self._menu_skip_count
+            self._menu_skip_count = 0
 
             # ARCHITECTURAL INVARIANT (see "Autonomous Mode VLM-
             # Misclassification Traps" in CLAUDE.md Known Issues):
@@ -2077,10 +2106,36 @@ class AutonomousMode:
                 # iteration's audio/overlay signals catch up, eliminating
                 # the home-flap loop observed 2026-06-06.
                 if not self._is_youtube_home_screen():
-                    logger.info("[AutonomousMode] MENU select dispatch "
-                                "skipped — OCR shows no home-screen "
-                                "keywords (likely overlay-less playing "
-                                "frame, not a real menu)")
+                    # WATCHDOG: this skip is correct for a transient
+                    # overlay-less playing frame, but a screen NO detector
+                    # recognizes (observed live 2026-07-02: the "Sign in
+                    # to YouTube TV" activation screen) produces this skip
+                    # every cycle forever — a silent stall. No audio + no
+                    # overlay + no recognizable screen for N consecutive
+                    # cycles (~3 min) means nothing is playing and nothing
+                    # is progressing: escape with Back presses + content
+                    # selection. A genuinely-playing quiet video never
+                    # accumulates N — any audio blip or overlay resets us
+                    # via the paths above.
+                    self._menu_skip_count = _prev_menu_skip + 1
+                    if self._menu_skip_count >= self._MENU_SKIP_ESCAPE_AT:
+                        logger.warning(
+                            f"[AutonomousMode] MENU skip-loop stuck "
+                            f"({self._menu_skip_count} consecutive skips, "
+                            f"no audio/overlay/home) — escaping")
+                        self._log_event(
+                            "MENU skip-loop stuck — escaping with Back")
+                        self._menu_skip_count = 0
+                        self._overlay_veto_count = 0
+                        self._escape_stuck_state()
+                        return True
+
+                    logger.info(f"[AutonomousMode] MENU select dispatch "
+                                f"skipped — OCR shows no home-screen "
+                                f"keywords (likely overlay-less playing "
+                                f"frame, not a real menu) "
+                                f"({self._menu_skip_count}/"
+                                f"{self._MENU_SKIP_ESCAPE_AT})")
                     self._log_event(
                         "MENU select skipped — home OCR not confirmed")
                     self._overlay_veto_count = 0

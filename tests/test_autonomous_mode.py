@@ -1621,6 +1621,102 @@ class TestYouTubeTVPromptDetection(unittest.TestCase):
             _cleanup_mode(mode)
 
 
+class TestYouTubeTVActivationScreen(unittest.TestCase):
+    """The 'Sign in to YouTube TV' activation screen (live OCR capture
+    2026-07-02) stalled autonomous mode for 40 min because no detector
+    recognized it. It must trip BOTH the keyboard-stuck check (activation
+    code markers) and the YouTube TV prompt detector."""
+
+    # Verbatim OCR output from the live incident
+    LIVE_OCR = ["finalthemeu", "Or scan with your phone", "STEP3", "Suw",
+                "YFW-XVR-STL", "STEP2", "Enterthis code:",
+                "tv.youtube.com/start", "STEP1", "Orm",
+                "Sign in to YouTube TV"]
+
+    def test_keyboard_stuck_detects_activation_screen(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, self.LIVE_OCR)
+            self.assertTrue(mode._is_keyboard_stuck_screen())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_yttv_prompt_detects_activation_screen(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, self.LIVE_OCR)
+            self.assertTrue(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+
+class TestMenuSkipWatchdog(unittest.TestCase):
+    """The MENU-select skip guard must escalate to an escape after N
+    consecutive no-op skips instead of stalling forever on an
+    unrecognized dead-end screen."""
+
+    def _stalled_mode(self):
+        """Mode where every cycle produces a skipped MENU verdict."""
+        mode = _make_mode()
+        roku = MagicMock()
+        roku.is_connected.return_value = True
+        roku.send_command.return_value = True
+        mode.set_device_controller(roku, 'roku')
+        _set_ocr_texts(mode, ["finalthemeu", "STEP1"])  # nothing recognizable
+        mode._ad_blocker.display_connected = False  # skip audio-recovery section
+        # Force the dead-end path: MENU verdict, no audio, no overlay,
+        # no recognizable screen of any kind
+        mode._check_roku_active_app = MagicMock(return_value=True)
+        mode._is_roku_home_screen = MagicMock(return_value=False)
+        mode._is_keyboard_stuck_screen = MagicMock(return_value=False)
+        mode._is_youtube_tv_prompt = MagicMock(return_value=False)
+        mode._is_survey_screen = MagicMock(return_value=False)
+        mode._is_signed_out_screen = MagicMock(return_value=False)
+        mode._is_youtube_login_screen = MagicMock(return_value=False)
+        mode._is_youtube_shorts = MagicMock(return_value=False)
+        mode._is_youtube_home_screen = MagicMock(return_value=False)
+        mode._has_live_content_indicator = MagicMock(return_value=False)
+        mode._query_screen = MagicMock(return_value="MENU")
+        mode._is_audio_flowing = MagicMock(return_value=False)
+        mode._is_video_player_overlay = MagicMock(return_value=False)
+        mode._escape_stuck_state = MagicMock(return_value=True)
+        return mode, roku
+
+    def test_escapes_after_threshold_consecutive_skips(self):
+        mode, roku = self._stalled_mode()
+        try:
+            for i in range(mode._MENU_SKIP_ESCAPE_AT - 1):
+                self.assertFalse(mode._ensure_youtube_playing())
+            mode._escape_stuck_state.assert_not_called()
+
+            # Nth consecutive skip triggers the escape
+            self.assertTrue(mode._ensure_youtube_playing())
+            mode._escape_stuck_state.assert_called_once()
+            self.assertEqual(mode._menu_skip_count, 0)
+        finally:
+            _cleanup_mode(mode)
+
+    def test_playing_screen_resets_skip_counter(self):
+        mode, roku = self._stalled_mode()
+        try:
+            for _ in range(mode._MENU_SKIP_ESCAPE_AT - 1):
+                mode._ensure_youtube_playing()
+
+            # A genuinely-playing cycle resets the watchdog
+            mode._query_screen = MagicMock(return_value="PLAYING")
+            mode._is_screen_static = MagicMock(return_value=False)
+            self.assertFalse(mode._ensure_youtube_playing())
+            self.assertEqual(mode._menu_skip_count, 0)
+
+            # Back to stalled MENU: counts from 1 again, no premature escape
+            mode._query_screen = MagicMock(return_value="MENU")
+            mode._ensure_youtube_playing()
+            mode._escape_stuck_state.assert_not_called()
+            self.assertEqual(mode._menu_skip_count, 1)
+        finally:
+            _cleanup_mode(mode)
+
+
 # =============================================================================
 # YouTube Shorts Detection Tests
 # =============================================================================
