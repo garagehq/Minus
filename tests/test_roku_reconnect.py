@@ -145,6 +145,31 @@ class TestRediscovery(unittest.TestCase):
         self.assertEqual(new_ips, [])
 
 
+class TestKeypressStatusCodes(unittest.TestCase):
+    """ECP returns 202 Accepted under load — must count as success."""
+
+    def _resp(self, code):
+        r = MagicMock()
+        r.status_code = code
+        return r
+
+    def test_202_is_success(self):
+        c = _make_controller(connected=True)
+        with patch('roku.requests.post', return_value=self._resp(202)) as post:
+            self.assertTrue(c._send_keypress('Back'))
+            post.assert_called_once()
+
+    def test_500_is_failure(self):
+        c = _make_controller(connected=True)
+        with patch('roku.requests.post', return_value=self._resp(500)):
+            self.assertFalse(c._send_keypress('Back'))
+
+    def test_launch_202_is_success(self):
+        c = _make_controller(connected=True)
+        with patch('roku.requests.post', return_value=self._resp(202)):
+            self.assertTrue(c.launch_app('youtube'))
+
+
 class TestMonitoringLifecycle(unittest.TestCase):
     """Tests for start_monitoring() and user-initiated disconnect."""
 

@@ -1719,6 +1719,20 @@ class AutonomousMode:
             # STUCK DETECTION: Check for keyboard/sign-in screens we can't automate
             # This must come BEFORE other checks to escape stuck states quickly
             if self._is_keyboard_stuck_screen():
+                # AUDIO GUARD (per the ARCHITECTURAL INVARIANT below):
+                # real keyboard/sign-in screens are static and SILENT.
+                # Observed live 2026-07-02 03:31: the character-pattern
+                # heuristic (many short OCR fragments + digits) false-
+                # positived on a playing video frame and the 4-Back
+                # escape exited YouTube to the Roku home screen. Audio
+                # flowing means a video is playing — never escape.
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] Keyboard-screen verdict vetoed: "
+                                "audio flowing — video is playing")
+                    self._log_event("Keyboard verdict vetoed: audio flowing")
+                    self._stuck_count = 0
+                    return False
+
                 self._stuck_count += 1
                 logger.warning(f"[AutonomousMode] Keyboard/stuck screen detected ({self._stuck_count}/{self._STUCK_THRESHOLD})")
 

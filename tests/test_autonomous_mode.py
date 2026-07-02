@@ -1717,6 +1717,48 @@ class TestMenuSkipWatchdog(unittest.TestCase):
             _cleanup_mode(mode)
 
 
+class TestKeyboardStuckAudioGuard(unittest.TestCase):
+    """The keyboard-stuck escape must not fire while audio is flowing —
+    real sign-in/keyboard screens are silent. Observed live 2026-07-02
+    03:31: the character-pattern heuristic false-positived on a playing
+    video and the Back-escape exited YouTube."""
+
+    def _keyboardish_mode(self):
+        mode = _make_mode()
+        roku = MagicMock()
+        roku.is_connected.return_value = True
+        roku.send_command.return_value = True
+        mode.set_device_controller(roku, 'roku')
+        # OCR that trips the character-pattern heuristic: mostly 1-2 char
+        # fragments including digits
+        _set_ocr_texts(mode, ["1", "2", "a", "b", "c", "longer text"])
+        mode._check_roku_active_app = MagicMock(return_value=True)
+        mode._is_roku_home_screen = MagicMock(return_value=False)
+        mode._escape_stuck_state = MagicMock(return_value=True)
+        mode._full_reset_to_youtube = MagicMock(return_value=True)
+        return mode, roku
+
+    def test_audio_flowing_vetoes_keyboard_escape(self):
+        mode, roku = self._keyboardish_mode()
+        try:
+            self.assertTrue(mode._is_keyboard_stuck_screen())  # heuristic trips
+            mode._is_audio_flowing = MagicMock(return_value=True)
+            self.assertFalse(mode._ensure_youtube_playing())
+            mode._escape_stuck_state.assert_not_called()
+            mode._full_reset_to_youtube.assert_not_called()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_silent_keyboard_screen_still_escapes(self):
+        mode, roku = self._keyboardish_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            self.assertTrue(mode._ensure_youtube_playing())
+            mode._escape_stuck_state.assert_called_once()
+        finally:
+            _cleanup_mode(mode)
+
+
 class TestScreensaverLaunchGuards(unittest.TestCase):
     """The SCREENSAVER→launch action must consult authoritative playback
     signals (audio, Roku ECP) before wake+relaunch. Observed live

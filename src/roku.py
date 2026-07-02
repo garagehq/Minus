@@ -446,8 +446,10 @@ class RokuController:
         for attempt in range(2):
             try:
                 response = requests.post(url, timeout=5)
-                # Roku returns 200 or 204 for successful key presses
-                if response.status_code in (200, 204):
+                # Roku returns 200/204 for successful key presses; under
+                # load it returns 202 Accepted (key queued) — also success
+                # (observed live 2026-07-02 during a Back sequence).
+                if response.status_code in (200, 202, 204):
                     logger.debug(f"[Roku] Sent key: {key}")
                     return True
                 else:
@@ -497,8 +499,8 @@ class RokuController:
         try:
             url = f'http://{self._ip_address}:{ROKU_PORT}/launch/{app_id}'
             response = requests.post(url, timeout=5)
-            # Roku returns 200 or 204 for successful launches
-            if response.status_code in (200, 204):
+            # Roku returns 200/204 for successful launches; 202 = queued
+            if response.status_code in (200, 202, 204):
                 logger.info(f"[Roku] Launched app: {app_name}")
                 return True
             else:
