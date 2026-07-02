@@ -2837,6 +2837,43 @@ upsell prompts.** Fixes in `src/autonomous_mode.py`:
   `test_is_audio_flowing_with_ad_blocker`, broken since the June
   `recent_level` silence-threshold change).
 
+**3. 48-hour live-watch follow-ups (Jul 2026).** A monitored soak run
+immediately after the fixes above surfaced four more trap classes, all
+the same root shape — **an interrupting action firing on a VLM
+misclassification without consulting an authoritative signal** (the
+CLAUDE.md invariant). Every VLM-driven interrupting action is now
+guarded; each was observed live before being fixed:
+- **"Sign in to YouTube TV" activation screen** (Enter this code /
+  tv.youtube.com/start / scan with your phone) matched NO detector and
+  stalled a session 40 min. Its markers were added to
+  `KEYBOARD_STUCK_KEYWORDS` (incl. OCR-merged `enterthis code`) and
+  `'sign in to youtube tv'` to `YOUTUBE_TV_PROMPT_KEYWORDS`.
+- **MENU skip-loop watchdog** (`_menu_skip_count`,
+  `_MENU_SKIP_ESCAPE_AT=5`): the "MENU select skipped — home OCR not
+  confirmed" guard could no-op forever on unrecognized dead-end
+  screens. After 5 consecutive skips (~3 min, no audio/overlay/home) it
+  runs `_escape_stuck_state()`. Verified live twice: dead-end → escape →
+  ECP home detect → relaunch → new video in ~3 min.
+- **SCREENSAVER→launch guarded** by audio + a Roku ECP re-check
+  (screensaver absent + app 837 ⇒ dark playing frame): unguarded, VLM's
+  SCREENSAVER misreads of dark scenes ran `_wake_device` (power+home) +
+  relaunch, killing playback every ~2 min.
+- **Keyboard-stuck escape audio-guarded**: the character-pattern
+  heuristic (many short OCR fragments + digits) false-positived on a
+  playing video and the 4-Back escape exited YouTube. Real sign-in
+  screens are silent, so audio flowing vetoes the escape.
+- **DIALOG→dismiss audio-guarded** (the last unguarded action): VLM
+  misread playing frames as DIALOG twice in one hour; each `back` exited
+  the video into a ~3-min watchdog recovery. Real blocking dialogs pause
+  playback (no audio) and are still dismissed; a banner over a playing
+  video just lingers.
+- Also: Roku ECP `202 Accepted` now counts as keypress/launch success
+  (was logged as failure under load).
+Tests: `TestYouTubeTVActivationScreen`, `TestMenuSkipWatchdog`,
+`TestScreensaverLaunchGuards`, `TestKeyboardStuckAudioGuard`,
+`TestDialogDismissAudioGuard` in `tests/test_autonomous_mode.py`;
+`TestKeypressStatusCodes` in `tests/test_roku_reconnect.py`.
+
 ### Axera libaxcl_*.so broken symlinks — VLM dead at boot (May 2026)
 
 **Symptom:** VLM marked `disabled` in `/api/health.subsystems.vlm`

@@ -2062,6 +2062,22 @@ class AutonomousMode:
                 # If the dialog actually paused the video (e.g. "Are you
                 # still watching?"), the next pause-detection cycle will
                 # send play_pause via the "play" action.
+                #
+                # AUDIO GUARD (the LAST interrupting action to get one):
+                # observed live 2026-07-02 04:36 + 05:07 — audio was
+                # flowing 30-60s before each DIALOG verdict; VLM had
+                # misread a playing-video frame as DIALOG and the `back`
+                # press EXITED the video, costing a ~3-min watchdog
+                # recovery each time. Real blocking dialogs ("Are you
+                # still watching?") pause playback → no audio → still
+                # dismissed. A banner over a playing video merely lingers
+                # (video keeps playing underneath) — acceptable.
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] DIALOG verdict vetoed: "
+                                "audio flowing — video is playing")
+                    self._log_event("DIALOG vetoed: audio flowing")
+                    self._last_screen_state = 'playing'
+                    return False
                 self._device_controller.send_command("back")
                 logger.info("[AutonomousMode] Dismissed dialog with back")
 

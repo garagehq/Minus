@@ -1759,6 +1759,51 @@ class TestKeyboardStuckAudioGuard(unittest.TestCase):
             _cleanup_mode(mode)
 
 
+class TestDialogDismissAudioGuard(unittest.TestCase):
+    """DIALOG→back must be vetoed while audio flows: VLM misreads playing
+    frames as DIALOG and back EXITS the video (observed live 2026-07-02,
+    twice, each costing a ~3-min watchdog recovery)."""
+
+    def _dialog_mode(self):
+        mode = _make_mode()
+        roku = MagicMock()
+        roku.is_connected.return_value = True
+        roku.send_command.return_value = True
+        mode.set_device_controller(roku, 'roku')
+        _set_ocr_texts(mode, [])
+        mode._ad_blocker.display_connected = False
+        mode._check_roku_active_app = MagicMock(return_value=True)
+        mode._is_roku_home_screen = MagicMock(return_value=False)
+        mode._is_keyboard_stuck_screen = MagicMock(return_value=False)
+        mode._is_youtube_tv_prompt = MagicMock(return_value=False)
+        mode._is_survey_screen = MagicMock(return_value=False)
+        mode._is_signed_out_screen = MagicMock(return_value=False)
+        mode._is_youtube_login_screen = MagicMock(return_value=False)
+        mode._is_youtube_shorts = MagicMock(return_value=False)
+        mode._is_youtube_home_screen = MagicMock(return_value=False)
+        mode._query_screen = MagicMock(return_value="DIALOG")
+        return mode, roku
+
+    def test_audio_flowing_vetoes_dismiss(self):
+        mode, roku = self._dialog_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=True)
+            self.assertFalse(mode._ensure_youtube_playing())
+            roku.send_command.assert_not_called()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_silent_dialog_still_dismissed(self):
+        """Real blocking dialogs pause playback (no audio) → back sent."""
+        mode, roku = self._dialog_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            self.assertTrue(mode._ensure_youtube_playing())
+            roku.send_command.assert_called_with("back")
+        finally:
+            _cleanup_mode(mode)
+
+
 class TestScreensaverLaunchGuards(unittest.TestCase):
     """The SCREENSAVER→launch action must consult authoritative playback
     signals (audio, Roku ECP) before wake+relaunch. Observed live
