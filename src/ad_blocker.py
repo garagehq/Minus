@@ -308,17 +308,38 @@ class DRMAdBlocker:
             logger.debug(f"[DRMAdBlocker] API call error ({endpoint}): {e}")
             return None
 
+    def _color_settings_neutral(self, settings=None):
+        """True when color settings are identity (no adjustment needed)."""
+        s = settings or getattr(self, '_saved_color_settings', None) or {}
+        return (abs(s.get('saturation', 1.0) - 1.0) < 1e-6
+                and abs(s.get('brightness', 0.0)) < 1e-6
+                and abs(s.get('contrast', 1.0) - 1.0) < 1e-6
+                and abs(s.get('hue', 0.0)) < 1e-6)
+
     def _init_pipeline(self):
         """Initialize simple GStreamer display pipeline with queue element."""
         try:
             # Simple pipeline with small queue for low latency
             # - 3 buffer queue provides minimal latency while absorbing brief hiccups
             # - leaky=downstream drops oldest frames if queue fills (prevents latency buildup)
+            #
+            # videobalance is CPU per-pixel processing and the measured 4K
+            # ceiling with non-neutral settings is ~56fps (vs 120fps decode
+            # headroom without it). When the saved color settings are
+            # NEUTRAL, omit the element entirely so the DMABuf path from
+            # mppjpegdec to kmssink stays zero-copy. Crossing between
+            # neutral and non-neutral at runtime restarts the pipeline
+            # (see set_color_settings).
+            self._pipeline_has_colorbalance = not self._color_settings_neutral()
+            colorbalance_part = (
+                f"videobalance saturation=1.0 brightness=0.0 contrast=1.0 hue=0.0 name=colorbalance ! "
+                if self._pipeline_has_colorbalance else ""
+            )
             pipeline_str = (
                 f"souphttpsrc location=http://localhost:{self.ustreamer_port}/stream "
                 f"is-live=true blocksize=524288 timeout=10 retries=-1 keep-alive=true ! "
                 f"multipartdemux ! jpegparse ! mppjpegdec ! video/x-raw,format=NV12 ! "
-                f"videobalance saturation=1.0 brightness=0.0 contrast=1.0 hue=0.0 name=colorbalance ! "
+                f"{colorbalance_part}"
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "
                 f"identity name=fpsprobe ! "
                 f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
@@ -383,12 +404,14 @@ class DRMAdBlocker:
             'hue': 0.0
         }
 
+        saved = getattr(self, '_saved_color_settings', None)
         if not self.pipeline:
-            return defaults
+            return dict(saved) if saved else defaults
 
         colorbalance = self.pipeline.get_by_name('colorbalance')
         if not colorbalance:
-            return defaults
+            # Element omitted (neutral settings, zero-copy pipeline)
+            return dict(saved) if saved else defaults
 
         return {
             'saturation': colorbalance.get_property('saturation'),
@@ -414,7 +437,32 @@ class DRMAdBlocker:
 
         colorbalance = self.pipeline.get_by_name('colorbalance')
         if not colorbalance:
-            return {'success': False, 'error': 'Color balance element not found'}
+            # The pipeline was built without videobalance because settings
+            # were neutral (zero-copy fast path). If the new settings are
+            # still neutral there is nothing to do; otherwise persist them
+            # and rebuild the pipeline so the element gets inserted and
+            # _apply_saved_color_settings picks the values up.
+            merged = (getattr(self, '_saved_color_settings', None) or {
+                'saturation': 1.0, 'brightness': 0.0, 'contrast': 1.0, 'hue': 0.0}).copy()
+            if saturation is not None:
+                merged['saturation'] = max(0.0, min(2.0, float(saturation)))
+            if brightness is not None:
+                merged['brightness'] = max(-1.0, min(1.0, float(brightness)))
+            if contrast is not None:
+                merged['contrast'] = max(0.0, min(2.0, float(contrast)))
+            if hue is not None:
+                merged['hue'] = max(-1.0, min(1.0, float(hue)))
+
+            self._saved_color_settings = merged.copy()
+            self._save_color_settings(merged)
+
+            if self._color_settings_neutral(merged):
+                return {'success': True, **merged}
+
+            logger.info("[DRMAdBlocker] Color settings became non-neutral - "
+                        "restarting pipeline to insert videobalance")
+            self.restart()
+            return {'success': True, **merged}
 
         try:
             if saturation is not None:

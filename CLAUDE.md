@@ -2823,19 +2823,39 @@ the vocab card). Verified: overlay text renders, full blocking overlay
 clean, `/snapshot` + `/snapshot/raw` + OCR + VLM all work, stream
 returns to 60fps after the block ends.
 
-**Display-side (GStreamer) findings:** `mppjpegdec` + `videobalance`
-(even at sat=1.4/bri=0.2) + kmssink-path all sustain 60fps at **1080p**
-(benchmarked to fakesink — no TV was attached during this work). At
-**4K60** the VEPU encodes in ~18.4ms (54fps single-context, ~65fps
-aggregate across contexts) so 4K should now reach ~60fps, and the CPU
-`videobalance` at 4K60 is the most likely NEXT bottleneck (~12MB/frame
-per-pixel on throttled cores + it breaks DMABuf zero-copy into
-kmssink). If 4K display fps still falls short with the TV attached:
-benchmark `videobalance` at 4K, and consider `glcolorbalance` (GPU) or
-neutral-settings passthrough as the fix. Also note 4K NV12 zero-copy
-DMABUF import into MPP is fallback-protected but was NOT live-tested
-(no 4K source available headless) — check for a one-time
-"Zero-copy encode failed" log line when 4K first plays.
+**4K resilience validation (no 4K HDMI source available — validated
+with real 4K content in dma-heap buffers, the same memory class as
+V4L2 capture buffers):**
+- **Encoder**: the exact `MPP_BUFFER_TYPE_EXT_DMA` import path was
+  exercised at 3840×2160 with 16 real (upscaled-capture) NV12 frames in
+  CMA dmabufs: import OK, output JPEGs valid (~380KB @q80),
+  single-context 18.0ms/frame (55.4fps), **4-worker sustained aggregate
+  66.7fps over 10s** — 4K60 encode headroom confirmed
+  (`scratchpad/test4k_extdma.c` pattern).
+- **Display decode**: `mppjpegdec` at 4K does **120fps** to fakesink;
+  neutral `videobalance` passes through at 120fps; **non-neutral
+  videobalance (sat=1.4/bri=0.2, the saved user settings) caps 4K at
+  ~56fps** — the only remaining sub-60 link, CPU per-pixel.
+- **Dead ends tested**: GStreamer-GL (`glupload!glcolorbalance`)
+  SIGSEGVs on this BSP/Mali stack; VOP2 exposes no BCSH/saturation DRM
+  props (COLOR_ENCODING/COLOR_RANGE only); RGA has no saturation op;
+  feeding YUV444SP/BGR888 straight to the JPEG VEPU corrupts bitstreams.
+- **Mitigation shipped**: `ad_blocker._init_pipeline` now OMITS
+  `videobalance` entirely when saved color settings are neutral (pure
+  zero-copy DMABuf mppjpegdec→kmssink, 120fps headroom);
+  `set_color_settings` rebuilds the pipeline when settings cross
+  neutral↔non-neutral.
+- **Open lead for full 60fps at 4K WITH color correction** (needs the
+  TV attached to verify visually): the saved sat=1.4/bri=0.2 looks like
+  compensation for a **limited-range YCbCr HDMI capture being encoded
+  into JPEG (full-range container) and displayed as full-range** —
+  i.e., washed-out picture. If so, the proper fix is range expansion,
+  not saturation: either set the kmssink plane's `COLOR_RANGE` prop /
+  caps colorimetry, or do the limited→full range expansion in the
+  ustreamer RGA pass (RGA supports range conversion in `imcvtcolor`
+  modes). Then color settings can go neutral → zero-copy display path.
+  Test with the TV: `modetest -M rockchip` plane COLOR_RANGE, compare
+  picture with videobalance neutral.
 
 ### Roku sticky-disconnect + autonomous Shorts/YouTube-TV avoidance (Jul 2026)
 
