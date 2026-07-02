@@ -921,13 +921,17 @@ class AutonomousMode:
     ]
 
     # Keywords that indicate we're on the Roku home screen (not YouTube)
-    # These are app names and UI elements only visible on Roku home
+    # These are app names and UI elements only visible on Roku home.
+    # NOTE: 'watchnow' was removed 2026-07-02 — "Watch now" is a generic
+    # ad CTA (observed live: a YouTube ad's "Watch now" button OCR-merged
+    # to 'watchnow' and triggered a YouTube relaunch mid-video). The ECP
+    # active-app check is the authoritative Roku-home detector; this OCR
+    # fallback must only contain strings that CANNOT appear inside apps.
     ROKU_HOME_KEYWORDS = [
         'rokuchannel',
         'roku channel',
         'ad-free tv',
         'frndly',            # Frndly TV app on Roku
-        'watchnow',
         'press for more',    # Roku UI prompt
     ]
 
@@ -1440,6 +1444,13 @@ class AutonomousMode:
             return False  # Only for Roku
 
         try:
+            # Ad blocker actively blocking → the OCR text is from an AD,
+            # not the Roku home screen (observed live 2026-07-02: an ad's
+            # "Watch now" CTA matched this check mid-block and relaunched
+            # YouTube during a playing video).
+            if self._ad_blocker and getattr(self._ad_blocker, 'is_visible', False):
+                return False
+
             if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
                 texts = self._ad_blocker.last_ocr_texts
                 if texts:
@@ -1707,14 +1718,24 @@ class AutonomousMode:
                 self._consecutive_static = 0
                 return True
 
-            # OCR-based Roku home screen fallback (if ECP missed it)
+            # OCR-based Roku home screen fallback (if ECP missed it).
+            # AUDIO GUARD: the Roku home screen is essentially silent;
+            # continuous audio means an app is playing video and the OCR
+            # match came from in-app content (e.g. an ad CTA) — never
+            # relaunch over playing video on OCR evidence alone. The ECP
+            # active-app check above is authoritative and stays unguarded.
             if self._is_roku_home_screen():
-                logger.info("[AutonomousMode] Roku home detected via OCR - launching YouTube")
-                self._log_event("Roku home (OCR fallback) - launching YouTube")
-                self._launch_youtube()
-                self._consecutive_static = 0
-                self._stuck_count = 0
-                return True
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] Roku-home OCR match vetoed: "
+                                "audio flowing — video is playing")
+                    self._log_event("Roku-home OCR vetoed: audio flowing")
+                else:
+                    logger.info("[AutonomousMode] Roku home detected via OCR - launching YouTube")
+                    self._log_event("Roku home (OCR fallback) - launching YouTube")
+                    self._launch_youtube()
+                    self._consecutive_static = 0
+                    self._stuck_count = 0
+                    return True
 
             # STUCK DETECTION: Check for keyboard/sign-in screens we can't automate
             # This must come BEFORE other checks to escape stuck states quickly

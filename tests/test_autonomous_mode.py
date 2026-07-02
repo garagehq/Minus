@@ -1759,6 +1759,75 @@ class TestKeyboardStuckAudioGuard(unittest.TestCase):
             _cleanup_mode(mode)
 
 
+class TestRokuHomeOCRGuards(unittest.TestCase):
+    """The Roku-home OCR fallback must never relaunch over playing video:
+    observed live 2026-07-02, an ad's 'Watch now' CTA OCR-merged to
+    'watchnow' and relaunched YouTube mid-ad-break."""
+
+    def _roku_mode(self, ocr_texts):
+        mode = _make_mode()
+        roku = MagicMock()
+        roku.is_connected.return_value = True
+        mode.set_device_controller(roku, 'roku')
+        _set_ocr_texts(mode, ocr_texts)
+        return mode, roku
+
+    def test_watch_now_cta_no_longer_matches(self):
+        mode, roku = self._roku_mode(["WatchNow", "Get 3 months free"])
+        try:
+            self.assertFalse(mode._is_roku_home_screen())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_distinctive_keywords_still_match(self):
+        mode, roku = self._roku_mode(["Roku Channel", "Frndly TV", "hulu"])
+        try:
+            self.assertTrue(mode._is_roku_home_screen())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_suppressed_while_ad_blocking(self):
+        mode, roku = self._roku_mode(["Roku Channel"])
+        try:
+            mode._ad_blocker.is_visible = True
+            self.assertFalse(mode._is_roku_home_screen())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_audio_flowing_vetoes_ocr_relaunch(self):
+        """OCR says Roku home but audio flows → no relaunch."""
+        mode, roku = self._roku_mode(["Roku Channel"])
+        try:
+            mode._check_roku_active_app = MagicMock(return_value=True)
+            mode._is_audio_flowing = MagicMock(return_value=True)
+            mode._launch_youtube = MagicMock()
+            mode._is_keyboard_stuck_screen = MagicMock(return_value=False)
+            mode._is_youtube_tv_prompt = MagicMock(return_value=False)
+            mode._is_survey_screen = MagicMock(return_value=False)
+            mode._is_signed_out_screen = MagicMock(return_value=False)
+            mode._is_youtube_login_screen = MagicMock(return_value=False)
+            mode._is_youtube_shorts = MagicMock(return_value=False)
+            mode._is_youtube_home_screen = MagicMock(return_value=False)
+            mode._ad_blocker.display_connected = False
+            mode._query_screen = MagicMock(return_value="PLAYING")
+            mode._is_screen_static = MagicMock(return_value=False)
+            self.assertFalse(mode._ensure_youtube_playing())
+            mode._launch_youtube.assert_not_called()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_silent_roku_home_still_relaunches(self):
+        mode, roku = self._roku_mode(["Roku Channel"])
+        try:
+            mode._check_roku_active_app = MagicMock(return_value=True)
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            mode._launch_youtube = MagicMock(return_value=True)
+            self.assertTrue(mode._ensure_youtube_playing())
+            mode._launch_youtube.assert_called_once()
+        finally:
+            _cleanup_mode(mode)
+
+
 class TestDialogDismissAudioGuard(unittest.TestCase):
     """DIALOG→back must be vetoed while audio flows: VLM misreads playing
     frames as DIALOG and back EXITS the video (observed live 2026-07-02,
