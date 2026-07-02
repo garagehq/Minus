@@ -2157,7 +2157,44 @@ class AutonomousMode:
                 self._log_event("Selected video from menu")
 
             elif action == "launch":
-                # Screensaver/sleep - wake up and launch YouTube
+                # Screensaver/sleep per VLM - wake up and launch YouTube.
+                # GUARDS (per the ARCHITECTURAL INVARIANT above — this was
+                # the one interrupting action without any): VLM regularly
+                # misclassifies dark playing scenes as SCREENSAVER.
+                # Observed live 2026-07-02: a video that was demonstrably
+                # playing (audio-flowing vetoes 30s earlier, ECP reporting
+                # YouTube active with no screensaver) drew a SCREENSAVER
+                # verdict → _wake_device (power+home) + relaunch killed
+                # playback, bounced through the Roku home screen, and
+                # churned to a new video every ~2 min.
+                #
+                # AUDIO GUARD: real screensavers are silent; audio flowing
+                # means a video is playing and VLM misread a dark frame.
+                if self._is_audio_flowing():
+                    logger.info("[AutonomousMode] SCREENSAVER verdict vetoed: "
+                                "audio flowing — video is playing")
+                    self._log_event("SCREENSAVER vetoed: audio flowing")
+                    self._last_screen_state = 'playing'
+                    return False
+
+                # ROKU ECP GUARD: ECP is authoritative for screensaver
+                # state. The active-app check at the top of this cycle
+                # already dismissed a real screensaver overlay, so if ECP
+                # still reports YouTube active with no screensaver, this
+                # is a dark/quiet playing frame — don't wake+relaunch.
+                if (self._device_type == DEVICE_TYPE_ROKU
+                        and hasattr(self._device_controller, 'is_screensaver_active')
+                        and hasattr(self._device_controller, 'get_active_app_id')):
+                    try:
+                        if (not self._device_controller.is_screensaver_active()
+                                and self._device_controller.get_active_app_id() == '837'):
+                            logger.info("[AutonomousMode] SCREENSAVER verdict vetoed: "
+                                        "ECP reports YouTube active, no screensaver")
+                            self._log_event("SCREENSAVER vetoed: ECP shows YouTube")
+                            return False
+                    except Exception as e:
+                        logger.debug(f"[AutonomousMode] ECP screensaver re-check failed: {e}")
+
                 self._wake_device()
                 time.sleep(2)
                 self._launch_youtube()

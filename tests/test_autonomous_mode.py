@@ -1717,6 +1717,84 @@ class TestMenuSkipWatchdog(unittest.TestCase):
             _cleanup_mode(mode)
 
 
+class TestScreensaverLaunchGuards(unittest.TestCase):
+    """The SCREENSAVER→launch action must consult authoritative playback
+    signals (audio, Roku ECP) before wake+relaunch. Observed live
+    2026-07-02: dark playing scenes drew SCREENSAVER verdicts and the
+    unguarded launch killed playback every ~2 min."""
+
+    def _screensaver_mode(self, device='roku'):
+        mode = _make_mode()
+        controller = MagicMock()
+        controller.is_connected.return_value = True
+        controller.send_command.return_value = True
+        mode.set_device_controller(controller, device)
+        _set_ocr_texts(mode, [])
+        mode._ad_blocker.display_connected = False  # skip audio-recovery section
+        mode._check_roku_active_app = MagicMock(return_value=True)
+        mode._is_roku_home_screen = MagicMock(return_value=False)
+        mode._is_keyboard_stuck_screen = MagicMock(return_value=False)
+        mode._is_youtube_tv_prompt = MagicMock(return_value=False)
+        mode._is_survey_screen = MagicMock(return_value=False)
+        mode._is_signed_out_screen = MagicMock(return_value=False)
+        mode._is_youtube_login_screen = MagicMock(return_value=False)
+        mode._is_youtube_shorts = MagicMock(return_value=False)
+        mode._is_youtube_home_screen = MagicMock(return_value=False)
+        mode._query_screen = MagicMock(return_value="SCREENSAVER")
+        mode._wake_device = MagicMock()
+        mode._launch_youtube = MagicMock(return_value=True)
+        return mode, controller
+
+    def test_audio_flowing_vetoes_launch(self):
+        mode, controller = self._screensaver_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=True)
+            self.assertFalse(mode._ensure_youtube_playing())
+            mode._wake_device.assert_not_called()
+            mode._launch_youtube.assert_not_called()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_roku_ecp_youtube_active_vetoes_launch(self):
+        """No audio (quiet dark scene) but ECP says YouTube active with no
+        screensaver — VLM misread a dark frame; don't wake+relaunch."""
+        mode, controller = self._screensaver_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            controller.is_screensaver_active.return_value = False
+            controller.get_active_app_id.return_value = '837'
+            self.assertFalse(mode._ensure_youtube_playing())
+            mode._wake_device.assert_not_called()
+            mode._launch_youtube.assert_not_called()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_genuine_screensaver_still_launches(self):
+        """No audio + ECP confirms screensaver → wake+launch proceeds."""
+        mode, controller = self._screensaver_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            controller.is_screensaver_active.return_value = True
+            with patch("autonomous_mode.time.sleep"):
+                self.assertTrue(mode._ensure_youtube_playing())
+            mode._wake_device.assert_called_once()
+            mode._launch_youtube.assert_called_once()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_fire_tv_no_audio_still_launches(self):
+        """Non-Roku device with no audio: no ECP to consult, launch runs."""
+        mode, controller = self._screensaver_mode(device='fire_tv')
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            with patch("autonomous_mode.time.sleep"):
+                self.assertTrue(mode._ensure_youtube_playing())
+            mode._wake_device.assert_called_once()
+            mode._launch_youtube.assert_called_once()
+        finally:
+            _cleanup_mode(mode)
+
+
 # =============================================================================
 # YouTube Shorts Detection Tests
 # =============================================================================
