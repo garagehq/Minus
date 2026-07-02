@@ -2775,6 +2775,68 @@ disable when upstream is fixed).
 constant + `_inferences_since_restart` counter + restart trigger in
 `transcribe()`), CLAUDE.md.
 
+### 60fps pipeline fix — ustreamer zero-copy VPU + RGA (Jul 2026)
+
+The HDMI pipeline capped at **27-30fps** (dipping to 23) at every
+resolution despite the VPU being rated 4K60. Diagnosed with ustreamer's
+`--perf` logging + standalone MPP/RGA benchmarks; fixed on the
+`fix/fps-early-buffer-release` branch of `ustreamer-garagehq`
+(commit `32ab470`), deployed to `/home/radxa/ustreamer-patched`
+(backup: `ustreamer-patched.bak-pre-60fps`). Measured: **29.4 → 60.0 fps**
+served at 1080p60 NV24, grab-to-expose latency **110ms → 17ms**.
+
+Three stacked root causes, all in the ustreamer fork:
+1. **Deferred V4L2 buffer release starved capture to half rate.** A
+   worker's capture buffer was only decref'd when the dispatcher next
+   picked that worker (~100ms later), permanently pinning 4 of 5 V4L2
+   buffers — `captured_fps` dropped 60→30 the moment a client attached.
+   Buffers are now released inside the worker right after encode.
+2. **The CPU touched every pixel of UNCACHED V4L2 mmap memory.** The
+   per-frame copy/convert into the MPP buffer read uncached DMA memory:
+   ~90ms per 1080p NV24 frame (vs ~5ms actual VPU encode; benchmarked
+   213fps pure VPU at 1080p). Replaced with hardware paths:
+   - **NV12 sources (4K)**: V4L2 DMABUF imported directly into MPP
+     (`MPP_BUFFER_TYPE_EXT_DMA`) — true zero-copy, VPU reads via IOMMU.
+     `dma_export` enabled for the MPP encoder type in `stream.c`.
+   - **NV24 sources (1080p YCbCr 4:4:4, e.g. Roku)**: two RGA passes —
+     Y plane copied as an RGBA-reinterpreted image; the NV24 UV plane
+     viewed as RGBA (each px = U0V0U1V1) downscaled 2× == exactly the
+     NV12 UV plane layout. ~2.4ms/frame. NOTE: RGA has no native
+     YUV444SP support, and feeding YUV444SP/BGR888 directly to the JPEG
+     VEPU produces CORRUPT bitstreams (tested — the old "only NV12 is
+     reliable" comment was right); the RGA plane tricks are the way.
+   - **BGR24 sources (Google TV)**: RGA `imcvtcolor` (~2ms, benchmarked
+     478fps).
+   Import handles are cached per fd; ANY hardware-path failure logs once
+   and permanently falls back to the old CPU path (`zero_copy_broken` /
+   `rga_broken`).
+3. Minor: per-frame full-buffer `memset` removed (cleared once at
+   configure); releaser poll 5ms → 1ms.
+
+**Feature preservation (verified live):** blocking composite and the
+notification overlay REQUIRE CPU pixel access, so the encoder checks
+`us_blocking_is_enabled_fast()` and the new `us_overlay_is_enabled()`
+per frame and routes through the legacy CPU path while either is active
+(fps drops to CPU rates during a block — acceptable, the screen shows
+the vocab card). Verified: overlay text renders, full blocking overlay
+(header/vocab/preview/stats/OCR-snippet) renders, path switching is
+clean, `/snapshot` + `/snapshot/raw` + OCR + VLM all work, stream
+returns to 60fps after the block ends.
+
+**Display-side (GStreamer) findings:** `mppjpegdec` + `videobalance`
+(even at sat=1.4/bri=0.2) + kmssink-path all sustain 60fps at **1080p**
+(benchmarked to fakesink — no TV was attached during this work). At
+**4K60** the VEPU encodes in ~18.4ms (54fps single-context, ~65fps
+aggregate across contexts) so 4K should now reach ~60fps, and the CPU
+`videobalance` at 4K60 is the most likely NEXT bottleneck (~12MB/frame
+per-pixel on throttled cores + it breaks DMABuf zero-copy into
+kmssink). If 4K display fps still falls short with the TV attached:
+benchmark `videobalance` at 4K, and consider `glcolorbalance` (GPU) or
+neutral-settings passthrough as the fix. Also note 4K NV12 zero-copy
+DMABUF import into MPP is fallback-protected but was NOT live-tested
+(no 4K source available headless) — check for a one-time
+"Zero-copy encode failed" log line when 4K first plays.
+
 ### Roku sticky-disconnect + autonomous Shorts/YouTube-TV avoidance (Jul 2026)
 
 **1. Roku connection died ~daily and never came back (sticky disconnect).**
