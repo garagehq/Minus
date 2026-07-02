@@ -206,6 +206,16 @@ class AutonomousMode:
         self._menu_skip_count: int = 0
         self._MENU_SKIP_ESCAPE_AT = 5
 
+        # Timestamp of the last _is_audio_flowing() == True observation.
+        # Destructive guards use _audio_recently_flowing() instead of the
+        # instantaneous check: pre-roll ad pods have silent gaps of a few
+        # seconds between ads, and a VLM misfire inside such a gap slipped
+        # past the instantaneous guard (observed live 2026-07-02 17:21:
+        # DIALOG verdict 4s after an ad block ended → back exited the
+        # just-started video → home → re-select churn, 7 videos in 15 min).
+        self._last_audio_flowing_time: Optional[float] = None
+        self._AUDIO_RECENT_WINDOW = 20.0
+
         # Logging
         self._log_file = "/home/radxa/Minus/autonomous-mode-logs.md"
 
@@ -874,6 +884,8 @@ class AutonomousMode:
                     f"(threshold={self.AUDIO_SILENCE_THRESHOLD}) "
                     f"flowing={is_flowing}"
                 )
+                if is_flowing:
+                    self._last_audio_flowing_time = time.time()
                 return is_flowing
             except Exception:
                 pass
@@ -885,9 +897,27 @@ class AutonomousMode:
                 content = f.read()
             is_running = 'state: RUNNING' in content
             logger.debug(f"[AutonomousMode] ALSA capture: {'RUNNING' if is_running else 'not running'}")
+            if is_running:
+                self._last_audio_flowing_time = time.time()
             return is_running
         except Exception:
             return False
+
+    def _audio_recently_flowing(self) -> bool:
+        """True if audio is flowing now OR flowed within the last
+        _AUDIO_RECENT_WINDOW seconds.
+
+        Used by DESTRUCTIVE guards (dismiss/back, keyboard escape) where a
+        few-second silent gap between pre-roll ads must not count as "not
+        playing". A real blocking dialog / sign-in screen sits silent for
+        minutes, so it still gets handled one cycle after the window
+        expires (~1 min at the 33s cycle cadence).
+        """
+        if self._is_audio_flowing():
+            return True
+        if self._last_audio_flowing_time is None:
+            return False
+        return (time.time() - self._last_audio_flowing_time) < self._AUDIO_RECENT_WINDOW
 
     # Keywords that indicate YouTube login/account selection screen
     # Includes variants to handle OCR noise (missing/merged spaces)
@@ -1747,7 +1777,9 @@ class AutonomousMode:
                 # positived on a playing video frame and the 4-Back
                 # escape exited YouTube to the Roku home screen. Audio
                 # flowing means a video is playing — never escape.
-                if self._is_audio_flowing():
+                # Uses the 20s-recent window so ad-pod silence gaps don't
+                # count as "not playing" (see the dismiss guard).
+                if self._audio_recently_flowing():
                     logger.info("[AutonomousMode] Keyboard-screen verdict vetoed: "
                                 "audio flowing — video is playing")
                     self._log_event("Keyboard verdict vetoed: audio flowing")
@@ -2093,7 +2125,13 @@ class AutonomousMode:
                 # still watching?") pause playback → no audio → still
                 # dismissed. A banner over a playing video merely lingers
                 # (video keeps playing underneath) — acceptable.
-                if self._is_audio_flowing():
+                # RECENCY (added same day, 17:21 incident): uses the
+                # 20s-recent window, not the instantaneous check — a
+                # DIALOG misfire inside a silent gap BETWEEN pre-roll ads
+                # slipped past the instant guard and back-exited the
+                # just-started video. Real dialogs sit silent for minutes,
+                # so they're still dismissed one cycle after the window.
+                if self._audio_recently_flowing():
                     logger.info("[AutonomousMode] DIALOG verdict vetoed: "
                                 "audio flowing — video is playing")
                     self._log_event("DIALOG vetoed: audio flowing")

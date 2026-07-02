@@ -1872,6 +1872,32 @@ class TestDialogDismissAudioGuard(unittest.TestCase):
         finally:
             _cleanup_mode(mode)
 
+    def test_recent_audio_vetoes_dismiss_during_ad_gap(self):
+        """Silent gap between pre-roll ads: audio flowed seconds ago —
+        the recency window must veto the back press (live incident
+        2026-07-02 17:21: DIALOG misfire 4s after an ad block ended
+        back-exited the just-started video)."""
+        mode, roku = self._dialog_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            mode._last_audio_flowing_time = time.time() - 5.0
+            self.assertFalse(mode._ensure_youtube_playing())
+            roku.send_command.assert_not_called()
+        finally:
+            _cleanup_mode(mode)
+
+    def test_stale_audio_does_not_veto_dismiss(self):
+        """Audio last flowed beyond the window → real silent dialog,
+        dismiss proceeds."""
+        mode, roku = self._dialog_mode()
+        try:
+            mode._is_audio_flowing = MagicMock(return_value=False)
+            mode._last_audio_flowing_time = time.time() - 60.0
+            self.assertTrue(mode._ensure_youtube_playing())
+            roku.send_command.assert_called_with("back")
+        finally:
+            _cleanup_mode(mode)
+
 
 class TestScreensaverLaunchGuards(unittest.TestCase):
     """The SCREENSAVER→launch action must consult authoritative playback
