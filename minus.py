@@ -1433,6 +1433,19 @@ class Minus:
             # Initialize notification overlay
             roku_notification = RokuNotification(ustreamer_port=self.config.ustreamer_port)
             self.roku_controller = RokuController()
+
+            # Persist the Roku's IP whenever auto-reconnect follows it to a
+            # new DHCP address, so the next service restart connects directly.
+            self.roku_controller.set_ip_change_callback(self._persist_roku_ip)
+
+            # Wire autonomous mode immediately (not only on success):
+            # every autonomous action gates on is_connected(), so if the
+            # initial connect fails and the background reconnect succeeds
+            # later, autonomous mode starts working without user help.
+            if self.autonomous_mode:
+                self.autonomous_mode.set_device_controller(self.roku_controller, 'roku')
+                logger.info("[AutonomousMode] Roku controller wired")
+
             connected = False
             connected_ip = None
 
@@ -1487,11 +1500,6 @@ class Minus:
                 except Exception as e:
                     logger.warning(f"[Roku] Could not update config: {e}")
 
-                # Connect autonomous mode to Roku controller
-                if self.autonomous_mode:
-                    self.autonomous_mode.set_device_controller(self.roku_controller, 'roku')
-                    logger.info("[AutonomousMode] Roku controller connected")
-
                 # Check if Roku is in limited mode
                 control_mode = self.roku_controller.check_control_mode()
                 if control_mode == 'limited':
@@ -1523,9 +1531,28 @@ class Minus:
             else:
                 logger.warning("[Roku] Could not connect to any Roku device")
                 roku_notification.show_failed("No Roku found")
+                # Keep trying in the background: the Roku may be powered
+                # off or mid-reboot at service start. The reconnect loop
+                # retries the saved IP every 10s and periodically rescans
+                # the network; a user disconnect via the web UI stops it.
+                self.roku_controller.start_monitoring(saved_ip)
+                logger.info("[Roku] Background reconnect armed" +
+                            (f" (saved IP {saved_ip})" if saved_ip else " (will rescan network)"))
 
         except Exception as e:
             logger.error(f"[Roku] Error starting Roku connection: {e}")
+
+    def _persist_roku_ip(self, new_ip: str):
+        """Persist the Roku's IP after auto-reconnect followed it to a new address."""
+        try:
+            from src.device_config import get_device_config_manager
+            manager = get_device_config_manager()
+            if manager.config.device_ip != new_ip:
+                manager.set_device_ip(new_ip)
+                manager.set_setup_complete(True)
+                logger.info(f"[Roku] Saved new Roku IP {new_ip}")
+        except Exception as e:
+            logger.warning(f"[Roku] Could not persist new IP {new_ip}: {e}")
 
     def _on_fire_tv_state_change(self, new_state: str):
         """Handle Fire TV setup state changes."""

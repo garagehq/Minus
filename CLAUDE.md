@@ -2775,6 +2775,68 @@ disable when upstream is fixed).
 constant + `_inferences_since_restart` counter + restart trigger in
 `transcribe()`), CLAUDE.md.
 
+### Roku sticky-disconnect + autonomous Shorts/YouTube-TV avoidance (Jul 2026)
+
+**1. Roku connection died ~daily and never came back (sticky disconnect).**
+`RokuController._reconnect_loop` only called `connect()` when the live
+HTTP health check was *currently failing*. Roku devices reboot nightly
+(update check): during the reboot the check failed, `_connected` was
+cleared, the single immediate reconnect attempt failed while the device
+was still booting — and once the Roku came back the health check passed
+again, so `connect()` was never called and the controller stayed
+"disconnected" until the user reconnected via the web UI. A transient
+keypress error (`_send_keypress` sets `_connected = False`) hit the same
+trap. Fixes in `src/roku.py`:
+- Reconnect tick (`_reconnect_tick`, split out of the loop for tests) now
+  reconnects when **either** the health check fails **or** the
+  `_connected` flag was dropped.
+- **DHCP-change recovery:** every 3rd consecutive failure the loop falls
+  back to SSDP rediscovery (`_rediscover_and_connect`), preferring the
+  same physical device by **serial number** (a different-serial Roku is
+  never hijacked). On success at a new IP it fires the new
+  `set_ip_change_callback`, which `minus.py._persist_roku_ip` uses to
+  save the address to `~/.minus_device_config.json` for the next restart.
+- **Startup resilience:** `_start_roku_connection` now wires autonomous
+  mode + the ip-change callback immediately after constructing the
+  controller, and on total startup failure arms
+  `start_monitoring(saved_ip)` so the background loop keeps retrying /
+  rescanning until the Roku appears. User-initiated `disconnect()` (web
+  UI device switch) permanently stops the loop — auto-reconnect never
+  fights an explicit disconnect. `disconnect()` also now joins the
+  reconnect thread *outside* the lock (the loop's `connect()` takes the
+  same lock; joining under it could orphan a thread that reconnected
+  after the user disconnected).
+- Tests: `tests/test_roku_reconnect.py` (12 tests incl. the
+  dropped-flag regression and serial-match rediscovery).
+
+**2. Autonomous mode kept landing in YouTube Shorts and on YouTube TV
+upsell prompts.** Fixes in `src/autonomous_mode.py`:
+- **YouTube TV prompts:** new `_is_youtube_tv_prompt()` +
+  `YOUTUBE_TV_PROMPT_KEYWORDS`/`_MARKERS`. Exact promo phrases
+  ("cable-free live tv", "try youtube tv", …) OR `"youtube tv"` +
+  a promo marker (free trial / per month / sign up / live tv) — plain
+  "youtube tv" alone is NOT enough (video titles contain it). Dispatch
+  (right after the keyboard-stuck check) presses Back, escalating to
+  `_full_reset_to_youtube()` after `_STUCK_THRESHOLD` consecutive hits.
+  Suppressed while the ad blocker is visible (a YouTube TV *ad* belongs
+  to ad handling; Back mid-ad could exit the video).
+- **Shorts:** the old OCR duration check was a tautology
+  (`any(c.isdigit() and ':' in combined for c in combined)` ≡ "any digit
+  + any colon anywhere") so `@handle + subscribe + no duration` almost
+  never fired. Now a real `\b\d{1,2}:\d{2}\b` time-marker regex. Added a
+  second, OCR-independent signal: `_is_vertical_video_frame()` detects
+  the pillarboxed 9:16 format (outer 22% side bands dark `<25` AND flat
+  `std<6` — true bars are flat; gray-converted noise in a dark movie
+  scene is ~8 — plus a center ≥4× brighter), **double-confirmed on two
+  frames ~2s apart** so a single dark movie shot can't trigger a Back
+  press on a playing video. Skipped while blocking is active. The Shorts
+  escape also gained the same stuck-escalation → full reset. Existing
+  home-screen "push past the Shorts row" navigation is unchanged.
+- Tests: `TestYouTubeTVPromptDetection` + `TestShortsDetection` in
+  `tests/test_autonomous_mode.py` (also repaired the stale
+  `test_is_audio_flowing_with_ad_blocker`, broken since the June
+  `recent_level` silence-threshold change).
+
 ### Axera libaxcl_*.so broken symlinks — VLM dead at boot (May 2026)
 
 **Symptom:** VLM marked `disabled` in `/api/health.subsystems.vlm`

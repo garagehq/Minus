@@ -920,6 +920,38 @@ class AutonomousMode:
         'press for more',    # Roku UI prompt
     ]
 
+    # Phrases that only appear on YouTube TV (the paid live-TV service)
+    # promo/upsell prompts that autonomous mode sometimes lands on from
+    # the YouTube home screen or after a mis-navigation. These screens are
+    # dead ends: every selectable option leads to sign-up/payment flows.
+    # Each phrase is specific to the promo layout and never appears during
+    # normal video playback or on the regular home rows.
+    YOUTUBE_TV_PROMPT_KEYWORDS = [
+        'cable-free live tv',
+        'cablefree live tv',
+        'cable free live tv',
+        'try youtube tv',
+        'tryyoutube tv',     # OCR sometimes merges spaces
+        'youtube tv free trial',
+        'new users only. terms apply',
+    ]
+
+    # Generic promo markers: any of these *together with* "youtube tv" in
+    # the OCR text marks the screen as a YouTube TV upsell. "youtube tv"
+    # alone is NOT enough — video titles and search results legitimately
+    # contain it (e.g. "YouTube TV review").
+    YOUTUBE_TV_PROMPT_MARKERS = [
+        'free trial',
+        'try it free',
+        'try free',
+        'start trial',
+        'per month',
+        '/month',
+        '/mo',
+        'sign up',
+        'live tv',
+    ]
+
     # Keywords that indicate we're on a keyboard/sign-in screen (STUCK - need to escape)
     # These screens require manual input we can't provide - press Back to escape
     KEYBOARD_STUCK_KEYWORDS = [
@@ -1172,31 +1204,93 @@ class AutonomousMode:
             logger.debug(f"[AutonomousMode] Overlay check failed: {e}")
             return False
 
-    def _is_youtube_shorts(self) -> bool:
-        """Check if we're watching YouTube Shorts (short-form video).
+    def _is_vertical_video_frame(self, frame) -> bool:
+        """Detect a pillarboxed vertical video (Shorts/Reels format) frame.
 
-        Shorts have a distinctive UI:
-        - "@username" handle visible
-        - "Subscribe" button visible
-        - Hashtags like "#topic"
-        - No progress bar or video duration
+        A 9:16 video centered on a 16:9 display fills only ~32% of the
+        width; the black bars are ~34% on each side. We sample the outer
+        22% on each side (safely inside the bars) and the middle 20%
+        (safely inside the video) and require:
+          - both side bands dark AND uniform (low std) — true pillarbox
+            bars are flat black; a dark movie scene has texture
+          - the center clearly brighter than the sides
 
-        We want to exit Shorts and find full-length videos.
+        Callers double-confirm across two frames a couple of seconds apart
+        so a single unlucky movie shot can't false-trigger a Back press.
         """
         try:
+            if frame is None:
+                return False
+            h, w = frame.shape[:2]
+            if h == 0 or w <= h:
+                return False
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if len(frame.shape) == 3 else frame
+            side_w = max(1, int(w * 0.22))
+            left = gray[:, :side_w].astype(np.float32)
+            right = gray[:, w - side_w:].astype(np.float32)
+            center = gray[:, int(w * 0.40):int(w * 0.60)].astype(np.float32)
+
+            left_mean, right_mean = float(left.mean()), float(right.mean())
+            sides_dark = left_mean < 25 and right_mean < 25
+            # True pillarbox bars are FLAT (std ~1-3 from JPEG noise on
+            # video-range black). Keep this tight: even dim random noise
+            # grays out to std ~8 after BGR→gray conversion, and a dark
+            # movie scene with a lit center subject must not trigger a
+            # Back press on a playing video.
+            sides_flat = float(left.std()) < 6 and float(right.std()) < 6
+            center_mean = float(center.mean())
+            center_lit = center_mean > 40 and center_mean > 4 * max(left_mean, right_mean, 1.0)
+            return sides_dark and sides_flat and center_lit
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] Vertical-frame check error: {e}")
+            return False
+
+    def _is_youtube_shorts(self) -> bool:
+        """Check if we're watching YouTube Shorts (short-form vertical video).
+
+        We want to exit Shorts and find full-length videos. Two
+        complementary signals:
+
+        1. OCR signature — "@handle" + "subscribe" visible with no video
+           duration/progress time marker (Shorts have no progress bar).
+           Catches the moments the Shorts UI overlay is on screen.
+        2. Vertical-format frame — pillarboxed 9:16 video (dark uniform
+           side bars + lit center), confirmed on TWO frames ~2s apart.
+           Catches overlay-less playback where OCR sees nothing.
+        """
+        try:
+            # Signal 1: OCR signature
             if self._ad_blocker and hasattr(self._ad_blocker, 'last_ocr_texts'):
                 texts = self._ad_blocker.last_ocr_texts
                 if texts:
                     combined = ' '.join(str(t) for t in texts).lower()
 
-                    # Shorts UI pattern: has "@handle" and "subscribe" but no duration/progress indicators
                     has_handle = '@' in combined
                     has_subscribe = 'subscribe' in combined
-                    # Full videos have duration like "10:23" or progress indicators
-                    has_duration = any(c.isdigit() and ':' in combined for c in combined)
+                    # Full videos show a time marker like "10:23"; Shorts
+                    # never do. (The old check here was a tautology — it
+                    # matched any digit anywhere + any colon anywhere, so
+                    # it almost always suppressed detection.)
+                    has_duration = re.search(r'\b\d{1,2}:\d{2}\b', combined) is not None
 
                     if has_handle and has_subscribe and not has_duration:
-                        logger.debug("[AutonomousMode] Shorts pattern detected: @handle + subscribe, no duration")
+                        logger.info("[AutonomousMode] Shorts detected via OCR: "
+                                    "@handle + subscribe, no duration")
+                        return True
+
+            # Signal 2: vertical-format (pillarboxed) frames, double-checked.
+            # Skip while the blocking overlay is active — an ad is being
+            # handled and a Back press could exit the underlying video.
+            if self._frame_capture and not (
+                self._ad_blocker and getattr(self._ad_blocker, 'is_visible', False)
+            ):
+                frame = self._frame_capture.capture()
+                if self._is_vertical_video_frame(frame):
+                    time.sleep(2)
+                    frame2 = self._frame_capture.capture()
+                    if self._is_vertical_video_frame(frame2):
+                        logger.info("[AutonomousMode] Shorts detected via "
+                                    "vertical-format (pillarboxed) frames")
                         return True
 
             return False
@@ -1269,6 +1363,48 @@ class AutonomousMode:
 
         except Exception as e:
             logger.debug(f"[AutonomousMode] Survey screen check failed: {e}")
+            return False
+
+    def _is_youtube_tv_prompt(self) -> bool:
+        """Check if we've landed on a YouTube TV (live-TV service) upsell prompt.
+
+        These promo screens ("Try YouTube TV", "Cable-free live TV", free
+        trial offers) are dead ends for autonomous mode: every option leads
+        to a sign-up/payment flow. Detected via OCR — either an exact promo
+        phrase, or "youtube tv" combined with a promo marker (free trial /
+        pricing / sign up). The escape action is Back, escalating to a full
+        YouTube relaunch if the prompt keeps reappearing.
+        """
+        try:
+            # If the ad blocker is actively blocking, this is an *ad* for
+            # YouTube TV — let ad handling deal with it. Pressing Back
+            # mid-ad could exit the underlying video.
+            if self._ad_blocker and getattr(self._ad_blocker, 'is_visible', False):
+                return False
+
+            if not self._ad_blocker or not hasattr(self._ad_blocker, 'last_ocr_texts'):
+                return False
+            texts = self._ad_blocker.last_ocr_texts
+            if not texts:
+                return False
+            combined = ' '.join(str(t) for t in texts).lower()
+
+            for kw in self.YOUTUBE_TV_PROMPT_KEYWORDS:
+                if kw in combined:
+                    logger.info(f"[AutonomousMode] YouTube TV prompt detected: '{kw}'")
+                    return True
+
+            if 'youtube tv' in combined or 'youtubetv' in combined:
+                for marker in self.YOUTUBE_TV_PROMPT_MARKERS:
+                    if marker in combined:
+                        logger.info(f"[AutonomousMode] YouTube TV prompt detected: "
+                                    f"'youtube tv' + '{marker}'")
+                        return True
+
+            return False
+
+        except Exception as e:
+            logger.debug(f"[AutonomousMode] YouTube TV prompt check failed: {e}")
             return False
 
     def _is_roku_home_screen(self) -> bool:
@@ -1572,6 +1708,29 @@ class AutonomousMode:
                     self._escape_stuck_state()
                     return True
 
+            # YouTube TV upsell prompt — a dead end (every option leads to
+            # sign-up/payment flows). Press Back to dismiss; escalate to a
+            # full YouTube relaunch if it keeps reappearing.
+            if self._is_youtube_tv_prompt():
+                if self._last_screen_state == 'yttv_prompt':
+                    self._stuck_count += 1
+                else:
+                    self._stuck_count = 1
+                    self._last_screen_state = 'yttv_prompt'
+
+                if self._stuck_count >= self._STUCK_THRESHOLD:
+                    logger.warning(f"[AutonomousMode] Stuck on YouTube TV prompt "
+                                   f"({self._stuck_count}x) - full reset")
+                    self._full_reset_to_youtube()
+                    return True
+
+                logger.info("[AutonomousMode] YouTube TV prompt detected - pressing Back to dismiss")
+                self._log_event("YouTube TV prompt detected - pressing Back")
+                self._device_controller.send_command("back")
+                time.sleep(0.5)
+                self._consecutive_static = 0
+                return True
+
             # OCR-based screen detection (VLM often misclassifies static screens as PLAYING)
 
             # Check for survey dialog - need to skip it
@@ -1633,6 +1792,20 @@ class AutonomousMode:
 
             # Check if we're stuck in YouTube Shorts - exit back to home
             if self._is_youtube_shorts():
+                if self._last_screen_state == 'shorts':
+                    self._stuck_count += 1
+                else:
+                    self._stuck_count = 1
+                    self._last_screen_state = 'shorts'
+
+                if self._stuck_count >= self._STUCK_THRESHOLD:
+                    # Back isn't getting us out (or home keeps feeding us
+                    # back into the Shorts row) - full reset
+                    logger.warning(f"[AutonomousMode] Stuck in Shorts "
+                                   f"({self._stuck_count}x) - full reset")
+                    self._full_reset_to_youtube()
+                    return True
+
                 logger.info("[AutonomousMode] YouTube Shorts detected - exiting to find full video")
                 self._log_event("YouTube Shorts detected - pressing Back")
                 self._device_controller.send_command("back")

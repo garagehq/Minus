@@ -91,12 +91,25 @@ class RokuController:
         self._stop_reconnect = threading.Event()
         self._consecutive_failures = 0
 
+        # Serial number of the device we last connected to, so rediscovery
+        # after a DHCP change follows the SAME physical Roku (and can't
+        # hijack a second Roku on the network).
+        self._last_serial: Optional[str] = None
+
         # Connection callback
         self._on_connection_change: Optional[Callable[[bool], None]] = None
+
+        # Fired when auto-reconnect finds the Roku at a NEW IP address
+        # (DHCP lease change) so the owner can persist it.
+        self._on_ip_change: Optional[Callable[[str], None]] = None
 
     def set_connection_callback(self, callback: Callable[[bool], None]):
         """Set callback for connection state changes."""
         self._on_connection_change = callback
+
+    def set_ip_change_callback(self, callback: Callable[[str], None]):
+        """Set callback fired when auto-reconnect follows the Roku to a new IP."""
+        self._on_ip_change = callback
 
     def _notify_connection_change(self, connected: bool):
         """Notify callback of connection state change."""
@@ -230,6 +243,7 @@ class RokuController:
                     }
                     self._connected = True
                     self._consecutive_failures = 0
+                    self._last_serial = self._device_info.get('serial') or self._last_serial
                     logger.info(f"[Roku] Connected to {self._device_info['name']} ({self._device_info['model']})")
                     self._notify_connection_change(True)
                     self._start_reconnect_thread()
@@ -250,18 +264,37 @@ class RokuController:
                 return False
 
     def disconnect(self):
-        """Disconnect from Roku."""
-        with self._lock:
-            self._stop_reconnect.set()
-            if self._reconnect_thread:
-                self._reconnect_thread.join(timeout=2.0)
-                self._reconnect_thread = None
+        """Disconnect from Roku (user-initiated — permanently stops auto-reconnect)."""
+        # Stop the reconnect thread OUTSIDE the lock: the loop calls
+        # connect(), which takes the lock, so joining while holding it can
+        # time out and leave an orphan thread that reconnects after the
+        # user asked to disconnect.
+        self._stop_reconnect.set()
+        thread = self._reconnect_thread
+        self._reconnect_thread = None
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
 
+        with self._lock:
             if self._connected:
                 logger.info(f"[Roku] Disconnected from {self._ip_address}")
             self._connected = False
             self._device_info = None
-            self._notify_connection_change(False)
+        self._notify_connection_change(False)
+
+    def start_monitoring(self, ip_address: Optional[str] = None):
+        """Arm the auto-reconnect loop without requiring a successful
+        initial connection.
+
+        Used at startup when the saved Roku is unreachable (powered off,
+        rebooting, mid-DHCP-renew): the loop keeps retrying the saved IP
+        and periodically rescans the network, so the controller comes up
+        on its own once the device returns. A user-initiated disconnect()
+        still stops the loop for good.
+        """
+        if ip_address:
+            self._ip_address = ip_address
+        self._start_reconnect_thread()
 
     def _start_reconnect_thread(self):
         """Start connection monitoring thread."""
@@ -287,16 +320,86 @@ class RokuController:
             if self._stop_reconnect.is_set():
                 break
 
-            if not self._check_connection():
-                logger.warning("[Roku] Connection lost, attempting reconnect...")
-                self._connected = False
-                self._notify_connection_change(False)
+            self._reconnect_tick()
 
-                if self._ip_address:
-                    time.sleep(2.0)
-                    if self._stop_reconnect.is_set():
-                        break
-                    self.connect(self._ip_address)
+    def _reconnect_tick(self):
+        """One health-check / reconnect cycle (separated for testability).
+
+        Reconnects when EITHER the device stops answering ECP OR the
+        `_connected` flag was dropped by a failed keypress. Checking only
+        the live HTTP endpoint was a sticky trap: a transient outage
+        (Roku's nightly update reboot, a WiFi blip) cleared `_connected`,
+        the single immediate reconnect attempt failed while the device was
+        still booting, and once the Roku came back the health check passed
+        again — so connect() was never called and the controller stayed
+        "disconnected" until the user reconnected via the web UI.
+        """
+        if self._connected and self._check_connection():
+            self._consecutive_failures = 0
+            return
+
+        if self._connected:
+            logger.warning("[Roku] Connection lost, attempting reconnect...")
+            self._connected = False
+            self._notify_connection_change(False)
+
+        self._consecutive_failures += 1
+
+        if self._stop_reconnect.is_set():
+            return
+
+        # Try the last known IP first
+        if self._ip_address and self.connect(self._ip_address):
+            return
+
+        # The known IP keeps failing — the Roku may have picked up a new
+        # DHCP lease. Every 3rd consecutive failure (~30s), rescan the
+        # network and follow the device to its new address.
+        if self._consecutive_failures % 3 == 0 and not self._stop_reconnect.is_set():
+            self._rediscover_and_connect()
+
+    def _rediscover_and_connect(self) -> bool:
+        """Scan the network for the Roku after the saved IP went stale.
+
+        Prefers the same physical device (serial match); a device whose
+        serial definitely differs from the one we were paired with is
+        skipped. On success at a new address, fires the ip-change callback
+        so the owner can persist it for the next restart.
+        """
+        old_ip = self._ip_address
+        logger.info(f"[Roku] {old_ip or 'Saved IP'} unreachable — rescanning network "
+                    "(the Roku's IP may have changed)")
+        try:
+            devices = self.discover_devices(timeout=DISCOVERY_TIMEOUT)
+        except Exception as e:
+            logger.debug(f"[Roku] Rediscovery error: {e}")
+            return False
+
+        candidates = []
+        for device in devices:
+            serial = device.get('serial', '') or ''
+            if self._last_serial and serial and serial != self._last_serial:
+                continue  # a DIFFERENT Roku on the network — not ours
+            candidates.append(device)
+        # Exact serial matches first, unknown-serial entries as fallback
+        candidates.sort(key=lambda d: 0 if (self._last_serial and d.get('serial') == self._last_serial) else 1)
+
+        for device in candidates:
+            if self._stop_reconnect.is_set():
+                return False
+            ip = device.get('ip')
+            if not ip:
+                continue
+            if self.connect(ip):
+                if ip != old_ip:
+                    logger.info(f"[Roku] Roku moved {old_ip} -> {ip}")
+                    if self._on_ip_change:
+                        try:
+                            self._on_ip_change(ip)
+                        except Exception as e:
+                            logger.error(f"[Roku] IP-change callback error: {e}")
+                return True
+        return False
 
     def _check_connection(self) -> bool:
         """Check if connection is still alive."""

@@ -975,6 +975,11 @@ class WebUI:
                     manager.set_device_ip(ip)
                     manager.set_setup_complete(True)
 
+                    # Follow the Roku across DHCP changes and persist the
+                    # new IP (mirrors the startup wiring in minus.py)
+                    if hasattr(self.minus, '_persist_roku_ip'):
+                        self.minus.roku_controller.set_ip_change_callback(self.minus._persist_roku_ip)
+
                     # Connect autonomous mode to Roku controller
                     if hasattr(self.minus, 'autonomous_mode') and self.minus.autonomous_mode:
                         self.minus.autonomous_mode.set_device_controller(self.minus.roku_controller, 'roku')

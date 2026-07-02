@@ -1423,10 +1423,19 @@ class TestAutonomousModeStaticDetection(unittest.TestCase):
         try:
             mode._ad_blocker = MagicMock()
             mode._ad_blocker.audio = MagicMock()
-            mode._ad_blocker.audio.get_status.return_value = {'last_buffer_age': 0.5}
+            # Fresh buffer + real content level (above AUDIO_SILENCE_THRESHOLD)
+            mode._ad_blocker.audio.get_status.return_value = {
+                'last_buffer_age': 0.5, 'recent_level': 0.15}
             self.assertTrue(mode._is_audio_flowing())
 
-            mode._ad_blocker.audio.get_status.return_value = {'last_buffer_age': 10.0}
+            # Fresh buffer but digital silence (paused source keeps the
+            # HDMI carrier alive) — must NOT count as flowing
+            mode._ad_blocker.audio.get_status.return_value = {
+                'last_buffer_age': 0.5, 'recent_level': 0.0}
+            self.assertFalse(mode._is_audio_flowing())
+
+            mode._ad_blocker.audio.get_status.return_value = {
+                'last_buffer_age': 10.0, 'recent_level': 0.15}
             self.assertFalse(mode._is_audio_flowing())
         finally:
             _cleanup_mode(mode)
@@ -1526,6 +1535,214 @@ class TestAutonomousModeWakeDevice(unittest.TestCase):
             mode.set_device_controller(ftv, 'fire_tv')
             mode._wake_device()
             ftv.send_command.assert_called_with('wakeup')
+        finally:
+            _cleanup_mode(mode)
+
+
+# =============================================================================
+# YouTube TV Prompt Detection Tests
+# =============================================================================
+
+
+def _set_ocr_texts(mode, texts):
+    """Point the mode's mocked ad_blocker at the given OCR texts."""
+    mode._ad_blocker.last_ocr_texts = texts
+    mode._ad_blocker.is_visible = False
+
+
+class TestYouTubeTVPromptDetection(unittest.TestCase):
+    """Tests for _is_youtube_tv_prompt() — avoiding YouTube TV upsell screens."""
+
+    def test_exact_promo_phrase(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["YouTube TV", "Cable-free live TV", "Try it free"])
+            self.assertTrue(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_try_youtube_tv(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["Try YouTube TV", "Learn more"])
+            self.assertTrue(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_youtube_tv_plus_marker(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["YouTube TV", "$72.99 per month", "Sign up"])
+            self.assertTrue(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_youtube_tv_free_trial_merged(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["youtubetv", "free trial", "New users only"])
+            self.assertTrue(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_video_title_mentioning_youtube_tv_not_detected(self):
+        """A video titled 'YouTube TV review' must NOT trigger the escape."""
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["YouTube TV review 2026", "347K views", "3 days ago"])
+            self.assertFalse(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_normal_home_screen_not_detected(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["Recommended", "Trending", "Subscriptions"])
+            self.assertFalse(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_suppressed_while_ad_blocking(self):
+        """A YouTube TV *ad* is the ad blocker's problem — no Back press."""
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, ["Try YouTube TV", "free trial"])
+            mode._ad_blocker.is_visible = True
+            self.assertFalse(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_empty_ocr_not_detected(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, [])
+            self.assertFalse(mode._is_youtube_tv_prompt())
+        finally:
+            _cleanup_mode(mode)
+
+
+# =============================================================================
+# YouTube Shorts Detection Tests
+# =============================================================================
+
+
+class TestShortsDetection(unittest.TestCase):
+    """Tests for the improved _is_youtube_shorts() and vertical-frame check."""
+
+    @staticmethod
+    def _pillarboxed_frame(width=640, height=360, center_val=120):
+        """Synthetic Shorts-style frame: black side bars, lit vertical center."""
+        import numpy as np
+        frame = np.zeros((height, width, 3), dtype=np.uint8)
+        # Centered vertical video ~32% of width
+        x0 = int(width * 0.34)
+        x1 = int(width * 0.66)
+        frame[:, x0:x1] = center_val
+        return frame
+
+    def test_vertical_frame_detected(self):
+        mode = _make_mode()
+        try:
+            frame = self._pillarboxed_frame()
+            self.assertTrue(mode._is_vertical_video_frame(frame))
+        finally:
+            _cleanup_mode(mode)
+
+    def test_full_width_frame_not_vertical(self):
+        import numpy as np
+        mode = _make_mode()
+        try:
+            frame = np.full((360, 640, 3), 120, dtype=np.uint8)
+            self.assertFalse(mode._is_vertical_video_frame(frame))
+        finally:
+            _cleanup_mode(mode)
+
+    def test_letterboxed_frame_not_vertical(self):
+        """Cinematic content (dark top/bottom bars, bright full width)."""
+        import numpy as np
+        mode = _make_mode()
+        try:
+            frame = np.zeros((360, 640, 3), dtype=np.uint8)
+            frame[60:300, :] = 120  # bright band across full width
+            self.assertFalse(mode._is_vertical_video_frame(frame))
+        finally:
+            _cleanup_mode(mode)
+
+    def test_dark_scene_with_textured_sides_not_vertical(self):
+        """A dark movie shot with a lit center subject: sides have texture
+        (std too high for true pillarbox bars) so it must not trigger."""
+        import numpy as np
+        mode = _make_mode()
+        try:
+            rng = np.random.default_rng(42)
+            frame = rng.integers(0, 45, (360, 640, 3), dtype=np.uint8).astype(np.uint8)
+            frame[:, 256:384] = 150  # lit center
+            self.assertFalse(mode._is_vertical_video_frame(frame))
+        finally:
+            _cleanup_mode(mode)
+
+    def test_none_frame_not_vertical(self):
+        mode = _make_mode()
+        try:
+            self.assertFalse(mode._is_vertical_video_frame(None))
+        finally:
+            _cleanup_mode(mode)
+
+    def test_ocr_signature_detected(self):
+        mode = _make_mode()
+        try:
+            mode._frame_capture = None  # isolate OCR path
+            _set_ocr_texts(mode, ["@somecreator", "Subscribe", "#shorts"])
+            self.assertTrue(mode._is_youtube_shorts())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_ocr_signature_with_duration_not_shorts(self):
+        """A full video's player overlay (@handle + Subscribe + 10:23) is
+        NOT Shorts — the time marker distinguishes it. The old tautological
+        duration check regressed here."""
+        mode = _make_mode()
+        try:
+            mode._frame_capture = None
+            _set_ocr_texts(mode, ["@somecreator", "Subscribe", "10:23"])
+            self.assertFalse(mode._is_youtube_shorts())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_vertical_frames_detected_as_shorts(self):
+        """Overlay-less Shorts playback: OCR empty, both frames pillarboxed."""
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, [])
+            frame = self._pillarboxed_frame()
+            mode._frame_capture.capture.return_value = frame
+            with patch("autonomous_mode.time.sleep"):
+                self.assertTrue(mode._is_youtube_shorts())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_single_vertical_frame_not_enough(self):
+        """Double-confirmation: one pillarboxed frame + one normal frame
+        (scene cut in a dark movie) must not trigger."""
+        import numpy as np
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, [])
+            normal = np.full((360, 640, 3), 120, dtype=np.uint8)
+            mode._frame_capture.capture.side_effect = [self._pillarboxed_frame(), normal]
+            with patch("autonomous_mode.time.sleep"):
+                self.assertFalse(mode._is_youtube_shorts())
+        finally:
+            _cleanup_mode(mode)
+
+    def test_vertical_check_skipped_while_blocking(self):
+        mode = _make_mode()
+        try:
+            _set_ocr_texts(mode, [])
+            mode._ad_blocker.is_visible = True
+            mode._frame_capture.capture.return_value = self._pillarboxed_frame()
+            self.assertFalse(mode._is_youtube_shorts())
+            mode._frame_capture.capture.assert_not_called()
         finally:
             _cleanup_mode(mode)
 
