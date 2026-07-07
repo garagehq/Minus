@@ -11,6 +11,8 @@ Deduplication uses perceptual difference hashing (dHash):
 """
 
 import logging
+import os
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +31,19 @@ BLACK_FRAME_THRESHOLD = 15
 
 # Reject frames with std deviation below this (solid color)
 SOLID_FRAME_THRESHOLD = 10
+
+# Disk-budget guard (env-overridable). Autonomous mode collects training
+# screenshots 24/7 with max_screenshots=0 (unlimited by design), which on
+# the 59GB root filled ~1.5GB/day and would have exhausted the disk in
+# days (observed 2026-07-07: 13GB / 21.8k files, root at 84%). The budget
+# keeps collection unbounded in TIME but bounded in BYTES: when the
+# screenshots tree exceeds SCREENSHOTS_MAX_GB or root free space drops
+# below SCREENSHOTS_MIN_FREE_GB, the OLDEST files across all categories
+# are evicted until 10% under budget. Checked at most once per
+# DISK_ENFORCE_INTERVAL seconds so the 20k-file scan stays off the hot path.
+SCREENSHOTS_MAX_GB = float(os.environ.get('MINUS_SCREENSHOTS_MAX_GB', '10'))
+SCREENSHOTS_MIN_FREE_GB = float(os.environ.get('MINUS_SCREENSHOTS_MIN_FREE_GB', '4'))
+DISK_ENFORCE_INTERVAL = 300.0
 
 
 class ScreenshotManager:
@@ -51,6 +66,7 @@ class ScreenshotManager:
         """
         self.base_dir = Path(base_dir)
         self.max_screenshots = max_screenshots
+        self._last_budget_check = 0.0
 
         # Organized subdirectories
         self.ads_dir = self.base_dir / "ads"
@@ -154,7 +170,11 @@ class ScreenshotManager:
         """Common gate for all screenshot saves: rate limit, blank reject, dedup.
 
         Returns True if the frame should be saved.
+
+        Also piggybacks the (rate-limited) disk-budget enforcement so every
+        save path keeps the screenshots tree within its byte budget.
         """
+        self._enforce_disk_budget()
         if frame is None:
             logger.warning(f"[Screenshot] Cannot save {category} screenshot: no frame")
             return False
@@ -274,6 +294,63 @@ class ScreenshotManager:
 
         except Exception as e:
             logger.error(f"[Screenshot] Failed to save spastic screenshot: {e}")
+
+    def _enforce_disk_budget(self):
+        """Evict oldest screenshots across all categories when the tree
+        exceeds its byte budget or root free space runs low.
+
+        Preserves the unlimited-count training-data intent while making
+        disk exhaustion impossible. Rate-limited internally.
+        """
+        now = time.time()
+        if now - self._last_budget_check < DISK_ENFORCE_INTERVAL:
+            return
+        self._last_budget_check = now
+        try:
+            files = []
+            total = 0
+            for d in (self.ads_dir, self.non_ads_dir, self.static_dir, self.vlm_spastic_dir):
+                for p in d.glob("*.png"):
+                    try:
+                        st = p.stat()
+                    except OSError:
+                        continue
+                    files.append((st.st_mtime, st.st_size, p))
+                    total += st.st_size
+
+            free = shutil.disk_usage(self.base_dir).free
+            max_bytes = int(SCREENSHOTS_MAX_GB * 1024 ** 3)
+            min_free = int(SCREENSHOTS_MIN_FREE_GB * 1024 ** 3)
+            if total <= max_bytes and free >= min_free:
+                return
+
+            # Hysteresis: evict to 10% under budget / 0.5GB over min-free so
+            # we don't re-trigger on every check.
+            target_total = int(max_bytes * 0.9)
+            target_free = min_free + (512 * 1024 ** 2)
+
+            files.sort()  # oldest first
+            removed = 0
+            freed = 0
+            for _mtime, size, p in files:
+                if total <= target_total and free >= target_free:
+                    break
+                try:
+                    p.unlink()
+                except OSError:
+                    continue
+                total -= size
+                free += size
+                freed += size
+                removed += 1
+
+            if removed:
+                logger.warning(
+                    f"[Screenshot] Disk budget enforced: evicted {removed} oldest "
+                    f"screenshots ({freed / 1024 ** 3:.2f}GB); tree now "
+                    f"{total / 1024 ** 3:.2f}GB, disk free {free / 1024 ** 3:.2f}GB")
+        except Exception as e:
+            logger.warning(f"[Screenshot] Disk budget check failed: {e}")
 
     def _truncate_dir(self, directory: Path):
         """Remove oldest screenshots in a directory if we exceed the max limit."""
