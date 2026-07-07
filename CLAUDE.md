@@ -2857,6 +2857,30 @@ V4L2 capture buffers):**
   Test with the TV: `modetest -M rockchip` plane COLOR_RANGE, compare
   picture with videobalance neutral.
 
+**Display-side follow-up — kmssink double-vsync (Jul 2026, TV attached):**
+with the TV connected (CRTC genuinely at 3840x2160p60) the display
+pipeline pinned at **exactly 30.00fps** while the encoder served 60 to
+both clients and a parallel decode-to-fakesink consumer got 60.
+Isolated to kmssink: GST_DEBUG=kmssink:7 showed dmabuf import + SetPlane
+taking microseconds but ~33ms between frames. Two measured facts:
+(1) `drmWaitVBlank` fires at a clean 60Hz; (2) **the rockchip BSP's
+legacy `drmModeSetPlane` ioctl BLOCKS until the flip latches at vblank**
+(measured 16.67ms/call in a bare-DRM loop). kmssink doesn't know that
+and does its own internal vsync wait after SetPlane → 2 vblanks/frame →
+30fps. Fix: `skip-vsync=true` on kmssink (upstream property since 1.22,
+description literally says "avoid double vsync") — frame pacing is
+still vsync-locked by the blocking SetPlane, so no tearing. Applied to
+all three kmssink pipelines in `ad_blocker.py` (main / no-signal /
+loading). Verified live: **fps_display 30.00 → 59.99** at 4K60 output.
+Notes from the same session: videobalance was NOT the 30fps culprit at
+1080p (passthrough test stayed at 30); the conditional-videobalance
+omission still matters for 4K sources (videobalance @4K ~56fps ceiling).
+VOP2 debugfs (`/sys/kernel/debug/dri/0/summary`) shows the video on the
+Esmart3 plane as BT.601/Limited — matching the limited-range data the
+RGA path preserves verbatim, so neutral color settings should now look
+correct; the old sat=1.4/bri=0.2 likely compensated for the pre-RGA CPU
+conversion path.
+
 ### Roku sticky-disconnect + autonomous Shorts/YouTube-TV avoidance (Jul 2026)
 
 **1. Roku connection died ~daily and never came back (sticky disconnect).**

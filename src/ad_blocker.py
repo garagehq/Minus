@@ -342,7 +342,12 @@ class DRMAdBlocker:
                 f"{colorbalance_part}"
                 f"queue max-size-buffers=3 leaky=downstream name=videoqueue ! "
                 f"identity name=fpsprobe ! "
-                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
+                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false skip-vsync=true"
+                # skip-vsync=true: the rockchip BSP's legacy drmModeSetPlane ioctl BLOCKS
+                # until the flip latches at vblank (measured 16.67ms/call), so kmssink's
+                # own internal vsync wait was a SECOND full vblank -> every frame took
+                # 2 vblanks -> display pinned at exactly 30fps on a 60Hz mode. Frame
+                # pacing/tearing is still handled by the blocking SetPlane itself.
             )
 
             logger.debug("[DRMAdBlocker] Creating pipeline with queue element...")
@@ -935,7 +940,12 @@ class DRMAdBlocker:
                 f"valignment=position halignment=position xpos=0.5 ypos=0.5 "
                 f"font-desc=\"Sans Bold 24\" ! "
                 f"videoconvert ! video/x-raw,format=NV12 ! "
-                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
+                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false skip-vsync=true"
+                # skip-vsync=true: the rockchip BSP's legacy drmModeSetPlane ioctl BLOCKS
+                # until the flip latches at vblank (measured 16.67ms/call), so kmssink's
+                # own internal vsync wait was a SECOND full vblank -> every frame took
+                # 2 vblanks -> display pinned at exactly 30fps on a 60Hz mode. Frame
+                # pacing/tearing is still handled by the blocking SetPlane itself.
             )
 
             logger.debug(f"[DRMAdBlocker] Creating no-signal pipeline (plane={self.plane_id}, connector={self.connector_id})...")
@@ -1120,7 +1130,12 @@ class DRMAdBlocker:
                 f"textoverlay name=loading_text text=\"[ INITIALIZING ]\" "
                 f"valignment=center halignment=center font-desc=\"Sans Bold 24\" ! "
                 f"videoconvert ! video/x-raw,format=NV12 ! "
-                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false"
+                f"kmssink plane-id={self.plane_id} connector-id={self.connector_id} sync=false skip-vsync=true"
+                # skip-vsync=true: the rockchip BSP's legacy drmModeSetPlane ioctl BLOCKS
+                # until the flip latches at vblank (measured 16.67ms/call), so kmssink's
+                # own internal vsync wait was a SECOND full vblank -> every frame took
+                # 2 vblanks -> display pinned at exactly 30fps on a 60Hz mode. Frame
+                # pacing/tearing is still handled by the blocking SetPlane itself.
             )
 
             logger.debug("[DRMAdBlocker] Creating loading pipeline...")
