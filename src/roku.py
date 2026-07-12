@@ -545,7 +545,11 @@ class RokuController:
             response = requests.get(url, timeout=3)
             if response.status_code == 200:
                 import re
-                match = re.search(r'<app\s+id="(\d+)"', response.text)
+                # Accept non-numeric ids too: Roku OS 15.x reports the home screen
+                # as <app id="native-ui">; a digits-only match returned None which
+                # callers treat as "query failed, don't interfere" (observed live
+                # 2026-07-12: 50-minute stuck-on-home loop).
+                match = re.search(r'<app\s+id="([^"]+)"', response.text)
                 if match:
                     return match.group(1)
             return None

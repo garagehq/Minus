@@ -2975,6 +2975,19 @@ guarded; each was observed live before being fixed:
   video just lingers.
 - Also: Roku ECP `202 Accepted` now counts as keypress/launch success
   (was logged as failure under load).
+- **Stuck-on-Roku-home loop (Jul 2026, 50-min stall):** Roku OS 15.2
+  reports the home screen as `<app id="native-ui">`; `get_active_app_id`'s
+  digits-only regex (`id="(\d+)"`) returned None → callers treated it as
+  "query failed, don't interfere" → the authoritative unguarded ECP
+  recovery never fired. The OCR home-tile fallback DID detect home every
+  cycle, but the Roku home screen AUTOPLAYS promo audio in its side pane,
+  so the audio-flowing veto blocked the relaunch indefinitely (92
+  vetoed matches/hour observed). Two fixes: (a) regex now accepts any id
+  (`id="([^"]+)"`) so ECP is authoritative again; (b) the OCR fallback
+  escalates past the audio veto after `_ROKU_HOME_VETO_ESCAPE_AT` (6)
+  consecutive vetoed matches (~3 min) — persistent home-tile OCR for
+  minutes IS the home screen, promo audio notwithstanding. Tests:
+  `TestActiveAppIdParsing` (roku), streak covered by dispatch tests.
 Tests: `TestYouTubeTVActivationScreen`, `TestMenuSkipWatchdog`,
 `TestScreensaverLaunchGuards`, `TestKeyboardStuckAudioGuard`,
 `TestDialogDismissAudioGuard` in `tests/test_autonomous_mode.py`;
