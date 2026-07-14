@@ -92,6 +92,7 @@ del _os, _subprocess, _time, _FALLBACK_MARKER
 
 import argparse
 import gc
+import glob
 import os
 import sys
 import signal
@@ -2049,6 +2050,7 @@ class Minus:
 
             # Memory/health
             'memory_percent': health_status.memory_percent if health_status else 0,
+            'temperature_c': self._get_soc_temperature(),
             'ustreamer_ok': health_status.ustreamer_responding if health_status else True,
             'video_ok': health_status.video_pipeline_ok if health_status else True,
 
@@ -2069,6 +2071,25 @@ class Minus:
             'remote_connected': self._is_remote_connected(),
             'remote_device_type': self._get_configured_device_type(),
         }
+
+    def _get_soc_temperature(self):
+        """Hottest RK3588 thermal zone in °C (soc/bigcore/littlecore/center/gpu/npu).
+
+        Max across zones: the UI badge answers "how hot is the unit", and the
+        throttle trip (~85°C) fires on whichever zone gets there first.
+        Returns None if sysfs is unreadable so the UI can show '--'.
+        """
+        temps = []
+        try:
+            for zone in glob.glob('/sys/class/thermal/thermal_zone*/temp'):
+                try:
+                    with open(zone) as f:
+                        temps.append(int(f.read().strip()) / 1000.0)
+                except (OSError, ValueError):
+                    continue
+        except Exception:
+            return None
+        return round(max(temps), 1) if temps else None
 
     def _get_bandwidth_status(self) -> dict:
         """Get HDMI bandwidth/color format status for API."""
