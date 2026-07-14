@@ -204,6 +204,9 @@ class AutonomousMode:
         # (~3 min) with no audio, no overlay, and no recognizable screen,
         # escape with Back presses + content selection.
         self._menu_skip_count: int = 0
+        # Consecutive audio-vetoed Roku-home OCR matches (see dispatch escalation)
+        self._roku_home_veto_streak: int = 0
+        self._ROKU_HOME_VETO_ESCAPE_AT = 6  # ~3 min at the ~33s monitor cycle
         self._MENU_SKIP_ESCAPE_AT = 5
 
         # Timestamp of the last _is_audio_flowing() == True observation.
@@ -1756,16 +1759,38 @@ class AutonomousMode:
             # active-app check above is authoritative and stays unguarded.
             if self._is_roku_home_screen():
                 if self._is_audio_flowing():
+                    # Roku home AUTOPLAYS promo/ad audio in its side pane, so
+                    # "audio flowing" is not proof a video is playing when the
+                    # home-tile text persists. Observed live 2026-07-12: Roku
+                    # OS 15.2 reported home as <app id="native-ui"> which the
+                    # digits-only ECP regex failed to parse (ECP stood down)
+                    # and home promo audio vetoed this fallback for 50+ min.
+                    # Escalate after enough consecutive vetoed matches —
+                    # home-tile OCR persisting ~3 minutes IS the home screen.
+                    self._roku_home_veto_streak += 1
+                    if self._roku_home_veto_streak >= self._ROKU_HOME_VETO_ESCAPE_AT:
+                        logger.warning(
+                            f"[AutonomousMode] Roku-home OCR persisted through "
+                            f"{self._roku_home_veto_streak} audio vetoes — relaunching anyway")
+                        self._log_event("Roku home persisted despite audio - launching YouTube")
+                        self._roku_home_veto_streak = 0
+                        self._launch_youtube()
+                        self._consecutive_static = 0
+                        self._stuck_count = 0
+                        return True
                     logger.info("[AutonomousMode] Roku-home OCR match vetoed: "
                                 "audio flowing — video is playing")
                     self._log_event("Roku-home OCR vetoed: audio flowing")
                 else:
                     logger.info("[AutonomousMode] Roku home detected via OCR - launching YouTube")
                     self._log_event("Roku home (OCR fallback) - launching YouTube")
+                    self._roku_home_veto_streak = 0
                     self._launch_youtube()
                     self._consecutive_static = 0
                     self._stuck_count = 0
                     return True
+            else:
+                self._roku_home_veto_streak = 0
 
             # STUCK DETECTION: Check for keyboard/sign-in screens we can't automate
             # This must come BEFORE other checks to escape stuck states quickly

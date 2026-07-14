@@ -2775,6 +2775,112 @@ disable when upstream is fixed).
 constant + `_inferences_since_restart` counter + restart trigger in
 `transcribe()`), CLAUDE.md.
 
+### 60fps pipeline fix — ustreamer zero-copy VPU + RGA (Jul 2026)
+
+The HDMI pipeline capped at **27-30fps** (dipping to 23) at every
+resolution despite the VPU being rated 4K60. Diagnosed with ustreamer's
+`--perf` logging + standalone MPP/RGA benchmarks; fixed on the
+`fix/fps-early-buffer-release` branch of `ustreamer-garagehq`
+(commit `32ab470`), deployed to `/home/radxa/ustreamer-patched`
+(backup: `ustreamer-patched.bak-pre-60fps`). Measured: **29.4 → 60.0 fps**
+served at 1080p60 NV24, grab-to-expose latency **110ms → 17ms**.
+
+Three stacked root causes, all in the ustreamer fork:
+1. **Deferred V4L2 buffer release starved capture to half rate.** A
+   worker's capture buffer was only decref'd when the dispatcher next
+   picked that worker (~100ms later), permanently pinning 4 of 5 V4L2
+   buffers — `captured_fps` dropped 60→30 the moment a client attached.
+   Buffers are now released inside the worker right after encode.
+2. **The CPU touched every pixel of UNCACHED V4L2 mmap memory.** The
+   per-frame copy/convert into the MPP buffer read uncached DMA memory:
+   ~90ms per 1080p NV24 frame (vs ~5ms actual VPU encode; benchmarked
+   213fps pure VPU at 1080p). Replaced with hardware paths:
+   - **NV12 sources (4K)**: V4L2 DMABUF imported directly into MPP
+     (`MPP_BUFFER_TYPE_EXT_DMA`) — true zero-copy, VPU reads via IOMMU.
+     `dma_export` enabled for the MPP encoder type in `stream.c`.
+   - **NV24 sources (1080p YCbCr 4:4:4, e.g. Roku)**: two RGA passes —
+     Y plane copied as an RGBA-reinterpreted image; the NV24 UV plane
+     viewed as RGBA (each px = U0V0U1V1) downscaled 2× == exactly the
+     NV12 UV plane layout. ~2.4ms/frame. NOTE: RGA has no native
+     YUV444SP support, and feeding YUV444SP/BGR888 directly to the JPEG
+     VEPU produces CORRUPT bitstreams (tested — the old "only NV12 is
+     reliable" comment was right); the RGA plane tricks are the way.
+   - **BGR24 sources (Google TV)**: RGA `imcvtcolor` (~2ms, benchmarked
+     478fps).
+   Import handles are cached per fd; ANY hardware-path failure logs once
+   and permanently falls back to the old CPU path (`zero_copy_broken` /
+   `rga_broken`).
+3. Minor: per-frame full-buffer `memset` removed (cleared once at
+   configure); releaser poll 5ms → 1ms.
+
+**Feature preservation (verified live):** blocking composite and the
+notification overlay REQUIRE CPU pixel access, so the encoder checks
+`us_blocking_is_enabled_fast()` and the new `us_overlay_is_enabled()`
+per frame and routes through the legacy CPU path while either is active
+(fps drops to CPU rates during a block — acceptable, the screen shows
+the vocab card). Verified: overlay text renders, full blocking overlay
+(header/vocab/preview/stats/OCR-snippet) renders, path switching is
+clean, `/snapshot` + `/snapshot/raw` + OCR + VLM all work, stream
+returns to 60fps after the block ends.
+
+**4K resilience validation (no 4K HDMI source available — validated
+with real 4K content in dma-heap buffers, the same memory class as
+V4L2 capture buffers):**
+- **Encoder**: the exact `MPP_BUFFER_TYPE_EXT_DMA` import path was
+  exercised at 3840×2160 with 16 real (upscaled-capture) NV12 frames in
+  CMA dmabufs: import OK, output JPEGs valid (~380KB @q80),
+  single-context 18.0ms/frame (55.4fps), **4-worker sustained aggregate
+  66.7fps over 10s** — 4K60 encode headroom confirmed
+  (`scratchpad/test4k_extdma.c` pattern).
+- **Display decode**: `mppjpegdec` at 4K does **120fps** to fakesink;
+  neutral `videobalance` passes through at 120fps; **non-neutral
+  videobalance (sat=1.4/bri=0.2, the saved user settings) caps 4K at
+  ~56fps** — the only remaining sub-60 link, CPU per-pixel.
+- **Dead ends tested**: GStreamer-GL (`glupload!glcolorbalance`)
+  SIGSEGVs on this BSP/Mali stack; VOP2 exposes no BCSH/saturation DRM
+  props (COLOR_ENCODING/COLOR_RANGE only); RGA has no saturation op;
+  feeding YUV444SP/BGR888 straight to the JPEG VEPU corrupts bitstreams.
+- **Mitigation shipped**: `ad_blocker._init_pipeline` now OMITS
+  `videobalance` entirely when saved color settings are neutral (pure
+  zero-copy DMABuf mppjpegdec→kmssink, 120fps headroom);
+  `set_color_settings` rebuilds the pipeline when settings cross
+  neutral↔non-neutral.
+- **Open lead for full 60fps at 4K WITH color correction** (needs the
+  TV attached to verify visually): the saved sat=1.4/bri=0.2 looks like
+  compensation for a **limited-range YCbCr HDMI capture being encoded
+  into JPEG (full-range container) and displayed as full-range** —
+  i.e., washed-out picture. If so, the proper fix is range expansion,
+  not saturation: either set the kmssink plane's `COLOR_RANGE` prop /
+  caps colorimetry, or do the limited→full range expansion in the
+  ustreamer RGA pass (RGA supports range conversion in `imcvtcolor`
+  modes). Then color settings can go neutral → zero-copy display path.
+  Test with the TV: `modetest -M rockchip` plane COLOR_RANGE, compare
+  picture with videobalance neutral.
+
+**Display-side follow-up — kmssink double-vsync (Jul 2026, TV attached):**
+with the TV connected (CRTC genuinely at 3840x2160p60) the display
+pipeline pinned at **exactly 30.00fps** while the encoder served 60 to
+both clients and a parallel decode-to-fakesink consumer got 60.
+Isolated to kmssink: GST_DEBUG=kmssink:7 showed dmabuf import + SetPlane
+taking microseconds but ~33ms between frames. Two measured facts:
+(1) `drmWaitVBlank` fires at a clean 60Hz; (2) **the rockchip BSP's
+legacy `drmModeSetPlane` ioctl BLOCKS until the flip latches at vblank**
+(measured 16.67ms/call in a bare-DRM loop). kmssink doesn't know that
+and does its own internal vsync wait after SetPlane → 2 vblanks/frame →
+30fps. Fix: `skip-vsync=true` on kmssink (upstream property since 1.22,
+description literally says "avoid double vsync") — frame pacing is
+still vsync-locked by the blocking SetPlane, so no tearing. Applied to
+all three kmssink pipelines in `ad_blocker.py` (main / no-signal /
+loading). Verified live: **fps_display 30.00 → 59.99** at 4K60 output.
+Notes from the same session: videobalance was NOT the 30fps culprit at
+1080p (passthrough test stayed at 30); the conditional-videobalance
+omission still matters for 4K sources (videobalance @4K ~56fps ceiling).
+VOP2 debugfs (`/sys/kernel/debug/dri/0/summary`) shows the video on the
+Esmart3 plane as BT.601/Limited — matching the limited-range data the
+RGA path preserves verbatim, so neutral color settings should now look
+correct; the old sat=1.4/bri=0.2 likely compensated for the pre-RGA CPU
+conversion path.
+
 ### Roku sticky-disconnect + autonomous Shorts/YouTube-TV avoidance (Jul 2026)
 
 **1. Roku connection died ~daily and never came back (sticky disconnect).**
@@ -2869,6 +2975,19 @@ guarded; each was observed live before being fixed:
   video just lingers.
 - Also: Roku ECP `202 Accepted` now counts as keypress/launch success
   (was logged as failure under load).
+- **Stuck-on-Roku-home loop (Jul 2026, 50-min stall):** Roku OS 15.2
+  reports the home screen as `<app id="native-ui">`; `get_active_app_id`'s
+  digits-only regex (`id="(\d+)"`) returned None → callers treated it as
+  "query failed, don't interfere" → the authoritative unguarded ECP
+  recovery never fired. The OCR home-tile fallback DID detect home every
+  cycle, but the Roku home screen AUTOPLAYS promo audio in its side pane,
+  so the audio-flowing veto blocked the relaunch indefinitely (92
+  vetoed matches/hour observed). Two fixes: (a) regex now accepts any id
+  (`id="([^"]+)"`) so ECP is authoritative again; (b) the OCR fallback
+  escalates past the audio veto after `_ROKU_HOME_VETO_ESCAPE_AT` (6)
+  consecutive vetoed matches (~3 min) — persistent home-tile OCR for
+  minutes IS the home screen, promo audio notwithstanding. Tests:
+  `TestActiveAppIdParsing` (roku), streak covered by dispatch tests.
 Tests: `TestYouTubeTVActivationScreen`, `TestMenuSkipWatchdog`,
 `TestScreensaverLaunchGuards`, `TestKeyboardStuckAudioGuard`,
 `TestDialogDismissAudioGuard` in `tests/test_autonomous_mode.py`;

@@ -194,5 +194,31 @@ class TestMonitoringLifecycle(unittest.TestCase):
         self.assertFalse(c._connected)
 
 
+class TestActiveAppIdParsing(unittest.TestCase):
+    """get_active_app_id must parse non-numeric ids like Roku OS 15.x's
+    home screen <app id="native-ui"> — a digits-only regex returned None,
+    callers treated it as query-failure, and the stuck-on-home ECP
+    recovery never fired (observed live 2026-07-12, 50-min stall)."""
+
+    def _controller_with_response(self, body):
+        c = RokuController()
+        c._connected = True
+        c._ip_address = '192.168.1.50'
+        resp = MagicMock(status_code=200, text=body)
+        return c, resp
+
+    def test_parses_numeric_youtube_id(self):
+        c, resp = self._controller_with_response(
+            '<active-app><app id="837" type="appl">YouTube</app></active-app>')
+        with patch('roku.requests.get', return_value=resp):
+            self.assertEqual(c.get_active_app_id(), '837')
+
+    def test_parses_native_ui_home_id(self):
+        c, resp = self._controller_with_response(
+            '<active-app><app id="native-ui" type="appl" ui-location="home">Native UI</app></active-app>')
+        with patch('roku.requests.get', return_value=resp):
+            self.assertEqual(c.get_active_app_id(), 'native-ui')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
