@@ -257,6 +257,7 @@
                     <span id="vlm-status" class="system-badge">VLM: --</span>
                     <span id="asr-status" class="system-badge">ASR: --</span>
                     <span id="memory-status" class="system-badge">Mem: --</span>
+                    <span id="temp-status" class="system-badge">Temp: --</span>
                     <span id="hdmi-status" class="system-badge">HDMI: --</span>
                 </div>
             </section>
@@ -1334,6 +1335,20 @@
                 const memPercent = Math.round(status.memory_percent || 0);
                 memStatus.textContent = `Mem: ${memPercent}%`;
                 memStatus.className = memPercent > 80 ? 'system-badge warning' : 'system-badge ok';
+
+                const tempStatus = document.getElementById('temp-status');
+                if (status.temperature_c != null) {
+                    const t = Math.round(status.temperature_c);
+                    tempStatus.textContent = `Temp: ${t}\u00B0C`;
+                    // RK3588 throttle trip is ~85\u00B0C; this box runs hot under
+                    // 4K passthrough, so: <70 ok, 70-84 warming, >=85 throttling.
+                    tempStatus.className = t >= 85 ? 'system-badge error'
+                                         : t >= 70 ? 'system-badge warning'
+                                         : 'system-badge ok';
+                } else {
+                    tempStatus.textContent = 'Temp: --';
+                    tempStatus.className = 'system-badge';
+                }
 
                 const hdmiStatus = document.getElementById('hdmi-status');
                 hdmiStatus.textContent = status.hdmi_signal ? 'HDMI: OK' : 'HDMI: No Signal';
